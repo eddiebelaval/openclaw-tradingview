@@ -27,6 +27,12 @@ CATEGORY_URLS = {
     "editors_picks": "https://www.tradingview.com/scripts/editors-picks/",
     "top": "https://www.tradingview.com/scripts/?sort=top",
     "trending": "https://www.tradingview.com/scripts/?sort=trending",
+    "oscillators": "https://www.tradingview.com/scripts/oscillators/",
+    "trend_analysis": "https://www.tradingview.com/scripts/trendanalysis/",
+    "volume": "https://www.tradingview.com/scripts/volume/",
+    "moving_averages": "https://www.tradingview.com/scripts/movingaverage/",
+    "volatility": "https://www.tradingview.com/scripts/volatility/",
+    "momentum": "https://www.tradingview.com/scripts/momentum/",
 }
 
 
@@ -65,10 +71,22 @@ def collect_script_urls(page, category: str, limit: int = 0) -> list[dict]:
     except Exception:
         pass
 
-    # Scroll to load more scripts
-    for i in range(20):
+    # Scroll to load more scripts — detect when no new content loads
+    max_scrolls = 50
+    no_new_count = 0
+    prev_height = 0
+    for i in range(max_scrolls):
+        current_height = page.evaluate("document.body.scrollHeight")
         page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
         time.sleep(1)
+        new_height = page.evaluate("document.body.scrollHeight")
+        if new_height == current_height:
+            no_new_count += 1
+            if no_new_count >= 3:
+                print(f"    Scroll stopped after {i+1} scrolls (no new content)")
+                break
+        else:
+            no_new_count = 0
 
     # Extract script links
     scripts = page.evaluate("""() => {
@@ -170,6 +188,7 @@ def main():
     parser.add_argument("--save-category", type=str, default="custom", help="Category folder when using --urls")
     parser.add_argument("--limit", type=int, default=0, help="Max scripts per category")
     parser.add_argument("--headed", action="store_true", help="Show browser")
+    parser.add_argument("--incremental", action="store_true", help="Skip scripts already in state file or on disk")
     args = parser.parse_args()
 
     # Load cookies
@@ -181,7 +200,7 @@ def main():
     cookies = json.loads(COOKIES_FILE.read_text())
     state = load_state()
 
-    print("OpenClaw TradingView Batch Scraper")
+    print("DeepStack TradingView Batch Scraper")
     print("=" * 60)
 
     with sync_playwright() as p:
@@ -234,17 +253,16 @@ def main():
                 url = script["url"]
                 slug = slugify(name)
 
-                # Skip if already scraped
-                if url in state["scraped"]:
-                    total_skipped += 1
-                    continue
-
                 pine_path = cat_dir / f"{slug}.pine"
-                if pine_path.exists():
-                    state["scraped"].append(url)
-                    save_state(state)
-                    total_skipped += 1
-                    continue
+
+                # Skip if already scraped (state or file on disk)
+                if args.incremental:
+                    if url in state["scraped"] or pine_path.exists():
+                        if pine_path.exists() and url not in state["scraped"]:
+                            state["scraped"].append(url)
+                            save_state(state)
+                        total_skipped += 1
+                        continue
 
                 print(f"\n  [{i}/{len(scripts)}] {name[:60]}")
 
