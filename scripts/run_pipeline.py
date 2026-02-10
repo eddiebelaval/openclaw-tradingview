@@ -23,7 +23,7 @@ from framework.data_fetcher import fetch_all_tickers
 from framework.pine_converter import convert_pine_to_python
 from framework.stats_formatter import format_stats_header
 
-CATEGORIES = ["editors_picks", "top", "trending"]
+CATEGORIES = ["editors_picks", "popular", "top", "trending"]
 
 
 def get_unprocessed_pines(category: str | None = None, rerun: bool = False) -> list[Path]:
