@@ -1,0 +1,431 @@
+//@version=5
+// 
+// ███████╗██████╗  █████╗ ███╗   ███╗ █████╗ 
+// ██╔════╝██╔══██╗██╔══██╗████╗ ████║██╔══██╗
+// █████╗  ██████╔╝███████║██╔████╔██║███████║
+// ██╔══╝  ██╔══██╗██╔══██║██║╚██╔╝██║██╔══██║
+// ██║     ██║  ██║██║  ██║██║ ╚═╝ ██║██║  ██║
+// ╚═╝     ╚═╝  ╚═╝╚═╝  ╚═╝╚═╝     ╚═╝╚═╝  ╚═╝
+// 
+//╔══════════════════════════════════════════════════════════════════════════════════════════════════════╗
+//║                        FRAMA ZONE TRAPPER - Wyckoff-Inspired Adaptive System                        ║
+//║                                  [Previous Bar Box / Next Bar Break]                                 ║
+//╠══════════════════════════════════════════════════════════════════════════════════════════════════════╣
+//║  Concept: Identifies significant FRAMA crosses WITHIN candle bodies, then marks the PREVIOUS candle ║
+//║           as a "Smart Money Zone" (box) and the FRAMA level as a "Trigger Line" on the current bar. ║
+//║           Includes a 3-touch block mechanism to prevent overtrading.                                 ║
+//╚══════════════════════════════════════════════════════════════════════════════════════════════════════╝
+//
+// 🔰 INSPIRATION:
+//    • Wyckoff Method (Spring/Upthrust) - Smart money positioning
+//    • John Ehlers (FRAMA) - Fractal adaptive calculations
+//    • Market Profile - Previous value areas as magnets
+//
+// 📚 PUBLICATION NOTES:
+//    This indicator combines classical Wyckoff psychology with modern adaptive mathematics.
+//    The unique "Previous Bar Box / Next Bar Line" separation creates a natural confirmation delay,
+//    filtering out false signals and aligning with institutional order flow.
+//
+// ✨ UNIQUE FEATURES:
+//    1. Time-Shifted Box Placement - Box appears on PREVIOUS candle, line on CURRENT
+//    2. Body-Only Detection - Only counts crosses WITHIN candle bodies (ignores wick noise)
+//    3. Adaptive FRAMA Levels - Self-adjusts to market fractal efficiency
+//    4. Touch Block Mechanism - Auto-deactivates after N touches (prevents repainting)
+//    5. Dual Visualization - Lines, Boxes, or Both with intelligent color coding
+//
+// ⚙️ HOW IT WORKS:
+//    1. FRAMA calculates adaptive support/resistance based on market fractal efficiency
+//    2. When price crosses FRAMA WITHIN the candle body, a signal is generated
+//    3. BOX appears on the PREVIOUS candle (marking the "Smart Money Zone")
+//    4. LINE appears at the FRAMA level on the CURRENT candle (the "Trigger Level")
+//    5. Each subsequent touch increments counter until block threshold is reached
+//    6. Blocked elements turn gray and stop expanding
+//
+// 🧠 PSYCHOLOGICAL EDGE:
+//    • Box on previous bar = "Where smart money positioned"
+//    • Line on current bar = "Level to watch for confirmation"
+//    • Break of line = "Smart money move is activating"
+//    • Block after N touches = "Level is now exhausted/obvious to everyone"
+//
+
+indicator("FRAMA Zone Trapper [Pro]",
+         shorttitle="FZT [Pro]",
+         overlay=true,
+         format=format.price,
+         precision=2,
+         max_labels_count=500,
+         max_lines_count=500,
+         max_boxes_count=500)
+
+//════════════════════════════════════════════════════════════════════════════════════════════════════════╗
+//║                                           USER CONFIGURATION                                         ║
+//╚════════════════════════════════════════════════════════════════════════════════════════════════════════╝
+
+// FRAMA Settings
+price_src = input.source(hl2, "🔷 Price Source", tooltip="Source price for FRAMA calculation")
+frama_len = input.int(100, "🔷 FRAMA Length", minval=10, maxval=500, tooltip="Higher values = smoother but slower")
+fast_const = input.int(5, "🔷 Fast Constant", minval=1, maxval=20, tooltip="Faster constant (SC-FC range)")
+slow_const = input.int(8, "🔷 Slow Constant", minval=2, maxval=30, tooltip="Slower constant (SC-FC range)")
+
+// Visual Settings
+display_mode = input.string("Both", "🎨 Display Mode", options=["Lines Only", "Boxes Only", "Both"],
+     tooltip="Lines = FRAMA level only | Boxes = Previous candle zone | Both = Everything")
+
+max_history = input.int(100, "🎨 Max Historical Elements", minval=20, maxval=300,
+     tooltip="Maximum number of lines/boxes shown at once")
+
+// Block Settings
+touch_limit = input.int(3, "🛑 Touches Until Block", minval=1, maxval=10,
+     tooltip="Number of body touches before element is deactivated (1=block immediately)")
+     
+color_bull = input.color(color.new(color.green, 85), "🛑 Bullish Box Fill", tooltip="Fill color for bullish boxes")
+color_bear = input.color(color.new(color.red, 85), "🛑 Bearish Box Fill", tooltip="Fill color for bearish boxes")
+color_line_bull = input.color(color.new(color.green, 70), "🛑 Bullish Line", tooltip="Line color for bullish crosses")
+color_line_bear = input.color(color.new(color.red, 70), "🛑 Bearish Line", tooltip="Line color for bearish crosses")
+color_blocked = input.color(color.new(color.gray, 85), "🛑 Blocked Element", tooltip="Color for blocked/deactivated elements")
+
+// Advanced Options
+show_debug = input.bool(false, "⚡ Show Debug Info", tooltip="Display current settings on chart")
+show_frama_line = input.bool(true, "⚡ Show FRAMA Line", tooltip="Display the adaptive FRAMA line")
+
+//════════════════════════════════════════════════════════════════════════════════════════════════════════╗
+//║                                       FRAMA CALCULATION ENGINE                                       ║
+//║                                   (John Ehlers' Fractal Adaptive MA)                                 ║
+//╚════════════════════════════════════════════════════════════════════════════════════════════════════════╝
+
+len1 = math.floor(frama_len / 2)
+w_val = math.log(2 / (slow_const + 1))
+
+// Fractal dimension calculations
+H1 = ta.highest(high, len1)
+L1 = ta.lowest(low, len1)
+N1 = (H1 - L1) / len1
+
+H2 = ta.highest(high, frama_len)[len1]
+L2 = ta.lowest(low, frama_len)[len1]
+N2 = (H2 - L2) / len1
+
+H3 = ta.highest(high, frama_len)
+L3 = ta.lowest(low, frama_len)
+N3 = (H3 - L3) / frama_len
+
+// Dimen = fractal dimension
+dimen_raw = (math.log(N1 + N2) - math.log(N3)) / math.log(2)
+dimen = N1 > 0 and N2 > 0 and N3 > 0 ? dimen_raw : nz(dimen_raw[1])
+
+alpha_exp = math.exp(w_val * (dimen - 1))
+alpha_raw = alpha_exp > 1 ? 1 : (alpha_exp < 0.01 ? 0.01 : alpha_exp)
+
+old_N = (2 - alpha_raw) / alpha_raw
+N_adaptive = (((slow_const - fast_const) * (old_N - 1)) / (slow_const - 1)) + fast_const
+
+alpha_calc = 2 / (N_adaptive + 1)
+alpha_final = alpha_calc < 2 / (slow_const + 1) ? 2 / (slow_const + 1) : (alpha_calc > 1 ? 1 : alpha_calc)
+
+// FRAMA line
+var float frama_raw = na
+frama_raw := (1 - alpha_final) * nz(frama_raw[1]) + alpha_final * price_src
+frama_line = frama_raw
+
+//════════════════════════════════════════════════════════════════════════════════════════════════════════╗
+//║                                      SIGNAL DETECTION LOGIC                                          ║
+//║                              (Body-Only Cross Detection - Wick Filter)                               ║
+//╚════════════════════════════════════════════════════════════════════════════════════════════════════════╝
+
+// Body detection function
+isPriceInBody(bar_high, bar_low, bar_open, bar_close, test_price) =>
+    body_upper = math.max(bar_open, bar_close)
+    body_lower = math.min(bar_open, bar_close)
+    test_price >= body_lower and test_price <= body_upper
+
+// Cross detection with body filter
+bullish_cross = ta.crossover(close, frama_line) and isPriceInBody(high, low, open, close, frama_line)
+bearish_cross = ta.crossunder(close, frama_line) and isPriceInBody(high, low, open, close, frama_line)
+any_cross = bullish_cross or bearish_cross
+
+//════════════════════════════════════════════════════════════════════════════════════════════════════════╗
+//║                                      DYNAMIC STORAGE ARRAYS                                          ║
+//║                         (Manages historical lines/boxes with auto-cleanup)                           ║
+//╚════════════════════════════════════════════════════════════════════════════════════════════════════════╝
+
+// Line storage
+var line[] active_lines = array.new_line()
+var bool[] line_is_blocked = array.new_bool()
+var int[] line_touch_counter = array.new_int()
+var float[] line_stored_price = array.new_float()
+var int[] line_start_index = array.new_int()  // Store starting bar index for cleanup
+
+// Box storage
+var box[] active_boxes = array.new_box()
+var float[] box_stored_high = array.new_float()
+var float[] box_stored_low = array.new_float()
+var bool[] box_is_blocked = array.new_bool()
+var int[] box_touch_counter = array.new_int()
+var int[] box_start_index = array.new_int()  // Store starting bar index for cleanup
+
+//════════════════════════════════════════════════════════════════════════════════════════════════════════╗
+//║                                   ELEMENT CREATION ON SIGNAL                                         ║
+//║                      (Box on PREVIOUS candle, Line on CURRENT candle)                                ║
+//╚════════════════════════════════════════════════════════════════════════════════════════════════════════╝
+
+if any_cross and barstate.isconfirmed
+    signal_price = frama_line
+    current_high = high
+    current_low = low
+    
+    //━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    // LINES (Current Candle - Trigger Level)
+    //━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    if display_mode == "Lines Only" or display_mode == "Both"
+        // Duplicate check
+        is_duplicate_line = false
+        if array.size(active_lines) > 0
+            for i = 0 to array.size(active_lines) - 1
+                if not array.get(line_is_blocked, i) and math.abs(array.get(line_stored_price, i) - signal_price) < syminfo.mintick * 5
+                    is_duplicate_line := true
+                    break
+        
+        if not is_duplicate_line
+            // Color selection
+            line_clr = bullish_cross ? color_line_bull : color_line_bear
+            
+            // Create line on CURRENT candle
+            new_line = line.new(
+                 x1=bar_index,
+                 y1=signal_price,
+                 x2=bar_index,
+                 y2=signal_price,
+                 color=line_clr,
+                 width=2,
+                 style=line.style_solid,
+                 extend=extend.none
+             )
+            
+            // Store line data
+            array.push(active_lines, new_line)
+            array.push(line_is_blocked, false)
+            array.push(line_touch_counter, 0)
+            array.push(line_stored_price, signal_price)
+            array.push(line_start_index, bar_index)
+            
+            // Maintain history limit
+            if array.size(active_lines) > max_history
+                line.delete(array.get(active_lines, 0))
+                array.remove(active_lines, 0)
+                array.remove(line_is_blocked, 0)
+                array.remove(line_touch_counter, 0)
+                array.remove(line_stored_price, 0)
+                array.remove(line_start_index, 0)
+    
+    //━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    // BOXES (Previous Candle - Smart Money Zone)
+    //━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    if display_mode == "Boxes Only" or display_mode == "Both"
+        // Duplicate check
+        is_duplicate_box = false
+        if array.size(active_boxes) > 0
+            for i = 0 to array.size(active_boxes) - 1
+                if not array.get(box_is_blocked, i)
+                    stored_high = array.get(box_stored_high, i)
+                    stored_low = array.get(box_stored_low, i)
+                    if math.abs(stored_high - high[1]) < syminfo.mintick * 5 and 
+                       math.abs(stored_low - low[1]) < syminfo.mintick * 5
+                        is_duplicate_box := true
+                        break
+        
+        if not is_duplicate_box
+            // Color selection
+            box_fill = bullish_cross ? color_bull : color_bear
+            box_border = bullish_cross ? color.green : color.red
+            
+            // Create box on PREVIOUS candle with label
+            new_box = box.new(
+                 left=bar_index[1] - 1,  // Slight left extension for visibility
+                 top=high[1],
+                 right=bar_index[1] + 1,  // Slight right extension for visibility
+                 bottom=low[1],
+                 bgcolor=box_fill,
+                 border_color=box_border,
+                 border_width=1,
+                 extend=extend.none,
+                 text="⚡",
+                 text_size=size.tiny,
+                 text_color=box_border
+             )
+            
+            // Store box data
+            array.push(active_boxes, new_box)
+            array.push(box_stored_high, high[1])
+            array.push(box_stored_low, low[1])
+            array.push(box_is_blocked, false)
+            array.push(box_touch_counter, 0)
+            array.push(box_start_index, bar_index[1])
+            
+            // Maintain history limit
+            if array.size(active_boxes) > max_history
+                box.delete(array.get(active_boxes, 0))
+                array.remove(active_boxes, 0)
+                array.remove(box_stored_high, 0)
+                array.remove(box_stored_low, 0)
+                array.remove(box_is_blocked, 0)
+                array.remove(box_touch_counter, 0)
+                array.remove(box_start_index, 0)
+
+//════════════════════════════════════════════════════════════════════════════════════════════════════════╗
+//║                                      TOUCH DETECTION & UPDATE                                        ║
+//║                         (Monitors each candle for body touches)                                      ║
+//╚════════════════════════════════════════════════════════════════════════════════════════════════════════╝
+
+// Current candle body range
+current_body_top = math.max(open, close)
+current_body_bottom = math.min(open, close)
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// Update Lines
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+if (display_mode == "Lines Only" or display_mode == "Both") and array.size(active_lines) > 0
+    for i = 0 to array.size(active_lines) - 1
+        current_line = array.get(active_lines, i)
+        
+        if not array.get(line_is_blocked, i)
+            line_price = array.get(line_stored_price, i)
+            current_touches = array.get(line_touch_counter, i)
+            
+            // Check if current candle body touches the line
+            if line_price >= current_body_bottom and line_price <= current_body_top
+                // Touch detected
+                new_touch_count = current_touches + 1
+                array.set(line_touch_counter, i, new_touch_count)
+                
+                if new_touch_count >= touch_limit
+                    // Block the line
+                    array.set(line_is_blocked, i, true)
+                    line.set_x2(current_line, bar_index)
+                    line.set_color(current_line, color_blocked)
+                    line.set_width(current_line, 1)
+                else
+                    // Touch but not blocked yet
+                    line.set_x2(current_line, bar_index)
+                    
+                    // Visual feedback on touch (optional)
+                    // line.set_width(current_line, 3)  // Thicken on touch
+            else
+                // No touch - extend to current bar
+                line.set_x2(current_line, bar_index)
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// Update Boxes
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+if (display_mode == "Boxes Only" or display_mode == "Both") and array.size(active_boxes) > 0
+    for i = 0 to array.size(active_boxes) - 1
+        current_box = array.get(active_boxes, i)
+        
+        if not array.get(box_is_blocked, i)
+            box_high = array.get(box_stored_high, i)
+            box_low = array.get(box_stored_low, i)
+            current_touches = array.get(box_touch_counter, i)
+            
+            // Check if current candle's body touches the box
+            if (current_body_top >= box_low and current_body_bottom <= box_high) or
+               (box_high >= current_body_bottom and box_low <= current_body_top)
+                
+                // Touch detected
+                new_touch_count = current_touches + 1
+                array.set(box_touch_counter, i, new_touch_count)
+                
+                if new_touch_count >= touch_limit
+                    // Block the box
+                    array.set(box_is_blocked, i, true)
+                    box.set_right(current_box, bar_index)
+                    box.set_bgcolor(current_box, color_blocked)
+                    box.set_border_color(current_box, color.gray)
+                    
+                    // Add X mark to show blocked
+                    box.set_text(current_box, "✖")
+                    box.set_text_color(current_box, color.gray)
+                else
+                    // Touch but not blocked yet
+                    box.set_right(current_box, bar_index)
+                    
+                    // Update touch counter text
+                    box.set_text(current_box, str.tostring(new_touch_count))
+                    box.set_text_color(current_box, box_high > current_body_top ? color.green : color.red)
+            else
+                // No touch - extend to current bar
+                box.set_right(current_box, bar_index)
+
+//════════════════════════════════════════════════════════════════════════════════════════════════════════╗
+//║                                         VISUAL OUTPUTS                                               ║
+//╚════════════════════════════════════════════════════════════════════════════════════════════════════════╝
+
+// FRAMA line plot
+plot(show_frama_line ? frama_line : na, 
+     title="FRAMA Adaptive Line", 
+     color=color.orange, 
+     linewidth=2,
+     display=display.pane)
+
+// Background highlight for signals (optional visual enhancement)
+bgcolor(any_cross ? color.new(color.yellow, 95) : na, title="Signal Background")
+
+// Debug information
+if show_debug and barstate.islast
+    // Create info box with current settings
+    debug_text = "⚡ FRAMA ZONE TRAPPER ⚡\n" +
+                 "━━━━━━━━━━━━━━━━━━━━\n" +
+                 "Mode: " + display_mode + "\n" +
+                 "Touch Limit: " + str.tostring(touch_limit) + "\n" +
+                 "Active Lines: " + str.tostring(array.size(active_lines)) + "\n" +
+                 "Active Boxes: " + str.tostring(array.size(active_boxes)) + "\n" +
+                 "━━━━━━━━━━━━━━━━━━━━\n" +
+                 "📊 Box = Previous Candle\n" +
+                 "📈 Line = Current Candle\n" +
+                 "🎯 Block after " + str.tostring(touch_limit) + " touches\n" +
+                 "━━━━━━━━━━━━━━━━━━━━\n" +
+                 "⚡ Box shows touch count\n" +
+                 "✖ = Blocked"
+    
+    // Position debug info in top-right corner
+    debug_label = label.new(bar_index - 20, high + (3 * ta.atr(50)), 
+              text=debug_text,
+              color=color.new(color.purple, 90),
+              textcolor=color.white,
+              size=size.small,
+              style=label.style_label_up)
+    
+    // Delete old debug labels to prevent accumulation
+    label.delete(debug_label[1])
+
+//════════════════════════════════════════════════════════════════════════════════════════════════════════╗
+//║                                         SIGNATURE & NOTES                                            ║
+//╚════════════════════════════════════════════════════════════════════════════════════════════════════════╝
+// 
+// 🔥 UNIQUE SELLING POINTS:
+//    • Time-Shifted Box Placement - Box on PREVIOUS bar (Smart Money Zone)
+//    • Line on CURRENT bar (Trigger Level)
+//    • Body-Only Detection - Ignores wick noise
+//    • Adaptive FRAMA - Self-adjusts to market conditions
+//    • Touch Blocking - Prevents overtrading on exhausted levels
+//    • Visual Touch Counter - Boxes show number of touches
+//
+// 📖 EDUCATIONAL VALUE:
+//    This indicator teaches the concept of "setup vs execution" in trading.
+//    The box represents WHERE smart money positioned (Wyckoff accumulation/distribution).
+//    The line represents WHEN to act (the trigger/spring).
+//    The block mechanism teaches that levels lose power after too many touches.
+//
+// ⚠️ IMPORTANT NOTES:
+//    • Boxes always appear on the PREVIOUS candle (historical zone)
+//    • Lines appear at FRAMA level on CURRENT candle (active trigger)
+//    • Only counts touches WITHIN candle body (not wicks)
+//    • Elements turn gray and show ✖ after reaching touch limit
+//    • Boxes display current touch count as number
+//    • Designed for all timeframes
+//
+// 🏆 VERSION: 2.1.0
+// 📅 LAST UPDATED: 2024
+// 👤 AUTHOR: [Your Name/Pseudonym]
+// 📧 CONTACT: [Optional contact info]
+//
+// 📜 LICENSE: This source code is subject to the terms of the Mozilla Public License 2.0
+//            https://mozilla.org/MPL/2.0/

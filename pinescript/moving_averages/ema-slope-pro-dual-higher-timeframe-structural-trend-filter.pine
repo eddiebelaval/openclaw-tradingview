@@ -1,0 +1,259 @@
+//@version=6
+// ===================================================================
+// EMA Slope Pro - Dual Higher Timeframe Structural Trend Filter
+// Author: [The Scalping Ant]
+// License: Mozilla Public License 2.0
+// Description: Open-source indicator. See publication for full details.
+// ===================================================================
+// REPAINTING NOTE:
+// All request.security() calls use ONLY barmerge.lookahead_off.
+// Live-bar updates are controlled by barstate.isconfirmed, NOT by
+// lookahead_on. This eliminates all lookahead bias. When waitClose=true,
+// both EMAs update only on confirmed HTF closes. When waitClose=false,
+// both EMAs update on every realtime tick using the current (unconfirmed)
+// bar's close — which is the live price, not a future price. Zero repainting.
+// ===================================================================
+indicator("EMA Slope Pro - Dual Higher Timeframe Structural Trend Filter", overlay=true, max_labels_count=2)
+
+// ─── TOOLTIP CONSTANTS ───────────────────────────────────────────────
+var string TT_EMA_LEN     = "The period of EMA 1. 200 is the institutional standard for primary market structure." +
+     " Shorter values (50, 100) increase responsiveness at the cost of more noise."
+
+var string TT_SLOPE_BARS  = "Number of HTF bars used to measure slope: ((EMA_now - EMA[n]) / close) * 100." +
+     " Smaller = faster response. Larger = smoother readings. Applies to both EMAs."
+
+var string TT_HTF         = "Higher timeframe for EMA 1. Example: if your chart is 15m, set this to 4H or Daily." +
+     " EMA and slope are computed entirely on the HTF dataset before being returned."
+
+var string TT_WAIT        = "When ON: both EMAs update only after their HTF bar fully closes. No lookahead bias." +
+     " When OFF: both EMAs update on every realtime tick using the current live close." +
+     " OFF does NOT use lookahead_on — it uses the live bar close, which is not a future price." +
+     " Strongly recommended: leave ON for all signal-based use."
+
+var string TT_FLAT_THRESH = "Minimum absolute slope % to classify as trending. Below this = sideways (grey)." +
+     " Raise to 0.10-0.15 for high-volatility crypto. Lower to 0.02-0.03 for low-volatility pairs."
+
+var string TT_EMA2_LEN    = "The period of EMA 2. Defaults to 200 on the Daily timeframe." +
+     " Set a different length than EMA 1 to track two distinct structural levels simultaneously."
+
+var string TT_HTF2        = "Higher timeframe for EMA 2. Defaults to Daily (1D)." +
+     " A higher timeframe than EMA 1 creates a dual-layer filter: trade only when both agree."
+
+var string TT_SHOW_EMA2   = "Show or hide EMA 2 line. Alert conditions for EMA 2 remain active when hidden."
+
+var string TT_SHOW_LABEL  = "Show slope percentage labels at the right edge of each EMA line." +
+     " Each label shows the current slope value and state: BULL, BEAR, or SIDE."
+
+var string TT_BULL_COL    = "Line colour when the HTF slope is positive and above the flat threshold." +
+     " Applies to both EMAs simultaneously."
+
+var string TT_BEAR_COL    = "Line colour when the HTF slope is negative and below the flat threshold." +
+     " Applies to both EMAs simultaneously."
+
+var string TT_FLAT_COL    = "Line colour when the absolute slope is below the flat threshold (sideways zone)." +
+     " Applies to both EMAs simultaneously."
+
+var string TT_LINE_WIDTH  = "Visual thickness of EMA 1 line. Range 1 to 5." +
+     " Thicker lines are easier to read when using other overlays simultaneously."
+
+var string TT_LINE_WIDTH2 = "Visual thickness of EMA 2 line. Range 1 to 5." +
+     " A thinner width than EMA 1 (e.g. 2 vs 4) creates visual hierarchy between the two levels."
+
+var string TT_SHOW_BG     = "Show a background tint driven by EMA 2 trend state." +
+     " Green tint = EMA 2 bullish. Red tint = EMA 2 bearish. No tint = flat/sideways." +
+     " Disable for a cleaner chart when using other background-based indicators."
+
+var string TT_BG_BULL_COL = "Background tint colour used when EMA 2 slope is bullish." +
+     " Default is a subtle green. Transparency is set separately via the Tint Transparency input."
+
+var string TT_BG_BEAR_COL = "Background tint colour used when EMA 2 slope is bearish." +
+     " Default is a subtle red. Transparency is set separately via the Tint Transparency input."
+
+var string TT_BG_TRANSP   = "Transparency of the background tint (0 = fully opaque, 100 = fully transparent)." +
+     " Default 93 gives a very subtle ambient wash. Raise toward 97-98 for minimal tint," +
+     " lower toward 85-88 for a stronger colour zone."
+
+var string TT_ALERT_BULL  = "Alert fires once when EMA 1 slope transitions into bullish for the first time." +
+     " Early-warning signal that the intermediate trend layer has turned upward."
+
+var string TT_ALERT_BEAR  = "Alert fires once when EMA 1 slope transitions into bearish for the first time." +
+     " Intermediate trend has reversed to the downside."
+
+var string TT_ALERT_FLAT  = "Alert fires once when EMA 1 slope drops below the flat threshold from a trending state." +
+     " Useful as a position-exit warning when momentum is fading."
+
+var string TT_ALERT_BULL2 = "Alert fires once when EMA 2 slope transitions into bullish for the first time." +
+     " Higher-weight signal than EMA 1 alone — primary trend layer has turned up."
+
+var string TT_ALERT_BEAR2 = "Alert fires once when EMA 2 slope transitions into bearish for the first time." +
+     " Primary trend layer has turned down."
+
+var string TT_ALERT_AGREE = "Alert fires once when both EMA 1 and EMA 2 simultaneously agree on direction." +
+     " Highest-confidence confluence signal: intermediate and primary trends are aligned."
+
+// ─── INPUTS: EMA 1 ──────────────────────────────────────────────────
+emaLen      = input.int(200,    "EMA 1 - Length",                  minval=1,     maxval=500,  tooltip=TT_EMA_LEN,     group="EMA 1 Settings")
+slopeBars   = input.int(10,     "Slope Lookback Bars",              minval=1,     maxval=100,  tooltip=TT_SLOPE_BARS,  group="EMA 1 Settings")
+htf         = input.timeframe("240", "EMA 1 - Timeframe",                                    tooltip=TT_HTF,         group="EMA 1 Settings")
+waitClose   = input.bool(true,  "Wait for Candle Close",                                      tooltip=TT_WAIT,        group="EMA 1 Settings")
+flatThresh  = input.float(0.05, "Flat Threshold (%)",              minval=0.001, step=0.005,  tooltip=TT_FLAT_THRESH, group="EMA 1 Settings")
+
+// ─── INPUTS: EMA 2 ──────────────────────────────────────────────────
+ema2Len     = input.int(200,    "EMA 2 - Length",                  minval=1,     maxval=500,  tooltip=TT_EMA2_LEN,    group="EMA 2 Settings")
+htf2        = input.timeframe("1D", "EMA 2 - Timeframe",                                     tooltip=TT_HTF2,        group="EMA 2 Settings")
+showEMA2    = input.bool(true,  "Show EMA 2",                                                 tooltip=TT_SHOW_EMA2,   group="EMA 2 Settings")
+
+// ─── INPUTS: DISPLAY ────────────────────────────────────────────────
+showLabel   = input.bool(true,  "Show Slope Labels",                                          tooltip=TT_SHOW_LABEL,  group="Display")
+lineWidth   = input.int(4,      "EMA 1 - Line Width",              minval=1,     maxval=5,    tooltip=TT_LINE_WIDTH,  group="Display")
+lineWidth2  = input.int(2,      "EMA 2 - Line Width",              minval=1,     maxval=5,    tooltip=TT_LINE_WIDTH2, group="Display")
+bullColor   = input.color(color.rgb(37, 253, 8),    "Bullish Color",                         tooltip=TT_BULL_COL,    group="Display")
+bearColor   = input.color(color.rgb(247, 11, 11),   "Bearish Color",                         tooltip=TT_BEAR_COL,    group="Display")
+flatColor   = input.color(color.rgb(120, 120, 120), "Flat / Sideways Color",                 tooltip=TT_FLAT_COL,    group="Display")
+showBG      = input.bool(true,                      "Show Background Tint",                  tooltip=TT_SHOW_BG,     group="Display")
+bgBullColor = input.color(color.rgb(0, 200, 80),    "Background - Bullish Color",             tooltip=TT_BG_BULL_COL, group="Display")
+bgBearColor = input.color(color.rgb(220, 30, 30),   "Background - Bearish Color",             tooltip=TT_BG_BEAR_COL, group="Display")
+bgTransp    = input.int(93,                         "Background Tint Transparency",           minval=0, maxval=99,   tooltip=TT_BG_TRANSP,   group="Display")
+
+// ─── INPUTS: ALERTS ─────────────────────────────────────────────────
+alertBull   = input.bool(true,  "EMA 1 - Alert: Bullish Transition",                         tooltip=TT_ALERT_BULL,  group="Alerts")
+alertBear   = input.bool(true,  "EMA 1 - Alert: Bearish Transition",                         tooltip=TT_ALERT_BEAR,  group="Alerts")
+alertFlat   = input.bool(false, "EMA 1 - Alert: Flat Transition",                            tooltip=TT_ALERT_FLAT,  group="Alerts")
+alertBull2  = input.bool(true,  "EMA 2 - Alert: Bullish Transition",                         tooltip=TT_ALERT_BULL2, group="Alerts")
+alertBear2  = input.bool(true,  "EMA 2 - Alert: Bearish Transition",                         tooltip=TT_ALERT_BEAR2, group="Alerts")
+alertAgree  = input.bool(true,  "Both EMAs - Alert: Confluence Agreement",                   tooltip=TT_ALERT_AGREE, group="Alerts")
+
+// ─── HTF EMA 1 ───────────────────────────────────────────────────────
+// Both calls use lookahead_off — the ONLY repainting-safe setting.
+// waitClose controls WHICH bar's data is used:
+//   true  -> barstate.isconfirmed gate: EMA only updates on HTF bar close.
+//   false -> updates on every realtime tick using current live close.
+// Neither path uses lookahead_on, so there is ZERO lookahead bias.
+[htfEMA_raw, htfSlope_raw] = request.security(
+     syminfo.tickerid, htf,
+     [ta.ema(close, emaLen),
+      ((ta.ema(close, emaLen) - ta.ema(close, emaLen)[slopeBars]) / math.max(close, 1e-10)) * 100.0],
+     lookahead = barmerge.lookahead_off)
+
+// Confirmed-only version: hold the last confirmed value, ignore unconfirmed ticks.
+var float htfEMA_confirmed   = na
+var float htfSlope_confirmed = na
+if barstate.isconfirmed
+    htfEMA_confirmed   := htfEMA_raw
+    htfSlope_confirmed := htfSlope_raw
+
+htfEMA      = waitClose ? htfEMA_confirmed   : htfEMA_raw
+htfSlopePct = waitClose ? htfSlope_confirmed : htfSlope_raw
+
+// ─── HTF EMA 2 ───────────────────────────────────────────────────────
+[htf2EMA_raw, htf2Slope_raw] = request.security(
+     syminfo.tickerid, htf2,
+     [ta.ema(close, ema2Len),
+      ((ta.ema(close, ema2Len) - ta.ema(close, ema2Len)[slopeBars]) / math.max(close, 1e-10)) * 100.0],
+     lookahead = barmerge.lookahead_off)
+
+var float htf2EMA_confirmed   = na
+var float htf2Slope_confirmed = na
+if barstate.isconfirmed
+    htf2EMA_confirmed   := htf2EMA_raw
+    htf2Slope_confirmed := htf2Slope_raw
+
+htf2EMA      = waitClose ? htf2EMA_confirmed   : htf2EMA_raw
+htf2SlopePct = waitClose ? htf2Slope_confirmed : htf2Slope_raw
+
+// ─── TREND STATE: EMA 1 ─────────────────────────────────────────────
+isFlat  = math.abs(htfSlopePct)  < flatThresh
+isBull  = not isFlat  and htfSlopePct  > 0
+isBear  = not isFlat  and htfSlopePct  < 0
+
+// ─── TREND STATE: EMA 2 ─────────────────────────────────────────────
+isFlat2 = math.abs(htf2SlopePct) < flatThresh
+isBull2 = not isFlat2 and htf2SlopePct > 0
+isBear2 = not isFlat2 and htf2SlopePct < 0
+
+// ─── COLOR LOGIC ────────────────────────────────────────────────────
+emaColor  = isFlat  ? flatColor : isBull  ? bullColor : bearColor
+ema2Color = isFlat2 ? flatColor : isBull2 ? bullColor : bearColor
+
+// ─── PLOTS ──────────────────────────────────────────────────────────
+plot(htfEMA,                  title="EMA 1 (HTF)",   color=emaColor,  linewidth=lineWidth)
+plot(showEMA2 ? htf2EMA : na, title="EMA 2 (Daily)", color=ema2Color, linewidth=lineWidth2)
+
+// ─── SLOPE LABELS ───────────────────────────────────────────────────
+var label slopeLabel  = na
+var label slopeLabel2 = na
+if barstate.islast and showLabel
+    label.delete(slopeLabel)
+    labelState  = isBull  ? "BULL" : isBear  ? "BEAR" : "SIDE"
+    labelTxt    = str.tostring(htfSlopePct,  "#.###") + "% | EMA1 " + labelState
+    slopeLabel := label.new(
+         bar_index + 1, htfEMA, labelTxt,
+         style=label.style_label_left, textcolor=color.rgb(0, 0, 0),
+         color=isFlat ? color.gray : isBull ? bullColor : bearColor,
+         size=size.small)
+    if showEMA2
+        label.delete(slopeLabel2)
+        labelState2  = isBull2 ? "BULL" : isBear2 ? "BEAR" : "SIDE"
+        labelTxt2    = str.tostring(htf2SlopePct, "#.###") + "% | EMA2 " + labelState2
+        slopeLabel2 := label.new(
+             bar_index + 1, htf2EMA, labelTxt2,
+             style=label.style_label_left, textcolor=color.rgb(0, 0, 0),
+             color=isFlat2 ? color.gray : isBull2 ? bullColor : bearColor,
+             size=size.small)
+
+// ─── ALERT CONDITIONS: EMA 1 ────────────────────────────────────────
+// [1] is safe here: htfSlopePct is derived from lookahead_off data only.
+// On the chart timeframe, [1] = previous chart bar. The HTF value at that
+// bar is the same confirmed HTF close, so state-transition detection is clean.
+prevIsFlat = math.abs(htfSlopePct[1]) < flatThresh
+prevIsBull = not prevIsFlat and htfSlopePct[1] > 0
+prevIsBear = not prevIsFlat and htfSlopePct[1] < 0
+
+transitionToBull = isBull and not prevIsBull
+transitionToBear = isBear and not prevIsBear
+transitionToFlat = isFlat and not prevIsFlat
+
+alertcondition(alertBull and transitionToBull,
+     title   = "EMA 1 Slope - Bullish Trend",
+     message = "{{ticker}} [{{interval}}] - EMA 1 slope turned BULLISH. Slope: {{plot_0}}%")
+
+alertcondition(alertBear and transitionToBear,
+     title   = "EMA 1 Slope - Bearish Trend",
+     message = "{{ticker}} [{{interval}}] - EMA 1 slope turned BEARISH. Slope: {{plot_0}}%")
+
+alertcondition(alertFlat and transitionToFlat,
+     title   = "EMA 1 Slope - Sideways / Consolidation",
+     message = "{{ticker}} [{{interval}}] - EMA 1 slope entered FLAT zone.")
+
+// ─── ALERT CONDITIONS: EMA 2 ────────────────────────────────────────
+prevIsFlat2 = math.abs(htf2SlopePct[1]) < flatThresh
+prevIsBull2 = not prevIsFlat2 and htf2SlopePct[1] > 0
+prevIsBear2 = not prevIsFlat2 and htf2SlopePct[1] < 0
+
+transitionToBull2 = isBull2 and not prevIsBull2
+transitionToBear2 = isBear2 and not prevIsBear2
+
+alertcondition(alertBull2 and transitionToBull2,
+     title   = "EMA 2 Slope - Bullish Trend (Daily)",
+     message = "{{ticker}} [{{interval}}] - EMA 2 Daily slope turned BULLISH. Slope: {{plot_1}}%")
+
+alertcondition(alertBear2 and transitionToBear2,
+     title   = "EMA 2 Slope - Bearish Trend (Daily)",
+     message = "{{ticker}} [{{interval}}] - EMA 2 Daily slope turned BEARISH. Slope: {{plot_1}}%")
+
+// ─── CONFLUENCE ALERT: BOTH EMAs AGREE ──────────────────────────────
+bothBull     = isBull  and isBull2
+bothBear     = isBear  and isBear2
+prevBothBull = prevIsBull  and prevIsBull2
+prevBothBear = prevIsBear  and prevIsBear2
+
+alertcondition(alertAgree and ((bothBull and not prevBothBull) or (bothBear and not prevBothBear)),
+     title   = "EMA 1 + EMA 2 - Confluence Agreement",
+     message = "{{ticker}} [{{interval}}] - Both EMAs now agree. EMA1={{plot_0}}% EMA2={{plot_1}}%. High-confidence structural alignment.")
+
+// ─── BACKGROUND HIGHLIGHT ───────────────────────────────────────────
+// Driven by EMA 2 (higher-authority timeframe) for ambient trend context.
+// showBG toggle, bgBullColor, bgBearColor and bgTransp are all independently
+// configurable — the tint colour is fully decoupled from the EMA line colours.
+bgcolor(showBG ? (isBull2 ? color.new(bgBullColor, bgTransp) : isBear2 ? color.new(bgBearColor, bgTransp) : na) : na,
+        title="EMA 2 Trend Background Tint")

@@ -1,0 +1,194 @@
+//@version=5
+indicator("Exponential Nadaraya–Watson kernel regression [Jamallo]", shorttitle = "ENW Kernel Bands [Jamallo]", overlay=true)
+
+// =============================================================================
+// INPUTS
+// =============================================================================
+// Vervoort Stop Settings
+vPeriod = input.int(100, "ATR Period", minval=1, group="Vervoort Stop")
+vMultiplier = input.float(0.5, "ATR Multiplier", minval=0.1, step=0.1, group="Vervoort Stop")
+
+// Signal Line - Vervoort Stop 2
+vPeriodSignal = input.int(100, "Signal Line ATR Period", minval=1, group="Vervoort Stop")
+vMultiplierSignal = input.float(1.0, "Signal Line ATR Multiplier", minval=0.1, step=0.1, group="Vervoort Stop")
+
+// ENW Kernel Settings for K Line
+waveletLenK = input.int(100, "K Line Kernel Length", minval=5, maxval=200, group="ENW Kernel K Line")
+waveletAlphaK = input.float(0.3, "K Line Kernel Alpha", minval=0.1, maxval=100, step=0.1, group="ENW Kernel K Line")
+
+// ENW Kernel Volatility for Range Bands
+volWaveletLen = input.int(14, "Volatility Kernel Length", minval=5, maxval=100, group="ENW Volatility Bands")
+volWaveletAlpha = input.float(0.5, "Volatility Kernel Alpha", minval=0.1, maxval=100, step=0.1, group="ENW Volatility Bands")
+
+// Range Bands - Inner
+rangeDeviation = input.float(1.2, "Inner Band Deviation", minval=0.1, step=0.1, group="Range Bands")
+// Range Bands - Outer
+rangeDeviation2 = input.float(2.0, "Outer Band Deviation", minval=0.1, step=0.1, group="Range Bands")
+
+// Display Options
+showALine = input.bool(true, "Show A Line (Vervoort)", group="Display")
+showSignalLine = input.bool(true, "Show Signal Line (Vervoort 2)", group="Display")
+showKLine = input.bool(true, "Show K Line", group="Display")
+showRangeBands = input.bool(true, "Show Inner Range Bands", group="Display")
+showOuterBands = input.bool(true, "Show Outer Range Bands", group="Display")
+showCrossSignals = input.bool(true, "Show Cross Signals", group="Display")
+showTrendFill = input.bool(true, "Show A & K Background Fill", group="Display")
+
+// =============================================================================
+// HEIKIN ASHI SMOOTHED PRICE (ohlc/4)
+// =============================================================================
+var float haClose = na
+var float haOpen  = na
+
+haClose := (open + high + low + close) / 4.0
+haOpen  := na(haOpen[1]) ? (open + close) / 2.0 : (haOpen[1] + haClose[1]) / 2.0
+haHigh  = math.max(high, math.max(haOpen, haClose))
+haLow   = math.min(low,  math.min(haOpen, haClose))
+
+// Smoothed price used throughout the indicator
+haPrice = (haOpen + haHigh + haLow + haClose) / 4.0
+
+// =============================================================================
+// VERVOORT STOP FUNCTION
+// =============================================================================
+f_vervoort(int period, float multiplier) =>
+    xClose = haPrice
+    v_atr = ta.atr(period)
+    loss = multiplier * v_atr
+
+    var float v_stop = 0.0
+    var bool trend_is_up = true
+
+    if bar_index == 0
+        v_stop := haClose - loss
+        trend_is_up := true
+    else
+        float prev_v_stop = nz(v_stop[1], haClose - loss)
+        trend_is_up := haClose > prev_v_stop
+
+        if trend_is_up
+            v_stop := math.max(prev_v_stop, xClose - loss)
+        else
+            v_stop := math.min(prev_v_stop, xClose + loss)
+
+        if trend_is_up and haClose < v_stop
+            trend_is_up := false
+            v_stop := xClose + loss
+        else if not trend_is_up and haClose > v_stop
+            trend_is_up := true
+            v_stop := xClose - loss
+
+    v_stop
+
+// =============================================================================
+// ENW KERNEL FUNCTION
+// =============================================================================
+f_waveletKernel(series float src, int len, float alpha) =>
+    float sum = 0.0
+    float weightSum = 0.0
+
+    float center = len / 2.0
+
+    for i = 0 to len - 1
+        float x = float(i)
+        float price = src[len - 1 - i]
+
+        float dist = math.abs(x - center)
+        float recencyWeight = math.exp(-alpha * (len - 1 - i) / len)
+        float localWeight = math.exp(-math.pow(dist / (len / 3), 2))
+        float weight = recencyWeight * localWeight
+
+        sum += price * weight
+        weightSum += weight
+
+    weightSum > 0 ? sum / weightSum : src
+
+// =============================================================================
+// ENW VOLATILITY FUNCTION
+// =============================================================================
+f_waveletVolatility(series float price, series float baseline, int len, float alpha) =>
+    float deviation = math.abs(price - baseline)
+    float smoothedVol = f_waveletKernel(deviation, len, alpha)
+    smoothedVol
+
+// =============================================================================
+// A LINE - VERVOORT STOP
+// =============================================================================
+float a = f_vervoort(vPeriod, vMultiplier)
+
+// =============================================================================
+// SIGNAL LINE - VERVOORT STOP 2
+// =============================================================================
+float signalLine = f_vervoort(vPeriodSignal, vMultiplierSignal)
+
+// =============================================================================
+// K LINE - ENW KERNEL (on HA smoothed price)
+// =============================================================================
+float k = f_waveletKernel(haPrice, waveletLenK, waveletAlphaK)
+
+// =============================================================================
+// RANGE FILTER BANDS - ENW VOLATILITY (on HA smoothed price)
+// =============================================================================
+vola = f_waveletVolatility(haPrice, k, volWaveletLen, volWaveletAlpha)
+
+upper  = k + vola * rangeDeviation
+lower  = k - vola * rangeDeviation
+
+upper2 = k + vola * rangeDeviation2
+lower2 = k - vola * rangeDeviation2
+
+// =============================================================================
+// CROSSOVER SIGNALS - A LINE CROSSES K LINE
+// =============================================================================
+longSignal  = ta.crossover(a, k)
+shortSignal = ta.crossunder(a, k)
+
+// Additional cross conditions
+longSignalVsSignal  = ta.crossover(a, signalLine)
+shortSignalVsSignal = ta.crossunder(a, signalLine)
+
+// =============================================================================
+// ALERTS
+// =============================================================================
+alertcondition(longSignal,  "Long Signal — A crosses above K",       "ENW: A Line crossed ABOVE K Line — Bullish signal on {{ticker}} ({{interval}})")
+alertcondition(shortSignal, "Short Signal — A crosses below K",      "ENW: A Line crossed BELOW K Line — Bearish signal on {{ticker}} ({{interval}})")
+alertcondition(longSignalVsSignal,  "A crosses above Signal Line",   "ENW: A Line crossed ABOVE Signal Line on {{ticker}} ({{interval}})")
+alertcondition(shortSignalVsSignal, "A crosses below Signal Line",   "ENW: A Line crossed BELOW Signal Line on {{ticker}} ({{interval}})")
+alertcondition(longSignal  or longSignalVsSignal,  "Any Bullish Alert", "ENW: Bullish condition triggered on {{ticker}} ({{interval}})")
+alertcondition(shortSignal or shortSignalVsSignal, "Any Bearish Alert", "ENW: Bearish condition triggered on {{ticker}} ({{interval}})")
+
+// =============================================================================
+// INNER BAND COLOR - BASED ON A LINE VS K LINE
+// =============================================================================
+innerBandColor = a > k ? color.new(color.green, 50) :
+                 a < k ? color.new(color.red, 50) :
+                 color.new(color.gray, 50)
+
+// =============================================================================
+// PLOTTING
+// =============================================================================
+aColor = a > k ? color.new(color.green, 30) : color.new(color.red, 30)
+kColor = color.new(color.white, 30)
+signalColor = color.new(color.gray, 30)
+outerColor = color.new(color.blue, 50)
+trendFill = showTrendFill ? (a > k ? color.new(color.green, 95) : color.new(color.red, 95)) : na
+
+upperBandFill = color.new(#008080, 90)
+lowerBandFill = color.new(#800020, 90)
+
+aPlot = plot(showALine ? a : na, "A Line (Vervoort)", color=aColor, linewidth=1)
+signalPlot = plot(showSignalLine ? signalLine : na, "Signal Line (Vervoort 2)", color=signalColor, linewidth=1)
+kPlot = plot(showKLine ? k : na, "K Line", color=kColor, linewidth=1)
+
+upperPlot  = plot(showRangeBands ? upper  : na, "Upper Band",       color=innerBandColor, linewidth=1)
+lowerPlot  = plot(showRangeBands ? lower  : na, "Lower Band",       color=innerBandColor, linewidth=1)
+
+upper2Plot = plot(showOuterBands ? upper2 : na, "Outer Upper Band", color=outerColor, linewidth=1)
+lower2Plot = plot(showOuterBands ? lower2 : na, "Outer Lower Band", color=outerColor, linewidth=1)
+
+fill(aPlot, kPlot, color=trendFill, title="Trend Fill")
+fill(upper2Plot, upperPlot, color=upperBandFill, title="Upper Band Fill")
+fill(lowerPlot, lower2Plot, color=lowerBandFill, title="Lower Band Fill")
+
+plotshape(showCrossSignals and longSignal,  "Long Signal",  shape.triangleup,   location.belowbar, color.new(color.green, 0), size=size.small)
+plotshape(showCrossSignals and shortSignal, "Short Signal", shape.triangledown, location.abovebar, color.new(color.red,   0), size=size.small)

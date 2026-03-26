@@ -1,0 +1,146 @@
+//@version=6
+indicator("Hull Suite + Session Master MTF [NY + Alertas]", overlay=true)
+
+//=========================
+// INPUTS
+//=========================
+src           = input.source(close, "Source")
+modeSwitch    = input.string("Hma", "Hull Variation", options=["Hma","Thma","Ehma"])
+length        = input.int(55, "Length", minval=1)
+lengthMult    = input.float(1.0, "Length multiplier", minval=0.1, step=0.1)
+swingLookback = input.int(3, "Swing Lookback (M3)", minval=1)
+lineBars      = input.int(10, "Line length (bars)", minval=1)
+tz            = "America/New_York"
+nySession     = "0930-1600"
+
+//=========================
+// FILTRO DE SESIÓN NY
+//=========================
+is_ny_session = not na(time(timeframe.period, nySession, tz))
+
+//=========================
+// FUNCIONES HULL Y SWINGS
+//=========================
+HMA(_src, _length) => ta.wma(2.0 * ta.wma(_src, int(_length / 2)) - ta.wma(_src, _length), int(math.sqrt(_length)))
+EHMA(_src, _length) => ta.ema(2.0 * ta.ema(_src, int(_length / 2)) - ta.ema(_src, _length), int(math.sqrt(_length)))
+THMA(_src, _length) => ta.wma(ta.wma(_src, int(_length / 3)) * 3.0 - ta.wma(_src, int(_length / 2)) - ta.wma(_src, _length), _length)
+
+get_swings(_lb) => [ta.lowest(low, _lb), ta.highest(high, _lb)]
+
+//=========================
+// FUNCIÓN SESSION MASTER (Lógica DI)
+//=========================
+get_sm_trend() =>
+    lenSM = 28
+    tr = math.max(math.max(high - low, math.abs(high - nz(close[1]))), math.abs(low - nz(close[1])))
+    dp = high - nz(high[1]) > nz(low[1]) - low ? math.max(high - nz(high[1]), 0) : 0
+    dm = nz(low[1]) - low > high - nz(high[1]) ? math.max(nz(low[1]) - low, 0) : 0
+    
+    var sTR = 0.0
+    var sDP = 0.0
+    var sDM = 0.0
+    
+    sTR := nz(sTR[1]) - (nz(sTR[1]) / lenSM) + tr
+    sDP := nz(sDP[1]) - (nz(sDP[1]) / lenSM) + dp
+    sDM := nz(sDM[1]) - (nz(sDM[1]) / lenSM) + dm
+    
+    diP = sDP / sTR * 100
+    diM = sDM / sTR * 100
+    diP - diM > 2 ? 1 : -1
+
+//=========================
+// CÁLCULOS MTF (HULL + SESSION MASTER)
+//=========================
+int len = int(math.round(length * lengthMult))
+
+get_hull_trend(_s, _l, _m) =>
+    _h = _m == "Hma" ? HMA(_s, _l) : _m == "Ehma" ? EHMA(_s, _l) : THMA(_s, int(_l / 2))
+    _h[1] > _h[3] ? 1 : _h[1] < _h[3] ? -1 : 0
+
+hTrend1m = request.security(syminfo.tickerid, "1", get_hull_trend(src, len, modeSwitch))
+hTrend3m = request.security(syminfo.tickerid, "3", get_hull_trend(src, len, modeSwitch))
+hTrend5m = request.security(syminfo.tickerid, "5", get_hull_trend(src, len, modeSwitch))
+
+smTrend1m = request.security(syminfo.tickerid, "1", get_sm_trend())
+smTrend3m = request.security(syminfo.tickerid, "3", get_sm_trend())
+smTrend5m = request.security(syminfo.tickerid, "5", get_sm_trend())
+
+[lowM3, highM3] = request.security(syminfo.tickerid, "3", get_swings(swingLookback))
+
+mtfAlcista = hTrend1m == 1 and hTrend3m == 1 and hTrend5m == 1 and smTrend1m == 1 and smTrend3m == 1 and smTrend5m == 1
+mtfBajista = hTrend1m == -1 and hTrend3m == -1 and hTrend5m == -1 and smTrend1m == -1 and smTrend3m == -1 and smTrend5m == -1
+
+//=========================
+// CÁLCULO LOCAL
+//=========================
+float HULL = modeSwitch == "Hma" ? HMA(src, len) : modeSwitch == "Ehma" ? EHMA(src, len) : THMA(src, int(len / 2))
+esVerde = HULL[1] > HULL[3]
+esRojo  = HULL[1] < HULL[3]
+
+//=========================
+// ESTADOS PERSISTENTES
+//=========================
+var float precioV2 = na
+var retrocesoConfirmado = false
+var entradaRealizadaEnEsteCiclo = false
+
+if (esRojo and not esRojo[1]) or (esVerde and not esVerde[1])
+    precioV2 := na
+    retrocesoConfirmado := false
+    entradaRealizadaEnEsteCiclo := false
+
+//=========================
+// LÓGICA DE GATILLOS
+//=========================
+esV2Alcista = is_ny_session and esVerde and not (HULL[2] > HULL[4]) and mtfAlcista
+esV2Bajista = is_ny_session and esRojo and not (HULL[2] < HULL[4]) and mtfBajista
+
+if esV2Alcista or esV2Bajista
+    precioV2 := open
+
+if esVerde and not na(precioV2) and (low < precioV2) and (close < open)
+    retrocesoConfirmado := true
+
+if esRojo and not na(precioV2) and (high > precioV2) and (close > open)
+    retrocesoConfirmado := true
+
+definitivaLong  = is_ny_session and esVerde and retrocesoConfirmado and not entradaRealizadaEnEsteCiclo and (close > open) and (close > HULL) and mtfAlcista
+definitivaShort = is_ny_session and esRojo  and retrocesoConfirmado and not entradaRealizadaEnEsteCiclo and (close < open) and (close < HULL) and mtfBajista
+
+//=========================
+// CONFIGURACIÓN DE ALERTAS SONORAS
+//=========================
+alertcondition(esV2Alcista, title="Alerta V2 Alcista", message="¡V2 Alcista Detectado! NY Session alineada.")
+alertcondition(esV2Bajista, title="Alerta V2 Bajista", message="¡V2 Bajista Detectado! NY Session alineada.")
+
+//=========================
+// LÍNEAS Y PLOTS
+//=========================
+var float entryPriceSeg = na
+var float slSeg = na
+var float tp1Seg = na
+var int segStart = na
+var int segEnd = na
+
+if definitivaLong or definitivaShort
+    float sl = definitivaLong ? lowM3 : highM3
+    float risk = math.abs(close - sl)
+    entryPriceSeg := close
+    slSeg := sl
+    tp1Seg := definitivaLong ? close + risk : close - risk
+    segStart := bar_index
+    segEnd := bar_index + lineBars
+    entradaRealizadaEnEsteCiclo := true
+
+segActive = not na(segStart) and bar_index >= segStart and bar_index <= segEnd
+
+plot(segActive ? entryPriceSeg : na, "Entry", color=color.white, linewidth=2, style=plot.style_linebr)
+plot(segActive ? slSeg : na, "SL", color=color.red, linewidth=2, style=plot.style_linebr)
+plot(segActive ? tp1Seg : na, "TP1", color=color.lime, linewidth=2, style=plot.style_linebr)
+
+plot(HULL, "Hull Line", color=esVerde ? color.lime : esRojo ? color.red : color.gray, linewidth=3)
+plotshape(esV2Alcista, title="V2 Alcista", style=shape.triangleup, location=location.belowbar, color=color.lime, size=size.small, text="V2")
+plotshape(esV2Bajista, title="V2 Bajista", style=shape.triangledown, location=location.abovebar, color=color.red, size=size.small, text="V2")
+plotshape(definitivaLong, title="COMPRA", style=shape.labelup, location=location.belowbar, color=color.lime, size=size.normal, text="COMPRA", textcolor=color.black)
+plotshape(definitivaShort, title="VENTA", style=shape.labeldown, location=location.abovebar, color=color.red, size=size.normal, text="VENTA", textcolor=color.white)
+bgcolor(is_ny_session ? color.new(color.gray, 92) : na)

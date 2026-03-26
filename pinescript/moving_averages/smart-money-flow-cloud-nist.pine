@@ -1,0 +1,270 @@
+// This Pine Script® code is subject to the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © NiSt
+
+//@version=6
+indicator("Smart Money Flow Cloud [NiSt]", overlay=true, max_labels_count=500)
+
+// ┌────────────────────────────── NiSt ─ Constants ──────────────────────────────┐
+// └──────────────────────────────────────────────────────────────────────────────────┘
+const string grpCore  = "Core Trend Engine"
+const string grpMF    = "Smart Money Flow"
+const string grpBand  = "Adaptive Cloud"
+const string grpUI    = "Signals and Plotting"
+
+color BULL = #00C8FF
+color BEAR = #FF005D
+
+// ┌────────────────────────────── NiSt ─ Tooltips ───────────────────────────────┐
+// └──────────────────────────────────────────────────────────────────────────────────┘
+const string tt_len         = "Controls the main trend baseline length. Higher = smoother trend, fewer flips. Lower = faster response, more noise."
+const string tt_basisType   = "Selects the trend baseline engine. EMA is responsive and common. ALMA is smoother with adjustable weighting."
+const string tt_almaOffset  = "ALMA only. Shifts weighting toward recent bars (higher) or older bars (lower). Higher offset = more responsive baseline."
+const string tt_almaSigma   = "ALMA only. Controls the smoothness of ALMA weighting. Higher sigma = smoother baseline."
+const string tt_basisSmooth = "Extra smoothing applied to the baseline output. Higher = cleaner trend, slower turns."
+
+const string tt_mfLen       = "Lookback window used to compute volume-weighted flow. Higher = steadier flow read. Lower = more reactive flow."
+const string tt_mfSmooth    = "Smoothing applied to the flow signal. Higher = cleaner regimes, slower to shift. Lower = faster, noisier."
+const string tt_mfPower     = "Nonlinear sensitivity for flow strength. Higher = bands react more during strong flow and tighten more during weak flow."
+
+const string tt_atrLen      = "ATR lookback used to size the adaptive bands. Higher = smoother bands. Lower = faster volatility response."
+const string tt_minMult     = "Minimum band multiplier during weak flow. Lower = tighter bands and more signals. Higher = wider bands and fewer signals."
+const string tt_maxMult     = "Maximum band multiplier during strong flow. Higher = more band expansion in strong moves. Lower = less expansion."
+
+const string tt_showDots    = "Marks retests when price crosses the baseline against the current regime direction, often seen during pullbacks."
+
+// ┌────────────────────────────── NiSt ─ Inputs ─────────────────────────────────┐
+// └──────────────────────────────────────────────────────────────────────────────────┘
+color  bullMain     = input.color(BULL, "Bullish Color", inline="c")
+color  bearMain     = input.color(BEAR, "Bearish Color", inline="c")
+
+int    len          = input.int(34, "Trend Length", minval=5, group=grpCore, tooltip=tt_len)
+string basisType    = input.string("EMA", "Trend Engine", options=["EMA","ALMA"], group=grpCore, tooltip=tt_basisType)
+float  almaOffset   = input.float(0.85, "ALMA Offset", minval=0.01, maxval=0.99, step=0.01, group=grpCore, inline="ALMA", tooltip=tt_almaOffset)
+float  almaSigma    = input.float(6.0, "ALMA Sigma", minval=1.0, step=0.5, group=grpCore, inline="ALMA", tooltip=tt_almaSigma)
+int    basisSmooth  = input.int(3, "Trend Smoothing", minval=1, group=grpCore, tooltip=tt_basisSmooth)
+
+int    mfLen        = input.int(24, "Flow Window", minval=2, group=grpMF, tooltip=tt_mfLen)
+int    mfSmooth     = input.int(5, "Flow Smoothing", minval=1, group=grpMF, tooltip=tt_mfSmooth)
+float  mfPower      = input.float(1.2, "Flow Boost", minval=0.5, step=0.1, group=grpMF, tooltip=tt_mfPower)
+
+int    atrLen       = input.int(14, "ATR Length", minval=1, group=grpBand, tooltip=tt_atrLen)
+float  minMult      = input.float(0.9, "Band Tightness (Calm)", minval=0.1, step=0.1, group=grpBand, tooltip=tt_minMult)
+float  maxMult      = input.float(2.2, "Band Expansion (Strong Flow)", minval=0.1, step=0.1, group=grpBand, tooltip=tt_maxMult)
+bool   showBands    = input.bool(true, "Show Adaptive Bands", group=grpBand)
+
+bool   showGauge    = input.bool(true, "Show Trend Strength Gauge", group=grpUI)
+string gaugeSize    = input.string("Normal", "Strength Gauge Size", group=grpUI, options = ["Small","Normal"])
+bool   showCloud    = input.bool(true, "Show Cloud", group=grpUI)
+bool   paintBars    = input.bool(true, "Color Bars", group=grpUI)
+bool   showDots     = input.bool(true, "Trend Retest Signals", group=grpUI, tooltip=tt_showDots)
+int    dotCooldown  = input.int(12, "Reset Cooldown", minval=0, group=grpUI)
+bool   showSwitch   = input.bool(true, "Show Buy/Sell Signals", group=grpUI)
+bool   ColorBg      = input.bool(false, "Show Background Coloring", group=grpUI)
+
+// ┌────────────────────────────── NiSt ─ Types & State ──────────────────────────┐
+// └──────────────────────────────────────────────────────────────────────────────────┘
+type tBasis
+    float bO
+    float bC
+    float bMain
+
+type tMF
+    float clv
+    float raw
+    float num
+    float den
+    float mf
+    float mfSm
+    float strength
+    float mult
+
+type tBands
+    float atr
+    float upper
+    float lower
+
+type tState
+    int   lastSignal
+    color barCol
+    bool  longCond
+    bool  shortCond
+    bool  switchUp
+    bool  switchDown
+
+var tBasis bs  = tBasis.new(na, na, na)
+var tMF    mfx = tMF.new(na, na, na, na, na, na, na, na)
+var tBands bd  = tBands.new(na, na, na)
+var tState st  = tState.new(0, na, false, false, false, false)
+
+// ┌────────────────────────────── NiSt ─ Helpers ────────────────────────────────┐
+// └──────────────────────────────────────────────────────────────────────────────────┘
+method basisFrom(simple string bType, float x, simple int length, simple float aOff, simple float aSig, simple int smooth) =>
+    float _raw = bType == "ALMA" ? ta.alma(x, length, aOff, aSig) : ta.ema(x, length)
+    smooth > 1 ? ta.ema(_raw, smooth) : _raw
+
+// tanh helper (no built-in tanh in some Pine environments)
+f_tanh(float x) =>
+    float ex  = math.exp(x)
+    float emx = math.exp(-x)
+    (ex - emx) / (ex + emx)
+
+// ┌────────────────────────────── NiSt ─ Core Calculations ──────────────────────┐
+// └──────────────────────────────────────────────────────────────────────────────────┘
+calcMF() =>
+    mfx.clv := (high == low) ? 0.0 : ((close - low) - (high - close)) / (high - low)
+    mfx.raw := mfx.clv * volume
+    mfx.num := math.sum(mfx.raw, mfLen)
+    mfx.den := math.sum(math.abs(mfx.raw), mfLen)
+    mfx.mf  := mfx.den == 0.0 ? 0.0 : (mfx.num / mfx.den)
+
+    mfx.mfSm := mfSmooth > 1 ? ta.ema(mfx.mf, mfSmooth) : mfx.mf
+
+    mfx.strength := math.pow(math.abs(mfx.mfSm), mfPower)
+    mfx.strength := math.max(0.0, math.min(1.0, mfx.strength))
+
+    mfx.mult := minMult + (maxMult - minMult) * mfx.strength
+
+calcBasis() =>
+    bs.bO    := basisType.basisFrom(open,  len, almaOffset, almaSigma, basisSmooth)
+    bs.bC    := basisType.basisFrom(close, len, almaOffset, almaSigma, basisSmooth)
+    bs.bMain := bs.bC
+
+calcBands() =>
+    bd.atr   := ta.atr(atrLen)
+    bd.upper := bs.bMain + bd.atr * mfx.mult
+    bd.lower := bs.bMain - bd.atr * mfx.mult
+
+calcSignals() =>
+    st.longCond  := ta.crossover(close, bd.upper)
+    st.shortCond := ta.crossunder(close, bd.lower)
+
+    tState pst = st[1]
+
+    int prevLS  = na(pst) ? (close >= bs.bMain ? 1 : -1) : pst.lastSignal
+    int prevLS2 = na(pst) ? 0 : pst.lastSignal
+
+    st.lastSignal := st.longCond ? 1 : st.shortCond ? -1 : prevLS
+    st.barCol     := st.lastSignal == 1 ? bullMain : bearMain
+
+    st.switchUp   := showSwitch and st.lastSignal == 1  and prevLS2 == -1
+    st.switchDown := showSwitch and st.lastSignal == -1 and prevLS2 == 1
+
+// ┌────────────────────────────── NiSt ─ Run ────────────────────────────────────┐
+// └──────────────────────────────────────────────────────────────────────────────────┘
+calcMF()
+calcBasis()
+calcBands()
+calcSignals()
+
+// ┌────────────────────────────── NiSt ─ Plotting ──────────────────────────────┐
+// └─────────────────────────────────────────────────────────────────────────────────┘
+plotcandle(open, high, low, close, "Candles", st.barCol, st.barCol, bordercolor=st.barCol,
+     display=paintBars ? display.all : display.none)
+
+// Basis cloud
+pO = plot(showCloud ? bs.bO : na, "Basis Open", color=color.new(st.barCol, 0), linewidth=1)
+pC = plot(showCloud ? bs.bC : na, "Basis Close", color=color.new(st.barCol, 0), linewidth=2)
+fill(pO, pC, color=color.new(st.barCol, 75), title="Basis Cloud")
+
+// Adaptive bands
+dispBands = showBands ? display.all : display.none
+pU = plot(bd.upper, "Upper Band", color=color.new(color.white, 100), linewidth=1, display=dispBands)
+pL = plot(bd.lower, "Lower Band", color=color.new(color.white, 100), linewidth=1, display=dispBands)
+pP = plot(close, "Price", color=color.new(chart.fg_color, 70), display=display.none)
+
+// Volatility-colored fills
+color bullFill = (showBands and st.lastSignal == 1) ? color.new(bullMain, 40) : na
+color bearFill = (showBands and st.lastSignal == -1) ? color.new(bearMain, 40) : na
+
+fill(pU, pP, bd.upper, close, bearFill, color.new(chart.fg_color, 100), title="Bear Fill")
+fill(pL, pP, close, bd.lower, color.new(chart.fg_color, 100), bullFill, title="Bull Fill")
+
+bgcolor(ColorBg ? color.new(st.barCol, int(96 - 35 * mfx.strength)) : na, title="Regime Tint")
+
+atrOff = bd.atr * 0.25
+if st.switchUp
+    label.new(bar_index, low - atrOff, "𝑩𝒖𝒚", style=label.style_label_up, size=size.normal, color=bullMain, textcolor=chart.fg_color)
+if st.switchDown
+    label.new(bar_index, high + atrOff, "𝑺𝒆𝒍𝒍", style=label.style_label_down, size=size.normal, color=bearMain, textcolor=chart.fg_color)
+
+// Retest Signals
+bool bearDotCond = showDots and st.lastSignal == -1 and high > bs.bC
+bool bullDotCond = showDots and st.lastSignal ==  1 and low  < bs.bC
+
+var int lastBearDotBar = na
+var int lastBullDotBar = na
+
+bool bearOk = bearDotCond and (dotCooldown == 0 or na(lastBearDotBar) or (bar_index - lastBearDotBar) >= dotCooldown)
+bool bullOk = bullDotCond and (dotCooldown == 0 or na(lastBullDotBar) or (bar_index - lastBullDotBar) >= dotCooldown)
+
+if bearOk
+    lastBearDotBar := bar_index
+if bullOk
+    lastBullDotBar := bar_index
+
+plotchar(bearOk, title="Bearish Retest", char="✦", location=location.abovebar, color=bearMain, size=size.tiny)
+plotchar(bullOk, title="Bullish Retest", char="✦", location=location.belowbar, color=bullMain, size=size.tiny)
+
+// ┌──────────────────────── NiSt ─ Trend Strength Gauge ─────────────────────────┐
+// └──────────────────────────────────────────────────────────────────────────────────┘
+var table gaugeTbl = table.new(position.bottom_center, 80, 6, border_width=0)
+
+f_trendStrengthSigned() =>
+    float basis = bs.bMain
+    float up    = bd.upper
+    float dn    = bd.lower
+
+    float upSpan = math.max(up - basis, syminfo.mintick)
+    float dnSpan = math.max(basis - dn, syminfo.mintick)
+
+    float raw =
+         st.lastSignal == 1
+         ? (close - basis) / upSpan
+         : - (basis - close) / dnSpan
+
+    float v = f_tanh(raw * 1.5)
+    ta.ema(v, 3)
+
+drawGauge(float signed01, color bullCol, color bearCol) =>
+    if not showGauge
+        na
+    else
+        int w=30
+        if gaugeSize == "Normal"
+            w := 30
+        else if gaugeSize == "Small"
+            w := 10
+
+        int rowBar = 0
+        int rowTxt = 1
+
+        float v = math.max(-1.0, math.min(1.0, signed01))
+        int idx = int(math.round(((v + 1.0) * 0.5) * (w - 1)))
+        int mid = int(math.floor((w - 1) * 0.5))
+
+        for i = 0 to w - 1
+            color cellCol =
+                 i < mid
+                 ? color.from_gradient(i, 0, mid, color.new(bearCol, 0), color.new(chart.fg_color, 0))
+                 : color.from_gradient(i, mid, w - 1, color.new(chart.fg_color, 0), color.new(bullCol, 0))
+
+            bool isPtr = i == idx
+            table.cell(gaugeTbl, i, rowBar,
+                 isPtr ? "✦" : "",
+                 text_color = isPtr ? color.black : color.new(color.black, 100),
+                 bgcolor = cellCol,
+                 text_size = size.normal)
+
+        int strengthPct = int(math.round(math.abs(v) * 100.0))
+
+        table.cell(gaugeTbl, 0,   rowTxt, "Bear", text_color=chart.fg_color, bgcolor=color.new(color.black, 100))
+        table.cell(gaugeTbl, mid, rowTxt, "Strength: " + str.tostring(strengthPct) + "%", text_color=chart.fg_color, bgcolor=color.new(color.black, 100))
+        table.cell(gaugeTbl, w-1, rowTxt, "Bull", text_color=chart.fg_color, bgcolor=color.new(color.black, 100))
+
+drawGauge(f_trendStrengthSigned(), bullMain, bearMain)
+
+// ┌────────────────────────────── NiSt ─ Alerts ─────────────────────────────────┐
+// └──────────────────────────────────────────────────────────────────────────────────┘
+alertcondition(st.switchUp, "SMF Cloud Long", "Smart Money Flow Cloud LONG {{ticker}} {{interval}}")
+alertcondition(st.switchDown, "SMF Cloud Short", "Smart Money Flow Cloud SHORT {{ticker}} {{interval}}")
+alertcondition(bullOk or bearOk, "SMF Cloud Trend Retest", "Smart Money Flow Cloud Retest {{ticker}} {{interval}}")

@@ -1,0 +1,285 @@
+// MES Scalperino Strategy
+// Based on multi-year stress test (2022-2025) across MES/ES 1-min data.
+// Calibrated with 5s data for same-bar ambiguity. Includes IBKR commissions.
+//
+//
+// All entries are LONG only, entered at next bar open after signal to maintain causality
+//@version=6
+strategy("MES Scalperino",
+     overlay=true,
+     initial_capital=250000,
+     default_qty_type=strategy.fixed,
+     default_qty_value=4,
+     pyramiding=0,
+     commission_type=strategy.commission.cash_per_contract,
+     commission_value=0.624,
+     slippage=0,
+     process_orders_on_close=false,
+     calc_on_every_tick=false)
+
+// ============================================================================
+// INPUTS
+// ============================================================================
+
+// --- Signal Selection ---
+signalType = input.string("SMA(50) > SMA(200)", "Signal",
+     options=[
+         "SMA(20) x> SMA(50)",
+         "EMA(50) x> EMA(100)",
+         "RSI(9) <20 or >80",
+         "RSI(14) <25 or >75",
+         "RSI(14) <20 or >80",
+         "SMA(50) > SMA(200)",
+         "EMA(50) > EMA(100)",
+         "All Crossovers",
+         "All RSI"
+     ],
+     group="Signal",
+     tooltip="Select which entry signal to use. Crossovers are event-based (fire once). State signals fire every bar the condition holds.")
+
+// --- Risk ---
+tpPoints = input.float(3, "Take Profit (points)", minval=0.25, step=0.25, group="Risk",
+     tooltip="TP distance from entry in index points. Default 1.5 = $7.50/contract on MES.")
+slPoints = input.float(200.0, "Stop Loss (points)", minval=1.0, step=5.0, group="Risk",
+     tooltip="SL distance from entry in index points. Backtested: SL=50 evening has PF~4, SL=100 has PF~18+.")
+maxHoldBars = input.int(480, "Max Hold (bars)", minval=10, step=10, group="Risk",
+     tooltip="Close trade after this many bars if neither TP nor SL hit. 480 bars = 8 hours on 1-min.")
+gapExitMin = input.int(0, "Session Gap Exit (minutes)", minval=0, step=1, group="Risk",
+     tooltip="If gap between bars exceeds this, close at open of next bar. 120 = exit on session gaps on 1m tf. Set 0 to disable.")
+
+// --- Session Filter ---
+sessionFilter = input.string("Custom", "Session Filter",
+     options=[
+         "No Filter",
+         "RTH 9:30-16:00",
+         "Core RTH 10-15",
+         "Evening ETH 18-01",
+         "Full ETH (outside RTH)",
+         "Custom"
+     ],
+     group="Session",
+     tooltip="Evening ETH (18:00-01:00 ET) had the best net PF across all signals in backtesting.")
+
+customSessionStart = input.int(13, "Custom Session Start (hour ET)", minval=0, maxval=23, group="Session")
+customSessionEnd = input.int(16, "Custom Session End (hour ET)", minval=0, maxval=23, group="Session",
+     tooltip="If end < start, session wraps past midnight (e.g., 18-01 = 6pm to 1am).")
+
+// --- Display ---
+showLevels = input.bool(true, "Show TP/SL Lines on Chart", group="Display")
+showSignalMarkers = input.bool(true, "Show Signal Markers", group="Display")
+
+// ============================================================================
+// SESSION FILTER LOGIC
+// ============================================================================
+
+// Convert to exchange timezone (should be set to ET for CME futures)
+currentHour = hour(time, "America/New_York")
+
+inSessionWindow(int startH, int endH) =>
+    if startH <= endH
+        // Same-day range (e.g., 10-15)
+        currentHour >= startH and currentHour < endH
+    else
+        // Wraps midnight (e.g., 18-01)
+        currentHour >= startH or currentHour < endH
+
+sessionAllowed = switch sessionFilter
+    "No Filter"            => true
+    "RTH 9:30-16:00"       => currentHour >= 9 and currentHour < 16
+    "Core RTH 10-15"       => currentHour >= 10 and currentHour < 15
+    "Evening ETH 18-01"    => inSessionWindow(18, 1)
+    "Full ETH (outside RTH)" => currentHour < 9 or currentHour >= 16
+    "Custom"               => inSessionWindow(customSessionStart, customSessionEnd)
+    => true
+
+// ============================================================================
+// INDICATORS
+// ============================================================================
+
+// SMAs
+sma20  = ta.sma(close, 20)
+sma50  = ta.sma(close, 50)
+sma100 = ta.sma(close, 100)
+sma200 = ta.sma(close, 200)
+
+// EMAs
+ema50  = ta.ema(close, 50)
+ema100 = ta.ema(close, 100)
+
+// RSI
+rsi9  = ta.rsi(close, 9)
+rsi14 = ta.rsi(close, 14)
+
+// ============================================================================
+// SIGNAL GENERATION (causal: signal on this bar, enter next bar)
+// ============================================================================
+
+// Crossover signals (event-based, fire once)
+smaCross    = ta.crossover(sma20, sma50) and not na(sma50)
+emaCross    = ta.crossover(ema50, ema100)
+
+// RSI extreme signals
+rsi9Extreme  = (rsi9 < 20 or rsi9 > 80) and not na(rsi9)
+rsi14_25_75  = (rsi14 < 25 or rsi14 > 75) and not na(rsi14)
+rsi14_20_80  = (rsi14 < 20 or rsi14 > 80) and not na(rsi14)
+
+// State signals (fire every bar condition holds)
+smaState    = sma50 > sma200 and not na(sma200)
+emaState    = ema50 > ema100
+
+// Select active signal
+signalFired = switch signalType
+    "SMA(20) x> SMA(50)"   => smaCross
+    "EMA(50) x> EMA(100)"  => emaCross
+    "RSI(9) <20 or >80"    => rsi9Extreme
+    "RSI(14) <25 or >75"   => rsi14_25_75
+    "RSI(14) <20 or >80"   => rsi14_20_80
+    "SMA(50) > SMA(200)"   => smaState
+    "EMA(50) > EMA(100)"   => emaState
+    "All Crossovers"        => smaCross or emaCross
+    "All RSI"               => rsi9Extreme or rsi14_25_75
+    => false
+
+// Final entry condition: signal on previous bar (causal), session filter on entry bar
+enterLong = signalFired[1] and sessionAllowed and strategy.position_size == 0
+
+// ============================================================================
+// STRATEGY EXECUTION
+// ============================================================================
+
+var float entryPrice = na
+var int   entryBar   = na
+
+if enterLong
+    entryPrice := open
+    entryBar   := bar_index
+    strategy.entry("Long", strategy.long)
+    strategy.exit("TP/SL", "Long",
+         profit = tpPoints / syminfo.mintick,
+         loss   = slPoints / syminfo.mintick)
+
+// Session gap detection: exit if gap between bars > threshold
+barGapMinutes = (time - time[1]) / 60000
+isSessionGap = gapExitMin > 0 and barGapMinutes > gapExitMin
+
+// Time-based exit and gap exit
+if strategy.position_size > 0 and not na(entryBar)
+    barsHeld = bar_index - entryBar
+    if isSessionGap
+        strategy.close("Long", comment="Gap Exit")
+    else if barsHeld >= maxHoldBars
+        strategy.close("Long", comment="Time Exit")
+
+// ============================================================================
+// CHART OVERLAY: TP/SL LEVELS
+// ============================================================================
+
+var line lineTP = na
+var line lineSL = na
+var label lblTP = na
+var label lblSL = na
+
+// Clean up old lines
+line.delete(lineTP)
+line.delete(lineSL)
+label.delete(lblTP)
+label.delete(lblSL)
+
+if showLevels and strategy.position_size > 0 and not na(entryPrice) and not na(entryBar)
+    float tpLevel = entryPrice + tpPoints
+    float slLevel = entryPrice - slPoints
+    int rightX = bar_index + 5
+
+    lineTP := line.new(entryBar, tpLevel, rightX, tpLevel,
+         color=color.new(#00E676, 30), style=line.style_dashed, width=1)
+    lblTP := label.new(rightX, tpLevel,
+         "TP " + str.tostring(tpLevel, format.mintick) + " (+" + str.tostring(tpPoints) + ")",
+         color=color.new(color.black, 100), textcolor=#00E676,
+         style=label.style_label_left, size=size.small)
+
+    lineSL := line.new(entryBar, slLevel, rightX, slLevel,
+         color=color.new(#FF5252, 30), style=line.style_dashed, width=1)
+    lblSL := label.new(rightX, slLevel,
+         "SL " + str.tostring(slLevel, format.mintick) + " (-" + str.tostring(slPoints) + ")",
+         color=color.new(color.black, 100), textcolor=#FF5252,
+         style=label.style_label_left, size=size.small)
+
+// ============================================================================
+// SIGNAL MARKERS
+// ============================================================================
+
+plotshape(showSignalMarkers and signalFired and sessionAllowed,
+     title="Signal", style=shape.triangleup, location=location.belowbar,
+     color=#42A5F5, size=size.tiny)
+
+plotshape(showSignalMarkers and signalFired and not sessionAllowed,
+     title="Signal (filtered)", style=shape.triangleup, location=location.belowbar,
+     color=color.new(#42A5F5, 80), size=size.tiny)
+
+// ============================================================================
+// MA OVERLAYS (context, dimmed)
+// ============================================================================
+
+plot(signalType == "SMA(20) x> SMA(50)" or signalType == "All Crossovers" ? sma20 : na,
+     "SMA(20)", color=color.new(#FF9800, 40), linewidth=1)
+plot(signalType == "SMA(20) x> SMA(50)" or signalType == "SMA(50) > SMA(200)" or signalType == "All Crossovers" ? sma50 : na,
+     "SMA(50)", color=color.new(#2196F3, 40), linewidth=1)
+plot(signalType == "SMA(50) > SMA(200)" ? sma200 : na,
+     "SMA(200)", color=color.new(#9C27B0, 40), linewidth=1)
+plot(signalType == "EMA(50) x> EMA(100)" or signalType == "EMA(50) > EMA(100)" or signalType == "All Crossovers" ? ema50 : na,
+     "EMA(50)", color=color.new(#FF9800, 40), linewidth=1)
+plot(signalType == "EMA(50) x> EMA(100)" or signalType == "EMA(50) > EMA(100)" or signalType == "All Crossovers" ? ema100 : na,
+     "EMA(100)", color=color.new(#2196F3, 40), linewidth=1)
+
+// ============================================================================
+// SESSION BACKGROUND
+// ============================================================================
+
+bgcolor(sessionAllowed ? color.new(#1B5E20, 95) : color.new(#B71C1C, 97),
+     title="Session Zone")
+
+// ============================================================================
+// INFO TABLE
+// ============================================================================
+
+var table infoTbl = table.new(position.top_right, 2, 8,
+     bgcolor=color.new(color.black, 85), border_width=1,
+     border_color=color.new(color.gray, 70))
+
+if barstate.islast
+    table.cell(infoTbl, 0, 0, "MES SCALP", text_color=color.white,
+         bgcolor=color.new(#1976D2, 30), text_size=size.small)
+    table.cell(infoTbl, 1, 0, "v1.0", text_color=color.white,
+         bgcolor=color.new(#1976D2, 30), text_size=size.small)
+
+    table.cell(infoTbl, 0, 1, "Signal", text_color=color.gray, text_size=size.small)
+    table.cell(infoTbl, 1, 1, signalType, text_color=#42A5F5, text_size=size.small)
+
+    table.cell(infoTbl, 0, 2, "TP / SL", text_color=color.gray, text_size=size.small)
+    table.cell(infoTbl, 1, 2, str.tostring(tpPoints) + " / " + str.tostring(slPoints) + " pts",
+         text_color=color.white, text_size=size.small)
+
+    table.cell(infoTbl, 0, 3, "Session", text_color=color.gray, text_size=size.small)
+    sessColor = sessionAllowed ? #00E676 : #FF5252
+    sessText = sessionAllowed ? "ACTIVE" : "FILTERED"
+    table.cell(infoTbl, 1, 3, sessionFilter + " " + sessText,
+         text_color=sessColor, text_size=size.small)
+
+    table.cell(infoTbl, 0, 4, "Hour (ET)", text_color=color.gray, text_size=size.small)
+    table.cell(infoTbl, 1, 4, str.tostring(currentHour) + ":00",
+         text_color=color.white, text_size=size.small)
+
+    table.cell(infoTbl, 0, 5, "Position", text_color=color.gray, text_size=size.small)
+    posText = strategy.position_size > 0 ? "LONG " + str.tostring(strategy.position_size, "#") : "FLAT"
+    posColor = strategy.position_size > 0 ? #00E676 : color.gray
+    table.cell(infoTbl, 1, 5, posText, text_color=posColor, text_size=size.small)
+
+    table.cell(infoTbl, 0, 6, "RSI(9)", text_color=#9C27B0, text_size=size.small)
+    rsiColor = rsi9 < 20 ? #00E676 : rsi9 > 80 ? #FF5252 : color.white
+    table.cell(infoTbl, 1, 6, str.tostring(rsi9, "#.#"), text_color=rsiColor, text_size=size.small)
+
+    table.cell(infoTbl, 0, 7, "Net P&L", text_color=color.gray, text_size=size.small)
+    netPnl = strategy.netprofit
+    pnlColor = netPnl >= 0 ? #00E676 : #FF5252
+    table.cell(infoTbl, 1, 7, "$" + str.tostring(netPnl, "#,###.##"),
+         text_color=pnlColor, text_size=size.small)

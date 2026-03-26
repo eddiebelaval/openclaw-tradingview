@@ -1,0 +1,200 @@
+//@version=6
+indicator("Multi Timeframe Scalper Structure", shorttitle="MTF-Structure", overlay=true)
+
+// ==========================================
+// INPUTS
+// ==========================================
+
+// === MACRO SETTINGS ===
+macro_tf        = input.timeframe("240", "Macro Timeframe", group="Macro Settings", tooltip="Select the higher timeframe used to determine the macro trend direction. The indicator compares that timeframe's close against a moving average to establish bullish or bearish bias. Examples: '60' = 1H, '240' = 4H, 'D' = Daily. Should be significantly higher than your chart timeframe.")
+macro_ma_length = input.int(8, "Macro MA Length", minval=1, group="Macro Settings", tooltip="Lookback period for the moving average applied on the macro timeframe. A shorter length (e.g. 8) reacts faster to trend changes; a longer length (e.g. 21) produces smoother, more conservative bias signals.")
+macro_ma_type   = input.string("EMA", "Macro MA Type", options=["SMA", "EMA", "WMA", "VWMA"], group="Macro Settings", tooltip="Type of moving average used on the macro timeframe. EMA (Exponential) gives more weight to recent prices and reacts faster. SMA (Simple) treats all bars equally. WMA (Weighted) applies linearly increasing weights. VWMA (Volume-Weighted) incorporates volume into the calculation.")
+
+// === MICRO SETTINGS ===
+micro_tf        = input.timeframe("", "Micro Timeframe", group="Micro Settings", tooltip="Timeframe for the micro structure EMA pairs. Leave blank ('') to use the current chart timeframe. Set to a specific timeframe (e.g. '5', '15') if you want the structure calculated on a fixed timeframe regardless of your chart.")
+
+structure1_fast = input.int(8,  "Fast Structure Length 1", minval=1, group="Micro Settings", tooltip="Lookback period for the fast EMA of Structure Layer 1 (the inner/tighter ribbon). A shorter value makes this layer more sensitive to immediate price movements and produces earlier crossover signals.")
+structure1_slow = input.int(16, "Slow Structure Length 1", minval=1, group="Micro Settings", tooltip="Lookback period for the slow EMA of Structure Layer 1. The spread between fast and slow determines how quickly this layer confirms or denies a micro-trend. The crossover between this pair generates entry trigger dots.")
+structure2_fast = input.int(16, "Fast Structure Length 2", minval=1, group="Micro Settings", tooltip="Lookback period for the fast EMA of Structure Layer 2 (the outer/wider ribbon). This layer acts as a secondary structural filter — a broader trend context that must agree with Structure 1 before signals fire.")
+structure2_slow = input.int(30, "Slow Structure Length 2", minval=1, group="Micro Settings", tooltip="Lookback period for the slow EMA of Structure Layer 2. The wider spread between 16 and 30 creates a slower-reacting structural backdrop. Both Structure 2 and Structure 1 must agree directionally for a full confluence signal.")
+
+// === SIGNAL SETTINGS ===
+wait_candle_close      = input.bool(true, "Wait for Candle Close", group="Signal Settings", tooltip="When enabled, entry signals (dots) only appear after the bar has fully closed, preventing intra-bar repainting. When disabled, signals can appear during a live bar but may disappear if conditions change before close. Recommended: ON for live trading.")
+show_entry_labels      = input.bool(true, "Show Entry Labels", group="Signal Settings", tooltip="Toggle the visibility of the green/red entry dots that appear when all three confluence layers align and a crossover or color-change trigger fires.")
+show_macro_bg          = input.bool(true, "Show Macro Condition (Background)", group="Signal Settings", tooltip="When enabled, the chart background is tinted green during macro-bullish conditions (close > MA on macro TF) and red during macro-bearish conditions. This provides an at-a-glance directional bias overlay.")
+detect_early_reversals = input.bool(true, "Detect Early Reversals (Color Changes)", group="Signal Settings", tooltip="When enabled, the indicator also triggers entry dots when Structure Layer 2 changes color (shifts from bearish to bullish or vice versa), in addition to the standard Structure 1 crossover. This catches potential trend shifts earlier, before Structure 1 confirms, but may produce more aggressive signals.")
+
+// === VISUAL SETTINGS ===
+show_signal_matrix = input.bool(true, "Show Signal Matrix Table", group="Visual Settings", tooltip="Toggle the on-chart dashboard table that displays the real-time state of each confluence layer (Macro Trend, Structure 2, Structure 1) and the resulting combined signal (LONG / SHORT / WAIT).")
+table_position     = input.string(
+    "Bottom Right",
+    "Table Position",
+    options=["Top Left", "Top Center", "Top Right", "Middle Left", "Middle Center", "Middle Right", "Bottom Left", "Bottom Center", "Bottom Right"],
+    group="Visual Settings",
+    tooltip="Choose where the Signal Matrix table is positioned on the chart. Select based on your chart layout to avoid overlapping with price action or other indicators."
+)
+
+// === TP/SL SETTINGS ===
+show_tpsl_lines    = input.bool(true, "Show TP & SL Lines", group="TP/SL Settings", tooltip="Toggle the take-profit and stop-loss projection lines. These are visual planning tools that draw horizontal levels based on a percentage distance from the entry price.")
+trade_direction    = input.string("Long", "Direction", options=["Long", "Short"], group="TP/SL Settings", tooltip="Select the trade direction for TP/SL calculations. 'Long' places TP above and SL below the entry. 'Short' places TP below and SL above the entry.")
+manual_entry_price = input.float(0.0, "Manual Entry Price (0 = Auto)", minval=0.0, group="TP/SL Settings", tooltip="Manually set an entry price for TP/SL calculations. When set to 0, the indicator uses the current close price as the entry. Use a specific value when you have a planned entry at a known level.")
+tp_main_percent    = input.float(1.20, "Main Take Profit %", minval=0.1, step=0.1, group="TP/SL Settings", tooltip="Percentage distance from entry price to the main Take Profit level. For example, 1.20 means the TP line is drawn 1.2% above (long) or below (short) the entry price.")
+tp1_percent        = input.float(0.0, "Take Profit 1 % (0 = Hidden)", minval=0.0, step=0.1, group="TP/SL Settings", tooltip="Percentage distance for an optional first partial Take Profit level. Set to 0 to hide this level. Useful for scaling out of positions — e.g., take 33% off at TP1.")
+tp2_percent        = input.float(0.0, "Take Profit 2 % (0 = Hidden)", minval=0.0, step=0.1, group="TP/SL Settings", tooltip="Percentage distance for an optional second partial Take Profit level. Set to 0 to hide this level. Use with TP1 for a three-tier exit strategy.")
+sl_percent         = input.float(1.20, "Stop Loss %", minval=0.1, step=0.1, group="TP/SL Settings", tooltip="Percentage distance from entry price to the Stop Loss level. For example, 1.20 means the SL line is drawn 1.2% below (long) or above (short) the entry price.")
+
+// ==========================================
+// FUNCTIONS
+// ==========================================
+f_ma(src, length, ma_type) =>
+    switch ma_type
+        "SMA"  => ta.sma(src, length)
+        "EMA"  => ta.ema(src, length)
+        "WMA"  => ta.wma(src, length)
+        "VWMA" => ta.vwma(src, length)
+        => ta.ema(src, length)
+
+// ==========================================
+// MACRO TREND (NON-REPAINTING)
+// ==========================================
+macro_ma    = request.security(syminfo.tickerid, macro_tf, f_ma(close, macro_ma_length, macro_ma_type), lookahead=barmerge.lookahead_off)
+macro_close = request.security(syminfo.tickerid, macro_tf, close, lookahead=barmerge.lookahead_off)
+
+macro_bullish = macro_close > macro_ma
+macro_bearish = macro_close < macro_ma
+
+bgcolor(show_macro_bg ? (macro_bullish ? #0c705c66 : color.new(#a90738, 60)) : na)
+
+// ==========================================
+// MICRO STRUCTURE (USER-SELECTABLE TF)
+// ==========================================
+structure1_fast_ma = request.security(syminfo.tickerid, micro_tf, ta.ema(close, structure1_fast), lookahead=barmerge.lookahead_off)
+structure1_slow_ma = request.security(syminfo.tickerid, micro_tf, ta.ema(close, structure1_slow), lookahead=barmerge.lookahead_off)
+
+structure2_fast_ma = request.security(syminfo.tickerid, micro_tf, ta.ema(close, structure2_fast), lookahead=barmerge.lookahead_off)
+structure2_slow_ma = request.security(syminfo.tickerid, micro_tf, ta.ema(close, structure2_slow), lookahead=barmerge.lookahead_off)
+
+fill1_bullish = structure1_fast_ma > structure1_slow_ma
+fill1_bearish = structure1_fast_ma < structure1_slow_ma
+
+fill2_bullish = structure2_fast_ma > structure2_slow_ma
+fill2_bearish = structure2_fast_ma < structure2_slow_ma
+
+fill1_cross_bullish = ta.crossover(structure1_fast_ma, structure1_slow_ma)
+fill1_cross_bearish = ta.crossunder(structure1_fast_ma, structure1_slow_ma)
+
+fill2_color_change_bull = not fill2_bullish[1] and fill2_bullish
+fill2_color_change_bear = not fill2_bearish[1] and fill2_bearish
+
+// ==========================================
+// SIGNAL LOGIC
+// ==========================================
+trend_long  = macro_bullish and fill2_bullish and fill1_bullish
+trend_short = macro_bearish and fill2_bearish and fill1_bearish
+
+dot_long_trigger  = (fill1_cross_bullish or (detect_early_reversals and fill2_color_change_bull)) and macro_bullish
+dot_short_trigger = (fill1_cross_bearish or (detect_early_reversals and fill2_color_change_bear)) and macro_bearish
+
+confirmed_long_dot  = wait_candle_close ? (dot_long_trigger and barstate.isconfirmed) : dot_long_trigger
+confirmed_short_dot = wait_candle_close ? (dot_short_trigger and barstate.isconfirmed) : dot_short_trigger
+
+// ==========================================
+// VISUALS
+// ==========================================
+p2_slow = plot(structure2_slow_ma, display=display.none)
+p2_fast = plot(structure2_fast_ma, display=display.none)
+p1_slow = plot(structure1_slow_ma, display=display.none)
+p1_fast = plot(structure1_fast_ma, display=display.none)
+
+fill(p2_fast, p2_slow, color=fill2_bullish ? color.new(#00ff00, 50) : color.new(#ff0000, 50))
+fill(p1_fast, p1_slow, color=fill1_bullish ? color.new(#1fff00, 20) : color.new(#b10606, 20))
+
+plotshape(show_entry_labels and confirmed_long_dot, "Long Entry", shape.circle, location.bottom, color=#1fff00, size=size.tiny)
+plotshape(show_entry_labels and confirmed_short_dot, "Short Entry", shape.circle, location.top, color=#b10606, size=size.tiny)
+
+// ==========================================
+// TP/SL DRAWING
+// ==========================================
+var line l_tp  = na
+var label lb_tp = na
+var line l_tp1 = na
+var label lb_tp1 = na
+var line l_tp2 = na
+var label lb_tp2 = na
+var line l_ep  = na
+var label lb_ep = na
+var line l_sl  = na
+var label lb_sl = na
+
+if show_tpsl_lines
+    float ep = manual_entry_price > 0 ? manual_entry_price : close
+    float mult = trade_direction == "Long" ? 1 : -1
+
+    float tp  = ep * (1 + (tp_main_percent / 100) * mult)
+    float tp1 = tp1_percent > 0 ? ep * (1 + (tp1_percent / 100) * mult) : na
+    float tp2 = tp2_percent > 0 ? ep * (1 + (tp2_percent / 100) * mult) : na
+    float sl  = ep * (1 - (sl_percent / 100) * mult)
+
+    line.delete(l_tp),  label.delete(lb_tp)
+    line.delete(l_tp1), label.delete(lb_tp1)
+    line.delete(l_tp2), label.delete(lb_tp2)
+    line.delete(l_ep),  label.delete(lb_ep)
+    line.delete(l_sl),  label.delete(lb_sl)
+
+    int off = 40
+
+    l_tp := line.new(bar_index - 1, tp,  bar_index + off, tp,  color=#1fff00, width=3)
+    l_ep := line.new(bar_index - 1, ep,  bar_index + off, ep,  color=#000000, width=3)
+    l_sl := line.new(bar_index - 1, sl,  bar_index + off, sl,  color=#cb0000, width=3)
+
+    lb_tp := label.new(bar_index + off, tp,  "TP: "  + str.tostring(tp,  "#.##"), color=color.new(color.black, 100), textcolor=color.white, style=label.style_label_left)
+    lb_ep := label.new(bar_index + off, ep,  "EP: "  + str.tostring(ep,  "#.##"), color=color.new(color.black, 100), textcolor=color.white, style=label.style_label_left)
+    lb_sl := label.new(bar_index + off, sl,  "SL: "  + str.tostring(sl,  "#.##"), color=color.new(color.black, 100), textcolor=color.white, style=label.style_label_left)
+
+    if not na(tp1)
+        l_tp1 := line.new(bar_index - 1, tp1, bar_index + off, tp1, color=#1fff00, width=3)
+        lb_tp1 := label.new(bar_index + off, tp1, "TP1: " + str.tostring(tp1, "#.##"), color=color.new(color.black, 100), textcolor=color.white, style=label.style_label_left)
+
+    if not na(tp2)
+        l_tp2 := line.new(bar_index - 1, tp2, bar_index + off, tp2, color=#1fff00, width=3)
+        lb_tp2 := label.new(bar_index + off, tp2, "TP2: " + str.tostring(tp2, "#.##"), color=color.new(color.black, 100), textcolor=color.white, style=label.style_label_left)
+
+// ==========================================
+// MATRIX TABLE
+// ==========================================
+if show_signal_matrix
+    string pos_val = switch table_position
+        "Top Left"      => position.top_left
+        "Top Center"    => position.top_center
+        "Top Right"     => position.top_right
+        "Middle Left"   => position.middle_left
+        "Middle Center" => position.middle_center
+        "Middle Right"  => position.middle_right
+        "Bottom Left"   => position.bottom_left
+        "Bottom Center" => position.bottom_center
+        => position.bottom_right
+
+    var table matrix = table.new(pos_val, 2, 4, border_width=1)
+
+    if barstate.islast
+        table.cell(matrix, 0, 0, "Macro Trend", bgcolor=color.rgb(0, 0, 0), text_color=color.white)
+        table.cell(matrix, 1, 0, macro_bullish ? "Bullish" : "Bearish", bgcolor=color.white, text_color=macro_bullish ? #1fff00 : color.rgb(250, 6, 6))
+
+        table.cell(matrix, 0, 1, "Structure 2", bgcolor=color.rgb(0, 0, 0), text_color=color.white)
+        table.cell(matrix, 1, 1, fill2_bullish ? "Bullish" : "Bearish", bgcolor=color.white, text_color=fill2_bullish ? #1fff00 : color.rgb(247, 6, 6))
+
+        table.cell(matrix, 0, 2, "Structure 1", bgcolor=color.rgb(0, 0, 0), text_color=color.white)
+        table.cell(matrix, 1, 2, fill1_bullish ? "Bullish" : "Bearish", bgcolor=color.white, text_color=fill1_bullish ? #1fff00 : color.rgb(248, 4, 4))
+
+        sig_bg = trend_long ? #00FF00 : trend_short ? #FF0000 : #fcf7f7
+        sig_tx = color.rgb(0, 0, 0)
+        sig_msg = trend_long ? "LONG" : trend_short ? "SHORT" : "WAIT"
+
+        table.cell(matrix, 0, 3, "RESULT", bgcolor=color.rgb(1, 1, 2), text_color=color.white)
+        table.cell(matrix, 1, 3, sig_msg, bgcolor=sig_bg, text_color=sig_tx)
+
+// ==========================================
+// ALERTS
+// ==========================================
+alertcondition(confirmed_long_dot, "Long Signal", "Long Entry Detected")
+alertcondition(confirmed_short_dot, "Short Signal", "Short Entry Detected")

@@ -1,0 +1,140 @@
+//@version=6
+indicator("Multi-MA Wave Edges [MTF] + 25/75%", overlay = true, max_bars_back = 5000)
+
+// ──────────────────────────────────────
+// INPUTS
+// ──────────────────────────────────────
+ma_type     = input.string("SMA", "MA Type", options = ["SMA", "EMA", "RMA", "WMA", "VWMA"])
+
+num_mas     = input.int(32,   "Number of log-spaced MAs", minval = 20, maxval = 120, step = 5)
+start_len   = input.int(1,    "Min MA Length", minval = 1)
+max_len     = input.int(1440, "Max MA Length", minval = 10)
+
+upper_color = input.color(color.new(color.white, 88), "Upper Edge Color")
+lower_color = input.color(color.new(color.white, 88), "Lower Edge Color")
+fill_color  = input.color(color.new(#3179f5, 92),     "Fill Color")
+
+show_mid    = input.bool(true,  "Show 50% (Midpoint) Line")
+show_25     = input.bool(true,  "Show 25% Line")
+show_75     = input.bool(true,  "Show 75% Line")
+
+mid_color   = input.color(color.new(color.white, 40), "50% Color")
+q25_color   = input.color(color.new(color.orange, 55), "25% Color")
+q75_color   = input.color(color.new(color.orange, 55), "75% Color")
+
+line_width  = input.int(1, "Quartile Lines Width", minval=1, maxval=4)
+
+mtf_tf      = input.timeframe("1", "MTF Timeframe")
+src_type    = input.string("close", "Source", options = ["close", "high", "low", "hl2", "hlc3", "ohlc4"])
+
+smooth_enable = input.bool(false, "Smooth Edges with EMA")
+smooth_len    = input.int(5, "EMA Smoothing Length", minval=1, maxval=50)
+
+// ──────────────────────────────────────
+// Custom EMA and RMA (accept series lengths)
+// ──────────────────────────────────────
+ema_series(series float s, series float le) =>
+    float alpha = 2.0 / (le + 1)
+    var float em = na
+    em := na(em[1]) ? s : alpha * s + (1 - alpha) * nz(em[1])
+    em
+
+rma_series(series float s, series float le) =>
+    float alpha = 1.0 / le
+    var float rm = na
+    rm := na(rm[1]) ? s : alpha * s + (1 - alpha) * nz(rm[1])
+    rm
+
+// ──────────────────────────────────────
+// Build log-spaced lengths once
+// ──────────────────────────────────────
+var int[] lengths = array.new_int(0)
+var bool lengths_built = false
+
+if not lengths_built and barstate.isfirst
+    lengths_built := true
+    float log_min = math.log(math.max(1, start_len))
+    float log_max = math.log(math.max(start_len + 1, max_len))
+    for i = 0 to num_mas - 1
+        float t = i / math.max(1.0, num_mas - 1.0)
+        float log_l = log_min + t * (log_max - log_min)
+        int l = math.round(math.exp(log_l))
+        l := math.max(start_len, math.min(max_len, l))
+        if array.indexof(lengths, l) < 0
+            array.push(lengths, l)
+    array.sort(lengths, order.ascending)
+
+// ──────────────────────────────────────
+// MTF envelope calculation
+// ──────────────────────────────────────
+mtf_calc(string src_type_input, int[] lens, string ma_type_input) =>
+    src = switch src_type_input
+        "close" => close
+        "high"  => high
+        "low"   => low
+        "hl2"   => hl2
+        "hlc3"  => hlc3
+        => ohlc4
+
+    float upper = na
+    float lower = na
+    
+    for len in lens
+        if len >= 1
+            float ma = switch ma_type_input
+                "SMA"  => ta.sma(src, len)
+                "EMA"  => ema_series(src, len)
+                "RMA"  => rma_series(src, len)
+                "WMA"  => ta.wma(src, len)
+                "VWMA" => ta.vwma(src, len)
+            
+            if not na(ma)
+                upper := na(upper) ? ma : math.max(upper, ma)
+                lower := na(lower) ? ma : math.min(lower, ma)
+
+    [upper, lower]
+
+// ──────────────────────────────────────
+// Get MTF values
+// ──────────────────────────────────────
+bool same_tf = mtf_tf == "" or mtf_tf == timeframe.period
+
+float mtf_upper = na
+float mtf_lower = na
+
+if same_tf
+    [u, l] = mtf_calc(src_type, lengths, ma_type)
+    mtf_upper := u
+    mtf_lower := l
+else
+    [u, l] = request.security(
+         syminfo.tickerid, 
+         mtf_tf, 
+         mtf_calc(src_type, lengths, ma_type),
+         gaps       = barmerge.gaps_off,
+         lookahead  = barmerge.lookahead_off)
+    mtf_upper := u
+    mtf_lower := l
+
+// ──────────────────────────────────────
+// Final (smoothed) envelope + internal levels
+// ──────────────────────────────────────
+final_upper = smooth_enable ? ta.ema(mtf_upper, smooth_len) : mtf_upper
+final_lower = smooth_enable ? ta.ema(mtf_lower, smooth_len) : mtf_lower
+
+range_wave  = final_upper - final_lower
+midpoint    = na(range_wave) ? na : final_lower + 0.50 * range_wave
+level_25    = na(range_wave) ? na : final_lower + 0.25 * range_wave
+level_75    = na(range_wave) ? na : final_lower + 0.75 * range_wave
+
+// ──────────────────────────────────────
+// Plotting
+// ──────────────────────────────────────
+p_upper = plot(final_upper, "Upper Edge", color = upper_color, linewidth = 2)
+p_lower = plot(final_lower, "Lower Edge", color = lower_color, linewidth = 2)
+
+plot(show_mid  ? midpoint  : na, "50% ∙ Mid",   color = mid_color,  linewidth = line_width)
+plot(show_25   ? level_25  : na, "25% Level",   color = q25_color,  linewidth = line_width)
+plot(show_75   ? level_75  : na, "75% Level",   color = q75_color,  linewidth = line_width)
+
+fill(p_upper, p_lower, color = fill_color, title = "Envelope Fill")

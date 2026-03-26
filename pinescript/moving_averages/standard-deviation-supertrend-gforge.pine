@@ -1,0 +1,249 @@
+//@version=6
+indicator("Standard Deviation Supertrend", overlay=true)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// DISPLAY OPTIONS
+// ═══════════════════════════════════════════════════════════════════════════════
+show_signals    = input.bool(true, "Show Signal Markers", tooltip="Show diamond markers when trend direction flips.", group="📊 Display Options")
+show_fill       = input.bool(true, "Show Trend Fill", tooltip="Gradient fill between price and the active Supertrend line.", group="📊 Display Options")
+
+theme = input.string("Matrix Green", "Visual Theme", options=["Cyberpunk Red", "Plasma Fire", "Royal Purple", "Matrix Green", "Arctic Ice", "Neon Dreams", "Coral Reef", "Volcanic Ash", "Aurora Borealis", "Desert Storm", "Retro Wave", "Pearl White", "Pure Grayscale"], group="🎨 Visual Settings")
+
+[primary_up, primary_dn, accent] = switch theme
+    "Cyberpunk Red"    => [#00E5FF, #FF1744, #6a6a68]
+    "Plasma Fire"      => [#FFEB3B, #E91E63, color.rgb(255, 115, 0)]
+    "Royal Purple"     => [#9C27B0, #FFC107, #E040FB]
+    "Matrix Green"     => [#00FF00, #FF0000, #76FF03]
+    "Arctic Ice"       => [#E0F7FA, #5b6267, #00E5FF]
+    "Neon Dreams"      => [#00FFFF, #FF00FF, #514f4f]
+    "Coral Reef"       => [#FF7F50, #4682B4, #FFD700]
+    "Volcanic Ash"     => [#FF4500, #708090, #FFA500]
+    "Aurora Borealis"  => [#00FF7F, #BA55D3, #00FFFF]
+    "Desert Storm"     => [#F4A460, #8B4513, #FFD700]
+    "Retro Wave"       => [#FF6EC7, #00E5FF, #FFF700]
+    "Pearl White"      => [#23e3cd, #D32F2F, color.rgb(8, 203, 190)]
+    "Pure Grayscale"   => [#E0E0E0, #616161, #9E9E9E]
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SUPERTREND PARAMETERS
+// ═══════════════════════════════════════════════════════════════════════════════
+src      = input(close,  "Anchor Source", tooltip="Raw price source for the Supertrend anchor. hl2 is the classic Supertrend default.", group="📈 Supertrend")
+sd_length = input.int(26, "StdDev Length", minval=3, maxval=200, tooltip="Lookback for Standard Deviation. Unlike ATR which measures absolute range, StdDev measures dispersion from the mean — it naturally tightens during clean directional moves (low dispersion) and widens during erratic price action (high dispersion). This gives the Supertrend adaptive behavior that ATR-based versions lack.", group="📈 Supertrend")
+sd_mult   = input.float(2.8, "StdDev Multiplier", minval=0.5, maxval=8.0, step=0.1, tooltip="Band width multiplier. This serves the same role as the 'threshold' in oscillator-based indicators — higher values require a larger price move to flip the trend direction. Increase for fewer signals with less noise, decrease for faster reaction.", group="📈 Supertrend")
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SMOOTHING SETTINGS
+//
+// The two smoothing layers work together to clean up the Supertrend inputs:
+//
+// 1. ANCHOR MA — smooths the price source (hl2) before building bands.
+//    Raw hl2 reacts to every wick, so a single spike candle can yank the 
+//    raw band calculation and cause a premature flip. An MA anchor provides
+//    a calmer baseline so the ratcheting logic works on cleaner data.
+//
+// 2. STDDEV SMOOTHING — applies EMA to the raw StdDev output.
+//    ta.stdev() can jump significantly bar to bar when a volatile candle
+//    enters or exits the lookback window. Smoothing the deviation before
+//    it scales the bands prevents erratic band width changes.
+//
+// Together, these improve parameter robustness: small changes to StdDev 
+// Length or Multiplier produce smaller changes in output, meaning the 
+// indicator is less likely to break under slight parameter variation.
+// ═══════════════════════════════════════════════════════════════════════════════
+anchor_ma_type = input.string("TEMA", "Anchor MA Type", options=["None (hl2)", "SMA", "EMA", "WMA", "HMA", "DEMA", "TEMA", "VWMA", "RMA", "ALMA", "T3"], tooltip="Moving average applied to the price source before band calculation.\n\n• None (hl2) — raw source, classic Supertrend. Most reactive but noisiest.\n• SMA — simple average. Clean, moderate lag.\n• EMA — exponential. Good default. Balances smoothing and responsiveness.\n• WMA — linearly weighted. Slightly more recent-bar emphasis than EMA.\n• HMA — Hull MA. Very low lag but can overshoot on sharp reversals.\n• DEMA — Double EMA. Less lag than EMA without HMA's overshoot.\n• TEMA — Triple EMA. Aggressive lag reduction.\n• VWMA — Volume weighted. Naturally anchors to high-volume price levels.\n• RMA — Wilder's smoothing. Very smooth, significant lag.\n• ALMA — Arnaud Legoux. Gaussian-weighted with tunable offset/sigma.\n• T3 — Tillson. Extremely smooth, volume factor controls responsiveness.", group="🔧 Smoothing")
+anchor_ma_length = input.int(5, "Anchor MA Length", minval=2, maxval=100, tooltip="Lookback for the anchor MA. Only applies when MA Type is not 'None'.", group="🔧 Smoothing")
+alma_offset      = input.float(0.85, "ALMA Offset", minval=0.0, maxval=1.0, step=0.05, tooltip="ALMA Gaussian center. 0.85 = slightly right-shifted for less lag. Only used when ALMA is selected.", group="🔧 Smoothing")
+alma_sigma       = input.float(6.0,  "ALMA Sigma",  minval=1.0, maxval=20.0, step=0.5, tooltip="ALMA Gaussian width. Higher = smoother. Only used when ALMA is selected.", group="🔧 Smoothing")
+t3_factor        = input.float(0.7,  "T3 Volume Factor", minval=0.0, maxval=1.0, step=0.05, tooltip="T3 smoothing intensity. 0 = standard triple EMA, 1 = maximum smoothing. Only used when T3 is selected.", group="🔧 Smoothing")
+sd_smooth_length = input.int(1, "StdDev Smoothing", minval=1, maxval=50, tooltip="EMA applied to the raw StdDev before it scales the bands.\n1 = no smoothing (raw StdDev). Higher values make band width evolve gradually.", group="🔧 Smoothing")
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// MA CALCULATION
+//
+// All MA types are computed every bar regardless of which is selected.
+// This is a PineScript requirement: ta.* functions need continuous history
+// to produce correct values. The switch statement then selects the active one.
+// The computational overhead is negligible since PineScript optimizes this.
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// ── T3 (Tillson) implementation ──
+// T3 cascades 6 EMAs and combines them with polynomial coefficients.
+// The volume factor (vf) controls how aggressively the filter smooths.
+// At vf=0 it reduces to a triple EMA; at vf=1 it achieves maximum smoothing.
+t3_calc(float _src, int _len, float _vf) =>
+    float e1 = ta.ema(_src, _len)
+    float e2 = ta.ema(e1, _len)
+    float e3 = ta.ema(e2, _len)
+    float e4 = ta.ema(e3, _len)
+    float e5 = ta.ema(e4, _len)
+    float e6 = ta.ema(e5, _len)
+    float c1 = -_vf * _vf * _vf
+    float c2 = 3 * _vf * _vf + 3 * _vf * _vf * _vf
+    float c3 = -6 * _vf * _vf - 3 * _vf - 3 * _vf * _vf * _vf
+    float c4 = 1 + 3 * _vf + _vf * _vf * _vf + 3 * _vf * _vf
+    c1 * e6 + c2 * e5 + c3 * e4 + c4 * e3
+
+// Compute all MA variants
+float ma_sma  = ta.sma(src, anchor_ma_length)
+float ma_ema  = ta.ema(src, anchor_ma_length)
+float ma_wma  = ta.wma(src, anchor_ma_length)
+float ma_vwma = ta.vwma(src, anchor_ma_length)
+float ma_rma  = ta.rma(src, anchor_ma_length)
+float ma_alma = ta.alma(src, anchor_ma_length, alma_offset, alma_sigma)
+float ma_t3   = t3_calc(src, anchor_ma_length, t3_factor)
+
+// ── HMA (Hull Moving Average) ──
+// HMA = WMA( 2*WMA(n/2) - WMA(n) , sqrt(n) )
+// Achieves very low lag by taking the difference between a half-period
+// and full-period WMA, then smoothing with a sqrt(n) WMA.
+int hma_half = math.max(1, math.round(anchor_ma_length / 2))
+int hma_sqrt = math.max(1, math.round(math.sqrt(anchor_ma_length)))
+float ma_hma = ta.wma(2 * ta.wma(src, hma_half) - ta.wma(src, anchor_ma_length), hma_sqrt)
+
+// ── DEMA (Double Exponential Moving Average) ──
+// DEMA = 2*EMA - EMA(EMA)
+// Subtracting the EMA of EMA removes one layer of lag.
+float _ema1  = ta.ema(src, anchor_ma_length)
+float ma_dema = 2 * _ema1 - ta.ema(_ema1, anchor_ma_length)
+
+// ── TEMA (Triple Exponential Moving Average) ──
+// TEMA = 3*EMA - 3*EMA(EMA) + EMA(EMA(EMA))
+// Extends DEMA's logic with a third correction term for even less lag.
+float _ema2  = ta.ema(_ema1, anchor_ma_length)
+float _ema3  = ta.ema(_ema2, anchor_ma_length)
+float ma_tema = 3 * _ema1 - 3 * _ema2 + _ema3
+
+// Select active MA
+float anchor = switch anchor_ma_type
+    "None (hl2)" => src
+    "SMA"   => ma_sma
+    "EMA"   => ma_ema
+    "WMA"   => ma_wma
+    "HMA"   => ma_hma
+    "DEMA"  => ma_dema
+    "TEMA"  => ma_tema
+    "VWMA"  => ma_vwma
+    "RMA"   => ma_rma
+    "ALMA"  => ma_alma
+    "T3"    => ma_t3
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// CORE: Standard Deviation SUPERTREND
+//
+// This is a Supertrend that uses Standard Deviation instead of ATR for the
+// volatility measure, with two smoothing layers (MA anchor + StdDev EMA).
+//
+// Classic Supertrend formula:
+//   upper_band = anchor + multiplier × volatility
+//   lower_band = anchor - multiplier × volatility
+//
+// Ratcheting logic (the key Supertrend mechanic):
+//   - In an uptrend, the LOWER band can only move UP (tighten the trailing stop)
+//   - In a downtrend, the UPPER band can only move DOWN (tighten the trailing stop)
+//   - Bands reset only when price crosses the opposite band (trend flip)
+//
+// Why StdDev instead of ATR:
+//   ATR measures the average True Range — it treats all bars equally regardless
+//   of whether they move with or against the trend. A 3% up-candle and a 3% 
+//   gap-down produce the same ATR contribution.
+//
+//   StdDev measures dispersion from the mean. During clean directional moves,
+//   prices cluster on one side of the mean → low StdDev → bands tighten.
+//   During erratic/choppy price action, prices scatter around the mean →
+//   high StdDev → bands widen. This gives the Supertrend naturally adaptive
+//   behavior: tight stops in clean trends, wide stops in noisy conditions.
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// Step 1: Compute StdDev and apply smoothing
+// Raw ta.stdev() can jump abruptly when a volatile bar enters/exits the window.
+// The EMA smoothing makes band width evolve gradually instead.
+float raw_dev    = ta.stdev(close, sd_length)
+float smooth_dev = sd_smooth_length > 1 ? ta.ema(raw_dev, sd_smooth_length) : raw_dev
+float dev        = sd_mult * smooth_dev
+
+// Step 2: Build raw bands from smoothed anchor
+float up = anchor + dev
+float dn = anchor - dev
+
+// Step 3: Apply Supertrend ratcheting
+// nz() provides fallback for the first bars where [1] references don't exist yet.
+// Without this, bands start as na and the indicator never produces signals.
+//
+// Lower band ratchet: if previous close was above the previous lower band,
+// the new lower band can only move up (take the max). Otherwise, reset.
+// Upper band ratchet: if previous close was below the previous upper band,
+// the new upper band can only move down (take the min). Otherwise, reset.
+up := close[1] < nz(up[1], up) ? math.min(up, nz(up[1], up)) : up
+dn := close[1] > nz(dn[1], dn) ? math.max(dn, nz(dn[1], dn)) : dn
+
+// Step 4: Determine trend direction
+// Direction flips when close crosses the opposite band:
+//   - Bearish → Bullish: close crosses above the upper band
+//   - Bullish → Bearish: close crosses below the lower band
+var int trend = 1
+trend := trend == -1 and close > nz(up[1], up) ? 1 :
+         trend ==  1 and close < nz(dn[1], dn) ? -1 : trend
+
+// Step 5: Active Supertrend line
+// In an uptrend, display the lower band (support / trailing stop below price).
+// In a downtrend, display the upper band (resistance / trailing stop above price).
+float st_line = trend == 1 ? dn : up
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SIGNAL GENERATION
+//
+// Signals fire on trend direction changes (flips).
+// Unlike oscillator-based indicators that use threshold crossovers,
+// the Supertrend generates signals directly from price crossing the
+// trailing band. The StdDev multiplier serves the equivalent role 
+// of a threshold — higher multiplier = wider band = harder to flip.
+// ═══════════════════════════════════════════════════════════════════════════════
+bool is_bull    = trend == 1
+bool long_flip  = trend == 1 and trend[1] == -1
+bool short_flip = trend == -1 and trend[1] == 1
+
+var string signal_state = "flat"
+
+if long_flip
+    signal_state := "long"
+else if short_flip
+    signal_state := "flat"
+
+bool long_signal = long_flip and signal_state[1] != "long"
+bool exit_signal = short_flip and signal_state[1] == "long"
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// VISUALS
+// ═══════════════════════════════════════════════════════════════════════════════
+color trend_color = is_bull ? primary_up : primary_dn
+
+// Supertrend line with glow
+plot(st_line, "Glow 3", color=color.new(trend_color, 85), linewidth=10)
+plot(st_line, "Glow 2", color=color.new(trend_color, 70), linewidth=6)
+plot(st_line, "Glow 1", color=color.new(trend_color, 50), linewidth=3)
+plot(st_line, "Sigma Trend", color=trend_color, linewidth=2)
+
+// Trend fill
+p_close = plot(show_fill ? close : na, "Close", color=na, display=display.none)
+p_st    = plot(show_fill ? st_line : na, "ST Ref", color=na, display=display.none)
+fill(p_close, p_st, color=show_fill ? color.new(trend_color, 85) : na, title="Trend Fill")
+
+// Inactive band (shows where the flip would occur)
+plot(is_bull ? up : na, "Inactive Upper", color=color.new(primary_dn, 80), linewidth=1, style=plot.style_cross)
+plot(not is_bull ? dn : na, "Inactive Lower", color=color.new(primary_up, 80), linewidth=1, style=plot.style_cross)
+
+// Anchor MA reference line
+plot(anchor_ma_type != "None (hl2)" ? anchor : na, "Anchor MA", color=color.new(accent, 60), linewidth=1)
+
+// Bar coloring
+plotcandle(open, high, low, close, title="Bars", color=trend_color, bordercolor=trend_color, wickcolor=trend_color)
+
+// Signal markers (halo + core diamond)
+plotshape(show_signals ? long_signal : false, title="Long", style=shape.diamond, location=location.belowbar, color=primary_up, size=size.tiny)
+plotshape(show_signals ? exit_signal : false, title="Short/Cash", style=shape.diamond, location=location.abovebar, color=primary_dn, size=size.tiny)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ALERTS
+// ═══════════════════════════════════════════════════════════════════════════════
+alertcondition(long_signal,  "Long Signal",  "Sigma Trend: Bullish flip")
+alertcondition(exit_signal, "Short Signal", "Sigma Trend: Bearish flip")

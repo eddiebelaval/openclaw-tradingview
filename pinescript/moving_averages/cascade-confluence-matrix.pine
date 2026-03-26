@@ -1,0 +1,193 @@
+//@version=6
+indicator("Cascade Confluence Matrix", overlay=true, max_labels_count=500)
+
+// ====================================
+// INPUTS - GENERAL SETTINGS
+// ====================================
+string GROUP_GENERAL = "General Settings"
+
+waitForClose = input.bool(true, "Wait for Bar Close", group=GROUP_GENERAL, 
+     tooltip="When enabled, signals are generated only after the current bar closes. This eliminates intra-bar repainting and provides confirmed signals. Disable for faster but less reliable signals during live trading.")
+
+showSignalMarkers = input.bool(true, "Show Signal Markers", group=GROUP_GENERAL, 
+     tooltip="Display visual markers (circles with text) on the chart when new Long or Short entry signals occur. These appear at the moment all three confluence conditions align.")
+
+showExitMarkers = input.bool(true, "Show Exit Markers", group=GROUP_GENERAL, 
+     tooltip="Display visual markers when an active signal ends. Exit Long appears when bullish confluence breaks; Exit Short appears when bearish confluence breaks.")
+
+showTable = input.bool(true, "Show Status Table", group=GROUP_GENERAL, 
+     tooltip="Display an on-chart table showing the real-time status of each condition layer (Macro, Intermediate, Entry) for both Long and Short directions, plus the overall signal state.")
+
+tablePosition = input.string("Top Right", "Table Position", options=["Top Right", "Top Left", "Bottom Right", "Bottom Left"], group=GROUP_GENERAL, 
+     tooltip="Choose where the status table appears on your chart. Useful for avoiding overlap with price action or other indicators.")
+
+// ====================================
+// INPUTS - CONDITION 1 (MACRO TREND)
+// ====================================
+string GROUP_COND1 = "Condition 1 - Macro Trend Filter"
+
+timeframe1 = input.timeframe("240", "Timeframe", group=GROUP_COND1, 
+     tooltip="The higher timeframe used to determine the macro trend direction. Default is 4H (240 minutes). This acts as the primary trend filter - trades are only considered in the direction of this timeframe's trend.")
+
+ema1_length = input.int(8, "EMA Length", minval=1, maxval=500, group=GROUP_COND1, 
+     tooltip="The period length for the Exponential Moving Average on the macro timeframe. Price closing above this EMA indicates bullish macro trend; below indicates bearish. Shorter periods react faster but may produce more false signals.")
+
+// ====================================
+// INPUTS - CONDITION 2 (INTERMEDIATE)
+// ====================================
+string GROUP_COND2 = "Condition 2 - Intermediate Momentum"
+
+timeframe2 = input.timeframe("60", "Timeframe", group=GROUP_COND2, 
+     tooltip="The intermediate timeframe used to confirm momentum alignment. Default is 1H (60 minutes). This layer validates that momentum on a medium timeframe supports the macro trend direction before allowing signals.")
+
+ema2_fast_short = input.int(8, "Fast Cross - Short EMA", minval=1, maxval=500, group=GROUP_COND2, 
+     tooltip="The shorter EMA period for the fast crossover pair on the intermediate timeframe. When this EMA is above the Fast Cross Long EMA, it indicates short-term bullish momentum.")
+
+ema2_fast_long = input.int(12, "Fast Cross - Long EMA", minval=1, maxval=500, group=GROUP_COND2, 
+     tooltip="The longer EMA period for the fast crossover pair. The relationship between the Fast Short and Fast Long EMAs captures recent momentum shifts on the intermediate timeframe.")
+
+ema2_slow_short = input.int(16, "Slow Cross - Short EMA", minval=1, maxval=500, group=GROUP_COND2, 
+     tooltip="The shorter EMA period for the slow crossover pair on the intermediate timeframe. This pair filters out noise and confirms that the broader momentum trend aligns with the fast crossover.")
+
+ema2_slow_long = input.int(30, "Slow Cross - Long EMA", minval=1, maxval=500, group=GROUP_COND2, 
+     tooltip="The longer EMA period for the slow crossover pair. Both the fast pair AND slow pair must agree (both bullish or both bearish) for this condition to be satisfied.")
+
+// ====================================
+// INPUTS - CONDITION 3 (MICRO/ENTRY)
+// ====================================
+string GROUP_COND3 = "Condition 3 - Entry Timing"
+
+timeframe3 = input.timeframe("15", "Timeframe", group=GROUP_COND3, 
+     tooltip="The lower timeframe used to time entries precisely. Default is 15 minutes. This layer ensures that even the short-term price action confirms the trade direction established by the higher timeframes.")
+
+ema3_fast_short = input.int(30, "Fast Cross - Short EMA", minval=1, maxval=500, group=GROUP_COND3, 
+     tooltip="The shorter EMA period for the fast crossover pair on the entry timeframe. Larger values than Condition 2 help filter micro-noise while still capturing meaningful entry timing signals.")
+
+ema3_fast_long = input.int(50, "Fast Cross - Long EMA", minval=1, maxval=500, group=GROUP_COND3, 
+     tooltip="The longer EMA period for the fast crossover pair on the entry timeframe. The spread between short and long EMAs determines sensitivity to momentum changes.")
+
+ema3_slow_short = input.int(50, "Slow Cross - Short EMA", minval=1, maxval=500, group=GROUP_COND3, 
+     tooltip="The shorter EMA period for the slow crossover pair on the entry timeframe. This provides additional confirmation that the entry timing aligns with a broader micro-trend.")
+
+ema3_slow_long = input.int(150, "Slow Cross - Long EMA", minval=1, maxval=500, group=GROUP_COND3, 
+     tooltip="The longer EMA period for the slow crossover pair. The 150-period default captures significant trend structure on the entry timeframe, ensuring entries occur within established micro-trends.")
+
+// ====================================
+// VISUAL SETTINGS
+// ====================================
+string GROUP_VISUAL = "Visual Settings"
+
+// Background colors synced to exact signal hex codes with 90% transparency
+colorBullish = color.new(#1fff00, 75)
+colorBearish = color.new(#cb0000, 75)
+
+colorLongSignal = input.color(#1fff00, "Long Entry Marker", group=GROUP_VISUAL, 
+     tooltip="Color for Long entry signal markers and text. Default is bright green for high visibility.")
+
+colorShortSignal = input.color(#cb0000, "Short Entry Marker", group=GROUP_VISUAL, 
+     tooltip="Color for Short entry signal markers and text. Default is red for clear distinction from long signals.")
+
+colorExitLong = input.color(#ffffff, "Long Exit Marker (White)", group=GROUP_VISUAL, 
+     tooltip="Color for Long exit markers. Default is white to indicate the end of a bullish signal state.")
+
+colorExitShort = input.color(#000000, "Short Exit Marker (Black)", group=GROUP_VISUAL, 
+     tooltip="Color for Short exit markers. Default is black to indicate the end of a bearish signal state.")
+
+// ====================================
+// CALCULATIONS
+// ====================================
+// Non-repainting security function using confirmed historical data
+f_security(_sym, _tf, _src) =>
+    request.security(_sym, _tf, _src[1], lookahead=barmerge.lookahead_off)
+
+// Condition 1: Macro Trend Filter
+// Price position relative to EMA on the highest timeframe
+ema1_value = f_security(syminfo.tickerid, timeframe1, ta.ema(close, ema1_length))
+close1 = f_security(syminfo.tickerid, timeframe1, close)
+condition1_long = close1 > ema1_value
+condition1_short = close1 < ema1_value
+
+// Condition 2: Intermediate Momentum
+// Dual EMA crossover system requiring both fast and slow pairs to agree
+ema2_fs_v = f_security(syminfo.tickerid, timeframe2, ta.ema(close, ema2_fast_short))
+ema2_fl_v = f_security(syminfo.tickerid, timeframe2, ta.ema(close, ema2_fast_long))
+ema2_ss_v = f_security(syminfo.tickerid, timeframe2, ta.ema(close, ema2_slow_short))
+ema2_sl_v = f_security(syminfo.tickerid, timeframe2, ta.ema(close, ema2_slow_long))
+condition2_long = ema2_fs_v > ema2_fl_v and ema2_ss_v > ema2_sl_v
+condition2_short = ema2_fs_v < ema2_fl_v and ema2_ss_v < ema2_sl_v
+
+// Condition 3: Entry Timing
+// Dual EMA crossover system on lower timeframe for precise entry timing
+ema3_fs_v = f_security(syminfo.tickerid, timeframe3, ta.ema(close, ema3_fast_short))
+ema3_fl_v = f_security(syminfo.tickerid, timeframe3, ta.ema(close, ema3_fast_long))
+ema3_ss_v = f_security(syminfo.tickerid, timeframe3, ta.ema(close, ema3_slow_short))
+ema3_sl_v = f_security(syminfo.tickerid, timeframe3, ta.ema(close, ema3_slow_long))
+condition3_long = ema3_fs_v > ema3_fl_v and ema3_ss_v > ema3_sl_v
+condition3_short = ema3_fs_v < ema3_fl_v and ema3_ss_v < ema3_sl_v
+
+// Logic Status with optional bar close confirmation
+bool isConfirmed = waitForClose ? barstate.isconfirmed : true
+longState = condition1_long and condition2_long and condition3_long and isConfirmed
+shortState = condition1_short and condition2_short and condition3_short and isConfirmed
+
+// Signal event detection (state transitions)
+longEntry = longState and not longState[1]
+shortEntry = shortState and not shortState[1]
+longExit = not longState and longState[1]
+shortExit = not shortState and shortState[1]
+
+// ====================================
+// VISUAL OUTPUT
+// ====================================
+bgcolor(longState ? colorBullish : shortState ? colorBearish : na, title="Signal Background")
+
+// Entry Signals
+plotshape(showSignalMarkers and longEntry, title="Long Entry", style=shape.circle, location=location.bottom, color=colorLongSignal, size=size.tiny, text="LONG", textcolor=colorLongSignal)
+plotshape(showSignalMarkers and shortEntry, title="Short Entry", style=shape.circle, location=location.top, color=colorShortSignal, size=size.tiny, text="SHORT", textcolor=colorShortSignal)
+
+// Exit Signals
+plotshape(showExitMarkers and longExit, title="Long Exit", style=shape.circle, location=location.top, color=colorExitLong, size=size.tiny, text="EXIT LONG", textcolor=colorExitLong)
+plotshape(showExitMarkers and shortExit, title="Short Exit", style=shape.circle, location=location.bottom, color=colorExitShort, size=size.tiny, text="EXIT SHORT", textcolor=colorExitShort)
+
+// ====================================
+// STATUS TABLE
+// ====================================
+var table statusTable = table.new(tablePosition == "Top Right" ? position.top_right : tablePosition == "Top Left" ? position.top_left : tablePosition == "Bottom Right" ? position.bottom_right : position.bottom_left, 3, 5, border_width=1)
+
+if showTable and barstate.islast
+    // Header row
+    table.cell(statusTable, 0, 0, "Condition", bgcolor=color.rgb(0, 0, 0), text_color=color.white, text_size=size.small)
+    table.cell(statusTable, 1, 0, "Long", bgcolor=color.rgb(0, 0, 0), text_color=color.white, text_size=size.small)
+    table.cell(statusTable, 2, 0, "Short", bgcolor=color.rgb(0, 0, 0), text_color=color.white, text_size=size.small)
+    
+    // Condition 1 - Macro
+    table.cell(statusTable, 0, 1, "Macro", bgcolor=color.new(#010102, 70), text_color=color.white, text_size=size.small)
+    table.cell(statusTable, 1, 1, condition1_long ? "✓" : "-", bgcolor=condition1_long ? #03f50b : color.new(color.gray, 70), text_color=color.white, text_size=size.small)
+    table.cell(statusTable, 2, 1, condition1_short ? "✓" : "-", bgcolor=condition1_short ? #fa0404 : color.new(color.gray, 70), text_color=color.white, text_size=size.small)
+    
+    // Condition 2 - Intermediate
+    table.cell(statusTable, 0, 2, "Intermediate", bgcolor=color.new(#010102, 70), text_color=color.white, text_size=size.small)
+    table.cell(statusTable, 1, 2, condition2_long ? "✓" : "-", bgcolor=condition2_long ? #03f50b : color.new(color.gray, 70), text_color=color.white, text_size=size.small)
+    table.cell(statusTable, 2, 2, condition2_short ? "✓" : "-", bgcolor=condition2_short ? #fa0404 : color.new(color.gray, 70), text_color=color.white, text_size=size.small)
+    
+    // Condition 3 - Entry
+    table.cell(statusTable, 0, 3, "Entry", bgcolor=color.new(#010102, 70), text_color=color.white, text_size=size.small)
+    table.cell(statusTable, 1, 3, condition3_long ? "✓" : "-", bgcolor=condition3_long ? #03f50b : color.new(color.gray, 70), text_color=color.white, text_size=size.small)
+    table.cell(statusTable, 2, 3, condition3_short ? "✓" : "-", bgcolor=condition3_short ? #fa0404 : color.new(color.gray, 70), text_color=color.white, text_size=size.small)
+    
+    // Overall Signal
+    string overallStatus = longState ? "LONG" : shortState ? "SHORT" : "NEUTRAL"
+    color overallColor = longState ? color.new(#03f50b, 30) : shortState ? color.new(#fa0404, 30) : color.new(color.gray, 50)
+    table.cell(statusTable, 0, 4, "SIGNAL", bgcolor=color.rgb(0, 0, 0), text_color=color.white, text_size=size.small)
+    table.cell(statusTable, 1, 4, overallStatus, bgcolor=overallColor, text_color=color.white, text_size=size.small)
+    table.merge_cells(statusTable, 1, 4, 2, 4)
+
+// ====================================
+// ALERTS
+// ====================================
+alertcondition(longEntry, "Long Entry", "Cascade Confluence Matrix: Long Entry Signal on {{ticker}} at {{time}}")
+alertcondition(shortEntry, "Short Entry", "Cascade Confluence Matrix: Short Entry Signal on {{ticker}} at {{time}}")
+alertcondition(longExit, "Long Exit", "Cascade Confluence Matrix: Long Signal Ended on {{ticker}} at {{time}}")
+alertcondition(shortExit, "Short Exit", "Cascade Confluence Matrix: Short Signal Ended on {{ticker}} at {{time}}")
+alertcondition(longState, "Long State Active", "Cascade Confluence Matrix: Bullish Confluence Active on {{ticker}}")
+alertcondition(shortState, "Short State Active", "Cascade Confluence Matrix: Bearish Confluence Active on {{ticker}}")

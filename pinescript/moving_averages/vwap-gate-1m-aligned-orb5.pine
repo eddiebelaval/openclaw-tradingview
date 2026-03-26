@@ -1,0 +1,252 @@
+//@version=5
+indicator("Prop VWAP Gate v2.3 (1m aligned | Slope+Chop+Hold | VWAP Retest Entries | ORB5)", overlay=true, max_labels_count=500)
+
+//========================
+// Inputs
+//========================
+tz               = input.string("America/New_York", "Session Timezone")
+tradeWindow      = input.session("0940-1100", "Trade window (same tz)")
+
+rthSession       = input.session("0930-1600", "RTH Session (same tz)")
+showOvernight    = input.bool(true, "Show Overnight Anchored VWAP?")
+overnightSess    = input.session("0000-0930", "Overnight Session (same tz)")
+
+lookbackMin      = input.int(10, "Slope lookback (minutes)", minval=2, maxval=60)
+kRange           = input.float(0.15, "VWAP_move >= kRange * Range", minval=0.0, maxval=1.0, step=0.01)
+kSpread          = input.float(3.0,  "VWAP_move >= kSpread * Spread", minval=0.0, maxval=10.0, step=0.5)
+useStrictAND     = input.bool(true, "Threshold mode: AND (strict). OFF => MAX(thresholds)")
+
+maxCrossesN      = input.int(3, "Max VWAP flips in lookback", minval=0, maxval=20)
+
+onConfirmBars    = input.int(2, "Gate ON after N consecutive passes", minval=1, maxval=10)
+offConfirmBars   = input.int(3, "Gate OFF after N consecutive fails", minval=1, maxval=10)
+
+// IMPORTANT: input defaults must be CONST, so no syminfo.mintick here.
+spreadPts        = input.float(0.5, "Spread (points)", minval=0.0, step=0.1)
+tickSizePts      = input.float(1.0, "Tick size / price step (points)", minval=0.00001, step=0.00001)
+
+minTicksEps      = input.int(2, "Min ticks for ε", minval=0, maxval=50)
+epsSpreadMult    = input.float(1.0, "ε spread multiplier", minval=0.0, maxval=10.0, step=0.25)
+
+holdBars         = input.int(5, "Hold bars (1m closes)", minval=2, maxval=20)
+holdDeltaMult    = input.float(1.0, "δ = max(2 ticks, holdDeltaMult*spread)", minval=0.0, maxval=5.0, step=0.25)
+
+showEntrySignals = input.bool(true, "Show VWAP retest entry signals?")
+requirePullback  = input.bool(true, "Require pullback (prev close on trend side)?")
+rejCloseFrac     = input.float(0.50, "Rejection close threshold (fraction of ε)", minval=0.0, maxval=1.0, step=0.05)
+
+showORB          = input.bool(true, "Show ORB(5) High/Low?")
+orbSession       = input.session("0930-0935", "ORB Window (same tz)")
+showORBEps       = input.bool(true, "Show ε band around ORB levels?")
+
+showBgTint       = input.bool(false, "Tint background by gate state?")
+showGateLabel    = input.bool(true, "Show debug label (top-right)?")
+showTradeShade   = input.bool(true, "Shade outside trade window?")
+
+//========================
+// Helper: session membership
+//========================
+f_inSession(_sess) =>
+    not na(time("1", _sess, tz))
+
+//========================
+// 1m CORE: compute VWAPs + gate + holds + entries
+//========================
+f_core_1m() =>
+    inRTH      = f_inSession(rthSession)
+    startRTH   = inRTH and not inRTH[1]
+    inON       = f_inSession(overnightSess)
+    startON    = inON and not inON[1]
+    inTW       = f_inSession(tradeWindow)
+
+    v = (na(volume) or volume <= 0) ? 1.0 : volume
+
+    var float cumPV_rth = na
+    var float cumV_rth  = na
+    if startRTH
+        cumPV_rth := hlc3 * v
+        cumV_rth  := v
+    else if inRTH
+        cumPV_rth += hlc3 * v
+        cumV_rth  += v
+    vwapRTH = (inRTH and cumV_rth != 0) ? (cumPV_rth / cumV_rth) : na
+
+    var float cumPV_on = na
+    var float cumV_on  = na
+    if startON
+        cumPV_on := hlc3 * v
+        cumV_on  := v
+    else if inON
+        cumPV_on += hlc3 * v
+        cumV_on  += v
+    vwapON = (inON and cumV_on != 0) ? (cumPV_on / cumV_on) : na
+
+    epsPts   = math.max(minTicksEps * tickSizePts, spreadPts * epsSpreadMult)
+    deltaPts = math.max(2.0 * tickSizePts, spreadPts * holdDeltaMult)
+    vwapUpper = vwapRTH + epsPts
+    vwapLower = vwapRTH - epsPts
+
+    vwapMove = math.abs(vwapRTH - vwapRTH[lookbackMin])
+    rN       = ta.highest(high, lookbackMin) - ta.lowest(low, lookbackMin)
+    thrRange = kRange * rN
+    thrSpr   = kSpread * spreadPts
+
+    bool passSlope = false
+    if inRTH and not na(vwapRTH) and not na(vwapMove) and not na(rN)
+        if useStrictAND
+            passSlope := (vwapMove >= thrRange) and (vwapMove >= thrSpr)
+        else
+            passSlope := vwapMove >= math.max(thrRange, thrSpr)
+
+    buffer = math.max(2.0 * tickSizePts, spreadPts)
+    stateSide = close > vwapRTH + buffer ? 1 : close < vwapRTH - buffer ? -1 : 0
+    var int lastNZ = 0
+    lastNZ := stateSide != 0 ? stateSide : nz(lastNZ[1], 0)
+    crossNow = (lastNZ != 0 and lastNZ[1] != 0 and lastNZ != lastNZ[1]) ? 1.0 : 0.0
+    crossesN = ta.sma(crossNow, lookbackMin) * lookbackMin
+    passChop = crossesN <= maxCrossesN
+
+    rawPass = inRTH and passSlope and passChop
+
+    var bool gate = false
+    var int passStreak = 0
+    var int failStreak = 0
+
+    if startRTH
+        gate := false
+        passStreak := 0
+        failStreak := 0
+
+    if rawPass
+        passStreak += 1
+        failStreak := 0
+    else
+        failStreak += 1
+        passStreak := 0
+
+    if (not gate) and (passStreak >= onConfirmBars)
+        gate := true
+    if gate and (failStreak >= offConfirmBars)
+        gate := false
+
+    diffLong  = close - (vwapRTH + deltaPts)
+    diffShort = (vwapRTH - deltaPts) - close
+    holdLong  = ta.lowest(diffLong,  holdBars) > 0
+    holdShort = ta.lowest(diffShort, holdBars) > 0
+
+    vwapSlope = vwapRTH - vwapRTH[lookbackMin]
+    holdLongOk  = holdLong  and (vwapSlope > 0)
+    holdShortOk = holdShort and (vwapSlope < 0)
+
+    touchedZone = (low <= vwapUpper) and (high >= vwapLower)
+    rejLong  = touchedZone and (close > (vwapRTH + epsPts * rejCloseFrac))
+    rejShort = touchedZone and (close < (vwapRTH - epsPts * rejCloseFrac))
+
+    prevTrendLong  = close[1] > vwapRTH[1]
+    prevTrendShort = close[1] < vwapRTH[1]
+
+    entryLong  = gate and inTW and holdLongOk  and rejLong  and (not requirePullback or prevTrendLong)
+    entryShort = gate and inTW and holdShortOk and rejShort and (not requirePullback or prevTrendShort)
+
+    [vwapRTH, vwapON, vwapUpper, vwapLower, epsPts, deltaPts,
+     gate, rawPass, passSlope, passChop, vwapMove, rN, thrRange, thrSpr, crossesN,
+     holdLongOk, holdShortOk, entryLong, entryShort, inTW, inRTH]
+
+// ORB (separate)
+f_orb_1m() =>
+    inORB    = f_inSession(orbSession)
+    startORB = inORB and not inORB[1]
+    var float oH = na
+    var float oL = na
+    if startORB
+        oH := high
+        oL := low
+    else if inORB
+        oH := math.max(oH, high)
+        oL := math.min(oL, low)
+    [oH, oL]
+
+//========================
+// Security calls (IMPORTANT: keep tuple assignment on ONE LINE)
+//========================
+[vwapRTH_1m, vwapON_1m, vwapUpper_1m, vwapLower_1m, epsPts_1m, deltaPts_1m, gateOn, rawPass, passSlope, passChop, vwapMove_1m, rN_1m, thrRange_1m, thrSpr_1m, crossesN_1m, holdLongOk, holdShortOk, entryLong, entryShort, inTradeWin_1m, inRTH_1m] = request.security(syminfo.tickerid, "1", f_core_1m(), barmerge.gaps_off, barmerge.lookahead_off)
+[orbHigh_1m, orbLow_1m] = request.security(syminfo.tickerid, "1", f_orb_1m(), barmerge.gaps_off, barmerge.lookahead_off)
+
+// Gate active
+gateActive = gateOn and inTradeWin_1m and inRTH_1m
+
+//========================
+// Colors
+//========================
+noTradeColor = color.new(color.gray, 0)
+standbyColor = color.new(color.yellow, 0)
+longColor    = color.new(color.lime, 0)
+shortColor   = color.new(color.red, 0)
+
+gateColor = noTradeColor
+if gateActive
+    if holdLongOk
+        gateColor := longColor
+    else if holdShortOk
+        gateColor := shortColor
+    else
+        gateColor := standbyColor
+
+zoneFill = color.new(gateColor, 85)
+
+//========================
+// Plots
+//========================
+pVWAP = plot(vwapRTH_1m, "Session AVWAP", color=gateColor, linewidth=2)
+pU    = plot(vwapUpper_1m, "VWAP ε Upper", color=color.new(gateColor, 40), linewidth=1)
+pL    = plot(vwapLower_1m, "VWAP ε Lower", color=color.new(gateColor, 40), linewidth=1)
+fill(pU, pL, color=zoneFill, title="VWAP Touch Zone")
+
+plot(showOvernight ? vwapON_1m : na, "Overnight AVWAP", color=color.new(color.gray, 20), linewidth=1)
+
+// ORB
+orbColor = color.new(color.orange, 0)
+plot(showORB ? orbHigh_1m : na, "ORB High", color=orbColor, linewidth=1)
+plot(showORB ? orbLow_1m  : na, "ORB Low",  color=orbColor, linewidth=1)
+
+orbHighPlus  = (showORB and showORBEps) ? (orbHigh_1m + epsPts_1m) : na
+orbHighMinus = (showORB and showORBEps) ? (orbHigh_1m - epsPts_1m) : na
+orbLowPlus   = (showORB and showORBEps) ? (orbLow_1m  + epsPts_1m) : na
+orbLowMinus  = (showORB and showORBEps) ? (orbLow_1m  - epsPts_1m) : na
+
+plot(orbHighPlus,  "ORB High + ε", color=color.new(orbColor, 65), linewidth=1)
+plot(orbHighMinus, "ORB High - ε", color=color.new(orbColor, 65), linewidth=1)
+plot(orbLowPlus,   "ORB Low + ε",  color=color.new(orbColor, 65), linewidth=1)
+plot(orbLowMinus,  "ORB Low - ε",  color=color.new(orbColor, 65), linewidth=1)
+
+// Entry markers
+plotshape(showEntrySignals and gateActive and entryLong,  title="VWAP Retest Long",  style=shape.triangleup,   location=location.belowbar, size=size.tiny, color=longColor,  text="L")
+plotshape(showEntrySignals and gateActive and entryShort, title="VWAP Retest Short", style=shape.triangledown, location=location.abovebar, size=size.tiny, color=shortColor, text="S")
+
+// Background tint
+bgcolor(showBgTint ? (gateActive ? color.new(color.green, 92) : color.new(color.red, 92)) : na)
+bgcolor(showTradeShade and not inTradeWin_1m ? color.new(color.gray, 92) : na)
+
+// Debug label
+var label gateLbl = na
+if showGateLabel and barstate.islast
+    label.delete(gateLbl)
+    crossesInt = int(math.round(crossesN_1m))
+    txt = "GateActive: " + (gateActive ? "YES" : "NO") +
+          "\nInRTH: " + (inRTH_1m ? "YES" : "NO") +
+          "\nInTradeWin: " + (inTradeWin_1m ? "YES" : "NO") +
+          "\nGateOn: " + (gateOn ? "ON" : "OFF") +
+          "\nrawPass: " + (rawPass ? "true" : "false") +
+          "\npassSlope: " + (passSlope ? "true" : "false") +
+          "\npassChop: " + (passChop ? "true" : "false") +
+          "\nHoldOk: " + (holdLongOk ? "LONG" : holdShortOk ? "SHORT" : "-") +
+          "\nVWAP_move(" + str.tostring(lookbackMin) + "m): " + str.tostring(vwapMove_1m, format.mintick) +
+          "\nRange(" + str.tostring(lookbackMin) + "m): " + str.tostring(rN_1m, format.mintick) +
+          "\nThrRange: " + str.tostring(thrRange_1m, format.mintick) +
+          "\nThrSpr: " + str.tostring(thrSpr_1m, format.mintick) +
+          "\nCrosses(" + str.tostring(lookbackMin) + "m): " + str.tostring(crossesInt) + " (max " + str.tostring(maxCrossesN) + ")" +
+          "\nε: " + str.tostring(epsPts_1m, format.mintick) + " | δ: " + str.tostring(deltaPts_1m, format.mintick) +
+          "\nSpread: " + str.tostring(spreadPts, format.mintick) + " | Tick: " + str.tostring(tickSizePts, format.mintick) +
+          "\nEntry: " + (entryLong ? "LONG" : entryShort ? "SHORT" : "-")
+    
+    gateLbl := label.new(bar_index, high, txt, style=label.style_label_upper_right, textcolor=color.white, color=color.new(gateColor, 0))

@@ -1,0 +1,371 @@
+//@version=6
+indicator(title="BoaBias MTF Liquidation Levels", shorttitle="MTF Liquidation Levels", overlay=true, max_lines_count=500)
+
+// === Calculate EMAs (MTF) - Hidden logic ===
+src = close
+ema_15m = request.security(syminfo.tickerid, "15",  ta.ema(src, 16))
+ema_1h  = request.security(syminfo.tickerid, "60",  ta.ema(src, 24))
+ema_4h  = request.security(syminfo.tickerid, "240", ta.ema(src, 42))
+ema_1d  = request.security(syminfo.tickerid, "D",   ta.ema(src, 29))
+
+// === Visual Settings ===
+groupVisual = "Visual Settings"
+
+// Display options
+showOnlyActive  = input.bool(false, "Hide hit levels (show only active)", group=groupVisual)
+showShapes = input.bool(true, "Show shapes on level hits", group=groupVisual)
+iconOffsetPct = 0.5
+
+// Level lines - L1
+groupLinesL1 = "Level Lines — L1"
+styleL1_str  = input.string("Solid",  "Line style", options = ["Solid", "Dashed", "Dotted"], group=groupLinesL1)
+widthL1      = input.int(1,          "Line width", minval=1, maxval=4, group=groupLinesL1)
+
+// Level lines - L2
+groupLinesL2 = "Level Lines — L2"
+styleL2_str  = input.string("Dashed", "Line style", options = ["Solid", "Dashed", "Dotted"], group=groupLinesL2)
+widthL2      = input.int(1,          "Line width", minval=1, maxval=4, group=groupLinesL2)
+
+f_style_from_string(_s) =>
+    _s == "Dashed" ? line.style_dashed :
+     _s == "Dotted" ? line.style_dotted :
+     line.style_solid
+
+level1_style = f_style_from_string(styleL1_str)
+level2_style = f_style_from_string(styleL2_str)
+
+// Hit shapes - L1
+groupShapesL1 = "Hit Shapes — L1"
+shapeL1_str = input.string("circle", "Shape", options=["circle", "square", "diamond", "triangleup", "triangledown", "cross", "xcross", "arrowup", "arrowdown"], group=groupShapesL1)
+shapeSizeL1 = input.string("normal", "Size", options=["tiny", "small", "normal", "large", "huge"], group=groupShapesL1)
+
+// Hit shapes - L2
+groupShapesL2 = "Hit Shapes — L2"
+shapeL2_str = input.string("diamond", "Shape", options=["circle", "square", "diamond", "triangleup", "triangledown", "cross", "xcross", "arrowup", "arrowdown"], group=groupShapesL2)
+shapeSizeL2 = input.string("normal", "Size", options=["tiny", "small", "normal", "large", "huge"], group=groupShapesL2)
+
+f_shape_from_string(_s) =>
+    _s == "circle" ? shape.circle :
+     _s == "square" ? shape.square :
+     _s == "diamond" ? shape.diamond :
+     _s == "triangleup" ? shape.triangleup :
+     _s == "triangledown" ? shape.triangledown :
+     _s == "cross" ? shape.cross :
+     _s == "xcross" ? shape.xcross :
+     _s == "arrowup" ? shape.arrowup :
+     _s == "arrowdown" ? shape.arrowdown :
+     shape.circle
+
+shapeL1 = f_shape_from_string(shapeL1_str)
+shapeL2 = f_shape_from_string(shapeL2_str)
+
+// ===== Helpers =====
+f_add_level(_price, _color, _style, _width, line[] _lines, float[] _levels, bool[] _active, int[] _created) =>
+    l = line.new(bar_index, _price, bar_index, _price,        extend = extend.none,        color  = _color,        style  = _style,        width  = _width)
+    array.push(_lines,  l)
+    array.push(_levels, _price)
+    array.push(_active, true)
+    array.push(_created, bar_index)
+
+// возвращает массив [triggered, triggeredLongs, triggeredShorts]
+// triggeredLongs = true если был задет нижний уровень (ниже EMA) - ликвидация лонгов
+// triggeredShorts = true если был задет верхний уровень (выше EMA) - ликвидация шортов
+f_update_levels(line[] _lines, float[] _levels, bool[] _active, int[] _created, bool _deleteOnHit, float _ema) =>
+    bool triggered = false
+    bool triggeredLongs = false
+    bool triggeredShorts = false
+    sz = array.size(_lines)
+    for i = 0 to sz - 1
+        if array.get(_active, i)
+            l   = array.get(_lines,  i)
+            lvl = array.get(_levels, i)
+            cb  = array.get(_created, i)
+            line.set_x2(l, bar_index)
+            if bar_index > cb and high >= lvl and low <= lvl
+                array.set(_active, i, false)
+                if _deleteOnHit
+                    line.delete(l)
+                triggered := true
+                // Определяем направление ликвидации по сравнению уровня с EMA
+                // Нижние уровни (ниже EMA) = ликвидация лонгов
+                // Верхние уровни (выше EMA) = ликвидация шортов
+                if lvl < _ema
+                    triggeredLongs := true  // Уровень ниже EMA = нижний уровень = ликвидация лонгов
+                else if lvl > _ema
+                    triggeredShorts := true  // Уровень выше EMA = верхний уровень = ликвидация шортов
+                // Если уровень равен EMA (крайне редкий случай), определяем по направлению движения цены
+                else
+                    if close > close[1]
+                        triggeredShorts := true  // Цена выросла = ликвидация шортов
+                    else if close < close[1]
+                        triggeredLongs := true  // Цена упала = ликвидация лонгов
+    result = array.new<bool>(3, false)
+    array.set(result, 0, triggered)
+    array.set(result, 1, triggeredLongs)
+    array.set(result, 2, triggeredShorts)
+    result
+
+
+
+// ================== 25 & 20 Leverage Levels ==================
+group_15m    = "Liquidation Levels 25 & 20 Leverage"
+use_15m      = input.bool(true,  "Enable 25 & 20 leverage levels",       group=group_15m)
+enableL1_15m = input.bool(true,  "Show 25 leverage level",        group=group_15m)
+enableL2_15m = input.bool(true,  "Show 20 leverage level",        group=group_15m)
+
+pct1_15m = 4.0
+pct2_15m = 8.0
+
+var line[]  lines_15m_L1   = array.new_line()
+var float[] lvls_15m_L1    = array.new_float()
+var bool[]  act_15m_L1     = array.new_bool()
+var int[]   created_15m_L1 = array.new_int()
+
+var line[]  lines_15m_L2   = array.new_line()
+var float[] lvls_15m_L2    = array.new_float()
+var bool[]  act_15m_L2     = array.new_bool()
+var int[]   created_15m_L2 = array.new_int()
+
+bool trig_15m_L1 = false
+bool trig_15m_L2 = false
+bool trig_15m_L1_Long = false
+bool trig_15m_L2_Long = false
+bool trig_15m_L1_Short = false
+bool trig_15m_L2_Short = false
+
+if use_15m
+    if ta.cross(close, ema_15m)
+        lvl1_up = ema_15m * (1 + pct1_15m / 100.0)
+        lvl1_dn = ema_15m * (1 - pct1_15m / 100.0)
+        lvl2_up = ema_15m * (1 + pct2_15m / 100.0)
+        lvl2_dn = ema_15m * (1 - pct2_15m / 100.0)
+
+        if enableL1_15m
+            f_add_level(lvl1_up, color.new(color.orange, 0),  level1_style, widthL1, lines_15m_L1, lvls_15m_L1, act_15m_L1, created_15m_L1)
+            f_add_level(lvl1_dn, color.new(color.orange, 0),  level1_style, widthL1, lines_15m_L1, lvls_15m_L1, act_15m_L1, created_15m_L1)
+        if enableL2_15m
+            f_add_level(lvl2_up, color.new(color.orange, 55), level2_style, widthL2, lines_15m_L2, lvls_15m_L2, act_15m_L2, created_15m_L2)
+            f_add_level(lvl2_dn, color.new(color.orange, 55), level2_style, widthL2, lines_15m_L2, lvls_15m_L2, act_15m_L2, created_15m_L2)
+
+    if enableL1_15m and array.size(lines_15m_L1) > 0
+        result_15m_L1 = f_update_levels(lines_15m_L1, lvls_15m_L1, act_15m_L1, created_15m_L1, showOnlyActive, ema_15m)
+        trig_15m_L1 := array.get(result_15m_L1, 0)
+        trig_15m_L1_Long := array.get(result_15m_L1, 1)
+        trig_15m_L1_Short := array.get(result_15m_L1, 2)
+    if enableL2_15m and array.size(lines_15m_L2) > 0
+        result_15m_L2 = f_update_levels(lines_15m_L2, lvls_15m_L2, act_15m_L2, created_15m_L2, showOnlyActive, ema_15m)
+        trig_15m_L2 := array.get(result_15m_L2, 0)
+        trig_15m_L2_Long := array.get(result_15m_L2, 1)
+        trig_15m_L2_Short := array.get(result_15m_L2, 2)
+
+// Calculate vertical offset for stacked icons
+offsetStep = close * iconOffsetPct / 100.0
+
+// Calculate prices for stacked icons (25 & 20 leverage)
+price_15m_L1_up = showShapes and trig_15m_L1 and close >= ema_15m ? high + offsetStep * 0 : na
+price_15m_L1_dn = showShapes and trig_15m_L1 and close < ema_15m ? low - offsetStep * 0 : na
+price_15m_L2_up = showShapes and trig_15m_L2 and close >= ema_15m ? high + offsetStep * 1 : na
+price_15m_L2_dn = showShapes and trig_15m_L2 and close < ema_15m ? low - offsetStep * 1 : na
+
+// Plot shapes for 25 & 20 leverage Level 1 hits (small icons above/below bar, stacked)
+plotshape(price_15m_L1_up, title="25 Leverage Hit Up", style=shapeL1, location=location.absolute, color=color.new(color.orange, 0), size=size.tiny)
+plotshape(price_15m_L1_dn, title="25 Leverage Hit Dn", style=shapeL1, location=location.absolute, color=color.new(color.orange, 0), size=size.tiny)
+
+// Plot shapes for 25 & 20 leverage Level 2 hits (small icons above/below bar, stacked)
+plotshape(price_15m_L2_up, title="20 Leverage Hit Up", style=shapeL2, location=location.absolute, color=color.new(color.orange, 30), size=size.tiny)
+plotshape(price_15m_L2_dn, title="20 Leverage Hit Dn", style=shapeL2, location=location.absolute, color=color.new(color.orange, 30), size=size.tiny)
+
+// ================== 10 & 5 Leverage Levels ==================
+group_1h    = "Liquidation Levels 10 & 5 Leverage"
+use_1h      = input.bool(true,   "Enable 10 & 5 leverage levels",       group=group_1h)
+enableL1_1h = input.bool(true,   "Show 10 leverage level",        group=group_1h)
+enableL2_1h = input.bool(true,   "Show 5 leverage level",        group=group_1h)
+
+pct1_1h = 10.5
+pct2_1h = 21.0
+
+var line[]  lines_1h_L1   = array.new_line()
+var float[] lvls_1h_L1    = array.new_float()
+var bool[]  act_1h_L1     = array.new_bool()
+var int[]   created_1h_L1 = array.new_int()
+
+var line[]  lines_1h_L2   = array.new_line()
+var float[] lvls_1h_L2    = array.new_float()
+var bool[]  act_1h_L2     = array.new_bool()
+var int[]   created_1h_L2 = array.new_int()
+
+bool trig_1h_L1 = false
+bool trig_1h_L2 = false
+bool trig_1h_L1_Long = false
+bool trig_1h_L2_Long = false
+bool trig_1h_L1_Short = false
+bool trig_1h_L2_Short = false
+
+if use_1h
+    if ta.cross(close, ema_1h)
+        lvl1_up = ema_1h * (1 + pct1_1h / 100.0)
+        lvl1_dn = ema_1h * (1 - pct1_1h / 100.0)
+        lvl2_up = ema_1h * (1 + pct2_1h / 100.0)
+        lvl2_dn = ema_1h * (1 - pct2_1h / 100.0)
+
+        if enableL1_1h
+            f_add_level(lvl1_up, color.new(color.red, 0),   level1_style, widthL1, lines_1h_L1, lvls_1h_L1, act_1h_L1, created_1h_L1)
+            f_add_level(lvl1_dn, color.new(color.red, 0),   level1_style, widthL1, lines_1h_L1, lvls_1h_L1, act_1h_L1, created_1h_L1)
+        if enableL2_1h
+            f_add_level(lvl2_up, color.new(color.red, 55),  level2_style, widthL2, lines_1h_L2, lvls_1h_L2, act_1h_L2, created_1h_L2)
+            f_add_level(lvl2_dn, color.new(color.red, 55),  level2_style, widthL2, lines_1h_L2, lvls_1h_L2, act_1h_L2, created_1h_L2)
+
+    if enableL1_1h and array.size(lines_1h_L1) > 0
+        result_1h_L1 = f_update_levels(lines_1h_L1, lvls_1h_L1, act_1h_L1, created_1h_L1, showOnlyActive, ema_1h)
+        trig_1h_L1 := array.get(result_1h_L1, 0)
+        trig_1h_L1_Long := array.get(result_1h_L1, 1)
+        trig_1h_L1_Short := array.get(result_1h_L1, 2)
+    if enableL2_1h and array.size(lines_1h_L2) > 0
+        result_1h_L2 = f_update_levels(lines_1h_L2, lvls_1h_L2, act_1h_L2, created_1h_L2, showOnlyActive, ema_1h)
+        trig_1h_L2 := array.get(result_1h_L2, 0)
+        trig_1h_L2_Long := array.get(result_1h_L2, 1)
+        trig_1h_L2_Short := array.get(result_1h_L2, 2)
+
+// Calculate prices for stacked icons (10 & 5 leverage)
+price_1h_L1_up = showShapes and trig_1h_L1 and close >= ema_1h ? high + offsetStep * 2 : na
+price_1h_L1_dn = showShapes and trig_1h_L1 and close < ema_1h ? low - offsetStep * 2 : na
+price_1h_L2_up = showShapes and trig_1h_L2 and close >= ema_1h ? high + offsetStep * 3 : na
+price_1h_L2_dn = showShapes and trig_1h_L2 and close < ema_1h ? low - offsetStep * 3 : na
+
+// Plot shapes for 10 & 5 leverage Level 1 hits (small icons above/below bar, stacked)
+plotshape(price_1h_L1_up, title="10 Leverage Hit Up", style=shapeL1, location=location.absolute, color=color.new(color.red, 0), size=size.tiny)
+plotshape(price_1h_L1_dn, title="10 Leverage Hit Dn", style=shapeL1, location=location.absolute, color=color.new(color.red, 0), size=size.tiny)
+
+// Plot shapes for 10 & 5 leverage Level 2 hits (small icons above/below bar, stacked)
+plotshape(price_1h_L2_up, title="5 Leverage Hit Up", style=shapeL2, location=location.absolute, color=color.new(color.red, 30), size=size.tiny)
+plotshape(price_1h_L2_dn, title="5 Leverage Hit Dn", style=shapeL2, location=location.absolute, color=color.new(color.red, 30), size=size.tiny)
+
+// ================== 7 & 4 Leverage Levels ==================
+group_4h    = "Liquidation Levels 7 & 4 Leverage"
+use_4h      = input.bool(true,   "Enable 7 & 4 leverage levels",       group=group_4h)
+enableL1_4h = input.bool(true,   "Show 7 leverage level",        group=group_4h)
+enableL2_4h = input.bool(true,   "Show 4 leverage level",        group=group_4h)
+
+pct1_4h = 13.0
+pct2_4h = 26.0
+
+var line[]  lines_4h_L1   = array.new_line()
+var float[] lvls_4h_L1    = array.new_float()
+var bool[]  act_4h_L1     = array.new_bool()
+var int[]   created_4h_L1 = array.new_int()
+
+var line[]  lines_4h_L2   = array.new_line()
+var float[] lvls_4h_L2    = array.new_float()
+var bool[]  act_4h_L2     = array.new_bool()
+var int[]   created_4h_L2 = array.new_int()
+
+bool trig_4h_L1 = false
+bool trig_4h_L2 = false
+bool trig_4h_L1_Long = false
+bool trig_4h_L2_Long = false
+bool trig_4h_L1_Short = false
+bool trig_4h_L2_Short = false
+
+if use_4h
+    if ta.cross(close, ema_4h)
+        lvl1_up = ema_4h * (1 + pct1_4h / 100.0)
+        lvl1_dn = ema_4h * (1 - pct1_4h / 100.0)
+        lvl2_up = ema_4h * (1 + pct2_4h / 100.0)
+        lvl2_dn = ema_4h * (1 - pct2_4h / 100.0)
+
+        if enableL1_4h
+            f_add_level(lvl1_up, color.new(color.green, 0),  level1_style, widthL1, lines_4h_L1, lvls_4h_L1, act_4h_L1, created_4h_L1)
+            f_add_level(lvl1_dn, color.new(color.green, 0),  level1_style, widthL1, lines_4h_L1, lvls_4h_L1, act_4h_L1, created_4h_L1)
+        if enableL2_4h
+            f_add_level(lvl2_up, color.new(color.green, 55), level2_style, widthL2, lines_4h_L2, lvls_4h_L2, act_4h_L2, created_4h_L2)
+            f_add_level(lvl2_dn, color.new(color.green, 55), level2_style, widthL2, lines_4h_L2, lvls_4h_L2, act_4h_L2, created_4h_L2)
+
+    if enableL1_4h and array.size(lines_4h_L1) > 0
+        result_4h_L1 = f_update_levels(lines_4h_L1, lvls_4h_L1, act_4h_L1, created_4h_L1, showOnlyActive, ema_4h)
+        trig_4h_L1 := array.get(result_4h_L1, 0)
+        trig_4h_L1_Long := array.get(result_4h_L1, 1)
+        trig_4h_L1_Short := array.get(result_4h_L1, 2)
+    if enableL2_4h and array.size(lines_4h_L2) > 0
+        result_4h_L2 = f_update_levels(lines_4h_L2, lvls_4h_L2, act_4h_L2, created_4h_L2, showOnlyActive, ema_4h)
+        trig_4h_L2 := array.get(result_4h_L2, 0)
+        trig_4h_L2_Long := array.get(result_4h_L2, 1)
+        trig_4h_L2_Short := array.get(result_4h_L2, 2)
+
+// Calculate prices for stacked icons (7 & 4 leverage)
+price_4h_L1_up = showShapes and trig_4h_L1 and close >= ema_4h ? high + offsetStep * 4 : na
+price_4h_L1_dn = showShapes and trig_4h_L1 and close < ema_4h ? low - offsetStep * 4 : na
+price_4h_L2_up = showShapes and trig_4h_L2 and close >= ema_4h ? high + offsetStep * 5 : na
+price_4h_L2_dn = showShapes and trig_4h_L2 and close < ema_4h ? low - offsetStep * 5 : na
+
+// Plot shapes for 7 & 4 leverage Level 1 hits (small icons above/below bar, stacked)
+plotshape(price_4h_L1_up, title="7 Leverage Hit Up", style=shapeL1, location=location.absolute, color=color.new(color.green, 0), size=size.tiny)
+plotshape(price_4h_L1_dn, title="7 Leverage Hit Dn", style=shapeL1, location=location.absolute, color=color.new(color.green, 0), size=size.tiny)
+
+// Plot shapes for 7 & 4 leverage Level 2 hits (small icons above/below bar, stacked)
+plotshape(price_4h_L2_up, title="4 Leverage Hit Up", style=shapeL2, location=location.absolute, color=color.new(color.green, 30), size=size.tiny)
+plotshape(price_4h_L2_dn, title="4 Leverage Hit Dn", style=shapeL2, location=location.absolute, color=color.new(color.green, 30), size=size.tiny)
+
+// ================== 2 & 3 Leverage Levels ==================
+group_1d    = "Liquidation Levels 2 & 3 Leverage"
+use_1d      = input.bool(true,   "Enable 2 & 3 leverage levels",       group=group_1d)
+enableL1_1d = input.bool(true,   "Show 2 leverage level",        group=group_1d)
+enableL2_1d = input.bool(true,   "Show 3 leverage level",        group=group_1d)
+
+pct1_1d = 21.0
+pct2_1d = 27.0
+
+var line[]  lines_1d_L1   = array.new_line()
+var float[] lvls_1d_L1    = array.new_float()
+var bool[]  act_1d_L1     = array.new_bool()
+var int[]   created_1d_L1 = array.new_int()
+
+var line[]  lines_1d_L2   = array.new_line()
+var float[] lvls_1d_L2    = array.new_float()
+var bool[]  act_1d_L2     = array.new_bool()
+var int[]   created_1d_L2 = array.new_int()
+
+bool trig_1d_L1 = false
+bool trig_1d_L2 = false
+bool trig_1d_L1_Long = false
+bool trig_1d_L2_Long = false
+bool trig_1d_L1_Short = false
+bool trig_1d_L2_Short = false
+
+if use_1d
+    if ta.cross(close, ema_1d)
+        lvl1_up = ema_1d * (1 + pct1_1d / 100.0)
+        lvl1_dn = ema_1d * (1 - pct1_1d / 100.0)
+        lvl2_up = ema_1d * (1 + pct2_1d / 100.0)
+        lvl2_dn = ema_1d * (1 - pct2_1d / 100.0)
+
+        if enableL1_1d
+            f_add_level(lvl1_up, color.new(color.blue, 0),  level1_style, widthL1, lines_1d_L1, lvls_1d_L1, act_1d_L1, created_1d_L1)
+            f_add_level(lvl1_dn, color.new(color.blue, 0),  level1_style, widthL1, lines_1d_L1, lvls_1d_L1, act_1d_L1, created_1d_L1)
+        if enableL2_1d
+            f_add_level(lvl2_up, color.new(color.blue, 55), level2_style, widthL2, lines_1d_L2, lvls_1d_L2, act_1d_L2, created_1d_L2)
+            f_add_level(lvl2_dn, color.new(color.blue, 55), level2_style, widthL2, lines_1d_L2, lvls_1d_L2, act_1d_L2, created_1d_L2)
+
+    if enableL1_1d and array.size(lines_1d_L1) > 0
+        result_1d_L1 = f_update_levels(lines_1d_L1, lvls_1d_L1, act_1d_L1, created_1d_L1, showOnlyActive, ema_1d)
+        trig_1d_L1 := array.get(result_1d_L1, 0)
+        trig_1d_L1_Long := array.get(result_1d_L1, 1)
+        trig_1d_L1_Short := array.get(result_1d_L1, 2)
+    if enableL2_1d and array.size(lines_1d_L2) > 0
+        result_1d_L2 = f_update_levels(lines_1d_L2, lvls_1d_L2, act_1d_L2, created_1d_L2, showOnlyActive, ema_1d)
+        trig_1d_L2 := array.get(result_1d_L2, 0)
+        trig_1d_L2_Long := array.get(result_1d_L2, 1)
+        trig_1d_L2_Short := array.get(result_1d_L2, 2)
+
+// Calculate prices for stacked icons (2 & 3 leverage)
+price_1d_L1_up = showShapes and trig_1d_L1 and close >= ema_1d ? high + offsetStep * 6 : na
+price_1d_L1_dn = showShapes and trig_1d_L1 and close < ema_1d ? low - offsetStep * 6 : na
+price_1d_L2_up = showShapes and trig_1d_L2 and close >= ema_1d ? high + offsetStep * 7 : na
+price_1d_L2_dn = showShapes and trig_1d_L2 and close < ema_1d ? low - offsetStep * 7 : na
+
+// Plot shapes for 2 & 3 leverage Level 1 hits (small icons above/below bar, stacked)
+plotshape(price_1d_L1_up, title="2 Leverage Hit Up", style=shapeL1, location=location.absolute, color=color.new(color.blue, 0), size=size.tiny)
+plotshape(price_1d_L1_dn, title="2 Leverage Hit Dn", style=shapeL1, location=location.absolute, color=color.new(color.blue, 0), size=size.tiny)
+
+// Plot shapes for 2 & 3 leverage Level 2 hits (small icons above/below bar, stacked)
+plotshape(price_1d_L2_up, title="3 Leverage Hit Up", style=shapeL2, location=location.absolute, color=color.new(color.blue, 30), size=size.tiny)
+plotshape(price_1d_L2_dn, title="3 Leverage Hit Dn", style=shapeL2, location=location.absolute, color=color.new(color.blue, 30), size=size.tiny)

@@ -1,0 +1,277 @@
+// ╔══════════════════════════════════════════════════════════════════╗
+// ║  ES VWAP Institutional Pullback — INDICATOR (Signals Only)     ║
+// ║  Version: 2.0 | Target: /ES (S&P 500 E-mini) 5m Chart         ║
+// ║  Author: Tyler Pitre / Claude                                  ║
+// ║                                                                ║
+// ║  Same logic as Strategy version but as an indicator():          ║
+// ║  • No backtest engine overhead                                 ║
+// ║  • Alert-ready conditions for live trading                     ║
+// ║  • Cleaner visuals for discretionary decision-making           ║
+// ║  • Manual SL/TP/Trail level display                            ║
+// ╚══════════════════════════════════════════════════════════════════╝
+
+//@version=6
+indicator("ES VWAP Pullback v2.0 [Signals]", overlay=true, max_labels_count=500, max_lines_count=500)
+
+// ══════════════════════════════════════════════════════════════════
+// 1. INPUTS
+// ══════════════════════════════════════════════════════════════════
+
+// --- Session Filter ---
+grpSession = "Session Filter"
+useSessionFilter = input.bool(true, "Enable Session Filter (RTH Only)", group=grpSession)
+sessionStartHour = input.int(9,  "Session Start Hour (ET)", minval=0, maxval=23, group=grpSession)
+sessionStartMin  = input.int(30, "Session Start Minute",    minval=0, maxval=59, group=grpSession)
+sessionEndHour   = input.int(15, "Session End Hour (ET)",   minval=0, maxval=23, group=grpSession)
+sessionEndMin    = input.int(30, "Session End Minute",      minval=0, maxval=59, group=grpSession)
+
+// --- Higher Timeframe Trend ---
+grpHTF = "Higher Timeframe Trend Filter"
+useHTF     = input.bool(true, "Enable HTF Trend Filter", group=grpHTF)
+htfTF      = input.timeframe("15", "HTF Timeframe", group=grpHTF)
+htfEmaLen  = input.int(50, "HTF EMA Length", minval=5, group=grpHTF)
+
+// --- VWAP ---
+grpVWAP = "VWAP Filter"
+useVWAP = input.bool(true, "Enable VWAP Filter", group=grpVWAP)
+
+// --- Entry Trigger (MACD Histogram Reversal) ---
+grpMACD = "Entry Trigger (MACD)"
+macdFast   = input.int(12, "MACD Fast Length",   minval=2, group=grpMACD)
+macdSlow   = input.int(26, "MACD Slow Length",   minval=5, group=grpMACD)
+macdSignal = input.int(9,  "MACD Signal Length",  minval=2, group=grpMACD)
+
+// --- Volume Confirmation ---
+grpVol = "Volume Confirmation"
+useVolFilter = input.bool(true, "Require Volume Spike on Entry", group=grpVol)
+volSmaLen    = input.int(20, "Volume SMA Length", minval=5, group=grpVol)
+volMultReq   = input.float(1.2, "Min Volume Multiple of SMA", step=0.1, minval=0.5, group=grpVol)
+
+// --- Risk Management Display ---
+grpRisk = "Risk Levels (Display)"
+atrLength  = input.int(14, "ATR Length", group=grpRisk)
+slMult     = input.float(1.5, "Stop Loss ATR Multiplier", step=0.1, group=grpRisk)
+tpRatio    = input.float(2.0, "Take Profit R:R Ratio",    step=0.1, group=grpRisk)
+
+// --- Trailing Stop ---
+grpTrail = "Trailing Stop Display"
+useTrail       = input.bool(true, "Show Trailing Stop Level", group=grpTrail)
+trailTriggerR  = input.float(1.0, "Trail Activates at R-Multiple", step=0.1, group=grpTrail)
+trailOffsetATR = input.float(0.75, "Trail Offset (ATR Multiple)", step=0.1, group=grpTrail)
+
+// --- Visuals ---
+grpVis = "Visuals"
+showHTF       = input.bool(true, "Show HTF EMA", group=grpVis)
+showVWAP      = input.bool(true, "Show VWAP", group=grpVis)
+showLevels    = input.bool(true, "Show SL/TP/Trail Lines", group=grpVis)
+showBG        = input.bool(true, "Show Session Background", group=grpVis)
+showLabels    = input.bool(true, "Show Entry Labels", group=grpVis)
+maxSignalBars = input.int(50, "Max Bars to Show Levels After Signal", minval=10, maxval=200, group=grpVis)
+
+// (Alerts are always available — configure via TradingView's alert dialog)
+
+// ══════════════════════════════════════════════════════════════════
+// 2. CALCULATIONS
+// ══════════════════════════════════════════════════════════════════
+
+// --- Session Filter ---
+currentHour = hour(time, "America/New_York")
+currentMin  = minute(time, "America/New_York")
+timeInMins  = currentHour * 60 + currentMin
+sessionStartMins = sessionStartHour * 60 + sessionStartMin
+sessionEndMins   = sessionEndHour * 60 + sessionEndMin
+inSession = timeInMins >= sessionStartMins and timeInMins < sessionEndMins
+sessionOK = useSessionFilter ? inSession : true
+
+// --- VWAP ---
+vwapValue = ta.vwap(hlc3)
+
+// --- Higher Timeframe EMA ---
+htfEma = request.security(syminfo.tickerid, htfTF, ta.ema(close, htfEmaLen), lookahead=barmerge.lookahead_off)
+
+// --- MACD ---
+[macdLine, sigLine, histLine] = ta.macd(close, macdFast, macdSlow, macdSignal)
+
+// MACD Histogram Reversal (same logic as strategy)
+histRisingFromNeg  = histLine > histLine[1] and histLine[1] <= 0 and histLine > 0
+histFallingFromPos = histLine < histLine[1] and histLine[1] >= 0 and histLine < 0
+histBullReversal = histLine > 0 and histLine[1] <= 0 and histLine[2] <= 0
+histBearReversal = histLine < 0 and histLine[1] >= 0 and histLine[2] >= 0
+
+longMomentum  = histRisingFromNeg or histBullReversal
+shortMomentum = histFallingFromPos or histBearReversal
+
+// --- Volume ---
+volSma   = ta.sma(volume, volSmaLen)
+volSpike = volume >= (volSma * volMultReq)
+volumeOK = useVolFilter ? volSpike : true
+
+// --- ATR ---
+atr = ta.atr(atrLength)
+
+// ══════════════════════════════════════════════════════════════════
+// 3. SIGNAL CONDITIONS
+// ══════════════════════════════════════════════════════════════════
+
+htfBullish = useHTF ? (close > htfEma) : true
+htfBearish = useHTF ? (close < htfEma) : true
+vwapBullish = useVWAP ? (close > vwapValue) : true
+vwapBearish = useVWAP ? (close < vwapValue) : true
+
+longSignal  = htfBullish and vwapBullish and longMomentum and volumeOK and sessionOK
+shortSignal = htfBearish and vwapBearish and shortMomentum and volumeOK and sessionOK
+
+// ══════════════════════════════════════════════════════════════════
+// 4. SIGNAL TRACKING & LEVEL COMPUTATION
+// ══════════════════════════════════════════════════════════════════
+
+// Track the most recent signal for drawing SL/TP/Trail levels
+var int   signalDir       = 0      // 1 = long, -1 = short, 0 = none
+var float sigEntryPrice   = na
+var float sigSL           = na
+var float sigTP           = na
+var float sigTrailStop    = na
+var int   barsSinceSignal = 0
+var float sig1R           = na
+
+// Detect new signals (only fire when not already tracking same direction)
+newLong  = longSignal  and signalDir != 1
+newShort = shortSignal and signalDir != -1
+
+if newLong
+    signalDir       := 1
+    sigEntryPrice   := close
+    float risk      = atr * slMult
+    sigSL           := close - risk
+    sigTP           := close + (risk * tpRatio)
+    sig1R           := close + risk
+    sigTrailStop    := na
+    barsSinceSignal := 0
+
+if newShort
+    signalDir       := -1
+    sigEntryPrice   := close
+    float risk      = atr * slMult
+    sigSL           := close + risk
+    sigTP           := close - (risk * tpRatio)
+    sig1R           := close - risk
+    sigTrailStop    := na
+    barsSinceSignal := 0
+
+// Update trailing stop if signal is active
+if signalDir != 0
+    barsSinceSignal += 1
+
+    if useTrail and signalDir == 1
+        float currentR = sigEntryPrice > 0 and (atr * slMult) > 0 ? (close - sigEntryPrice) / (atr * slMult) : 0
+        if currentR >= trailTriggerR
+            float newTrail = close - (atr * trailOffsetATR)
+            sigTrailStop := na(sigTrailStop) ? newTrail : math.max(sigTrailStop, newTrail)
+
+    if useTrail and signalDir == -1
+        float currentR = sigEntryPrice > 0 and (atr * slMult) > 0 ? (sigEntryPrice - close) / (atr * slMult) : 0
+        if currentR >= trailTriggerR
+            float newTrail = close + (atr * trailOffsetATR)
+            sigTrailStop := na(sigTrailStop) ? newTrail : math.min(sigTrailStop, newTrail)
+
+    // Expire signal after max bars
+    if barsSinceSignal > maxSignalBars
+        signalDir     := 0
+        sigEntryPrice := na
+        sigSL         := na
+        sigTP         := na
+        sigTrailStop  := na
+        sig1R         := na
+
+    // Check if SL or TP was hit (to stop drawing)
+    if signalDir == 1 and (low <= sigSL or high >= sigTP)
+        signalDir     := 0
+        sigEntryPrice := na
+        sigSL         := na
+        sigTP         := na
+        sigTrailStop  := na
+        sig1R         := na
+
+    if signalDir == -1 and (high >= sigSL or low <= sigTP)
+        signalDir     := 0
+        sigEntryPrice := na
+        sigSL         := na
+        sigTP         := na
+        sigTrailStop  := na
+        sig1R         := na
+
+// ══════════════════════════════════════════════════════════════════
+// 5. VISUALS
+// ══════════════════════════════════════════════════════════════════
+
+// Session Background
+bgcolor(showBG and sessionOK and useSessionFilter ? color.new(color.blue, 95) : na, title="Session Window")
+
+// VWAP
+plot(showVWAP ? vwapValue : na, color=color.new(color.fuchsia, 0), title="VWAP", linewidth=2)
+
+// HTF EMA
+plot(showHTF ? htfEma : na, color=color.new(color.orange, 0), title="HTF EMA", linewidth=2)
+
+// Entry Signal Shapes
+plotshape(newLong,  style=shape.triangleup,   location=location.belowbar, color=color.new(color.lime, 0), size=size.small, title="Long Signal")
+plotshape(newShort, style=shape.triangledown,  location=location.abovebar, color=color.new(color.red, 0),  size=size.small, title="Short Signal")
+
+// Entry Labels with details
+if showLabels and newLong
+    label.new(bar_index, low - (atr * 0.5),
+         "BTO LONG\nSL: " + str.tostring(close - atr * slMult, "#.##") +
+         "\nTP: " + str.tostring(close + atr * slMult * tpRatio, "#.##") +
+         "\nRisk: " + str.tostring(atr * slMult, "#.##") + " pts",
+         color=color.new(color.green, 20), textcolor=color.white, style=label.style_label_up, size=size.small)
+
+if showLabels and newShort
+    label.new(bar_index, high + (atr * 0.5),
+         "STO SHORT\nSL: " + str.tostring(close + atr * slMult, "#.##") +
+         "\nTP: " + str.tostring(close - atr * slMult * tpRatio, "#.##") +
+         "\nRisk: " + str.tostring(atr * slMult, "#.##") + " pts",
+         color=color.new(color.red, 20), textcolor=color.white, style=label.style_label_down, size=size.small)
+
+// Active Signal SL/TP/Trail Lines
+bool showActive = showLevels and signalDir != 0
+plot(showActive ? sigSL : na,        color=color.new(color.red, 0),    style=plot.style_linebr, linewidth=2, title="Signal SL")
+plot(showActive ? sigTP : na,        color=color.new(color.green, 0),  style=plot.style_linebr, linewidth=2, title="Signal TP")
+plot(showActive ? sig1R : na,        color=color.new(color.aqua, 50),  style=plot.style_linebr, linewidth=1, title="1R Level")
+plot(showActive and not na(sigTrailStop) ? sigTrailStop : na, color=color.new(color.yellow, 0), style=plot.style_linebr, linewidth=1, title="Trailing Stop")
+
+// ══════════════════════════════════════════════════════════════════
+// 6. INFO TABLE
+// ══════════════════════════════════════════════════════════════════
+
+var table infoTable = table.new(position.top_right, 2, 9, bgcolor=color.new(color.black, 80), border_width=1)
+
+if barstate.islast
+    table.cell(infoTable, 0, 0, "Metric",         text_color=color.white, text_size=size.small)
+    table.cell(infoTable, 1, 0, "Value",           text_color=color.white, text_size=size.small)
+    table.cell(infoTable, 0, 1, "HTF Trend",       text_color=color.white, text_size=size.small)
+    table.cell(infoTable, 1, 1, htfBullish ? "BULL ▲" : htfBearish ? "BEAR ▼" : "NEUTRAL", text_color=htfBullish ? color.lime : color.red, text_size=size.small)
+    table.cell(infoTable, 0, 2, "VWAP Bias",       text_color=color.white, text_size=size.small)
+    table.cell(infoTable, 1, 2, close > vwapValue ? "ABOVE ▲" : "BELOW ▼", text_color=close > vwapValue ? color.lime : color.red, text_size=size.small)
+    table.cell(infoTable, 0, 3, "ATR",              text_color=color.white, text_size=size.small)
+    table.cell(infoTable, 1, 3, str.tostring(atr, "#.##"), text_color=color.yellow, text_size=size.small)
+    table.cell(infoTable, 0, 4, "Vol / SMA",        text_color=color.white, text_size=size.small)
+    table.cell(infoTable, 1, 4, str.tostring(volSma > 0 ? volume / volSma : 0, "#.##") + "x", text_color=volSpike ? color.lime : color.gray, text_size=size.small)
+    table.cell(infoTable, 0, 5, "Session",           text_color=color.white, text_size=size.small)
+    table.cell(infoTable, 1, 5, sessionOK ? "ACTIVE ✓" : "CLOSED ✗", text_color=sessionOK ? color.lime : color.red, text_size=size.small)
+    table.cell(infoTable, 0, 6, "Signal",            text_color=color.white, text_size=size.small)
+    table.cell(infoTable, 1, 6, signalDir > 0 ? "LONG ACTIVE" : signalDir < 0 ? "SHORT ACTIVE" : "NONE", text_color=signalDir > 0 ? color.lime : signalDir < 0 ? color.red : color.gray, text_size=size.small)
+    table.cell(infoTable, 0, 7, "MACD Hist",         text_color=color.white, text_size=size.small)
+    table.cell(infoTable, 1, 7, str.tostring(histLine, "#.##"), text_color=histLine > 0 ? color.lime : color.red, text_size=size.small)
+    table.cell(infoTable, 0, 8, "Risk (pts)",         text_color=color.white, text_size=size.small)
+    table.cell(infoTable, 1, 8, str.tostring(atr * slMult, "#.##"), text_color=color.yellow, text_size=size.small)
+
+// ══════════════════════════════════════════════════════════════════
+// 7. ALERTS
+// ══════════════════════════════════════════════════════════════════
+
+// ══════════════════════════════════════════════════════════════════
+// 7. ALERTS (must be at global scope)
+// ══════════════════════════════════════════════════════════════════
+
+alertcondition(newLong,  title="Long Signal",  message="ES VWAP Pullback: LONG signal at {{close}}")
+alertcondition(newShort, title="Short Signal", message="ES VWAP Pullback: SHORT signal at {{close}}")

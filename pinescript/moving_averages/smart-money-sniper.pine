@@ -1,0 +1,203 @@
+// ══════════════════════════════════════════════════════════════════════
+// Smart Money Shqip — by JoriDefi (Smart Money Academy)
+// ══════════════════════════════════════════════════════════════════════
+// Two proven systems merged into one clean indicator:
+//   • UT Bot ATR Trailing Stop — adaptive trend-following stop
+//   • LinReg Candle Smoothing  — noise-free candle direction
+//
+// BUY:  Price crosses ABOVE trailing stop AND LinReg candle is bullish
+// SELL: Price crosses BELOW trailing stop AND LinReg candle is bearish
+// ══════════════════════════════════════════════════════════════════════
+
+//@version=5
+indicator("Smart Money Shqip", shorttitle="SM Shqip", overlay=true, max_labels_count=500)
+
+// ════════════════════════════════════════════════════════════════
+//  INPUTS
+// ════════════════════════════════════════════════════════════════
+
+// ── UT Bot ──
+grp_ut         = "UT Bot"
+ut_key         = input.float(2.0,  "Key Value (Sensitivity)", minval=0.1, step=0.1, group=grp_ut, tooltip="Higher = wider stop, fewer signals. Lower = tighter stop, more signals.")
+ut_atr_period  = input.int(1,      "ATR Period",              minval=1,             group=grp_ut)
+use_ha         = input.bool(false, "Signals from Heikin Ashi Candles",              group=grp_ut)
+
+// ── LinReg Candles ──
+grp_lr         = "LinReg Candles"
+signal_length  = input.int(7,      "Signal Smoothing",        minval=1, maxval=200, group=grp_lr)
+use_sma_signal = input.bool(true,  "Simple MA (Signal Line)",                       group=grp_lr)
+use_linreg     = input.bool(true,  "Lin Reg",                                      group=grp_lr)
+linreg_length  = input.int(11,     "Linear Regression Length", minval=1, maxval=200, group=grp_lr)
+
+// ── Visual ──
+grp_vis        = "Visual"
+show_trail     = input.bool(true,  "Show Trailing Stop Line",  group=grp_vis)
+show_linreg_c  = input.bool(true,  "Show LinReg Candles",      group=grp_vis)
+show_signal_ln = input.bool(true,  "Show Signal Line",         group=grp_vis)
+show_barcolor  = input.bool(true,  "Bar Coloring",             group=grp_vis)
+show_labels    = input.bool(true,  "Show Price Labels",        group=grp_vis)
+
+// ════════════════════════════════════════════════════════════════
+//  LINREG CANDLE SMOOTHING
+//  Smooth OHLC with Linear Regression to remove noise
+// ════════════════════════════════════════════════════════════════
+lr_open  = use_linreg ? ta.linreg(open,  linreg_length, 0) : open
+lr_high  = use_linreg ? ta.linreg(high,  linreg_length, 0) : high
+lr_low   = use_linreg ? ta.linreg(low,   linreg_length, 0) : low
+lr_close = use_linreg ? ta.linreg(close, linreg_length, 0) : close
+
+// LinReg candle direction
+lr_bullish = lr_close > lr_open
+lr_bearish = lr_close < lr_open
+
+// Signal line (SMA or EMA of smoothed close)
+lr_signal = use_sma_signal ? ta.sma(lr_close, signal_length) : ta.ema(lr_close, signal_length)
+
+// ════════════════════════════════════════════════════════════════
+//  UT BOT ATR TRAILING STOP
+//  Adaptive trailing stop that flips on trend changes
+// ════════════════════════════════════════════════════════════════
+
+// Source: use Heikin Ashi close if enabled, otherwise LinReg close
+ha_close = request.security(ticker.heikinashi(syminfo.tickerid), timeframe.period, close)
+src = use_ha ? ha_close : lr_close
+
+// ATR and loss calculation
+ut_atr = ta.atr(ut_atr_period)
+nLoss  = ut_key * ut_atr
+
+// Trailing stop calculation
+var float trail_stop = na
+prev_stop = nz(trail_stop[1], close)
+
+trail_stop :=
+     src > prev_stop and src[1] > prev_stop ?
+         math.max(prev_stop, src - nLoss) :
+     src < prev_stop and src[1] < prev_stop ?
+         math.min(prev_stop, src + nLoss) :
+     src > prev_stop ?
+         src - nLoss :
+         src + nLoss
+
+// Position tracking
+var int pos = 0
+pos :=
+     src[1] < nz(trail_stop[1], 0) and src > trail_stop ?  1 :
+     src[1] > nz(trail_stop[1], 0) and src < trail_stop ? -1 :
+     pos
+
+// UT Bot crossover detection
+ut_ema   = ta.ema(src, 1)
+ut_above = ta.crossover(ut_ema, trail_stop)
+ut_below = ta.crossunder(ut_ema, trail_stop)
+
+// Position relative to trailing stop
+above_stop = src > trail_stop
+below_stop = src < trail_stop
+
+// ════════════════════════════════════════════════════════════════
+//  COMBINED SIGNALS
+//  UT Bot crossover + LinReg candle direction must agree
+// ════════════════════════════════════════════════════════════════
+
+// Strong signals: UT Bot crosses AND LinReg confirms direction
+buy_signal  = above_stop and ut_above and lr_bullish
+sell_signal = below_stop and ut_below and lr_bearish
+
+// Bar state: above or below trailing stop (for coloring)
+bar_bull = above_stop
+bar_bear = below_stop
+
+// ════════════════════════════════════════════════════════════════
+//  VISUALS
+// ════════════════════════════════════════════════════════════════
+
+// ── Trailing Stop Line ──
+trail_color = above_stop ? color.new(#10b981, 0) : color.new(#ef4444, 0)
+plot(show_trail ? trail_stop : na, "Trailing Stop", color=trail_color, linewidth=2, style=plot.style_line)
+
+// ── LinReg Candles (overlay) ──
+plotcandle(
+     show_linreg_c and lr_bullish ? lr_open : na,
+     show_linreg_c and lr_bullish ? lr_high : na,
+     show_linreg_c and lr_bullish ? lr_low  : na,
+     show_linreg_c and lr_bullish ? lr_close : na,
+     title="LinReg Bull", color=color.new(#10b981, 30),
+     wickcolor=color.new(#10b981, 30), bordercolor=color.new(#10b981, 30))
+
+plotcandle(
+     show_linreg_c and lr_bearish ? lr_open : na,
+     show_linreg_c and lr_bearish ? lr_high : na,
+     show_linreg_c and lr_bearish ? lr_low  : na,
+     show_linreg_c and lr_bearish ? lr_close : na,
+     title="LinReg Bear", color=color.new(#ef4444, 30),
+     wickcolor=color.new(#ef4444, 30), bordercolor=color.new(#ef4444, 30))
+
+// ── Signal Line (white) ──
+plot(show_signal_ln ? lr_signal : na, "Signal Line", color=color.new(color.white, 40), linewidth=1)
+
+// ── Bar Coloring ──
+barcolor(show_barcolor ? (bar_bull ? color.new(#10b981, 0) : bar_bear ? color.new(#ef4444, 0) : na) : na, title="Bar Color")
+
+// ── Buy / Sell Signals ──
+plotshape(buy_signal,  title="Buy",  text="Buy",  style=shape.labelup,   location=location.belowbar, color=color.new(#10b981, 0), textcolor=color.white, size=size.tiny)
+plotshape(sell_signal, title="Sell", text="Sell", style=shape.labeldown, location=location.abovebar, color=color.new(#ef4444, 0), textcolor=color.white, size=size.tiny)
+
+// ── Price Labels ──
+if buy_signal and show_labels
+    label.new(bar_index, low - ta.atr(14) * 0.3,
+         text=str.tostring(close, format.mintick),
+         style=label.style_label_up,
+         color=color.new(#10b981, 20),
+         textcolor=color.white,
+         size=size.tiny)
+
+if sell_signal and show_labels
+    label.new(bar_index, high + ta.atr(14) * 0.3,
+         text=str.tostring(close, format.mintick),
+         style=label.style_label_down,
+         color=color.new(#ef4444, 20),
+         textcolor=color.white,
+         size=size.tiny)
+
+// ── Alerts ──
+alertcondition(buy_signal,  title="Buy Signal",  message="SM Shqip BUY on {{ticker}} at {{close}}")
+alertcondition(sell_signal, title="Sell Signal", message="SM Shqip SELL on {{ticker}} at {{close}}")
+alertcondition(buy_signal or sell_signal, title="Any Signal", message="SM Shqip {{ticker}} Signal at {{close}}")
+
+// ════════════════════════════════════════════════════════════════
+//  INFO TABLE
+// ════════════════════════════════════════════════════════════════
+var table info = table.new(position.top_right, 2, 6, bgcolor=color.new(#0f1623, 5), border_width=1, border_color=color.new(color.white, 85))
+
+if barstate.islast
+    // Direction
+    dir_txt = above_stop ? "LONG" : "SHORT"
+    dir_clr = above_stop ? color.new(#10b981, 0) : color.new(#ef4444, 0)
+
+    // LinReg status
+    lr_txt = lr_bullish ? "BULLISH" : "BEARISH"
+    lr_clr = lr_bullish ? color.new(#10b981, 0) : color.new(#ef4444, 0)
+
+    // Agreement
+    agree = (above_stop and lr_bullish) or (below_stop and lr_bearish)
+    agree_txt = agree ? "ALIGNED ✓" : "DIVERGING ✗"
+    agree_clr = agree ? color.new(#10b981, 0) : color.new(#f59e0b, 0)
+
+    table.cell(info, 0, 0, "Smart Money", text_color=color.new(#a855f7, 0), text_size=size.small)
+    table.cell(info, 1, 0, "Shqip", text_color=color.new(color.white, 50), text_size=size.tiny)
+
+    table.cell(info, 0, 1, "Trail Stop", text_color=color.new(color.white, 40), text_size=size.tiny)
+    table.cell(info, 1, 1, dir_txt, text_color=dir_clr, text_size=size.tiny, bgcolor=color.new(dir_clr, 85))
+
+    table.cell(info, 0, 2, "LinReg", text_color=color.new(color.white, 40), text_size=size.tiny)
+    table.cell(info, 1, 2, lr_txt, text_color=lr_clr, text_size=size.tiny, bgcolor=color.new(lr_clr, 85))
+
+    table.cell(info, 0, 3, "Systems", text_color=color.new(color.white, 40), text_size=size.tiny)
+    table.cell(info, 1, 3, agree_txt, text_color=agree_clr, text_size=size.tiny)
+
+    table.cell(info, 0, 4, "Stop Level", text_color=color.new(color.white, 40), text_size=size.tiny)
+    table.cell(info, 1, 4, str.tostring(trail_stop, format.mintick), text_color=color.white, text_size=size.tiny)
+
+    table.cell(info, 0, 5, "Smart Money", text_color=color.new(#f59e0b, 20), text_size=size.tiny)
+    table.cell(info, 1, 5, "Academy", text_color=color.new(#f59e0b, 20), text_size=size.tiny)

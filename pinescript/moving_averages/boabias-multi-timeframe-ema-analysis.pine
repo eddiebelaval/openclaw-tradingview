@@ -1,0 +1,563 @@
+//@version=6
+indicator(title="BoaBias: Multi-Timeframe EMA Analysis",
+     shorttitle="BoaBias: MTF EMA",
+     overlay=true, max_labels_count=500, max_lines_count=500)
+
+// ---------- Helpers ----------
+fmt1(x) => na(x) ? "na" : str.format("{0,number,#.0}", x)     // 1 decimal
+fmt2(x) => na(x) ? "na" : str.format("{0,number,#.##}", x)    // 2 decimals
+
+// Convert HTF bar count to current chart bar count
+f_to_chart_bars(_avgBars, _tfStr, _fallbackBars) =>
+    _secTF    = timeframe.in_seconds(_tfStr)
+    _secChart = timeframe.in_seconds(timeframe.period)
+    _scale    = _secTF / _secChart
+    _barsRaw  = na(_avgBars) ? (_fallbackBars * _scale) : (_avgBars * _scale)
+    math.max(1, math.round(_barsRaw))
+
+// Average and current session lengths on NATIVE TF (over window _win, in bars of this TF).
+// Returns: [avgS, avgL, curS, curL, cntS, cntL]
+f_sessions_native_full(_len, _win) =>
+    _ema   = ta.ema(close, _len)
+    _above = close > _ema
+
+    // current lengths of unfinished sessions
+    var int _sRun = 0    // below EMA
+    var int _lRun = 0    // above EMA
+    _sRun := _above ? 0 : _sRun + 1
+    _lRun := _above ? _lRun + 1 : 0
+
+    // crosses on state change "above/below"
+    _prevAbove = _above[1]
+    _crossUp   =  _above      and not _prevAbove   // was below, now above
+    _crossDown = not _above   and     _prevAbove   // was above, now below
+
+    // lengths of COMPLETED sessions on state change bar
+    _sLen = _crossUp   ? nz(_sRun[1]) : 0  // ended "below"
+    _lLen = _crossDown ? nz(_lRun[1]) : 0  // ended "above"
+    _sCnt = _sLen > 0 ? 1 : 0
+    _lCnt = _lLen > 0 ? 1 : 0
+
+    // rolling sums over window _win (on native TF)
+    _cumSlen      = ta.cum(_sLen)
+    _cumScnt      = ta.cum(_sCnt)
+    _cumLlen      = ta.cum(_lLen)
+    _cumLcnt      = ta.cum(_lCnt)
+
+    _sumS       = _cumSlen      - nz(_cumSlen[_win])
+    _cntS       = _cumScnt      - nz(_cumScnt[_win])
+    _sumL       = _cumLlen      - nz(_cumLlen[_win])
+    _cntL       = _cumLcnt      - nz(_cumLcnt[_win])
+
+    _avgS = _cntS > 0 ? (_sumS / _cntS) : na
+    _avgL = _cntL > 0 ? (_sumL / _cntL) : na
+
+    _curS = _above ? 0 : _sRun
+    _curL = _above ? _lRun : 0
+    [_avgS, _avgL, _curS, _curL, _cntS, _cntL]
+
+// ---------- Inputs ----------
+showAllLabels = input.bool(true, title="Show all labels", group="Label Options")
+
+// Group: Main cross labels (S/L)
+groupLabelsCross = "Cross Labels (S/L)"
+showCrossLabels_15m = input.bool(false, "15m crosses", group=groupLabelsCross)
+showCrossLabels_1h  = input.bool(false, "1H crosses",  group=groupLabelsCross)
+showCrossLabels_4h  = input.bool(false, "4H crosses",  group=groupLabelsCross)
+showCrossLabels_1d  = input.bool(true,  "1D crosses",  group=groupLabelsCross)
+showCrossLabels_3d  = input.bool(false, "3D crosses",  group=groupLabelsCross)
+showCrossLabels_1w  = input.bool(false, "1W crosses",  group=groupLabelsCross)
+showCrossS = input.bool(true,  "Show S (from below EMA up)", group=groupLabelsCross)
+showCrossL = input.bool(true,  "Show L (from above down)",      group=groupLabelsCross)
+
+// Group: Final labels with full information
+groupLabelsFinal = "Final Labels (right side)"
+showFinalLabels_15m = input.bool(true,  "15m final", group=groupLabelsFinal)
+showFinalLabels_1h  = input.bool(true,  "1H final",  group=groupLabelsFinal)
+showFinalLabels_4h  = input.bool(true,  "4H final",  group=groupLabelsFinal)
+showFinalLabels_1d  = input.bool(true,  "1D final",  group=groupLabelsFinal)
+showFinalLabels_3d  = input.bool(true,  "3D final",  group=groupLabelsFinal)
+showFinalLabels_1w  = input.bool(true,  "1W final",  group=groupLabelsFinal)
+
+groupEMA = "EMA Settings"
+length_15m = input.int(16, "15m EMA Length", group=groupEMA, minval=1)
+length_1h  = input.int(24, "1H EMA Length",  group=groupEMA, minval=1)
+length_4h  = input.int(42, "4H EMA Length",  group=groupEMA, minval=1)
+length_1d  = input.int(29, "1D EMA Length",  group=groupEMA, minval=1)
+length_3d  = input.int(30, "3D EMA Length",  group=groupEMA, minval=1)
+length_1w  = input.int(52, "1W EMA Length",  group=groupEMA, minval=1)
+
+groupAvg = "Average Settings"
+avgWindow_15m = input.int(200, "Average window (15m)", group=groupAvg, minval=1)
+avgWindow_1h  = input.int(200, "Average window (1H)",  group=groupAvg, minval=1)
+avgWindow_4h  = input.int(200, "Average window (4H)",  group=groupAvg, minval=1)
+avgWindow_1d  = input.int(200, "Average window (1D)",  group=groupAvg, minval=1)
+avgWindow_3d  = input.int(200, "Average window (3D)",  group=groupAvg, minval=1)
+avgWindow_1w  = input.int(200, "Average window (1W)",  group=groupAvg, minval=1)
+
+source = close
+
+// ---------- EMAs & native closes ----------
+ema_15m = request.security(syminfo.tickerid, "15",  ta.ema(source, length_15m), barmerge.gaps_off, barmerge.lookahead_off)
+ema_1h  = request.security(syminfo.tickerid, "60",  ta.ema(source, length_1h), barmerge.gaps_off, barmerge.lookahead_off)
+ema_4h  = request.security(syminfo.tickerid, "240", ta.ema(source, length_4h), barmerge.gaps_off, barmerge.lookahead_off)
+ema_1d  = request.security(syminfo.tickerid, "D",   ta.ema(source, length_1d), barmerge.gaps_off, barmerge.lookahead_off)
+ema_3d  = request.security(syminfo.tickerid, "3D",  ta.ema(source, length_3d), barmerge.gaps_off, barmerge.lookahead_off)
+ema_1w  = request.security(syminfo.tickerid, "W",   ta.ema(source, length_1w), barmerge.gaps_off, barmerge.lookahead_off)
+
+close_15m = request.security(syminfo.tickerid, "15",  close, barmerge.gaps_off, barmerge.lookahead_off)
+close_1h  = request.security(syminfo.tickerid, "60",  close, barmerge.gaps_off, barmerge.lookahead_off)
+close_4h  = request.security(syminfo.tickerid, "240", close, barmerge.gaps_off, barmerge.lookahead_off)
+close_1d  = request.security(syminfo.tickerid, "D",   close, barmerge.gaps_off, barmerge.lookahead_off)
+close_3d  = request.security(syminfo.tickerid, "3D",  close, barmerge.gaps_off, barmerge.lookahead_off)
+close_1w  = request.security(syminfo.tickerid, "W",   close, barmerge.gaps_off, barmerge.lookahead_off)
+
+// ---------- Above/Below flags ----------
+above_15m = close_15m > ema_15m
+above_1h  = close_1h  > ema_1h
+above_4h  = close_4h  > ema_4h
+above_1d  = close_1d  > ema_1d
+above_3d  = close_3d  > ema_3d
+above_1w  = close_1w  > ema_1w
+
+// ---------- Deviations ----------
+deviation_15m = ((ema_15m - close_15m) / close_15m) * 100
+deviation_1h  = ((ema_1h  - close_1h)  / close_1h)  * 100
+deviation_4h  = ((ema_4h  - close_4h)  / close_4h)  * 100
+deviation_1d  = ((ema_1d  - close_1d)  / close_1d)  * 100
+deviation_3d  = ((ema_3d  - close_3d)  / close_3d)  * 100
+deviation_1w  = ((ema_1w  - close_1w)  / close_1w)  * 100
+
+// ---------- Plots ----------
+plot(ema_15m, title="15m EMA", color=color.yellow, linewidth=2)
+plot(ema_1h,  title="1H EMA",  color=color.red,    linewidth=2)
+plot(ema_4h,  title="4H EMA",  color=color.green,  linewidth=2)
+plot(ema_1d,  title="1D EMA",  color=color.blue,   linewidth=2)
+plot(ema_3d,  title="3D EMA",  color=color.purple, linewidth=2)
+plot(ema_1w,  title="1W EMA",  color=color.orange, linewidth=2)
+
+// ---------- STATE ----------
+var int   lastCrossBar_15m = -1
+var int   lastCrossBar_1h  = -1
+var int   lastCrossBar_4h  = -1
+var int   lastCrossBar_1d  = -1
+var int   lastCrossBar_3d  = -1
+var int   lastCrossBar_1w  = -1
+
+var float lastCrossPrice_15m = na
+var float lastCrossPrice_1h  = na
+var float lastCrossPrice_4h  = na
+var float lastCrossPrice_1d  = na
+var float lastCrossPrice_3d  = na
+var float lastCrossPrice_1w  = na
+
+var float lastCrossEMA_15m = na
+var float lastCrossEMA_1h  = na
+var float lastCrossEMA_4h  = na
+var float lastCrossEMA_1d  = na
+var float lastCrossEMA_3d  = na
+var float lastCrossEMA_1w  = na
+
+var int   lastCrossTime_15m = na
+var int   lastCrossTime_1h  = na
+var int   lastCrossTime_4h  = na
+var int   lastCrossTime_1d  = na
+var int   lastCrossTime_3d  = na
+var int   lastCrossTime_1w  = na
+
+// Direction of last cross: +1 = crossover (up), -1 = crossunder (down)
+var int lastDir_15m = 0
+var int lastDir_1h  = 0
+var int lastDir_4h  = 0
+var int lastDir_1d  = 0
+var int lastDir_3d  = 0
+var int lastDir_1w  = 0
+
+// === Run-length counters per TF ===
+var int runAbove_15m = 0, runBelow_15m = 0
+var int runAbove_1h  = 0, runBelow_1h  = 0
+var int runAbove_4h  = 0, runBelow_4h  = 0
+var int runAbove_1d  = 0, runBelow_1d  = 0
+var int runAbove_3d  = 0, runBelow_3d  = 0
+var int runAbove_1w  = 0, runBelow_1w  = 0
+
+runAbove_15m := above_15m ? nz(runAbove_15m[1]) + 1 : 0
+runBelow_15m := above_15m ? 0 : nz(runBelow_15m[1]) + 1
+runAbove_1h  := above_1h  ? nz(runAbove_1h[1])  + 1 : 0
+runBelow_1h  := above_1h  ? 0 : nz(runBelow_1h[1])  + 1
+runAbove_4h  := above_4h  ? nz(runAbove_4h[1])  + 1 : 0
+runBelow_4h  := above_4h  ? 0 : nz(runBelow_4h[1])  + 1
+runAbove_1d  := above_1d  ? nz(runAbove_1d[1])  + 1 : 0
+runBelow_1d  := above_1d  ? 0 : nz(runBelow_1d[1])  + 1
+runAbove_3d  := above_3d  ? nz(runAbove_3d[1])  + 1 : 0
+runBelow_3d  := above_3d  ? 0 : nz(runBelow_3d[1])  + 1
+runAbove_1w  := above_1w  ? nz(runAbove_1w[1])  + 1 : 0
+runBelow_1w  := above_1w  ? 0 : nz(runBelow_1w[1])  + 1
+
+// Crosses on "above EMA" flag change
+prevAbove_15m = bar_index > 0 ? above_15m[1] : above_15m
+prevAbove_1h  = bar_index > 0 ? above_1h[1]  : above_1h
+prevAbove_4h  = bar_index > 0 ? above_4h[1]  : above_4h
+prevAbove_1d  = bar_index > 0 ? above_1d[1]  : above_1d
+prevAbove_3d  = bar_index > 0 ? above_3d[1]  : above_3d
+prevAbove_1w  = bar_index > 0 ? above_1w[1]  : above_1w
+
+crossUp_15m   =  above_15m and not prevAbove_15m
+crossDown_15m = not above_15m and     prevAbove_15m
+crossUp_1h    =  above_1h  and not prevAbove_1h
+crossDown_1h  = not above_1h  and     prevAbove_1h
+crossUp_4h    =  above_4h  and not prevAbove_4h
+crossDown_4h  = not above_4h  and     prevAbove_4h
+crossUp_1d    =  above_1d  and not prevAbove_1d
+crossDown_1d  = not above_1d  and     prevAbove_1d
+crossUp_3d    =  above_3d  and not prevAbove_3d
+crossDown_3d  = not above_3d  and     prevAbove_3d
+crossUp_1w    =  above_1w  and not prevAbove_1w
+crossDown_1w  = not above_1w  and     prevAbove_1w
+
+
+var float sessionS_15m_event = na
+var float sessionL_15m_event = na
+var float sessionS_1h_event  = na
+var float sessionL_1h_event  = na
+var float sessionS_4h_event  = na
+var float sessionL_4h_event  = na
+var float sessionS_1d_event  = na
+var float sessionL_1d_event  = na
+var float sessionS_3d_event  = na
+var float sessionL_3d_event  = na
+var float sessionS_1w_event  = na
+var float sessionL_1w_event  = na
+
+lShift = syminfo.mintick * 2
+
+// ---------- Averages + current sessions on native TFs ----------
+[avgS_15m_final, avgL_15m_final, curS_15m_native, curL_15m_native, cntS_15m_dbg, cntL_15m_dbg] =    request.security(syminfo.tickerid, "15",  f_sessions_native_full(length_15m, avgWindow_15m), barmerge.gaps_off, barmerge.lookahead_off)
+
+[avgS_1h_final,  avgL_1h_final,  curS_1h_native,  curL_1h_native,  cntS_1h_dbg,  cntL_1h_dbg] =    request.security(syminfo.tickerid, "60",  f_sessions_native_full(length_1h,  avgWindow_1h), barmerge.gaps_off, barmerge.lookahead_off)
+
+[avgS_4h_final,  avgL_4h_final,  curS_4h_native,  curL_4h_native,  cntS_4h_dbg,  cntL_4h_dbg] =    request.security(syminfo.tickerid, "240", f_sessions_native_full(length_4h,  avgWindow_4h), barmerge.gaps_off, barmerge.lookahead_off)
+
+[avgS_1d_final,  avgL_1d_final,  curS_1d_native,  curL_1d_native,  cntS_1d_dbg,  cntL_1d_dbg] =    request.security(syminfo.tickerid, "D",   f_sessions_native_full(length_1d,  avgWindow_1d), barmerge.gaps_off, barmerge.lookahead_off)
+
+[avgS_3d_final,  avgL_3d_final,  curS_3d_native,  curL_3d_native,  cntS_3d_dbg,  cntL_3d_dbg] =    request.security(syminfo.tickerid, "3D",  f_sessions_native_full(length_3d,  avgWindow_3d), barmerge.gaps_off, barmerge.lookahead_off)
+
+[avgS_1w_final,  avgL_1w_final,  curS_1w_native,  curL_1w_native,  cntS_1w_dbg,  cntL_1w_dbg] =    request.security(syminfo.tickerid, "W",   f_sessions_native_full(length_1w,  avgWindow_1w), barmerge.gaps_off, barmerge.lookahead_off)
+
+
+// --- Cross logic / labels ---
+// 15m
+if crossUp_15m and bar_index != lastCrossBar_15m
+    lastCrossBar_15m   := bar_index
+    lastCrossPrice_15m := close_15m
+    lastCrossEMA_15m   := ema_15m
+    lastCrossTime_15m  := time("15")
+    lastDir_15m        := +1
+    sessionS_15m_event := runBelow_15m[1]
+    if showAllLabels and showCrossLabels_15m and showCrossS
+        pc = ((close_15m - lastCrossPrice_15m) / lastCrossPrice_15m) * 100
+        label.new(bar_index, ema_15m, "15m S " + str.tostring(nz(runBelow_15m[1])) + " (" + fmt2(pc) + "%)", color=color.yellow, style=label.style_label_down, textcolor=color.black, size=size.tiny)
+else if crossDown_15m and bar_index != lastCrossBar_15m
+    lastCrossBar_15m   := bar_index
+    lastCrossPrice_15m := close_15m
+    lastCrossEMA_15m   := ema_15m
+    lastCrossTime_15m  := time("15")
+    lastDir_15m        := -1
+    sessionL_15m_event := runAbove_15m[1]
+    if showAllLabels and showCrossLabels_15m and showCrossL
+        pc = ((close_15m - lastCrossPrice_15m) / lastCrossPrice_15m) * 100
+        label.new(bar_index, ema_15m + lShift, "15m L " + str.tostring(nz(runAbove_15m[1])) + " (" + fmt2(pc) + "%)", color=color.yellow, style=label.style_label_up, textcolor=color.black, size=size.tiny)
+
+// 1H
+if crossUp_1h and bar_index != lastCrossBar_1h
+    lastCrossBar_1h   := bar_index
+    lastCrossPrice_1h := close_1h
+    lastCrossEMA_1h   := ema_1h
+    lastCrossTime_1h  := time("60")
+    lastDir_1h        := +1
+    sessionS_1h_event := runBelow_1h[1]
+    if showAllLabels and showCrossLabels_1h and showCrossS
+        label.new(bar_index, ema_1h, "1H S " + str.tostring(nz(runBelow_1h[1])), color=color.red, style=label.style_label_down, textcolor=color.white, size=size.tiny)
+else if crossDown_1h and bar_index != lastCrossBar_1h
+    lastCrossBar_1h   := bar_index
+    lastCrossPrice_1h := close_1h
+    lastCrossEMA_1h   := ema_1h
+    lastCrossTime_1h  := time("60")
+    lastDir_1h        := -1
+    sessionL_1h_event := runAbove_1h[1]
+    if showAllLabels and showCrossLabels_1h and showCrossL
+        label.new(bar_index, ema_1h + lShift, "1H L " + str.tostring(nz(runAbove_1h[1])), color=color.red, style=label.style_label_up, textcolor=color.white, size=size.tiny)
+
+// 4H
+if crossUp_4h and bar_index != lastCrossBar_4h
+    lastCrossBar_4h   := bar_index
+    lastCrossPrice_4h := close_4h
+    lastCrossEMA_4h   := ema_4h
+    lastCrossTime_4h  := time("240")
+    lastDir_4h        := +1
+    sessionS_4h_event := runBelow_4h[1]
+    if showAllLabels and showCrossLabels_4h and showCrossS
+        label.new(bar_index, ema_4h, "4H S " + str.tostring(nz(runBelow_4h[1])), color=color.green, style=label.style_label_down, textcolor=color.white, size=size.tiny)
+else if crossDown_4h and bar_index != lastCrossBar_4h
+    lastCrossBar_4h   := bar_index
+    lastCrossPrice_4h := close_4h
+    lastCrossEMA_4h   := ema_4h
+    lastCrossTime_4h  := time("240")
+    lastDir_4h        := -1
+    sessionL_4h_event := runAbove_4h[1]
+    if showAllLabels and showCrossLabels_4h and showCrossL
+        label.new(bar_index, ema_4h + lShift, "4H L " + str.tostring(nz(runAbove_4h[1])), color=color.green, style=label.style_label_up, textcolor=color.white, size=size.tiny)
+
+// 1D
+if crossUp_1d and bar_index != lastCrossBar_1d
+    lastCrossBar_1d   := bar_index
+    lastCrossPrice_1d := close_1d
+    lastCrossEMA_1d   := ema_1d
+    lastCrossTime_1d  := time("D")
+    lastDir_1d        := +1
+    sessionS_1d_event := runBelow_1d[1]
+    if showAllLabels and showCrossLabels_1d and showCrossS
+        label.new(bar_index, ema_1d, "1D S " + str.tostring(nz(runBelow_1d[1])), color=color.blue, style=label.style_label_down, textcolor=color.white, size=size.tiny)
+else if crossDown_1d and bar_index != lastCrossBar_1d
+    lastCrossBar_1d   := bar_index
+    lastCrossPrice_1d := close_1d
+    lastCrossEMA_1d   := ema_1d
+    lastCrossTime_1d  := time("D")
+    lastDir_1d        := -1
+    sessionL_1d_event := runAbove_1d[1]
+    if showAllLabels and showCrossLabels_1d and showCrossL
+        label.new(bar_index, ema_1d + lShift, "1D L " + str.tostring(nz(runAbove_1d[1])), color=color.blue, style=label.style_label_up, textcolor=color.white, size=size.tiny)
+
+// 3D
+if crossUp_3d and bar_index != lastCrossBar_3d
+    lastCrossBar_3d   := bar_index
+    lastCrossPrice_3d := close_3d
+    lastCrossEMA_3d   := ema_3d
+    lastCrossTime_3d  := time("3D")
+    lastDir_3d        := +1
+    sessionS_3d_event := runBelow_3d[1]
+    if showAllLabels and showCrossLabels_3d and showCrossS
+        label.new(bar_index, ema_3d, "3D S " + str.tostring(nz(runBelow_3d[1])), color=color.purple, style=label.style_label_down, textcolor=color.white, size=size.tiny)
+else if crossDown_3d and bar_index != lastCrossBar_3d
+    lastCrossBar_3d   := bar_index
+    lastCrossPrice_3d := close_3d
+    lastCrossEMA_3d   := ema_3d
+    lastCrossTime_3d  := time("3D")
+    lastDir_3d        := -1
+    sessionL_3d_event := runAbove_3d[1]
+    if showAllLabels and showCrossLabels_3d and showCrossL
+        label.new(bar_index, ema_3d + lShift, "3D L " + str.tostring(nz(runAbove_3d[1])), color=color.purple, style=label.style_label_up, textcolor=color.white, size=size.tiny)
+
+// 1W
+if crossUp_1w and bar_index != lastCrossBar_1w
+    lastCrossBar_1w   := bar_index
+    lastCrossPrice_1w := close_1w
+    lastCrossEMA_1w   := ema_1w
+    lastCrossTime_1w  := time("W")
+    lastDir_1w        := +1
+    sessionS_1w_event := runBelow_1w[1]
+    if showAllLabels and showCrossLabels_1w and showCrossS
+        label.new(bar_index, ema_1w, "1W S " + str.tostring(nz(runBelow_1w[1])), color=color.orange, style=label.style_label_down, textcolor=color.white, size=size.tiny)
+else if crossDown_1w and bar_index != lastCrossBar_1w
+    lastCrossBar_1w   := bar_index
+    lastCrossPrice_1w := close_1w
+    lastCrossEMA_1w   := ema_1w
+    lastCrossTime_1w  := time("W")
+    lastDir_1w        := -1
+    sessionL_1w_event := runAbove_1w[1]
+    if showAllLabels and showCrossLabels_1w and showCrossL
+        label.new(bar_index, ema_1w + lShift, "1W L " + str.tostring(nz(runAbove_1w[1])), color=color.orange, style=label.style_label_up, textcolor=color.white, size=size.tiny)
+
+// ---------- Label text formatter ----------
+fmtLbl(tf, dev, avgS, avgL, curS, curL, cntS, cntL) =>
+    tf + ": " + fmt2(dev) + "% (Avg S:" + fmt1(avgS) + " Avg L:" + fmt1(avgL) +    " Cur S:" + str.tostring(curS) + " Cur L:" + str.tostring(curL) +    " | Evts S/L:" + str.tostring(cntS) + "/" + str.tostring(cntL) + ")"
+
+// ---------- Offsets ----------
+f_pick_avg(_dir, _avgS, _avgL) => _dir == +1 ? _avgL : _dir == -1 ? _avgS : na
+
+offset15m = f_to_chart_bars(f_pick_avg(lastDir_15m, avgS_15m_final, avgL_15m_final), "15", 5)
+offset1h  = f_to_chart_bars(f_pick_avg(lastDir_1h,  avgS_1h_final,  avgL_1h_final ), "60", 5)
+offset4h  = f_to_chart_bars(f_pick_avg(lastDir_4h,  avgS_4h_final,  avgL_4h_final ), "240", 5)
+offset1d  = f_to_chart_bars(f_pick_avg(lastDir_1d,  avgS_1d_final,  avgL_1d_final ), "D", 5)
+offset3d  = f_to_chart_bars(f_pick_avg(lastDir_3d,  avgS_3d_final,  avgL_3d_final ), "3D", 5)
+offset1w  = f_to_chart_bars(f_pick_avg(lastDir_1w,  avgS_1w_final,  avgL_1w_final ), "W", 5)
+
+// --- Limit for future drawings ---
+groupVis = "Visuals"
+maxFwdBars = input.int(500, "Max bars ahead for projections", minval=1, group=groupVis)
+
+f_cap_future(_x) => math.min(_x, bar_index + maxFwdBars)
+
+// ---------- Candle Coloring ----------
+groupCandle = "Candle Coloring"
+
+useCandleColoring   = input.bool(true, "Color candles by EMA", group=groupCandle)
+hideCurrentLiveBar  = input.bool(true, "Hide color on current open candle", group=groupCandle)
+
+// Main EMAs
+slowEmaTfOpt = input.string("4H", "Slow EMA (entry/SL)",
+     options = ["15m", "1H", "4H", "1D", "3D", "1W"], group   = groupCandle)
+
+fastEmaTfOpt = input.string("1H", "Fast EMA (TP)",
+     options = ["15m", "1H", "4H", "1D", "3D", "1W"], group   = groupCandle)
+
+// Base mode colors
+candleColorAbove   = input.color(color.new(color.lime, 0),  "Color ABOVE slow EMA",    group=groupCandle)
+candleColorBelow   = input.color(color.new(color.red,  0),  "Color BELOW slow EMA",    group=groupCandle)
+candleColorNeutral = input.color(color.new(color.gray, 0),  "Color BETWEEN slow/fast", group=groupCandle)
+
+// Additional rules: entry and re-entry
+useEntryColors    = input.bool(true,  "Highlight ENTRY bars (cross slow EMA)", group=groupCandle)
+useReentryColors = input.bool(true,  "Highlight RE-ENTRY bars (fast EMA dip/return)", group=groupCandle)
+
+entryLongColor    = input.color(color.new(color.teal,   0), "Entry LONG bar",      group=groupCandle)
+entryShortColor   = input.color(color.new(color.maroon, 0), "Entry SHORT bar",     group=groupCandle)
+reEntryLongColor  = input.color(color.new(color.aqua,   0), "Re-entry LONG bar",   group=groupCandle)
+reEntryShortColor = input.color(color.new(color.orange, 0), "Re-entry SHORT bar",  group=groupCandle)
+
+// --- TF -> EMA mapping ---
+slowEma =
+     slowEmaTfOpt == "15m" ? ema_15m :
+     slowEmaTfOpt == "1H"  ? ema_1h  :
+     slowEmaTfOpt == "4H"  ? ema_4h  :
+     slowEmaTfOpt == "1D"  ? ema_1d  :
+     slowEmaTfOpt == "3D"  ? ema_3d  :
+     slowEmaTfOpt == "1W"  ? ema_1w  :
+     na
+
+fastEma =
+     fastEmaTfOpt == "15m" ? ema_15m :
+     fastEmaTfOpt == "1H"  ? ema_1h  :
+     fastEmaTfOpt == "4H"  ? ema_4h  :
+     fastEmaTfOpt == "1D"  ? ema_1d  :
+     fastEmaTfOpt == "3D"  ? ema_3d  :
+     fastEmaTfOpt == "1W"  ? ema_1w  :
+     na
+
+// --- Base states ---
+isAboveSlow = not na(slowEma) and close > slowEma
+isBelowSlow = not na(slowEma) and close < slowEma
+
+inBetween =
+     not na(slowEma) and not na(fastEma) and
+     close > math.min(slowEma, fastEma) and
+     close < math.max(slowEma, fastEma)
+
+// --- Previous EMA relationships for patterns ---
+prevClose   = close[1]
+prevSlowEma = slowEma[1]
+prevFastEma = fastEma[1]
+
+prevIsAboveSlow = not na(prevSlowEma) and prevClose > prevSlowEma
+prevIsBelowSlow = not na(prevSlowEma) and prevClose < prevSlowEma
+
+aboveFast      = not na(fastEma)      and close > fastEma
+belowFast      = not na(fastEma)      and close < fastEma
+prevAboveFast  = not na(prevFastEma)  and prevClose > prevFastEma
+prevBelowFast  = not na(prevFastEma)  and prevClose < prevFastEma
+
+// --- 1) ENTRY bars: cross slow EMA and close on the other side ---
+entryLong  = not na(slowEma) and prevIsBelowSlow and isAboveSlow
+entryShort = not na(slowEma) and prevIsAboveSlow and isBelowSlow
+
+// --- 2) RE-ENTRY bars ---
+reEntryLong  = not na(slowEma) and not na(fastEma) and
+               isAboveSlow and prevBelowFast and aboveFast
+
+reEntryShort = not na(slowEma) and not na(fastEma) and
+               isBelowSlow and prevAboveFast and belowFast
+
+// --- Binary: current unclosed bar ---
+isLiveUnclosed = barstate.islast and not barstate.isconfirmed
+
+// --- Base color by zones ---
+baseColor =
+     useCandleColoring and not na(slowEma) ?
+         (inBetween
+             ? candleColorNeutral
+             : (isAboveSlow ? candleColorAbove : candleColorBelow))
+         : na
+
+// --- Priority: Entry > Re-entry > base mode ---
+logicColor =
+     useCandleColoring and useEntryColors   and entryLong      ? entryLongColor    :
+     useCandleColoring and useEntryColors   and entryShort     ? entryShortColor   :
+     useCandleColoring and useReentryColors and reEntryLong    ? reEntryLongColor  :
+     useCandleColoring and useReentryColors and reEntryShort   ? reEntryShortColor :
+     baseColor
+
+// --- Account for hiding current candle ---
+candleCol = hideCurrentLiveBar and isLiveUnclosed ? na : logicColor
+
+barcolor(candleCol)
+
+// ---------- Final labels / lines ----------
+if barstate.islast
+    baseIndex15m = lastCrossBar_15m != -1 ? lastCrossBar_15m : bar_index
+    baseEMA15m   = na(lastCrossEMA_15m) ? ema_15m : lastCrossEMA_15m
+    text15m      = fmtLbl("15m", deviation_15m, avgS_15m_final, avgL_15m_final, curS_15m_native, curL_15m_native, cntS_15m_dbg, cntL_15m_dbg)
+    x15m         = f_cap_future(baseIndex15m + offset15m)
+    line.new(x1=x15m, y1=baseEMA15m, x2=x15m, y2=baseEMA15m, color=color.yellow, width=1, extend=extend.both)
+    if showAllLabels and showFinalLabels_15m
+        label.new(x=x15m, y=baseEMA15m, text=text15m, color=color.yellow, textcolor=color.black, style=label.style_label_left, size=size.small)
+    line.new(x1=bar_index, y1=ema_15m, x2=x15m, y2=ema_15m, color=color.yellow, width=2)
+
+    baseIndex1h = lastCrossBar_1h != -1 ? lastCrossBar_1h : bar_index
+    baseEMA1h   = na(lastCrossEMA_1h) ? ema_1h : lastCrossEMA_1h
+    text1h      = fmtLbl("1H", deviation_1h, avgS_1h_final, avgL_1h_final, curS_1h_native, curL_1h_native, cntS_1h_dbg, cntL_1h_dbg)
+    x1h         = f_cap_future(baseIndex1h + offset1h)
+    line.new(x1=x1h, y1=baseEMA1h, x2=x1h, y2=baseEMA1h, color=color.red, width=1, extend=extend.both)
+    if showAllLabels and showFinalLabels_1h
+        label.new(x=x1h, y=baseEMA1h, text=text1h, color=color.red, textcolor=color.white, style=label.style_label_left, size=size.small)
+    line.new(x1=bar_index, y1=ema_1h, x2=x1h, y2=ema_1h, color=color.red, width=2)
+
+    baseIndex4h = lastCrossBar_4h != -1 ? lastCrossBar_4h : bar_index
+    baseEMA4h   = na(lastCrossEMA_4h) ? ema_4h : lastCrossEMA_4h
+    text4h      = fmtLbl("4H", deviation_4h, avgS_4h_final, avgL_4h_final, curS_4h_native, curL_4h_native, cntS_4h_dbg, cntL_4h_dbg)
+    x4h         = f_cap_future(baseIndex4h + offset4h)
+    line.new(x1=x4h, y1=baseEMA4h, x2=x4h, y2=baseEMA4h, color=color.green, width=1, extend=extend.both)
+    if showAllLabels and showFinalLabels_4h
+        label.new(x=x4h, y=baseEMA4h, text=text4h, color=color.green, textcolor=color.white, style=label.style_label_left, size=size.small)
+    line.new(x1=bar_index, y1=ema_4h, x2=x4h, y2=ema_4h, color=color.green, width=2)
+
+    baseIndex1d = lastCrossBar_1d != -1 ? lastCrossBar_1d : bar_index
+    baseEMA1d   = na(lastCrossEMA_1d) ? ema_1d : lastCrossEMA_1d
+    text1d      = fmtLbl("1D", deviation_1d, avgS_1d_final, avgL_1d_final, curS_1d_native, curL_1d_native, cntS_1d_dbg, cntL_1d_dbg)
+    x1d         = f_cap_future(baseIndex1d + offset1d)
+    line.new(x1=x1d, y1=baseEMA1d, x2=x1d, y2=baseEMA1d, color=color.blue, width=1, extend=extend.both)
+    if showAllLabels and showFinalLabels_1d
+        label.new(x=x1d, y=baseEMA1d, text=text1d, color=color.blue, textcolor=color.white, style=label.style_label_left, size=size.small)
+    line.new(x1=bar_index, y1=ema_1d, x2=x1d, y2=ema_1d, color=color.blue, width=2)
+
+    baseIndex3d = lastCrossBar_3d != -1 ? lastCrossBar_3d : bar_index
+    baseEMA3d   = na(lastCrossEMA_3d) ? ema_3d : lastCrossEMA_3d
+    text3d      = fmtLbl("3D", deviation_3d, avgS_3d_final, avgL_3d_final, curS_3d_native, curL_3d_native, cntS_3d_dbg, cntL_3d_dbg)
+    x3d         = f_cap_future(baseIndex3d + offset3d)
+    line.new(x1=x3d, y1=baseEMA3d, x2=x3d, y2=baseEMA3d, color=color.purple, width=1, extend=extend.both)
+    if showAllLabels and showFinalLabels_3d
+        label.new(x=x3d, y=baseEMA3d, text=text3d, color=color.purple, textcolor=color.white, style=label.style_label_left, size=size.small)
+    line.new(x1=bar_index, y1=ema_3d, x2=x3d, y2=ema_3d, color=color.purple, width=2)
+
+    baseIndex1w = lastCrossBar_1w != -1 ? lastCrossBar_1w : bar_index
+    baseEMA1w   = na(lastCrossEMA_1w) ? ema_1w : lastCrossEMA_1w
+    text1w      = fmtLbl("1W", deviation_1w, avgS_1w_final, avgL_1w_final, curS_1w_native, curL_1w_native, cntS_1w_dbg, cntL_1w_dbg)
+    x1w         = f_cap_future(baseIndex1w + offset1w)
+    line.new(x1=x1w, y1=baseEMA1w, x2=x1w, y2=baseEMA1w, color=color.orange, width=1, extend=extend.both)
+    if showAllLabels and showFinalLabels_1w
+        label.new(x=x1w, y=baseEMA1w, text=text1w, color=color.orange, textcolor=color.white, style=label.style_label_left, size=size.small)
+    line.new(x1=bar_index, y1=ema_1w, x2=x1w, y2=ema_1w, color=color.orange, width=2)
+
+// ---------- ETA verticals ----------
+vLine15m_raw = lastCrossBar_15m == -1 ? na : lastCrossBar_15m + offset15m
+vLine1h_raw  = lastCrossBar_1h  == -1 ? na : lastCrossBar_1h  + offset1h
+vLine4h_raw  = lastCrossBar_4h  == -1 ? na : lastCrossBar_4h  + offset4h
+vLine1d_raw  = lastCrossBar_1d  == -1 ? na : lastCrossBar_1d  + offset1d
+vLine3d_raw  = lastCrossBar_3d  == -1 ? na : lastCrossBar_3d  + offset3d
+vLine1w_raw  = lastCrossBar_1w  == -1 ? na : lastCrossBar_1w  + offset1w
+
+vLine15m = na(vLine15m_raw) or vLine15m_raw > bar_index + maxFwdBars ? na : vLine15m_raw
+vLine1h  = na(vLine1h_raw)  or vLine1h_raw  > bar_index + maxFwdBars ? na : vLine1h_raw
+vLine4h  = na(vLine4h_raw)  or vLine4h_raw  > bar_index + maxFwdBars ? na : vLine4h_raw
+vLine1d  = na(vLine1d_raw)  or vLine1d_raw  > bar_index + maxFwdBars ? na : vLine1d_raw
+vLine3d  = na(vLine3d_raw)  or vLine3d_raw  > bar_index + maxFwdBars ? na : vLine3d_raw
+vLine1w  = na(vLine1w_raw)  or vLine1w_raw  > bar_index + maxFwdBars ? na : vLine1w_raw

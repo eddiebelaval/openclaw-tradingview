@@ -1,0 +1,227 @@
+//@version=6
+indicator("MOSHIACH — GOD MODE V5 PRO", overlay=true, max_labels_count=500)
+
+//=============================================================================
+// INPUTS
+//=============================================================================
+groupCore   = "CORE"
+groupFilt   = "FILTERS"
+groupUI     = "UI"
+
+emaLen      = input.int(200, "EMA Trend", group=groupCore)
+atrLen      = input.int(14, "ATR Length", group=groupCore)
+
+// ADX
+useAdx      = input.bool(true, "Use ADX", group=groupFilt)
+adxLen      = input.int(14, "ADX DI Length", group=groupFilt)
+adxSmooth   = input.int(14, "ADX Smooth", group=groupFilt)
+adxMin      = input.float(20.0, "ADX Min", group=groupFilt)
+
+// MTF trend filter
+useMTF      = input.bool(true, "Use MTF Trend Filter", group=groupFilt)
+mtfTF       = input.timeframe("D", "MTF TF (ex: D)", group=groupFilt)
+mtfEmaLen   = input.int(200, "MTF EMA", group=groupFilt)
+
+// Session filter
+useSession  = input.bool(false, "Use Session Filter", group=groupFilt)
+sessTZ      = input.string("Etc/UTC", "Session TZ", group=groupFilt)
+sessLondon  = input.session("0700-1100", "London", group=groupFilt)
+sessNY      = input.session("1300-1700", "New York", group=groupFilt)
+
+// Compression
+useCompression = input.bool(true, "Use Compression Filter", group=groupFilt)
+compLen        = input.int(20, "Compression Lookback", group=groupFilt)
+compMaxAtrMult = input.float(1.2, "Max Range / ATR", step=0.05, group=groupFilt)
+
+// Momentum candle
+useMomentum    = input.bool(true, "Use Momentum Candle", group=groupFilt)
+momBodyAtrMin  = input.float(0.60, "Momentum body >= x ATR", step=0.05, group=groupFilt)
+
+// Scoring thresholds
+minScoreGo      = input.int(55, "Min Score to GO", minval=10, group=groupCore)
+
+// UI
+showMarks   = input.bool(true, "Show GO tags", group=groupUI)
+tagLifeBars = input.int(80, "Tag lifetime (bars)", minval=10, group=groupUI)
+showTable   = input.bool(true, "Show table", group=groupUI)
+showEMA     = input.bool(true, "Plot EMA", group=groupUI)
+
+//=============================================================================
+// CORE CALCS
+//=============================================================================
+emaTrend = ta.ema(close, emaLen)
+atrVal   = ta.atr(atrLen)
+
+// ADX (Pine v6 safe)
+[diPlus, diMinus, adxVal] = ta.dmi(adxLen, adxSmooth)
+adxOK = (not useAdx) or (adxVal >= adxMin)
+
+// MTF EMA
+mtfEma = request.security(syminfo.tickerid, mtfTF, ta.ema(close, mtfEmaLen), barmerge.gaps_off, barmerge.lookahead_off)
+mtfUp  = close > mtfEma
+mtfDn  = close < mtfEma
+mtfOKLong  = (not useMTF) or mtfUp
+mtfOKShort = (not useMTF) or mtfDn
+
+// Session OK
+inLondon = not na(time(timeframe.period, sessLondon, sessTZ))
+inNY     = not na(time(timeframe.period, sessNY, sessTZ))
+sessionOK = (not useSession) or (inLondon or inNY)
+
+// Trend
+trendLong  = close > emaTrend
+trendShort = close < emaTrend
+
+// Candle anatomy
+rng   = high - low
+body  = math.abs(close - open)
+uw    = high - math.max(open, close)
+lw    = math.min(open, close) - low
+
+bodyPct = rng > 0 ? (body / rng) * 100.0 : 0.0
+
+// Momentum candle
+momBull = close > open and body >= (atrVal * momBodyAtrMin)
+momBear = close < open and body >= (atrVal * momBodyAtrMin)
+momOK   = (not useMomentum) or momBull or momBear
+
+// Compression (range small vs ATR over lookback)
+rangeN = ta.highest(high, compLen) - ta.lowest(low, compLen)
+compression = useCompression ? (rangeN <= atrVal * compMaxAtrMult) : true
+compOK = (not useCompression) or compression
+
+//=============================================================================
+// HYBRID SETUPS (Pullback continuation)
+//=============================================================================
+// Pullback definition (simple + stable)
+pbLong  = trendLong  and close > open and close[1] < open[1]
+pbShort = trendShort and close < open and close[1] > open[1]
+
+// Trigger: pullback + filters
+goLongRaw  = pbLong
+goShortRaw = pbShort
+
+//=============================================================================
+// SCORING
+//=============================================================================
+f_clamp(_v, _lo, _hi) => math.max(_lo, math.min(_hi, _v))
+
+// Components (0..100-ish)
+scoreTrendLong  = trendLong  ? 25 : 0
+scoreTrendShort = trendShort ? 25 : 0
+
+scoreMTFLong  = mtfOKLong  ? 20 : 0
+scoreMTFShort = mtfOKShort ? 20 : 0
+
+scoreADX  = adxOK ? 15 : 0
+scoreSess = sessionOK ? 10 : 0
+scoreComp = compOK ? 10 : 0
+scoreMom  = momOK ? 10 : 0
+
+// Pullback quality (bodyPct)
+scorePB = f_clamp(bodyPct, 0, 100) >= 55 ? 10 : 0
+
+scoreLong  = scoreTrendLong  + scoreMTFLong  + scoreADX + scoreSess + scoreComp + scoreMom + scorePB
+scoreShort = scoreTrendShort + scoreMTFShort + scoreADX + scoreSess + scoreComp + scoreMom + scorePB
+
+goLong  = goLongRaw  and adxOK and sessionOK and compOK and momOK and mtfOKLong  and (scoreLong  >= minScoreGo)
+goShort = goShortRaw and adxOK and sessionOK and compOK and momOK and mtfOKShort and (scoreShort >= minScoreGo)
+
+//=============================================================================
+// VISUALS
+//=============================================================================
+plot(showEMA ? emaTrend : na, "Trend EMA", color=color.blue, linewidth=2)
+
+//=============================================================================
+// MINI TAGS (clean, no big block)
+//=============================================================================
+var label[] tags = array.new_label()
+
+f_grade(_s) =>
+    _s >= 85 ? "A+" :
+     _s >= 70 ? "A" :
+     _s >= 55 ? "B" :
+     _s >= 35 ? "C" : "D"
+
+f_makeTag(_isLong, _score) =>
+    dir = _isLong ? "L" : "S"
+    "GO " + dir + " | " + str.tostring(_score) + " " + f_grade(_score)
+
+f_tagColor(_isLong) =>
+    _isLong ? color.new(color.lime, 70) : color.new(color.red, 70)
+
+// Create labels
+if showMarks and (goLong or goShort)
+    isL = goLong
+    sc  = isL ? scoreLong : scoreShort
+    y   = isL ? low : high
+    st  = isL ? label.style_label_up : label.style_label_down
+
+    lbl = label.new(
+         bar_index, y,
+         f_makeTag(isL, sc),
+         style=st,
+         color=f_tagColor(isL),
+         textcolor=color.white,
+         size=size.tiny
+    )
+    array.push(tags, lbl)
+
+// Delete old labels
+if array.size(tags) > 0
+    for i = array.size(tags)-1 to 0
+        lb = array.get(tags, i)
+        if not na(lb)
+            if (bar_index - label.get_x(lb)) > tagLifeBars
+                label.delete(lb)
+                array.remove(tags, i)
+
+//=============================================================================
+// STATUS TABLE (PRO)
+//=============================================================================
+var table t = table.new(position.top_right, 2, 9, border_width=1)
+
+whyNoGo =
+     not sessionOK ? "Session" :
+     not adxOK ? "ADX" :
+     not compOK ? "Compression" :
+     not momOK ? "Momentum" :
+     (useMTF and not (mtfOKLong or mtfOKShort)) ? "MTF" :
+     "NoTrigger"
+
+signalTxt =
+     goLong ? "GO LONG" :
+     goShort ? "GO SHORT" : "WAIT"
+
+modeTxt =
+     (goLong or goShort) ? "PULLBACK" : "--"
+
+bestScore = math.max(scoreLong, scoreShort)
+
+if showTable and barstate.islast
+    table.cell(t,0,0,"MOSHIACH", text_color=color.white, bgcolor=color.black)
+    table.cell(t,1,0,"GOD MODE V5", text_color=color.white, bgcolor=color.black)
+
+    table.cell(t,0,1,"Signal")
+    table.cell(t,1,1,signalTxt)
+
+    table.cell(t,0,2,"Mode")
+    table.cell(t,1,2,modeTxt)
+
+    table.cell(t,0,3,"Session")
+    table.cell(t,1,3,sessionOK ? "OK" : "OFF")
+
+    table.cell(t,0,4,"ADX")
+    table.cell(t,1,4,adxOK ? "OK" : "OFF")
+
+    table.cell(t,0,5,"MTF")
+    table.cell(t,1,5,(not useMTF) ? "OFF" : (mtfUp ? "UP" : mtfDn ? "DOWN" : "--"))
+
+    table.cell(t,0,6,"Compression")
+    table.cell(t,1,6,compOK ? "OK" : "OFF")
+
+    table.cell(t,0,7,"Score")
+    table.cell(t,1,7,str.tostring(bestScore) + " (" + f_grade(bestScore) + ")")
+
+    table.cell(t,0,8,"WHY NO GO?")
+    table.cell(t,1,8,whyNoGo)

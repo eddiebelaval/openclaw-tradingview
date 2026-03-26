@@ -1,0 +1,380 @@
+// MA Signal Filter v2.0
+// Independent overlay indicator — use alongside "MA 30/45 Expansion & Squeeze Detector"
+// Implements R1-R5 entry/exit filters based on trade journal analysis (Jan-Mar 2026)
+// v2.0: R3 upgraded with same-direction dedup; R4 relaxed to 2.5x
+
+//@version=5
+indicator("MA Signal Filter (R1-R5)", overlay=true, max_labels_count=500)
+
+// ==================== INPUTS ====================
+string GRP_MA   = "MA Settings (match original)"
+ma30_len        = input.int(30, "MA 30 Length", group=GRP_MA)
+ma45_len        = input.int(45, "MA 45 Length", group=GRP_MA)
+ma60_len        = input.int(60, "MA 60 Length", group=GRP_MA)
+
+string GRP_SQ   = "Squeeze/Expansion (match original)"
+min_squeeze_bars    = input.int(3, "Minimum Squeeze Bars", group=GRP_SQ)
+use_dynamic_threshold = input.bool(true, "Use Dynamic Threshold", group=GRP_SQ)
+squeeze_threshold   = input.float(1.5, "Squeeze Threshold (%)", group=GRP_SQ)
+expansion_threshold = input.float(2.0, "Expansion Threshold (%)", group=GRP_SQ)
+
+string GRP_R    = "Filter Rules"
+r1_bars         = input.int(3, "R1: Gap Expansion Bars", minval=2, maxval=5, group=GRP_R, tooltip="MA gap must expand for this many consecutive bars")
+r2_block_early  = input.bool(false, "R2: Block EARLY Signals", group=GRP_R, tooltip="Filter out signals that fire while still in squeeze (default OFF — EARLY signals allowed)")
+r3_cooldown     = input.int(5, "R3: Reverse Signal Cooldown", minval=2, maxval=10, group=GRP_R, tooltip="Bars of cooldown after opposite signal before allowing entry")
+r3_same_dedup   = input.int(5, "R3: Same-Direction Dedup Window", minval=2, maxval=15, group=GRP_R, tooltip="Window to check for signal clustering. Triggers only when 3+ same-dir signals appear (complementary pairs like LONG+L-ALT are OK)")
+r3_cluster_min  = input.int(3, "R3: Min Signals for Cluster", minval=2, maxval=5, group=GRP_R, tooltip="How many same-direction signals in the window = too noisy")
+r4_extension    = input.float(2.5, "R4: Max Overextension (x spread)", minval=1.0, maxval=5.0, step=0.5, group=GRP_R, tooltip="Price distance from MA30 must be < this * (MA30-MA60 spread)")
+r5_gap_contract = input.int(2, "R5: Gap Contraction Bars for Exit", minval=2, maxval=4, group=GRP_R, tooltip="Consecutive bars of gap shrinkage to trigger exit warning")
+
+string GRP_VIS  = "Visual Settings"
+lang            = input.string("中文", "Language / 語言", options=["中文", "English"], group=GRP_VIS)
+show_squeeze_zone = input.bool(true, "Show Squeeze Zone Background", group=GRP_VIS, tooltip="Highlight squeeze zones with background color")
+show_filtered   = input.bool(true, "Show Filtered (blocked) Signals", group=GRP_VIS, tooltip="Show X marks where original signals get blocked")
+show_validated  = input.bool(true, "Show Validated Signals", group=GRP_VIS, tooltip="Show checkmarks where signals pass all filters")
+show_exit       = input.bool(true, "Show Exit Signals (R5)", group=GRP_VIS)
+signal_offset   = input.float(2.5, "Signal Distance (ATR mult)", minval=0.5, maxval=5.0, step=0.5, group=GRP_VIS)
+enable_alert    = input.bool(true, "Enable Alerts", group=GRP_VIS)
+
+// ==================== LANGUAGE STRINGS ====================
+is_zh = lang == "中文"
+
+// Block reasons
+str_r1_block = is_zh ? "MA未擴張" : "MA not fanning"
+str_r2_block = is_zh ? "EARLY信號" : "EARLY signal"
+str_r3a_block = is_zh ? "反向衝突" : "Reverse conflict"
+str_r3b_block = is_zh ? "信號過密" : "Signal cluster"
+str_r4_block = is_zh ? "偏離MA" : "Overextended"
+
+// Validated entry labels
+str_long  = is_zh ? "做多" : "LONG"
+str_short = is_zh ? "做空" : "SHORT"
+
+// Exit labels
+str_exit_long_hard  = is_zh ? "平多:MA交叉"       : "Exit Long: MA cross"
+str_exit_long_soft  = is_zh ? "注意:多方動能減弱"   : "Warn: Long momentum fading"
+str_exit_short_hard = is_zh ? "平空:MA交叉"       : "Exit Short: MA cross"
+str_exit_short_soft = is_zh ? "注意:空方動能減弱"   : "Warn: Short momentum fading"
+
+// Info table
+str_rule       = is_zh ? "規則" : "Rule"
+str_status     = is_zh ? "狀態" : "Status"
+str_expanding  = is_zh ? "擴張中" : "Expanding"
+str_not_yet    = is_zh ? "未擴張" : "Not yet"
+str_active     = is_zh ? "啟用" : "Active"
+str_off        = is_zh ? "關閉" : "Off"
+str_over       = is_zh ? "偏離" : "OVER"
+str_ok         = "OK"
+str_bull       = is_zh ? "多" : "BULL"
+str_bear       = is_zh ? "空" : "BEAR"
+str_none       = is_zh ? "無" : "NONE"
+str_squeeze_y  = is_zh ? "是" : "YES"
+str_squeeze_n  = is_zh ? "否" : "No"
+
+// ==================== REPLICATE ORIGINAL MA CALCULATIONS ====================
+ma30 = ta.sma(close, ma30_len)
+ma45 = ta.sma(close, ma45_len)
+ma60 = ta.sma(close, ma60_len)
+
+// MA gap as % of price
+ma_gap = math.abs(ma30 - ma45)
+ma_gap_pct = (ma_gap / close) * 100
+
+// Alignments
+bullish_alignment = ma30 > ma45 and ma45 > ma60
+bearish_alignment = ma30 < ma45 and ma45 < ma60
+
+// Slopes
+ma30_slope = ma30 - ma30[1]
+ma45_slope = ma45 - ma45[1]
+ma60_slope = ma60 - ma60[1]
+
+ma30_rising  = ma30 > ma30[1]
+ma30_falling = ma30 < ma30[1]
+
+ma30_slope_flattening = math.abs(ma30_slope) < math.abs(ma30_slope[1])
+ma45_slope_flattening = math.abs(ma45_slope) < math.abs(ma45_slope[1])
+slopes_flattening = ma30_slope_flattening and ma45_slope_flattening
+
+ma30_slope_steepening = math.abs(ma30_slope) > math.abs(ma30_slope[1])
+ma45_slope_steepening = math.abs(ma45_slope) > math.abs(ma45_slope[1])
+slopes_steepening = ma30_slope_steepening or ma45_slope_steepening
+
+bullish_slope_align = ma30_slope > 0 and ma45_slope > 0 and ma30_slope > ma45_slope
+bearish_slope_align = ma30_slope < 0 and ma45_slope < 0 and ma30_slope < ma45_slope
+
+ma30_slope_turned_up   = ma30_slope > 0 and ma30_slope[1] <= 0
+ma30_slope_turned_down = ma30_slope < 0 and ma30_slope[1] >= 0
+
+// ==================== REPLICATE SQUEEZE/EXPANSION ====================
+gap_highest = ta.highest(ma_gap_pct, 50)
+gap_lowest  = ta.lowest(ma_gap_pct, 50)
+gap_range   = gap_highest - gap_lowest
+
+dynamic_squeeze_thresh    = gap_lowest + (gap_range * 0.3)
+dynamic_expansion_thresh  = gap_lowest + (gap_range * 0.6)
+
+actual_squeeze_thresh    = use_dynamic_threshold ? dynamic_squeeze_thresh : squeeze_threshold
+actual_expansion_thresh  = use_dynamic_threshold ? dynamic_expansion_thresh : expansion_threshold
+
+is_squeeze = ma_gap_pct <= actual_squeeze_thresh or (ma_gap_pct <= actual_squeeze_thresh * 1.2 and slopes_flattening)
+
+var int squeeze_bar_count = 0
+if is_squeeze
+    squeeze_bar_count := squeeze_bar_count + 1
+else
+    squeeze_bar_count := 0
+
+was_in_squeeze = squeeze_bar_count[1] >= min_squeeze_bars
+
+// ==================== SQUEEZE ZONE BACKGROUND ====================
+bull_squeeze_color = is_squeeze and bullish_alignment ? color.new(#5c9dc4, 88) : na
+bear_squeeze_color = is_squeeze and bearish_alignment ? color.new(#b39ddb, 88) : na
+bgcolor(show_squeeze_zone ? bull_squeeze_color : na, title="Bullish Squeeze Zone")
+bgcolor(show_squeeze_zone ? bear_squeeze_color : na, title="Bearish Squeeze Zone")
+
+// ==================== REPLICATE ORIGINAL SIGNALS ====================
+gap_turning_up   = ma_gap_pct > ma_gap_pct[1] and ma_gap_pct[1] <= ma_gap_pct[2]
+gap_turning_down = ma_gap_pct < ma_gap_pct[1] and ma_gap_pct[1] >= ma_gap_pct[2]
+
+// Bullish signals (same as original)
+bull_expansion_signal = was_in_squeeze and gap_turning_up and bullish_alignment and ma30_rising and (slopes_steepening or bullish_slope_align)
+bull_alt_signal       = squeeze_bar_count[1] >= min_squeeze_bars and not is_squeeze and bullish_alignment and ma30_rising and ma30 > ma30[2] and (ma30_slope_turned_up or bullish_slope_align)
+bull_early_signal     = is_squeeze and gap_turning_up and bullish_alignment and close > ma30
+
+// Bearish signals (same as original)
+bear_expansion_signal = was_in_squeeze and gap_turning_up and bearish_alignment and ma30_falling and (slopes_steepening or bearish_slope_align)
+bear_alt_signal       = squeeze_bar_count[1] >= min_squeeze_bars and not is_squeeze and bearish_alignment and ma30_falling and ma30 < ma30[2] and (ma30_slope_turned_down or bearish_slope_align)
+bear_early_signal     = is_squeeze and gap_turning_up and bearish_alignment and close < ma30
+
+// Combined original signals (before filtering)
+raw_buy  = bull_expansion_signal or bull_alt_signal or bull_early_signal
+raw_sell = bear_expansion_signal or bear_alt_signal or bear_early_signal
+
+// Track signal type for labeling
+is_early_buy  = bull_early_signal and not bull_expansion_signal and not bull_alt_signal
+is_early_sell = bear_early_signal and not bear_expansion_signal and not bear_alt_signal
+
+// ==================== R1: 3-BAR GAP EXPANSION ====================
+// Instead of gap_turning_up (2 bar), require r1_bars consecutive expansion
+// after a contraction trough
+gap_expanding_r1 = true
+for i = 0 to r1_bars - 2
+    if ma_gap_pct[i] <= ma_gap_pct[i + 1]
+        gap_expanding_r1 := false
+
+// R1 pass: gap has been expanding for r1_bars
+r1_pass_bull = gap_expanding_r1 and bullish_alignment
+r1_pass_bear = gap_expanding_r1 and bearish_alignment
+
+// ==================== R2: BLOCK EARLY SIGNALS ====================
+// EARLY signals fire while still in squeeze — too risky
+r2_pass_buy  = r2_block_early ? (not is_early_buy) : true
+r2_pass_sell = r2_block_early ? (not is_early_sell) : true
+
+// ==================== R3: SIGNAL CLUSTER FILTER ====================
+// Two parts:
+// A) Reverse cooldown — no opposite signal within N bars
+// B) Same-direction dedup — after a signal fires, ignore same-direction repeats for N bars
+
+// --- Track bars since last signal of each direction ---
+var int bars_since_raw_sell = 999
+var int bars_since_raw_buy  = 999
+
+if raw_sell
+    bars_since_raw_sell := 0
+else
+    bars_since_raw_sell := bars_since_raw_sell + 1
+
+if raw_buy
+    bars_since_raw_buy := 0
+else
+    bars_since_raw_buy := bars_since_raw_buy + 1
+
+// A) Reverse cooldown: no opposite signal within r3_cooldown bars
+r3a_pass_buy  = bars_since_raw_sell > r3_cooldown
+r3a_pass_sell = bars_since_raw_buy  > r3_cooldown
+
+// B) Same-direction cluster filter: count same-dir signals in recent N bars
+//    Complementary pairs (LONG+L-ALT, SHORT+S-ALT) = normal, allow up to 2
+//    Only filter when 3+ same-dir signals cluster (real noise)
+buy_count_in_window  = 0
+sell_count_in_window = 0
+for i = 1 to r3_same_dedup
+    if raw_buy[i]
+        buy_count_in_window := buy_count_in_window + 1
+    if raw_sell[i]
+        sell_count_in_window := sell_count_in_window + 1
+
+// Only filter when cluster reaches r3_cluster_min (default 3+)
+r3b_pass_buy  = buy_count_in_window < r3_cluster_min - 1
+r3b_pass_sell = sell_count_in_window < r3_cluster_min - 1
+
+// Combined R3: must pass BOTH reverse cooldown AND same-direction dedup
+r3_pass_buy  = r3a_pass_buy  and r3b_pass_buy
+r3_pass_sell = r3a_pass_sell and r3b_pass_sell
+
+// ==================== R4: OVEREXTENSION FILTER ====================
+ma_spread       = math.abs(ma30 - ma60)
+price_dist_ma30 = math.abs(close - ma30)
+
+// Avoid division by zero when spread is tiny
+is_overextended = ma_spread > 0 ? (price_dist_ma30 > ma_spread * r4_extension) : false
+
+r4_pass = not is_overextended
+
+// ==================== COMBINED FILTER RESULTS ====================
+buy_validated  = raw_buy  and r1_pass_bull and r2_pass_buy  and r3_pass_buy  and r4_pass
+sell_validated = raw_sell and r1_pass_bear and r2_pass_sell and r3_pass_sell and r4_pass
+
+buy_filtered  = raw_buy  and not buy_validated
+sell_filtered = raw_sell and not sell_validated
+
+// Track which rules blocked (for label text)
+build_block_reason(r1, r2, r3a, r3b, r4) =>
+    string reason = ""
+    if not r1
+        reason := reason + str_r1_block + " "
+    if not r2
+        reason := reason + str_r2_block + " "
+    if not r3a
+        reason := reason + str_r3a_block + " "
+    if not r3b
+        reason := reason + str_r3b_block + " "
+    if not r4
+        reason := reason + str_r4_block + " "
+    reason
+
+// ==================== POSITION TRACKING ====================
+// Track whether a validated signal has fired, so EXIT only shows after entry
+// 0 = no position, 1 = long (after validated buy), -1 = short (after validated sell)
+var int position_state = 0
+
+if buy_validated
+    position_state := 1
+if sell_validated
+    position_state := -1
+
+// ==================== R5: EXIT SIGNALS ====================
+// Only fire after a validated entry signal (position_state != 0)
+
+r5_cooldown_bars = input.int(10, "R5: Exit Signal Cooldown", minval=5, maxval=20, group=GRP_R, tooltip="Min bars between exit signals to avoid spam")
+r5_gap_drop_pct  = input.float(30.0, "R5: Gap Drop % to Trigger", minval=10.0, maxval=60.0, step=5.0, group=GRP_R, tooltip="Gap must drop this % from its recent peak to trigger soft exit")
+
+// --- Hard exit: MA30 crosses MA45 ---
+bull_exit_cross_raw = ta.crossunder(ma30, ma45)
+bear_exit_cross_raw = ta.crossover(ma30, ma45)
+
+// --- Soft exit: significant gap contraction from a real expansion peak ---
+gap_recent_peak = ta.highest(ma_gap_pct, 15)
+was_in_real_expansion = gap_recent_peak > actual_expansion_thresh
+gap_drop_ratio = gap_recent_peak > 0 ? ((gap_recent_peak - ma_gap_pct) / gap_recent_peak) * 100 : 0.0
+gap_dropped_enough = gap_drop_ratio >= r5_gap_drop_pct
+gap_contracting_now = ma_gap_pct < ma_gap_pct[1] and ma_gap_pct[1] < ma_gap_pct[2]
+
+bull_exit_gap_raw = was_in_real_expansion and gap_dropped_enough and gap_contracting_now and bullish_alignment
+bear_exit_gap_raw = was_in_real_expansion and gap_dropped_enough and gap_contracting_now and bearish_alignment
+
+// --- Gate: only fire EXIT when we have a matching position ---
+bull_exit_cross_gated = bull_exit_cross_raw and position_state == 1
+bear_exit_cross_gated = bear_exit_cross_raw and position_state == -1
+bull_exit_gap_gated   = bull_exit_gap_raw   and position_state == 1
+bear_exit_gap_gated   = bear_exit_gap_raw   and position_state == -1
+
+// --- Cooldown: only fire once per N bars ---
+var int bars_since_exit_long  = 999
+var int bars_since_exit_short = 999
+
+bull_exit_gap_final = bull_exit_gap_gated and bars_since_exit_long > r5_cooldown_bars
+bear_exit_gap_final = bear_exit_gap_gated and bars_since_exit_short > r5_cooldown_bars
+
+if bull_exit_cross_gated or bull_exit_gap_final
+    bars_since_exit_long := 0
+    position_state := 0
+else
+    bars_since_exit_long := bars_since_exit_long + 1
+
+if bear_exit_cross_gated or bear_exit_gap_final
+    bars_since_exit_short := 0
+    position_state := 0
+else
+    bars_since_exit_short := bars_since_exit_short + 1
+
+// Final exit signals
+exit_long_hard  = bull_exit_cross_gated
+exit_long_soft  = bull_exit_gap_final and not bull_exit_cross_gated
+exit_short_hard = bear_exit_cross_gated
+exit_short_soft = bear_exit_gap_final and not bear_exit_cross_gated
+
+// ==================== PLOTTING ====================
+atr_val    = ta.atr(14)
+offset_up  = atr_val * signal_offset
+offset_dn  = atr_val * signal_offset
+
+// --- Validated signals ---
+if show_validated and buy_validated
+    label.new(bar_index, low - offset_dn * 1.5, "  " + str_long, style=label.style_label_up, color=color.new(#00e676, 10), textcolor=color.white, size=size.small, textalign=text.align_center)
+
+if show_validated and sell_validated
+    label.new(bar_index, high + offset_up * 1.5, str_short + "  ", style=label.style_label_down, color=color.new(#ff1744, 10), textcolor=color.white, size=size.small, textalign=text.align_center)
+
+// --- Filtered signals: grey X with reason ---
+if show_filtered and buy_filtered
+    string reason = build_block_reason(r1_pass_bull, r2_pass_buy, r3a_pass_buy, r3b_pass_buy, r4_pass)
+    label.new(bar_index, low - offset_dn * 1.5, "  " + reason, style=label.style_label_up, color=color.new(#9e9e9e, 30), textcolor=color.new(#ffffff, 30), size=size.tiny, textalign=text.align_center)
+
+if show_filtered and sell_filtered
+    string reason = build_block_reason(r1_pass_bear, r2_pass_sell, r3a_pass_sell, r3b_pass_sell, r4_pass)
+    label.new(bar_index, high + offset_up * 1.5, reason + "  ", style=label.style_label_down, color=color.new(#9e9e9e, 30), textcolor=color.new(#ffffff, 30), size=size.tiny, textalign=text.align_center)
+
+// --- R5 Exit signals (only appear after a validated entry) ---
+if show_exit and exit_long_hard
+    label.new(bar_index, high + offset_up * 0.8, str_exit_long_hard, style=label.style_label_down, color=color.new(#ff6d00, 10), textcolor=color.white, size=size.small, textalign=text.align_center)
+
+if show_exit and exit_long_soft
+    label.new(bar_index, high + offset_up * 0.8, str_exit_long_soft, style=label.style_label_down, color=color.new(#ffab40, 30), textcolor=color.white, size=size.tiny, textalign=text.align_center)
+
+if show_exit and exit_short_hard
+    label.new(bar_index, low - offset_dn * 0.8, str_exit_short_hard, style=label.style_label_up, color=color.new(#ff6d00, 10), textcolor=color.white, size=size.small, textalign=text.align_center)
+
+if show_exit and exit_short_soft
+    label.new(bar_index, low - offset_dn * 0.8, str_exit_short_soft, style=label.style_label_up, color=color.new(#ffab40, 30), textcolor=color.white, size=size.tiny, textalign=text.align_center)
+
+// ==================== ALERTS ====================
+if enable_alert and buy_validated
+    alert("FILTERED LONG signal on " + syminfo.tickerid + " — passed R1-R4", alert.freq_once_per_bar_close)
+
+if enable_alert and sell_validated
+    alert("FILTERED SHORT signal on " + syminfo.tickerid + " — passed R1-R4", alert.freq_once_per_bar_close)
+
+if enable_alert and exit_long_hard
+    alert("EXIT LONG (MA cross) on " + syminfo.tickerid, alert.freq_once_per_bar_close)
+
+if enable_alert and exit_short_hard
+    alert("EXIT SHORT (MA cross) on " + syminfo.tickerid, alert.freq_once_per_bar_close)
+
+alertcondition(buy_validated, "Validated LONG", "Filtered LONG signal — all R1-R4 rules passed")
+alertcondition(sell_validated, "Validated SHORT", "Filtered SHORT signal — all R1-R4 rules passed")
+alertcondition(exit_long_hard or exit_long_soft, "Exit Long Warning", "Long position exit signal triggered")
+alertcondition(exit_short_hard or exit_short_soft, "Exit Short Warning", "Short position exit signal triggered")
+
+// ==================== INFO TABLE ====================
+var table info = table.new(position.top_right, 2, 7, bgcolor=color.new(#1e1e1e, 10), border_color=color.new(#424242, 50), border_width=1)
+if barstate.islast
+    table.cell(info, 0, 0, str_rule, text_color=color.gray, text_size=size.tiny)
+    table.cell(info, 1, 0, str_status, text_color=color.gray, text_size=size.tiny)
+    table.cell(info, 0, 1, "R1 Gap " + str.tostring(r1_bars) + "bar", text_color=color.white, text_size=size.tiny)
+    table.cell(info, 1, 1, gap_expanding_r1 ? str_expanding : str_not_yet, text_color=gap_expanding_r1 ? #00e676 : #ff5252, text_size=size.tiny)
+    table.cell(info, 0, 2, "R2 No EARLY", text_color=color.white, text_size=size.tiny)
+    table.cell(info, 1, 2, r2_block_early ? str_active : str_off, text_color=r2_block_early ? #00e676 : #9e9e9e, text_size=size.tiny)
+    table.cell(info, 0, 3, "R3 Cluster", text_color=color.white, text_size=size.tiny)
+    string r3_status = "rev B:" + str.tostring(math.min(bars_since_raw_buy, 99)) + " S:" + str.tostring(math.min(bars_since_raw_sell, 99)) + " dup B:" + str.tostring(buy_count_in_window) + " S:" + str.tostring(sell_count_in_window)
+    table.cell(info, 1, 3, r3_status, text_color=(r3_pass_buy or r3_pass_sell) ? #00e676 : #ff5252, text_size=size.tiny)
+    table.cell(info, 0, 4, "R4", text_color=color.white, text_size=size.tiny)
+    table.cell(info, 1, 4, is_overextended ? str_over : str_ok, text_color=is_overextended ? #ff5252 : #00e676, text_size=size.tiny)
+    table.cell(info, 0, 5, "Alignment", text_color=color.white, text_size=size.tiny)
+    string align = bullish_alignment ? str_bull : bearish_alignment ? str_bear : str_none
+    color align_col = bullish_alignment ? #00e676 : bearish_alignment ? #ff5252 : #9e9e9e
+    table.cell(info, 1, 5, align, text_color=align_col, text_size=size.tiny)
+    table.cell(info, 0, 6, "Squeeze", text_color=color.white, text_size=size.tiny)
+    table.cell(info, 1, 6, is_squeeze ? str_squeeze_y + " (" + str.tostring(squeeze_bar_count) + ")" : str_squeeze_n, text_color=is_squeeze ? #ffab40 : #00e676, text_size=size.tiny)

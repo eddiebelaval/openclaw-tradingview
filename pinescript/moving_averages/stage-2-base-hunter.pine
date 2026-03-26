@@ -1,0 +1,206 @@
+//@version=5
+indicator("Stage 2 Base Hunter", shorttitle="S2BH", overlay=true, max_lines_count=500, max_labels_count=500, max_boxes_count=200)
+
+grp1 = "── Stage Detection ──"
+ma_len         = input.int(30, "Stage MA Length (Weekly 30)", group=grp1, minval=5)
+slope_lookback = input.int(4, "MA Slope Lookback (bars)", group=grp1, minval=1)
+
+grp2 = "── Base Settings ──"
+base_min_bars  = input.int(4, "Min Bars to Form a Base", group=grp2, minval=3)
+base_depth_pct = input.float(25.0, "Max Base Depth %", group=grp2, step=0.5)
+vcp_vol_ratio  = input.float(0.85, "VCP Volume Contraction Ratio", group=grp2, step=0.05)
+base_min_flat  = input.int(3, "Min Flat/Sideways Bars Required", group=grp2, minval=2)
+
+grp3 = "── Entry Trigger (2H Timing) ──"
+entry_ema      = input.int(10, "Entry EMA (2H)", group=grp3)
+entry_vol_mult = input.float(1.5, "Breakout Volume Multiplier (2H)", group=grp3, step=0.1)
+
+grp3b = "── Stop Loss (Weekly ATR) ──"
+w_atr_mult_sl   = input.float(1.5, "SL: Weekly ATR Multiplier", group=grp3b, step=0.1, tooltip="SL placed below entry by this multiple of WEEKLY ATR(14). Range: 1.0-2.0")
+show_trail_info = input.bool(true, "Show Trail Exit Info on Signal", group=grp3b)
+
+grp4 = "── Display ──"
+show_stage_bg  = input.bool(true,  "Show Stage 2 Background", group=grp4)
+show_labels    = input.bool(true,  "Show Annotation Labels",  group=grp4)
+show_entry     = input.bool(true,  "Show Entry Signals",      group=grp4)
+show_weekly_ma = input.bool(true,  "Show Weekly 30MA",        group=grp4)
+show_brklines  = input.bool(true,  "Show Breakout Lines",     group=grp4)
+
+C_GREEN    = color.green
+C_RED      = color.red
+C_WHITE    = color.white
+C_BLACK    = color.black
+C_YELLOW   = color.yellow
+C_ORANGE   = color.orange
+C_SILVER   = color.silver
+C_NAVY     = color.navy
+C_AQUA     = color.aqua
+C_LIME     = color.lime
+C_FUCHSIA  = color.fuchsia
+C_TEAL     = color.teal
+C_CYAN     = #00BCD4
+C_GRAY     = color.gray
+
+COL_STAGE2    = color.new(color.green,   88)
+COL_BASE_BRK  = color.new(color.yellow,  60)
+COL_ENTRY     = color.new(color.lime,     0)
+COL_MA        = color.new(color.fuchsia,  0)
+COL_SL        = color.new(color.red,      0)
+COL_TRAIL     = color.new(color.fuchsia, 30)
+COL_GREEN_10  = color.new(color.green,   10)
+COL_YELLOW_10 = color.new(color.yellow,  10)
+COL_ORANGE_10 = color.new(color.orange,  10)
+COL_NAVY_10   = color.new(color.navy,    10)
+COL_NAVY_20   = color.new(color.navy,    20)
+COL_BLACK_20  = color.new(color.black,   20)
+COL_WHITE_50  = color.new(color.white,   50)
+COL_AQUA_60   = color.new(color.aqua,    60)
+COL_GREEN_60  = color.new(color.green,   60)
+COL_GREEN_80  = color.new(color.green,   80)
+COL_RED_80    = color.new(color.red,     80)
+COL_CYAN_30   = color.new(#00BCD4,       30)
+
+[w_close, w_high, w_low, w_vol] = request.security(syminfo.tickerid, "W", [close, high, low, volume], lookahead=barmerge.lookahead_off)
+w_ma      = request.security(syminfo.tickerid, "W", ta.sma(close, ma_len),                 lookahead=barmerge.lookahead_off)
+w_ma_prev = request.security(syminfo.tickerid, "W", ta.sma(close, ma_len)[slope_lookback], lookahead=barmerge.lookahead_off)
+w_vol_ma  = request.security(syminfo.tickerid, "W", ta.sma(volume, 10),                    lookahead=barmerge.lookahead_off)
+w_atr     = request.security(syminfo.tickerid, "W", ta.atr(14),                            lookahead=barmerge.lookahead_off)
+
+ma_rising    = w_ma > w_ma_prev
+price_above  = w_close > w_ma
+is_stage2    = ma_rising and price_above
+stage2_start = is_stage2 and not is_stage2[1]
+
+plot(show_weekly_ma ? w_ma : na, "Weekly 30MA", color=COL_MA, linewidth=2)
+bgcolor(show_stage_bg and is_stage2 ? COL_STAGE2 : na, title="Stage 2 Background")
+plot(is_stage2 ? w_ma : na, "Trail Exit (30W MA)", color=COL_TRAIL, linewidth=1, style=plot.style_circles)
+
+atr_weekly      = ta.atr(14)
+bar_move        = math.abs(w_close - w_close[1])
+is_flat_bar     = bar_move < (atr_weekly * 0.5)
+flat_bar_count  = math.sum(is_flat_bar ? 1 : 0, base_min_bars)
+enough_flatness = flat_bar_count >= base_min_flat
+
+var int   base_count       = 0
+var int   pullback_count   = 0
+var float last_base_h      = na
+var float last_base_l      = na
+var int   last_base_s      = na
+var float confirmed_base_h = na
+var float confirmed_base_l = na
+var int   confirmed_base_s = na
+var bool  base_active      = false
+
+roll_high_prev  = ta.highest(w_high, base_min_bars)[1]
+roll_low_prev   = ta.lowest(w_low,   base_min_bars)[1]
+range_pct_prev  = (roll_high_prev - roll_low_prev) / roll_high_prev * 100
+vol_contracting = w_vol[1] < (vcp_vol_ratio * w_vol_ma[1])
+
+base_condition    = is_stage2 and range_pct_prev <= base_depth_pct and vol_contracting and enough_flatness
+base_just_started = base_condition and not base_condition[1]
+base_just_ended   = not base_condition and base_condition[1]
+
+if stage2_start
+    base_count       := 0
+    pullback_count   := 0
+    base_active      := false
+    confirmed_base_h := na
+    confirmed_base_s := na
+    confirmed_base_l := na
+
+if base_just_started and is_stage2
+    last_base_h := roll_high_prev
+    last_base_l := roll_low_prev
+    last_base_s := bar_index
+    base_active := true
+
+if base_just_ended and is_stage2[1] and base_active
+    confirmed_base_h := last_base_h
+    confirmed_base_l := last_base_l
+    confirmed_base_s := last_base_s
+    base_active      := false
+
+body_size    = math.abs(w_close - w_close[1])
+is_expansion = body_size > atr_weekly * 0.5
+vol_surge_w  = w_vol > w_vol_ma * 1.0
+
+breakout_from_base = is_stage2 and not na(confirmed_base_h) and w_close > confirmed_base_h and w_close > w_close[1] and is_expansion and vol_surge_w and not (w_close[1] > confirmed_base_h)
+
+var float brkout_level = na
+
+if breakout_from_base
+    brkout_level     := confirmed_base_h
+    base_count       += 1
+    confirmed_base_h := na
+
+if breakout_from_base and show_brklines and not na(brkout_level)
+    line.new(last_base_s, brkout_level, bar_index + 40, brkout_level, color=COL_BASE_BRK, width=2, style=line.style_dashed, extend=extend.none)
+
+prior_swing_hi = ta.highest(w_high, 10)[1]
+is_pullback    = is_stage2 and w_close < prior_swing_hi * 0.95 and w_close > w_ma
+pullback_start = is_pullback and not is_pullback[1]
+
+if pullback_start
+    pullback_count += 1
+
+if stage2_start and show_labels
+    label.new(bar_index, w_low * 0.985, "STAGE 2 BEGIN", color=COL_GREEN_10, textcolor=C_WHITE, style=label.style_label_up, size=size.normal)
+
+if breakout_from_base and show_labels and not na(brkout_level)
+    label.new(bar_index, brkout_level * 1.005, "Base #" + str.tostring(base_count) + "\nBrkout", color=COL_YELLOW_10, textcolor=C_BLACK, style=label.style_label_down, size=size.small)
+
+if pullback_start and show_labels
+    label.new(bar_index, w_high * 1.01, "PB #" + str.tostring(pullback_count), color=COL_ORANGE_10, textcolor=C_WHITE, style=label.style_label_down, size=size.small)
+
+var table dash = table.new(position.top_right, 2, 7, bgcolor=COL_BLACK_20, border_color=C_GRAY, border_width=1, frame_color=COL_WHITE_50, frame_width=1)
+
+if barstate.islast
+    stage_text   = is_stage2 ? "STAGE 2"    : "NOT S2"
+    stage_bg     = is_stage2 ? COL_GREEN_80 : COL_RED_80
+    stage_tc     = is_stage2 ? C_GREEN      : C_RED
+    ma_slope_str = ma_rising  ? "Rising"    : "Flat/Falling"
+    ma_slope_col = ma_rising  ? C_GREEN     : C_RED
+
+    table.cell(dash, 0, 0, "S2 BASE HUNTER", text_color=C_WHITE, bgcolor=COL_NAVY_20, text_size=size.small)
+    table.cell(dash, 1, 0, "v1.1", text_color=C_SILVER, bgcolor=COL_NAVY_20, text_size=size.small)
+    table.cell(dash, 0, 1, "Stage Status", text_color=C_SILVER, text_size=size.small)
+    table.cell(dash, 1, 1, stage_text, text_color=stage_tc, text_size=size.small, bgcolor=stage_bg)
+    table.cell(dash, 0, 2, "Bases (S2)", text_color=C_SILVER, text_size=size.small)
+    table.cell(dash, 1, 2, str.tostring(base_count), text_color=C_YELLOW, text_size=size.small)
+    table.cell(dash, 0, 3, "Pullbacks (S2)", text_color=C_SILVER, text_size=size.small)
+    table.cell(dash, 1, 3, str.tostring(pullback_count), text_color=C_ORANGE, text_size=size.small)
+    table.cell(dash, 0, 4, "30W MA", text_color=C_SILVER, text_size=size.small)
+    table.cell(dash, 1, 4, str.tostring(math.round(w_ma, 2)), text_color=COL_MA, text_size=size.small)
+    table.cell(dash, 0, 5, "MA Slope", text_color=C_SILVER, text_size=size.small)
+    table.cell(dash, 1, 5, ma_slope_str, text_color=ma_slope_col, text_size=size.small)
+    table.cell(dash, 0, 6, "Trail Exit", text_color=C_SILVER, text_size=size.small)
+    table.cell(dash, 1, 6, "Close < 30W MA", text_color=C_FUCHSIA, text_size=size.small)
+
+ema10      = ta.ema(close, entry_ema)
+vol_avg20  = ta.sma(volume, 20)
+near_ema   = math.abs(close - ema10) < w_atr * 0.5
+tight_high = ta.highest(high, 5)[1]
+vol_surge  = volume > (entry_vol_mult * vol_avg20)
+
+entry_signal = is_stage2 and near_ema and close > tight_high and vol_surge
+
+entry_sl = close - (w_atr_mult_sl * w_atr)
+sl_risk  = close - entry_sl
+
+plot(ema10, "EMA 10 (Entry Timing)", color=COL_CYAN_30, linewidth=1)
+
+plotshape(show_entry and entry_signal, title="Precise Entry", style=shape.triangleup, location=location.belowbar, color=COL_ENTRY, size=size.normal, text="ENTRY")
+
+if show_entry and entry_signal
+    line.new(bar_index, entry_sl, bar_index + 20, entry_sl, color=COL_SL, width=2, style=line.style_dashed)
+    line.new(bar_index, w_ma, bar_index + 20, w_ma, color=COL_TRAIL, width=1, style=line.style_dotted)
+    lbl_text = "ENTRY: " + str.tostring(math.round(close, 2)) + "\nSL (Wkly ATR x" + str.tostring(w_atr_mult_sl) + "): " + str.tostring(math.round(entry_sl, 2)) + "\nRisk/Share: " + str.tostring(math.round(sl_risk, 2)) + "\nTrail Exit: Close < 30W MA (" + str.tostring(math.round(w_ma, 2)) + ")"
+    label.new(bar_index + 1, close, lbl_text, color=COL_NAVY_10, textcolor=C_WHITE, style=label.style_label_left, size=size.small)
+
+barcolor(is_stage2 and vol_contracting ? COL_AQUA_60 : is_stage2 ? COL_GREEN_60 : na, title="Stage 2 Bar Color")
+
+alertcondition(stage2_start,       "Stage 2 Begin",        "Stage 2 started!")
+alertcondition(breakout_from_base, "Base Breakout",        "Base breakout detected!")
+alertcondition(entry_signal,       "Precise Entry Signal", "2H precise entry signal fired!")
+alertcondition(pullback_start,     "Stage 2 Pullback",     "Pullback detected in Stage 2!")
+alertcondition(is_stage2 and w_close < w_ma, "Trail Exit Triggered", "Weekly close below 30W MA - consider exiting!")

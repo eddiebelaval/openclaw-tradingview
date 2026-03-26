@@ -1,0 +1,221 @@
+//@version=6
+indicator("Scalp Options Call/Put Signals v3", overlay=true, max_labels_count=500)
+
+// =========================
+// Inputs
+// =========================
+fastEmaLen        = input.int(8,  "Fast EMA",   minval=1)
+slowEmaLen        = input.int(21, "Slow EMA",   minval=1)
+trendEmaLen       = input.int(50, "Trend EMA",  minval=1)
+rsiLen            = input.int(14, "RSI Length", minval=1)
+
+rsiBullLevel      = input.int(55, "Bull RSI Threshold", minval=1, maxval=100)
+rsiBearLevel      = input.int(45, "Bear RSI Threshold", minval=1, maxval=100)
+
+volLen            = input.int(20,  "Volume Avg Length", minval=1)
+volMultiplier     = input.float(1.2, "Volume Multiplier", minval=0.1, step=0.1)
+// NOTE: Raised default vol multiplier from 1.0 → 1.2 to reduce low-conviction signals
+
+atrLen            = input.int(14,  "ATR Length",                    minval=1)
+stopATRMult       = input.float(1.0, "Suggested Stop ATR Multiplier",   minval=0.1, step=0.1)
+targetATRMult     = input.float(1.5, "Suggested Target ATR Multiplier", minval=0.1, step=0.1)
+// NOTE: Raised stop multiplier default from 0.8 → 1.0 — 0.8 ATR is too tight for options premium/spread
+
+useSessionFilter  = input.bool(true, "Use Session Filter")
+sessionInput      = input.session("0930-1600", "Session (exchange time)")
+// NOTE: Defaults to full regular session — users can narrow to 0930-1130 for open-only scalping
+
+useHTF            = input.bool(true,  "Use Higher Timeframe Filter")
+htfTf             = input.timeframe("15", "Higher Timeframe")
+htfEmaLen         = input.int(21, "HTF EMA Length", minval=1)
+
+useConfirmedBars  = input.bool(true, "Signals Only On Confirmed Bar Close")
+
+useCooldown       = input.bool(true, "Use Cooldown")
+cooldownBars      = input.int(4, "Cooldown Bars", minval=1)
+// NOTE: Set to 4 bars for 5m chart usage (= ~20 min between signals) — enough spacing to prevent
+//       overtrading while keeping up with actionable moves during the session
+
+lookbackBreakout  = input.int(5, "Breakout Lookback Bars", minval=2)
+pullbackLookback  = input.int(3, "Pullback Lookback Bars",  minval=1)
+
+allowContinuation = input.bool(false, "Allow Continuation Entries")
+// NOTE: Disabled continuation by default — it was firing on nearly every trending bar (too noisy)
+allowPullbacks    = input.bool(true,  "Allow Pullback Entries")
+allowBreakouts    = input.bool(true,  "Allow Breakout Entries")
+
+// =========================
+// Core Calculations
+// =========================
+fastEma   = ta.ema(close, fastEmaLen)
+slowEma   = ta.ema(close, slowEmaLen)
+trendEma  = ta.ema(close, trendEmaLen)
+vwapVal   = ta.vwap(close)
+rsiVal    = ta.rsi(close, rsiLen)
+volAvg    = ta.sma(volume, volLen)
+atrVal    = ta.atr(atrLen)
+
+inSession = not na(time(timeframe.period, sessionInput))
+sessionOK = useSessionFilter ? inSession : true
+volOK     = volume >= volAvg * volMultiplier
+
+htfClose = request.security(syminfo.tickerid, htfTf, close)
+htfEma   = request.security(syminfo.tickerid, htfTf, ta.ema(close, htfEmaLen))
+htfBull  = htfClose > htfEma
+htfBear  = htfClose < htfEma
+
+htfLongOK  = useHTF ? htfBull : true
+htfShortOK = useHTF ? htfBear : true
+
+barConfirmed = useConfirmedBars ? barstate.isconfirmed : true
+
+// =========================
+// Trend State
+// =========================
+bullTrend = fastEma > slowEma and close > trendEma and close > vwapVal
+bearTrend = fastEma < slowEma and close < trendEma and close < vwapVal
+
+bullMomentum = rsiVal >= rsiBullLevel
+bearMomentum = rsiVal <= rsiBearLevel
+
+longContext  = sessionOK and volOK and htfLongOK  and bullTrend and bullMomentum and barConfirmed
+shortContext = sessionOK and volOK and htfShortOK and bearTrend and bearMomentum and barConfirmed
+
+// =========================
+// Entry Models
+// =========================
+
+// 1) Fresh crossover entry
+// FIX: Require BOTH fast/slow EMA cross AND VWAP cross to confirm — not OR.
+//      Previously, a VWAP cross alone (no EMA alignment) would trigger a "fresh" signal.
+//      On a choppy open this fired constantly.
+freshLong  = ta.crossover(fastEma, slowEma)  and close > vwapVal
+freshShort = ta.crossunder(fastEma, slowEma) and close < vwapVal
+
+// 2) Breakout continuation entry
+highestPrev = ta.highest(high[1], lookbackBreakout)
+lowestPrev  = ta.lowest(low[1],   lookbackBreakout)
+
+breakoutLong  = close > highestPrev and close > open
+breakoutShort = close < lowestPrev  and close < open
+
+// 3) Pullback-and-go entry
+// FIX: Added var bool flags to properly track pullback state across bars.
+//      Previously, pulledBackLong/Short checked the current bar's low/high against EMA/VWAP
+//      and immediately checked reclaim on the SAME bar — making it a single-bar condition
+//      that missed actual multi-bar pullbacks.
+var bool pullbackLongPending  = false
+var bool pullbackShortPending = false
+
+// Set flag when price pulls into EMA/VWAP zone during a bull/bear trend
+if allowPullbacks and bullTrend and (low <= fastEma or low <= slowEma or low <= vwapVal)
+    pullbackLongPending := true
+
+if allowPullbacks and bearTrend and (high >= fastEma or high >= slowEma or high >= vwapVal)
+    pullbackShortPending := true
+
+// Reset flags if trend breaks while waiting for reclaim
+if not bullTrend
+    pullbackLongPending := false
+if not bearTrend
+    pullbackShortPending := false
+
+// Reclaim condition — price recovered back above EMA and VWAP with a bull close
+reclaimLong  = close > fastEma and close > vwapVal and close > open
+reclaimShort = close < fastEma and close < vwapVal and close < open
+
+pullbackLong  = pullbackLongPending  and reclaimLong
+pullbackShort = pullbackShortPending and reclaimShort
+
+// Clear pending flag once signal fires
+if pullbackLong
+    pullbackLongPending := false
+if pullbackShort
+    pullbackShortPending := false
+
+// 4) Trend continuation
+// FIX: Added volOK requirement to continuation entries specifically — previously this fired
+//      on almost every bar in a trend with no volume confirmation (most noise of any entry type).
+continuationLong  = allowContinuation and bullTrend and close > high[1] and close > fastEma and volOK
+continuationShort = allowContinuation and bearTrend and close < low[1]  and close < fastEma and volOK
+
+rawCallSignal =
+     longContext and (
+     freshLong or
+     (allowBreakouts   and breakoutLong)  or
+     pullbackLong or
+     continuationLong)
+
+rawPutSignal =
+     shortContext and (
+     freshShort or
+     (allowBreakouts   and breakoutShort) or
+     pullbackShort or
+     continuationShort)
+
+// =========================
+// Cooldown Logic
+// =========================
+var int lastCallBar = na
+var int lastPutBar  = na
+
+callCooldownOK = not useCooldown or na(lastCallBar) or (bar_index - lastCallBar > cooldownBars)
+putCooldownOK  = not useCooldown or na(lastPutBar)  or (bar_index - lastPutBar  > cooldownBars)
+
+// FIX: Added mutual exclusion — if both call and put conditions trigger on the same bar
+//      (possible in choppy/transitioning markets), suppress both rather than showing a
+//      conflicting signal. A real edge shouldn't be ambiguous.
+callSignal = rawCallSignal and callCooldownOK and not rawPutSignal
+putSignal  = rawPutSignal  and putCooldownOK  and not rawCallSignal
+
+if callSignal
+    lastCallBar := bar_index
+
+if putSignal
+    lastPutBar := bar_index
+
+// =========================
+// Risk Guide
+// =========================
+callEntry  = close
+callStop   = close - atrVal * stopATRMult
+callTarget = close + atrVal * targetATRMult
+
+putEntry   = close
+putStop    = close + atrVal * stopATRMult
+putTarget  = close - atrVal * targetATRMult
+
+// =========================
+// Plots
+// =========================
+plot(fastEma,  "Fast EMA",  color=color.orange, linewidth=2)
+plot(slowEma,  "Slow EMA",  color=color.blue,   linewidth=2)
+plot(trendEma, "Trend EMA", color=color.gray,   linewidth=2)
+plot(vwapVal,  "VWAP",      color=color.purple,  linewidth=2)
+
+// FIX: Removed duplicate plotshape calls — labels already contain entry/stop/target info.
+//      Both plotshape + label.new were rendering on the same bar, stacking on top of each other.
+
+if callSignal
+    label.new(bar_index, low,
+      "CALL\nEntry: "  + str.tostring(callEntry,  format.mintick) +
+      "\nStop: "       + str.tostring(callStop,   format.mintick) +
+      "\nTarget: "     + str.tostring(callTarget, format.mintick),
+      style=label.style_label_up, color=color.lime, textcolor=color.black, size=size.small)
+
+if putSignal
+    label.new(bar_index, high,
+      "PUT\nEntry: "   + str.tostring(putEntry,  format.mintick) +
+      "\nStop: "       + str.tostring(putStop,   format.mintick) +
+      "\nTarget: "     + str.tostring(putTarget, format.mintick),
+      style=label.style_label_down, color=color.red, textcolor=color.white, size=size.small)
+
+// FIX: Merged dual bgcolor calls into one — two separate calls were blending/overlapping
+//      during trend transitions instead of cleanly switching colors.
+bgcolor(bullTrend ? color.new(color.green, 92) : bearTrend ? color.new(color.red, 92) : na)
+
+// =========================
+// Alerts
+// =========================
+alertcondition(callSignal, title="Scalp Call Signal", message="BUY CALL signal on {{ticker}} @ {{close}}")
+alertcondition(putSignal,  title="Scalp Put Signal",  message="BUY PUT signal on {{ticker}} @ {{close}}")

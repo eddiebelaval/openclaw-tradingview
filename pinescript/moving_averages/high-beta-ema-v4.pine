@@ -1,0 +1,143 @@
+//@version=5
+// 1.10 EMA Strategy 1:10pm Mar1
+// Params:
+// - TRIM trigger: close > EMA9 * (1 + 9%)
+// - REDEPLOY trigger: close <= EMA20 * (1 + 2.5%)
+// - REDEPLOY qualifiers: bull stack + above EMA50 + RS filter + risk_on gate
+// Emits webhooks via alert() JSON payloads.
+// Create alert: Condition = "Any alert() function call", Trigger = "Once per bar close".
+// NOTE: Execution sizing (trim size 2% shares, redeploy sizing, unlimited cap) is enforced by your Alpaca agent.
+
+indicator("Lean EMA Trim/Redeploy Signals (Daily) — V2.1", overlay=true, max_labels_count=500)
+
+// ─────────────────────────────
+// Inputs
+// ─────────────────────────────
+groupCore = "Core"
+emaFastLen   = input.int(9,   "EMA Fast", minval=1, group=groupCore)
+emaMidLen    = input.int(20,  "EMA Mid",  minval=1, group=groupCore)
+emaSlowLen   = input.int(50,  "EMA Slow", minval=1, group=groupCore)
+emaStructLen = input.int(200, "EMA 200",  minval=1, group=groupCore)
+
+trimPct     = input.float(0.09,  "TRIM trigger % (above EMA9)", step=0.005, group=groupCore)
+redeployPct = input.float(0.025, "REDEPLOY trigger % (above EMA20)", step=0.005, group=groupCore)
+
+requireBullStack = input.bool(true, "REDEPLOY requires bull stack (EMA9>EMA20>EMA50)", group=groupCore)
+requireAbove50   = input.bool(true, "REDEPLOY requires price > EMA50", group=groupCore)
+
+groupRegime = "Regime Gate"
+benchSymbol = input.symbol("QQQ", "Benchmark for risk gate", group=groupRegime)
+riskOffBelowBench200 = input.bool(true, "Risk-off when benchmark close < benchmark EMA200", group=groupRegime)
+
+groupRS = "Relative Strength Filter"
+useRS      = input.bool(true, "Use RS filter", group=groupRS)
+rsBench    = input.symbol("SPY", "RS benchmark", group=groupRS)
+rsLookback = input.int(126, "RS lookback (days)", minval=20, group=groupRS)
+rsPct      = input.float(50.0, "RS percentile threshold (50=median)", minval=5, maxval=95, step=5, group=groupRS)
+
+groupDebounce = "Debounce"
+debounceDaily = input.bool(true, "Debounce: max 1 TRIM + 1 REDEPLOY per day", group=groupDebounce)
+
+groupAlerts = "Webhook"
+token = input.string("REPLACE_ME", "Webhook token (shared secret)", group=groupAlerts)
+
+// ─────────────────────────────
+// DAILY DATA (forced)
+// ─────────────────────────────
+sym = syminfo.tickerid
+d_close = request.security(sym, "D", close, barmerge.gaps_off, barmerge.lookahead_off)
+d_high  = request.security(sym, "D", high,  barmerge.gaps_off, barmerge.lookahead_off)
+d_time  = request.security(sym, "D", time,  barmerge.gaps_off, barmerge.lookahead_off)
+
+ema9   = ta.ema(d_close, emaFastLen)
+ema20  = ta.ema(d_close, emaMidLen)
+ema50  = ta.ema(d_close, emaSlowLen)
+ema200 = ta.ema(d_close, emaStructLen)
+
+bullStack = ema9 > ema20 and ema20 > ema50
+
+// ─────────────────────────────
+// Regime Gate (Benchmark DAILY 200 EMA)
+// ─────────────────────────────
+benchCloseD  = request.security(benchSymbol, "D", close, barmerge.gaps_off, barmerge.lookahead_off)
+benchEma200D = request.security(benchSymbol, "D", ta.ema(close, emaStructLen), barmerge.gaps_off, barmerge.lookahead_off)
+
+risk_on = riskOffBelowBench200 ? (benchCloseD >= benchEma200D) : true
+
+// Optional regime transition events (useful for notifications/logging)
+riskWeakening  = riskOffBelowBench200 ? ta.crossunder(benchCloseD, benchEma200D) : false
+riskRecovering = riskOffBelowBench200 ? ta.crossover(benchCloseD, benchEma200D)  : false
+
+// ─────────────────────────────
+// Relative Strength Filter (daily ratio percentile)
+// ─────────────────────────────
+rsBenchCloseD = request.security(rsBench, "D", close, barmerge.gaps_off, barmerge.lookahead_off)
+rs = d_close / rsBenchCloseD
+rsThresh = ta.percentile_linear_interpolation(rs, rsLookback, rsPct)
+rsPass = useRS ? (rs >= rsThresh) : true
+
+// ─────────────────────────────
+// Signals (daily)
+// ─────────────────────────────
+trimSignal = d_close > ema9 * (1 + trimPct)
+
+// REDEPLOY: must pass qualifiers AND risk_on
+redeploySignal = (d_close <= ema20 * (1 + redeployPct)) and (not requireBullStack or bullStack) and (not requireAbove50 or d_close > ema50) and rsPass and risk_on
+
+// ─────────────────────────────
+// Debounce (daily)
+// Use daily bar time as the day-key so it behaves even if chart is intraday.
+// ─────────────────────────────
+var int lastTrimKey = na
+var int lastRedeployKey = na
+todayKey = int(d_time)
+
+trimFire = trimSignal and (not debounceDaily or na(lastTrimKey) or lastTrimKey != todayKey)
+redeployFire = redeploySignal and (not debounceDaily or na(lastRedeployKey) or lastRedeployKey != todayKey)
+
+if trimFire
+    lastTrimKey := todayKey
+if redeployFire
+    lastRedeployKey := todayKey
+
+// ─────────────────────────────
+// Visuals
+// ─────────────────────────────
+plot(ema9,   "EMA 9 (D)",   linewidth=1)
+plot(ema20,  "EMA 20 (D)",  linewidth=1)
+plot(ema50,  "EMA 50 (D)",  linewidth=1)
+plot(ema200, "EMA 200 (D)", linewidth=1)
+
+plotchar(trimFire,     "TRIM",     "T", location=location.abovebar, size=size.tiny)
+plotchar(redeployFire, "REDEPLOY", "R", location=location.belowbar, size=size.tiny)
+
+var label regimeLbl = na
+if barstate.islast
+    label.delete(regimeLbl)
+    regimeLbl := label.new(bar_index, d_high, risk_on ? "RISK ON" : "RISK OFF", style=label.style_label_down)
+
+// ─────────────────────────────
+// Webhook JSON payloads
+// ─────────────────────────────
+event_id_base = syminfo.ticker + "_" + str.tostring(d_time)
+px = d_close
+
+trimPayload = '{"token":"' + token + '","event_id":"' + event_id_base + '_TRIM","event":"TRIM_SIGNAL","ticker":"' + syminfo.ticker + '","risk_on":' + (risk_on ? "true" : "false") + ',"price":' + str.tostring(px) + '}'
+redeployPayload = '{"token":"' + token + '","event_id":"' + event_id_base + '_REDEP","event":"REDEPLOY_SIGNAL","ticker":"' + syminfo.ticker + '","risk_on":' + (risk_on ? "true" : "false") + ',"price":' + str.tostring(px) + '}'
+
+// Regime transition payloads (for agent notifications / logs)
+riskWeakPayload = '{"token":"' + token + '","event_id":"' + event_id_base + '_RISK_WEAK","event":"RISK_WEAKENING","ticker":"' + syminfo.ticker + '","risk_on":false,"price":' + str.tostring(px) + '}'
+riskRecPayload  = '{"token":"' + token + '","event_id":"' + event_id_base + '_RISK_REC","event":"RISK_RECOVERING","ticker":"' + syminfo.ticker + '","risk_on":true,"price":' + str.tostring(px) + '}'
+
+// Fire alerts
+if trimFire
+    alert(trimPayload, alert.freq_once_per_bar_close)
+
+if redeployFire
+    alert(redeployPayload, alert.freq_once_per_bar_close)
+
+if riskWeakening
+    alert(riskWeakPayload, alert.freq_once_per_bar_close)
+
+if riskRecovering
+    alert(riskRecPayload, alert.freq_once_per_bar_close)

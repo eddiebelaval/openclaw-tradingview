@@ -1,0 +1,253 @@
+//@version=6
+indicator("[CLH] Simple Sweep Reversal", overlay = true)
+
+// ── Inputs ─────────────────────────────────────
+fastLength     = input.int(20,   "Fast MA Length", minval=1)
+slowLength     = input.int(200,  "Slow MA Length", minval=1)
+showMAs        = input.bool(true, "Show moving averages?")
+maType         = "SMA"
+fastColor      = input.color(color.green, "Fast MA Color")
+slowColor      = input.color(color.red,   "Slow MA Color")
+maOffset       = input.float(0.0, "Min separation between fast & slow MA (points)", minval=0.0, step=0.5)
+minWickPct     = input.float(20.0, "Min Wick % of Candle Range (0 = disabled)", minval=0.0, maxval=100.0, step=5.0)
+
+// Daily Extreme Filter
+lookbackDaysBeyondPrior = input.int(7, "Lookback days to consider", minval=0, group="Daily Extreme Filter")
+maxDistanceToLookbackExtreme = input.float(100.0, "Max lookback distance (points)", minval=0.0, step=5.0)
+
+// Weekly Extreme Filter ────────────────────────────────
+lookbackWeeks      = input.int(2,   "Lookback weeks for weekly extremes", minval=1, group="Weekly Extreme Filter")
+weeklyDistance     = input.float(100.0, "Max distance to weekly high/low (points)", minval=0.0, step=10.0, group="Weekly Extreme Filter")
+
+// 4H panel inputs ────────────────────────────────
+show4HPanel     = input.bool(true, "Show 4H candles?", group="4H Candles")
+bodyColorBull4H = input.color(color.new(color.green, 0), "4H Bull Body Color")
+bodyColorBear4H = input.color(color.new(color.red, 0),   "4H Bear Body Color")
+wickColor4H     = input.color(color.black, "4H Wick Color")
+
+// Moving Averages ────────────────────────────────
+float fastMA = switch maType
+    "EMA" => ta.ema(close, fastLength)
+    "WMA" => ta.wma(close, fastLength)
+    => ta.sma(close, fastLength)
+
+float slowMA = switch maType
+    "EMA" => ta.ema(close, slowLength)
+    "WMA" => ta.wma(close, slowLength)
+    => ta.sma(close, slowLength)
+
+bool tfSupported = timeframe.isminutes and timeframe.multiplier == 60
+
+// Plot MAs conditionally
+plot(tfSupported and showMAs ? fastMA : na, "Fast MA", color = fastColor, linewidth = 1)
+plot(tfSupported and showMAs ? slowMA : na, "Slow MA", color = slowColor, linewidth = 1)
+
+// ── Prior day high/low (yesterday's closed day)
+float pdHigh = request.security(syminfo.tickerid, "D", high[1])
+float pdLow  = request.security(syminfo.tickerid, "D", low[1])
+
+// Fetch the lookback series of daily lows and highs
+series float dailyLowSeries = request.security(syminfo.tickerid, timeframe.period, low)
+series float dailyHighSeries = request.security(syminfo.tickerid, timeframe.period, high)
+int barsPerDay = math.round(timeframe.in_seconds("D") / timeframe.in_seconds())
+float minLookbackLow = ta.lowest(dailyLowSeries, barsPerDay * lookbackDaysBeyondPrior)
+float maxLookbackHigh = ta.highest(dailyHighSeries, barsPerDay * lookbackDaysBeyondPrior)
+
+// Weekly High/Low over last X completed weeks ────────────────────────────────
+int barsPerWeek = math.round(timeframe.in_seconds("W") / timeframe.in_seconds())
+float lowestWeeklyLow = ta.lowest(dailyLowSeries, barsPerWeek * lookbackDaysBeyondPrior)
+float highestWeeklyHigh = ta.highest(dailyHighSeries, barsPerWeek * lookbackDaysBeyondPrior)
+
+//float minLookbackLow = request.security(syminfo.tickerid, "D", ta.lowest(low, lookbackDaysBeyondPrior + 1)[1])
+//float maxLookbackHigh = request.security(syminfo.tickerid, "D", ta.highest(high, lookbackDaysBeyondPrior + 1)[1])
+
+//float highestWeeklyHigh = request.security(syminfo.tickerid, "W", ta.highest(high, lookbackWeeks)[1])
+//float lowestWeeklyLow   = request.security(syminfo.tickerid, "W", ta.lowest(low, lookbackWeeks)[1])
+
+// Overnight High/Low tracking (18:00 – 04:59)
+var float ovnHigh = na
+var float ovnLow  = na
+
+int openHour = hour(time)
+bool newDay  = ta.change(time("D")) != 0
+
+if newDay
+    ovnHigh := na
+    ovnLow  := na
+
+bool inOvernight = openHour >= 18 or openHour <= 4
+if inOvernight
+    ovnHigh := nz(math.max(ovnHigh, high), high)
+    ovnLow  := nz(math.min(ovnLow, low), low)
+
+// Time window: bars opening 01:00 – 10:59 (closes up to 11:00)
+bool inWindow = openHour >= 1 and openHour <= 9
+
+// Candle range & wick calculations
+float candleRange = high - low
+float upperWick = high - math.max(open, close)
+bool largeUpperWick = upperWick >= candleRange * (minWickPct / 100.0)
+float lowerWick = math.min(open, close) - low
+bool largeLowerWick = lowerWick >= candleRange * (minWickPct / 100.0)
+
+// ── Swing high conditions (prior day OR overnight OR overnight zone)
+bool swingHigh = high > high[1]
+bool abovePdHigh = high > pdHigh
+bool aboveOvnHigh = high >= ovnHigh
+bool inOvnHighZone = high > ovnHigh and high < pdHigh
+
+// Lookback filter for short: ignore if close to max lookback high
+bool tooCloseToLookbackHigh = (maxLookbackHigh - high) <= maxDistanceToLookbackExtreme
+bool ignoreShortDueToLookback = abovePdHigh and tooCloseToLookbackHigh and high < maxLookbackHigh
+bool tooCloseToWeeklyHigh = high < highestWeeklyHigh and (highestWeeklyHigh - high) <= weeklyDistance
+bool ignoreShortDueToWeekly = tooCloseToWeeklyHigh
+
+//bool shortSignalRaw = swingHigh and (abovePdHigh or aboveOvnHigh or inOvnHighZone) and largeUpperWick and (fastMA > slowMA + maOffset) and high > fastMA and not ignoreShortDueToLookback
+bool shortSignalRaw = swingHigh and (abovePdHigh or aboveOvnHigh or inOvnHighZone) 
+                   and largeUpperWick 
+                   and (fastMA > slowMA + maOffset) 
+                   and high > fastMA 
+                   and not ignoreShortDueToLookback
+                   and not ignoreShortDueToWeekly
+
+// ── Swing low conditions (prior day OR overnight OR overnight zone)
+bool swingLow = low < low[1]
+bool belowPdLow = low < pdLow
+bool belowOvnLow = low <= ovnLow
+bool inOvnLowZone = low <= ovnLow and low > pdLow
+
+// New lookback filter for long: ignore if close to min lookback low
+bool tooCloseToLookbackLow = (low - minLookbackLow) <= maxDistanceToLookbackExtreme
+bool ignoreLongDueToLookback = belowPdLow and tooCloseToLookbackLow and low > minLookbackLow
+bool tooCloseToWeeklyLow  = low > lowestWeeklyLow and (low - lowestWeeklyLow) <= weeklyDistance
+bool ignoreLongDueToWeekly  = tooCloseToWeeklyLow
+
+//bool longSignalRaw = swingLow and (belowPdLow or belowOvnLow or inOvnLowZone) 
+//                   and largeLowerWick 
+//                   and (fastMA < slowMA - maOffset) 
+//                   and low < fastMA 
+//                   and not ignoreLongDueToLookback
+
+bool longSignalRaw = swingLow and (belowPdLow or belowOvnLow or inOvnLowZone) 
+                  and largeLowerWick 
+                  and (fastMA < slowMA - maOffset) 
+                  and low < fastMA 
+                  and not ignoreLongDueToLookback
+                  and not ignoreLongDueToWeekly
+
+// ── Prevent both signals on same candle
+bool onlyLong  = longSignalRaw  and not shortSignalRaw
+bool onlyShort = shortSignalRaw and not longSignalRaw
+
+// ── Only on closed bars
+bool confirmed = barstate.isconfirmed
+
+// ── Plot signals
+plotshape(tfSupported and confirmed and onlyLong and inWindow, "Long", shape.triangleup, location.belowbar, color.new(color.green, 0), size = size.tiny)
+plotshape(tfSupported and confirmed and onlyShort and inWindow, "Short", shape.triangledown, location.abovebar, color.new(color.red, 0), size = size.tiny)
+
+// ── Weekly Levels Visualization ────────────────────────────────
+//plot(showWeeklyLevels ? highestWeeklyHigh : na, "Weekly High", 
+//     color=color.new(color.red, 40), linewidth=2, style=plot.style_linebr)
+
+//plot(showWeeklyLevels ? lowestWeeklyLow : na, "Weekly Low", 
+//     color=color.new(color.green, 40), linewidth=2, style=plot.style_linebr)
+
+// ── 4H candlestick panel in lower-right (white space to the right) ────────────────────────────────
+
+var box[] bodyBoxes = array.new_box()
+var line[] wickLines = array.new_line()
+var label myLabel = na
+
+if barstate.islast and tfSupported and show4HPanel
+    // Clear previous drawings
+    for b in bodyBoxes
+        box.delete(b)
+    for l in wickLines
+        line.delete(l)
+    
+    array.clear(bodyBoxes)
+    array.clear(wickLines)
+
+    // Fetch current (live) 4H candle + last 2 closed
+    // [0] = current/live (updates in real-time)
+    // [1] = last closed
+    // [2] = one before
+    [h4_open0, h4_high0, h4_low0, h4_close0] = request.security(syminfo.tickerid, "240", [open, high, low, close])
+    [h4_open1, h4_high1, h4_low1, h4_close1] = request.security(syminfo.tickerid, "240", [open[1], high[1], low[1], close[1]])
+    [h4_open2, h4_high2, h4_low2, h4_close2] = request.security(syminfo.tickerid, "240", [open[2], high[2], low[2], close[2]])
+
+    // Positioning: start ~8 bars into the future for white space
+    int rightOffset     = 16
+    int candleWidthBars = 4
+    
+    var label lbl4H = label.new(na, na, "", style=label.style_label_center, color=color.new(color.gray, 0), textcolor=color.white, size=size.small)
+
+    float centerPrice = (ta.highest(high, 50) + ta.lowest(low, 50)) / 2
+
+    // Draw oldest (leftmost) - closed
+    if not na(h4_open2)
+        isBull2 = h4_close2 >= h4_open2
+        bodyColor2 = isBull2 ? bodyColorBull4H : bodyColorBear4H
+        x_wick2 = bar_index + rightOffset
+        x_body_left2 = x_wick2 - candleWidthBars / 2
+        x_body_right2 = x_wick2 + candleWidthBars / 2
+        line l2 = line.new(x_wick2, h4_high2, x_wick2, h4_low2, color=wickColor4H, width=1)
+        box b2 = box.new(x_body_left2, math.max(h4_open2, h4_close2), x_body_right2, math.min(h4_open2, h4_close2),
+                         bgcolor=bodyColor2, border_color=bodyColor2, border_width=1)
+        array.push(wickLines, l2)
+        array.push(bodyBoxes, b2)
+
+    // Middle - closed
+    if not na(h4_open1)
+        isBull1 = h4_close1 >= h4_open1
+        bodyColor1 = isBull1 ? bodyColorBull4H : bodyColorBear4H
+        x_wick1 = bar_index + rightOffset + candleWidthBars + 1
+        x_body_left1 = x_wick1 - candleWidthBars / 2
+        x_body_right1 = x_wick1 + candleWidthBars / 2
+        line l1 = line.new(x_wick1, h4_high1, x_wick1, h4_low1, color=wickColor4H, width=1)
+        box b1 = box.new(x_body_left1, math.max(h4_open1, h4_close1), x_body_right1, math.min(h4_open1, h4_close1),
+                         bgcolor=bodyColor1, border_color=bodyColor1, border_width=1)
+        array.push(wickLines, l1)
+        array.push(bodyBoxes, b1)
+
+    // Most recent (live/real-time) 4H candle - updates as bar progresses
+    if not na(h4_open0)
+        isBull0 = h4_close0 >= h4_open0
+        bodyColor0 = isBull0 ? bodyColorBull4H : bodyColorBear4H
+        x_wick0 = (bar_index + rightOffset + 2 * candleWidthBars) + 2
+        x_body_left0 = x_wick0 - candleWidthBars / 2
+        x_body_right0 = x_wick0 + candleWidthBars / 2
+        line l0 = line.new(x_wick0, h4_high0, x_wick0, h4_low0, color=wickColor4H, width=1)
+        box b0 = box.new(x_body_left0, math.max(h4_open0, h4_close0), x_body_right0, math.min(h4_open0, h4_close0),
+                         bgcolor=bodyColor0, border_color=bodyColor0, border_width=1)
+        array.push(wickLines, l0)
+        array.push(bodyBoxes, b0)
+
+    // "4 Hour" label centered below the three candles
+    label.delete(myLabel)
+    
+    float lowest4H = math.min(
+        nz(h4_low2,  math.max(h4_low1, h4_low0)),
+        nz(h4_low1,  math.max(h4_low2, h4_low0)),
+        nz(h4_low0,  math.max(h4_low2, h4_low1))
+    )
+
+    float bufferBelow = lowest4H * 0.995
+
+    int labelX = bar_index + rightOffset + candleWidthBars + 1  // center under middle candle
+    float labelY = bufferBelow
+
+    myLabel := label.new(
+        x = labelX,
+        y = labelY,
+        text = "4 Hour Chart",
+        style = label.style_label_center,
+        color = color.white,
+        textcolor = color.black,
+        size = size.small
+    )
+
+// ── Alerts
+alertcondition(onlyLong and inWindow, title = "Long Swing Entry", message = "LONG – Swing low below PD low or OVN low or in OVN zone + MA bullish (1–11 AM)")
+alertcondition(onlyShort and inWindow, title = "Short Swing Entry", message = "SHORT – Swing high above PD high or OVN high or in OVN zone + MA bearish (1–11 AM)")

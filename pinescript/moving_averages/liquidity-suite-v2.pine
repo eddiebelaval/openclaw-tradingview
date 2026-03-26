@@ -1,0 +1,649 @@
+//@version=6
+// ============================================================
+// Liquidity Suite v2
+// Description: Unified day-trading indicator combining:
+//   • Hull Suite (Hma / Ehma / Thma) — InSilico port to v6
+//   • RSI — TradingView built-in formula with gradient fills
+//   • Supertrend — TradingView built-in, fetched on 15m MTF
+//   • Liquidity Levels — custom sequence logic + Sonarlab
+//     mitigation / extension system
+//   • Micro-Structure — 1-minute candle-color swing detector
+//
+// Designed for 1-minute intraday charts.
+// lookahead_off on all MTF requests — no repainting.
+// ============================================================
+
+indicator("Liquidity Suite v2", overlay=true,
+     max_bars_back=500, max_boxes_count=50,
+     max_labels_count=300, max_lines_count=100)
+
+// ╔══════════════════════════════════════════════════════════╗
+// ║  INPUTS                                                  ║
+// ╚══════════════════════════════════════════════════════════╝
+
+// ── Hull Suite ───────────────────────────────────────────────
+hullVariant    = input.string("Hma",   title="Variant",
+                 options=["Hma","Ehma","Thma"],          group="Hull Suite", inline="hv",
+                 tooltip="Hma = classic Hull | Ehma = EMA-based | Thma = Triple-WMA")
+hullLen        = input.int(55,         title="Length",                        group="Hull Suite", inline="hv")
+hullLenMult    = input.float(1.0,      title="Length Multiplier",             group="Hull Suite",
+                 tooltip="Multiply length to simulate higher timeframes", step=0.1)
+hullSrc        = input.source(close,   title="Source",                        group="Hull Suite")
+useHullHTF     = input.bool(false,     title="Use HTF Hull?",     inline="hhtf", group="Hull Suite")
+hullHTF        = input.timeframe("240",title="Hull HTF",          inline="hhtf", group="Hull Suite")
+showHullBand   = input.bool(true,      title="Show Band",                     group="Hull Suite")
+hullThickness  = input.int(2,          title="Line Thickness",                group="Hull Suite", minval=1)
+hullBandTransp = input.int(80,         title="Band Transparency", minval=0, maxval=100, group="Hull Suite")
+colorCandles   = input.bool(false,     title="Color Candles",                 group="Hull Suite")
+hullUpCol      = input.color(color.new(#00ff00, 80), title="Bull Color", inline="hc", group="Hull Suite")
+hullDnCol      = input.color(color.new(#ff0000, 80), title="Bear Color", inline="hc", group="Hull Suite")
+
+// ── RSI ──────────────────────────────────────────────────────
+rsiLen         = input.int(14,         title="Length",                        group="RSI Settings", inline="rl", minval=1)
+rsiSrc         = input.source(close,   title="Source",                        group="RSI Settings", inline="rl")
+rsiOB          = input.int(70,         title="Overbought",                    group="RSI Settings", inline="rlvl")
+rsiOS          = input.int(30,         title="Oversold",                      group="RSI Settings", inline="rlvl")
+
+// ── Supertrend 15m ───────────────────────────────────────────
+stFactor       = input.float(3.0,      title="Factor",    step=0.01,          group="Supertrend (15m)", inline="st")
+stAtrLen       = input.int(10,         title="ATR Length",                    group="Supertrend (15m)", inline="st")
+stTF           = input.timeframe("15", title="Timeframe",                     group="Supertrend (15m)",
+                 tooltip="Timeframe for trend filter — default 15m. The indicator must be on a ≤ this TF chart.")
+
+// ── Liquidity Levels — Logic Toggles ────────────────────────
+enableBull     = input.bool(true,  title="Bullish Logic",   inline="tog", group="Liquidity Levels")
+enableBear     = input.bool(true,  title="Bearish Logic",   inline="tog", group="Liquidity Levels")
+showCandZones  = input.bool(true,  title="Show Candidate Zones",           group="Liquidity Levels",
+                 tooltip="Display unvalidated (dashed) candidate zones")
+
+// ── Liquidity Levels — Mitigation (Sonarlab system) ─────────
+removeMitigated = input.bool(true,   title="Remove on Mitigation", inline="mit",  group="Mitigation Settings")
+mitiOption      = input.string("Show","",
+                 options=["Remove","Show"],               inline="mit",           group="Mitigation Settings",
+                 tooltip="Show: zone freezes in place when mitigated\nRemove: zone is deleted from chart")
+mitiCandleType  = input.string("Close","Candle Type",
+                 options=["Close","Wick"],                                        group="Mitigation Settings",
+                 tooltip="Close: needs a candle CLOSE to mitigate | Wick: high/low is enough")
+
+// ── Liquidity Levels — Display ───────────────────────────────
+displayStyle    = input.string("Boxes","Style",
+                 options=["Lines","Boxes"],                                       group="Display Settings")
+extOption       = input.string("Current","Extension",
+                 options=["Short","Current","Max"],                               group="Display Settings",
+                 tooltip="Short: fixed width | Current: extends to bar | Max: extends to chart edge")
+displayLimit    = input.int(5,   title="Display Limit (pairs)",                   group="Display Settings", minval=1)
+zoneExtBars     = input.int(20,  title="Short Extension (bars)",                  group="Display Settings",
+                 tooltip="Width of zones when Extension = Short")
+lineWidth       = input.int(1,   title="Line/Border Width",                       group="Display Settings", minval=1)
+
+// ── Colors — Candidate Zones ─────────────────────────────────
+bullCandLineCol = input.color(color.new(#1f4ef5, 0),   title="Bull Cand Line", inline="cc1", group="Zone Colors")
+bearCandLineCol = input.color(color.new(#fd441c, 0),   title="Bear Cand Line", inline="cc1", group="Zone Colors")
+bullCandBgCol   = input.color(color.new(#1f4ef5, 82),  title="Bull Cand Bg  ", inline="cc2", group="Zone Colors")
+bearCandBgCol   = input.color(color.new(#fd441c, 82),  title="Bear Cand Bg  ", inline="cc2", group="Zone Colors")
+// ── Colors — Validated Zones ─────────────────────────────────
+bullValLineCol  = input.color(color.new(#4c9650, 0),   title="Bull Val Line",  inline="cv1", group="Zone Colors")
+bearValLineCol  = input.color(color.new(#fd1c49, 0),   title="Bear Val Line",  inline="cv1", group="Zone Colors")
+bullValBgCol    = input.color(color.new(#4c9650, 80),  title="Bull Val Bg  ",  inline="cv2", group="Zone Colors")
+bearValBgCol    = input.color(color.new(#fd1c49, 80),  title="Bear Val Bg  ",  inline="cv2", group="Zone Colors")
+
+// ── Micro-Structure ──────────────────────────────────────────
+enableMS        = input.bool(true,  title="Enable Micro-Structure",          group="Micro-Structure")
+msHighCol       = input.color(color.new(#9c27b0, 0),  title="MSH Color", inline="msc", group="Micro-Structure")
+msLowCol        = input.color(color.new(#00bcd4, 0),  title="MSL Color", inline="msc", group="Micro-Structure")
+
+// ── Alert Toggles ────────────────────────────────────────────
+a_bullCand  = input.bool(true,  title="Bull Candidate",    inline="a1", group="Alerts")
+a_bearCand  = input.bool(true,  title="Bear Candidate",    inline="a1", group="Alerts")
+a_bullVal   = input.bool(true,  title="Bull Validated",    inline="a2", group="Alerts")
+a_bearVal   = input.bool(true,  title="Bear Validated",    inline="a2", group="Alerts")
+a_msHigh    = input.bool(true,  title="MS High",           inline="a3", group="Alerts")
+a_msLow     = input.bool(true,  title="MS Low",            inline="a3", group="Alerts")
+a_touch     = input.bool(true,  title="Level Touch",       inline="a4", group="Alerts")
+a_break     = input.bool(true,  title="Level Break",       inline="a4", group="Alerts")
+a_stBull    = input.bool(true,  title="ST → Bullish",      inline="a5", group="Alerts")
+a_stBear    = input.bool(true,  title="ST → Bearish",      inline="a5", group="Alerts")
+
+// ╔══════════════════════════════════════════════════════════╗
+// ║  HULL SUITE (InSilico — v6 port)                        ║
+// ╚══════════════════════════════════════════════════════════╝
+
+// Three Hull variants ─────────────────────────────────────────
+// HMA  = WMA( 2*WMA(n/2) − WMA(n) , √n )
+_HMA(_s, _n) =>
+    ta.wma(2.0 * ta.wma(_s, math.round(_n / 2)) - ta.wma(_s, _n), math.round(math.sqrt(_n)))
+
+// EHMA = EMA( 2*EMA(n/2) − EMA(n) , √n )
+_EHMA(_s, _n) =>
+    ta.ema(2.0 * ta.ema(_s, math.round(_n / 2)) - ta.ema(_s, _n), math.round(math.sqrt(_n)))
+
+// THMA = WMA( 3*WMA(n/3) − WMA(n/2) − WMA(n) , n )
+_THMA(_s, _n) =>
+    ta.wma(3.0 * ta.wma(_s, math.round(_n / 3)) - ta.wma(_s, math.round(_n / 2)) - ta.wma(_s, _n), _n)
+
+// Selector ────────────────────────────────────────────────────
+_hullMode(_v, _s, _n) =>
+    _v == "Hma"  ? _HMA(_s, _n) :
+     _v == "Ehma" ? _EHMA(_s, _n) :
+     _THMA(_s, math.round(_n / 2))
+
+// Effective length (with multiplier) and raw calculation
+_effLen   = math.round(hullLen * hullLenMult)
+_hullRaw  = _hullMode(hullVariant, hullSrc, _effLen)
+
+// Optional higher-timeframe fetch (lookahead_off = no repainting)
+hullVal   = useHullHTF
+     ? request.security(syminfo.tickerid, hullHTF, _hullRaw, lookahead=barmerge.lookahead_off)
+     : _hullRaw
+
+// MHULL = current bar | SHULL = 2 bars ago (matches InSilico band logic)
+MHULL     = hullVal
+SHULL     = hullVal[2]
+
+hullColor    = hullVal > hullVal[2] ? hullUpCol : hullDnCol
+hullTurnRed  = hullVal < hullVal[2] and hullVal[1] >= hullVal[3]  // Just crossed below SHULL
+hullTurnGrn  = hullVal > hullVal[2] and hullVal[1] <= hullVal[3]  // Just crossed above SHULL
+
+// ╔══════════════════════════════════════════════════════════╗
+// ║  RSI (TradingView built-in formula, v6)                 ║
+// ╚══════════════════════════════════════════════════════════╝
+
+_rsiChange = ta.change(rsiSrc)
+_rsiUp     = ta.rma(math.max(_rsiChange, 0), rsiLen)
+_rsiDown   = ta.rma(-math.min(_rsiChange, 0), rsiLen)
+rsi        = _rsiDown == 0 ? 100 : _rsiUp == 0 ? 0 : 100 - (100 / (1 + _rsiUp / _rsiDown))
+
+// ╔══════════════════════════════════════════════════════════╗
+// ║  SUPERTREND 15m MTF (TradingView built-in, v6)          ║
+// ╚══════════════════════════════════════════════════════════╝
+
+[_stVal, _stDir] = request.security(syminfo.tickerid, stTF,
+     ta.supertrend(stFactor, stAtrLen), lookahead=barmerge.lookahead_off)
+
+// direction < 0 → price above ST → bullish
+stBull15   = _stDir < 0
+stBear15   = _stDir > 0
+stVal15    = barstate.isfirst ? na : _stVal  // Suppress first-bar artifact
+
+stFlipBull = stBull15 and not stBull15[1]   // 15m ST just turned bullish
+stFlipBear = stBear15 and not stBear15[1]   // 15m ST just turned bearish
+
+// ╔══════════════════════════════════════════════════════════╗
+// ║  HELPER FUNCTIONS — Sonarlab mitigation / extension     ║
+// ╚══════════════════════════════════════════════════════════╝
+
+// Trim array to display limit (removes oldest entry first)
+_trimLines(_arr) =>
+    if array.size(_arr) > displayLimit
+        line.delete(array.shift(_arr))
+
+_trimBoxes(_arr) =>
+    if array.size(_arr) > displayLimit
+        box.delete(array.shift(_arr))
+
+// Extend all entries in a line array to current bar + zoneExtBars
+_extendLines(_arr) =>
+    if array.size(_arr) > 0
+        for i = array.size(_arr) - 1 to 0
+            l = array.get(_arr, i)
+            line.set_x2(l, bar_index + zoneExtBars)
+
+_extendBoxes(_arr) =>
+    if array.size(_arr) > 0
+        for i = array.size(_arr) - 1 to 0
+            b = array.get(_arr, i)
+            box.set_right(b, bar_index + zoneExtBars)
+
+// Check for mitigated lines; optionally replace with faded ghost lines.
+// Returns true if any mitigation fired this bar.
+_checkMitigatedLines(_arr, _isHigh, _activeLineCol, _fadedLineCol) =>
+    _hit = false
+    if array.size(_arr) > 0 and removeMitigated
+        for i = array.size(_arr) - 1 to 0
+            l = array.get(_arr, i)
+            _px   = line.get_y1(l)
+            _miti = _isHigh
+                 ? (mitiCandleType == "Close" ? close[1] > _px : high > _px)
+                 : (mitiCandleType == "Close" ? close[1] < _px : low  < _px)
+            if _miti
+                array.remove(_arr, i)
+                if mitiOption == "Show"
+                    // Ghost line — faded, fixed width
+                    line.new(line.get_x1(l), _px, bar_index + zoneExtBars, _px,
+                         color=_fadedLineCol, width=lineWidth)
+                line.delete(l)
+                _hit := true
+    _trimLines(_arr)
+    _hit
+
+// Same logic for box arrays
+_checkMitigatedBoxes(_arr, _isHigh, _activeBgCol, _activeBorderCol,
+     _fadedBgCol, _fadedBorderCol, _bStyle) =>
+    _hit = false
+    if array.size(_arr) > 0 and removeMitigated
+        for i = array.size(_arr) - 1 to 0
+            b = array.get(_arr, i)
+            _top  = box.get_top(b)
+            _bot  = box.get_bottom(b)
+            _miti = _isHigh
+                 ? (mitiCandleType == "Close" ? close[1] > _top : high > _top)
+                 : (mitiCandleType == "Close" ? close[1] < _bot : low  < _bot)
+            if _miti
+                array.remove(_arr, i)
+                if mitiOption == "Show"
+                    box.new(box.get_left(b), _top, bar_index + zoneExtBars, _bot,
+                         bgcolor=_fadedBgCol, border_color=_fadedBorderCol,
+                         border_style=_bStyle, border_width=lineWidth)
+                box.delete(b)
+                _hit := true
+    _trimBoxes(_arr)
+    _hit
+
+// ╔══════════════════════════════════════════════════════════╗
+// ║  ZONE ARRAYS (Sonarlab pattern)                         ║
+// ╚══════════════════════════════════════════════════════════╝
+
+// Candidate lines
+var candHighLines = array.new_line()
+var candLowLines  = array.new_line()
+// Candidate boxes
+var candHighBoxes = array.new_box()
+var candLowBoxes  = array.new_box()
+// Validated lines
+var valHighLines  = array.new_line()
+var valLowLines   = array.new_line()
+// Validated boxes
+var valHighBoxes  = array.new_box()
+var valLowBoxes   = array.new_box()
+
+// ╔══════════════════════════════════════════════════════════╗
+// ║  SEQUENCE STATE MACHINES                                ║
+// ╚══════════════════════════════════════════════════════════╝
+
+// ── Bullish sequence ─────────────────────────────────────────
+var bool  bSeq       = false   // 15m ST is bullish and we are in an active sequence
+var bool  bRsiDone   = false   // RSI exceeded OB at least once
+var float bHighPx    = na      // Highest high tracked during the push
+var bool  bCandOn    = false   // A candidate zone is currently active
+var float bZoneTop   = na      // Candidate top   = the push high
+var float bZoneBot   = na      // Candidate bottom = close when Hull turned red
+var int   bZoneBar   = na      // Bar index of candidate creation
+var bool  bValidated = false   // Candidate graduated to validated level
+var bool  bRetest    = false   // Price has touched the candidate zone
+
+if enableBull
+    // Sync sequence start/stop with 15m ST
+    if stFlipBull
+        bSeq     := true
+        bRsiDone := false
+        bHighPx  := na
+
+    if stFlipBear
+        bSeq    := false
+        bCandOn := false   // No new candidates; validated zones persist
+
+    if bSeq
+        // Step 1 — RSI overbought trigger
+        if rsi >= rsiOB
+            bRsiDone := true
+
+        // Step 2 — Track highest high while armed
+        if bRsiDone
+            bHighPx := na(bHighPx) ? high : math.max(bHighPx, high)
+
+        // Step 3 — Hull turns red → create candidate resistance zone
+        if bRsiDone and not na(bHighPx) and hullTurnRed
+            bZoneTop   := bHighPx
+            bZoneBot   := close
+            bZoneBar   := bar_index
+            bCandOn    := true
+            bValidated := false
+            bRetest    := false
+            bRsiDone   := false
+            bHighPx    := na
+
+    // Step 4 — First retest → validate
+    if bCandOn and not bValidated
+        if high >= bZoneBot and close <= bZoneTop   // Price entered zone from below
+            bRetest := true
+        // Validated: touched zone + Hull back in downtrend + no close above zone top
+        if bRetest and (hullVal < hullVal[2]) and close < bZoneTop
+            bValidated := true
+            bCandOn    := false
+
+// Detect the single bar when bull validation fires (for zone drawing + alerts)
+newBullVal = bValidated and not bValidated[1]
+// Detect the single bar when a bull candidate is created
+newBullCand = bCandOn and bar_index == bZoneBar
+
+// ── Bearish sequence ─────────────────────────────────────────
+var bool  brSeq       = false
+var bool  brRsiDone   = false
+var float brLowPx     = na
+var bool  brCandOn    = false
+var float brZoneTop   = na
+var float brZoneBot   = na
+var int   brZoneBar   = na
+var bool  brValidated = false
+var bool  brRetest    = false
+
+if enableBear
+    if stFlipBear
+        brSeq    := true
+        brRsiDone := false
+        brLowPx  := na
+
+    if stFlipBull
+        brSeq    := false
+        brCandOn := false
+
+    if brSeq
+        if rsi <= rsiOS
+            brRsiDone := true
+
+        if brRsiDone
+            brLowPx := na(brLowPx) ? low : math.min(brLowPx, low)
+
+        if brRsiDone and not na(brLowPx) and hullTurnGrn
+            brZoneBot  := brLowPx
+            brZoneTop  := close
+            brZoneBar  := bar_index
+            brCandOn   := true
+            brValidated := false
+            brRetest   := false
+            brRsiDone  := false
+            brLowPx    := na
+
+    if brCandOn and not brValidated
+        if low <= brZoneTop and close >= brZoneBot
+            brRetest := true
+        if brRetest and (hullVal > hullVal[2]) and close > brZoneBot
+            brValidated := true
+            brCandOn    := false
+
+newBearVal  = brValidated and not brValidated[1]
+newBearCand = brCandOn and bar_index == brZoneBar
+
+// ╔══════════════════════════════════════════════════════════╗
+// ║  ZONE DRAWING — Sonarlab lines/boxes system             ║
+// ╚══════════════════════════════════════════════════════════╝
+
+// Extension right edge for "Short" mode
+_rightEdge = bar_index + zoneExtBars
+// extend enum for Max mode
+_extMode   = extOption == "Max" ? extend.right : extend.none
+
+// ── Draw candidate zones ─────────────────────────────────────
+if showCandZones and newBullCand
+    if displayStyle == "Lines"
+        array.push(candHighLines,
+             line.new(bZoneBar, bZoneTop, _rightEdge, bZoneTop,
+                  color=bullCandLineCol, style=line.style_dashed, width=lineWidth,
+                  extend=_extMode))
+        array.push(candLowLines,
+             line.new(bZoneBar, bZoneBot, _rightEdge, bZoneBot,
+                  color=bullCandLineCol, style=line.style_dashed, width=lineWidth,
+                  extend=_extMode))
+    else
+        array.push(candHighBoxes,
+             box.new(bZoneBar, bZoneTop, _rightEdge, bZoneBot,
+                  bgcolor=bullCandBgCol, border_color=bullCandLineCol,
+                  border_style=line.style_dashed, border_width=lineWidth,
+                  extend=_extMode))
+
+if showCandZones and newBearCand
+    if displayStyle == "Lines"
+        array.push(candHighLines,
+             line.new(brZoneBar, brZoneTop, _rightEdge, brZoneTop,
+                  color=bearCandLineCol, style=line.style_dashed, width=lineWidth,
+                  extend=_extMode))
+        array.push(candLowLines,
+             line.new(brZoneBar, brZoneBot, _rightEdge, brZoneBot,
+                  color=bearCandLineCol, style=line.style_dashed, width=lineWidth,
+                  extend=_extMode))
+    else
+        array.push(candLowBoxes,
+             box.new(brZoneBar, brZoneTop, _rightEdge, brZoneBot,
+                  bgcolor=bearCandBgCol, border_color=bearCandLineCol,
+                  border_style=line.style_dashed, border_width=lineWidth,
+                  extend=_extMode))
+
+// ── Draw validated zones ─────────────────────────────────────
+if newBullVal
+    if displayStyle == "Lines"
+        array.push(valHighLines,
+             line.new(bZoneBar, bZoneTop, _rightEdge, bZoneTop,
+                  color=bullValLineCol, width=lineWidth + 1, extend=_extMode))
+        array.push(valLowLines,
+             line.new(bZoneBar, bZoneBot, _rightEdge, bZoneBot,
+                  color=bullValLineCol, width=lineWidth + 1, extend=_extMode))
+    else
+        array.push(valHighBoxes,
+             box.new(bZoneBar, bZoneTop, _rightEdge, bZoneBot,
+                  bgcolor=bullValBgCol, border_color=bullValLineCol,
+                  border_width=lineWidth + 1, extend=_extMode))
+    label.new(bar_index, bZoneTop, "✅ Bull Liq",
+         color=color.new(bullValLineCol, 60), textcolor=color.white,
+         style=label.style_label_down, size=size.small)
+
+if newBearVal
+    if displayStyle == "Lines"
+        array.push(valHighLines,
+             line.new(brZoneBar, brZoneTop, _rightEdge, brZoneTop,
+                  color=bearValLineCol, width=lineWidth + 1, extend=_extMode))
+        array.push(valLowLines,
+             line.new(brZoneBar, brZoneBot, _rightEdge, brZoneBot,
+                  color=bearValLineCol, width=lineWidth + 1, extend=_extMode))
+    else
+        array.push(valLowBoxes,
+             box.new(brZoneBar, brZoneTop, _rightEdge, brZoneBot,
+                  bgcolor=bearValBgCol, border_color=bearValLineCol,
+                  border_width=lineWidth + 1, extend=_extMode))
+    label.new(bar_index, brZoneBot, "✅ Bear Liq",
+         color=color.new(bearValLineCol, 60), textcolor=color.white,
+         style=label.style_label_up, size=size.small)
+
+// ── Mitigation checks (run every bar) ────────────────────────
+// Candidate zones — use candle type check vs zone boundary
+_candHighLineMiti = _checkMitigatedLines(candHighLines, true,
+     bullCandLineCol, color.new(bullCandLineCol, 70))
+_candLowLineMiti  = _checkMitigatedLines(candLowLines,  false,
+     bearCandLineCol, color.new(bearCandLineCol, 70))
+_candHighBoxMiti  = _checkMitigatedBoxes(candHighBoxes, true,
+     bullCandBgCol, bullCandLineCol,
+     color.new(bullCandBgCol, 92), color.new(bullCandLineCol, 80),
+     line.style_dashed)
+_candLowBoxMiti   = _checkMitigatedBoxes(candLowBoxes,  false,
+     bearCandBgCol, bearCandLineCol,
+     color.new(bearCandBgCol, 92), color.new(bearCandLineCol, 80),
+     line.style_dashed)
+
+// Validated zones
+_valHighLineMiti  = _checkMitigatedLines(valHighLines, true,
+     bullValLineCol, color.new(bullValLineCol, 70))
+_valLowLineMiti   = _checkMitigatedLines(valLowLines,  false,
+     bearValLineCol, color.new(bearValLineCol, 70))
+_valHighBoxMiti   = _checkMitigatedBoxes(valHighBoxes, true,
+     bullValBgCol, bullValLineCol,
+     color.new(bullValBgCol, 92), color.new(bullValLineCol, 80),
+     line.style_solid)
+_valLowBoxMiti    = _checkMitigatedBoxes(valLowBoxes,  false,
+     bearValBgCol, bearValLineCol,
+     color.new(bearValBgCol, 92), color.new(bearValLineCol, 80),
+     line.style_solid)
+
+// ── Extend to current bar when "Current" mode is selected ────
+if extOption == "Current"
+    _extendLines(candHighLines)
+    _extendLines(candLowLines)
+    _extendBoxes(candHighBoxes)
+    _extendBoxes(candLowBoxes)
+    _extendLines(valHighLines)
+    _extendLines(valLowLines)
+    _extendBoxes(valHighBoxes)
+    _extendBoxes(valLowBoxes)
+
+// ╔══════════════════════════════════════════════════════════╗
+// ║  TOUCH / BREAK CONDITIONS                               ║
+// ╚══════════════════════════════════════════════════════════╝
+
+// Touch: price enters validated zone intrabar
+bullTouchLvl = bValidated  and not na(bZoneBot)  and high >= bZoneBot  and close < bZoneTop
+bearTouchLvl = brValidated and not na(brZoneTop) and low  <= brZoneTop and close > brZoneBot
+
+// Break: price CLOSES through the validated zone boundary
+bullBreakLvl = bValidated  and not na(bZoneTop)  and close > bZoneTop
+bearBreakLvl = brValidated and not na(brZoneBot) and close < brZoneBot
+
+// ╔══════════════════════════════════════════════════════════╗
+// ║  MICRO-STRUCTURE (1-Minute candle-color detector)       ║
+// ╚══════════════════════════════════════════════════════════╝
+
+isGreen = close >= open
+isRed   = close < open
+
+var int   gCount  = 0    // Consecutive green candle count
+var int   rCount  = 0    // Consecutive red candle count
+var bool  hadTwoG = false
+var bool  hadTwoR = false
+var float msHPx   = na   // High of the preceding green run
+var float msLPx   = na   // Low  of the preceding red run
+
+if isGreen
+    gCount := gCount + 1
+    rCount := 0
+else if isRed
+    rCount := rCount + 1
+    gCount := 0
+
+if gCount >= 2
+    hadTwoG := true
+    hadTwoR := false
+    msHPx   := na(msHPx) ? high : math.max(msHPx, high)
+
+if rCount >= 2
+    hadTwoR := true
+    hadTwoG := false
+    msLPx   := na(msLPx) ? low : math.min(msLPx, low)
+
+// Confirmed on the exact 2nd bar of the confirming opposing run
+msHighFormed = enableMS and hadTwoG[1] and rCount == 2
+msLowFormed  = enableMS and hadTwoR[1] and gCount == 2
+
+if msHighFormed
+    label.new(bar_index[1], nz(msHPx, high[1]),
+         "MSH", color=color.new(msHighCol, 55), textcolor=color.white,
+         style=label.style_label_down, size=size.small)
+    msHPx := na
+
+if msLowFormed
+    label.new(bar_index[1], nz(msLPx, low[1]),
+         "MSL", color=color.new(msLowCol, 55), textcolor=color.white,
+         style=label.style_label_up, size=size.small)
+    msLPx := na
+
+// ╔══════════════════════════════════════════════════════════╗
+// ║  PLOTS                                                  ║
+// ╚══════════════════════════════════════════════════════════╝
+
+// Hull Suite band (MHULL / SHULL, same as InSilico)
+hullMPlot = plot(MHULL, title="Hull MHULL", color=hullColor, linewidth=hullThickness)
+hullSPlot = plot(showHullBand ? SHULL : na, title="Hull SHULL", color=hullColor, linewidth=hullThickness)
+fill(hullMPlot, hullSPlot, title="Hull Band Fill",
+     color=color.new(hullColor, hullBandTransp))
+
+// Candle coloring (optional)
+barcolor(colorCandles ? hullColor : na, title="Hull Candle Color")
+
+// ── Replace the two ST plot() lines and their plotshapes with this block ──
+
+// Supertrend 15m — TV built-in visual style (line + background fill)
+_stFirst     = barstate.isfirst ? na : stVal15
+_bodyMiddle  = barstate.isfirst ? na : (open + close) / 2
+
+stUpPlot   = plot(_stFirst, title="ST Up Trend (15m)",     color = stBull15 ? color.new(#2196f3, 0) : na,     style = plot.style_linebr, linewidth=1, display=display.none)
+
+stDnPlot   = plot(_stFirst, title="ST Down Trend (15m)",     color = stBear15 ? color.new(#ff5252, 0) : na,     style = plot.style_linebr, linewidth=1, display=display.none)
+
+stBodyPlot = plot(_bodyMiddle, title="ST Body Middle",     display=display.none, editable=false)//, display=display.none)
+
+fill(stBodyPlot, stUpPlot,
+     title="ST Uptrend Background",
+     color=color.new(color.green, 90), fillgaps=false)
+
+fill(stBodyPlot, stDnPlot,
+     title="ST Downtrend Background",
+     color=color.new(color.red, 90), fillgaps=false)
+
+// Flip markers (keep these as-is)
+plotshape(stFlipBull, title="ST Flip → Bull",
+     style=shape.labelup, location=location.belowbar,
+     color=color.new(#2196f3, 0), text="ST↑", textcolor=color.white, size=size.tiny)
+plotshape(stFlipBear, title="ST Flip → Bear",
+     style=shape.labeldown, location=location.abovebar,
+     color=color.new(#ff5252, 0), text="ST↓", textcolor=color.white, size=size.tiny)
+
+// // Supertrend flip markers
+// plotshape(stFlipBull, title="ST Flip → Bull",
+//      style=shape.labelup, location=location.belowbar,
+//      color=color.new(#2196f3, 0), text="ST↑", textcolor=color.white, size=size.tiny)
+// plotshape(stFlipBear, title="ST Flip → Bear",
+//      style=shape.labeldown, location=location.abovebar,
+//      color=color.new(#ff5252, 0), text="ST↓", textcolor=color.white, size=size.tiny)
+
+// Micro-Structure — small triangles one bar back
+plotshape(msHighFormed, title="MSH ▼",
+     style=shape.triangledown, location=location.abovebar,
+     color=msHighCol, size=size.tiny, offset=-1)
+plotshape(msLowFormed, title="MSL ▲",
+     style=shape.triangleup, location=location.belowbar,
+     color=msLowCol, size=size.tiny, offset=-1)
+
+// Touch circles
+plotshape(bullTouchLvl, title="Bull Zone Touch",
+     style=shape.circle, location=location.belowbar,
+     color=color.new(bullValLineCol, 30), size=size.tiny)
+plotshape(bearTouchLvl, title="Bear Zone Touch",
+     style=shape.circle, location=location.abovebar,
+     color=color.new(bearValLineCol, 30), size=size.tiny)
+
+// // Break crosses
+// plotshape(bullBreakLvl, title="Bull Zone Break ↑",
+//      style=shape.xcross, location=location.abovebar,
+//      color=bullValLineCol, size=size.small)
+// plotshape(bearBreakLvl, title="Bear Zone Break ↓",
+//      style=shape.xcross, location=location.belowbar,
+//      color=bearValLineCol, size=size.small)
+
+// ╔══════════════════════════════════════════════════════════╗
+// ║  ALERTS                                                 ║
+// ╚══════════════════════════════════════════════════════════╝
+
+alertcondition(a_bullCand  and newBullCand,     title  = "🔵 Bull Candidate Zone Created")//,     message= "New bullish resistance candidate. Zone top: " + str.tostring(bZoneTop, "#.####"))
+
+alertcondition(a_bearCand  and newBearCand,     title  = "🔴 Bear Candidate Zone Created")//,     message= "New bearish support candidate. Zone bot: " + str.tostring(brZoneBot, "#.####"))
+
+alertcondition(a_bullVal   and newBullVal,     title  = "✅ Bullish Liquidity Level Validated",     message= "Bullish resistance validated as liquidity level at {{close}}")
+
+alertcondition(a_bearVal   and newBearVal,     title  = "✅ Bearish Liquidity Level Validated",     message= "Bearish support validated as liquidity level at {{close}}")
+
+alertcondition(a_msHigh    and msHighFormed,     title  = "📍 Micro-Structure High (MSH)",     message= "1m MSH confirmed (2+ green → 2+ red) near {{high}}")
+
+alertcondition(a_msLow     and msLowFormed,     title  = "📍 Micro-Structure Low (MSL)",     message= "1m MSL confirmed (2+ red → 2+ green) near {{low}}")
+
+alertcondition(a_touch     and (bullTouchLvl or bearTouchLvl),     title  = "👆 Price Touching Validated Liquidity Level",     message= "Price touching validated liquidity zone at {{close}}")
+
+alertcondition(a_break     and (bullBreakLvl or bearBreakLvl),     title  = "💥 Price Broke Validated Liquidity Level",     message= "Price CLOSED through validated liquidity zone at {{close}}")
+
+alertcondition(a_stBull    and stFlipBull,     title  = "📈 15m Supertrend → BULLISH",     message= "15m Supertrend flipped bullish — long bias active")
+
+alertcondition(a_stBear    and stFlipBear,     title  = "📉 15m Supertrend → BEARISH",     message= "15m Supertrend flipped bearish — short bias active")
+
+// ── Sonarlab-style runtime alerts (fire once per bar on mitigation) ──────
+if (_valHighLineMiti or _valHighBoxMiti) and a_break
+    alert("✅ Bull Liquidity Level mitigated / broken at " + str.tostring(close, "#.####"),
+         alert.freq_once_per_bar)
+
+if (_valLowLineMiti or _valLowBoxMiti) and a_break
+    alert("✅ Bear Liquidity Level mitigated / broken at " + str.tostring(close, "#.####"),
+         alert.freq_once_per_bar)

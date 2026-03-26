@@ -1,0 +1,411 @@
+// This Pine Script™ source is subject to the terms of the Mozilla Public License 2.0
+// https://mozilla.org/MPL/2.0/
+
+//@version=6
+indicator("Keltner – Band Fade & Basis Bounce", overlay=true,
+         max_labels_count=500, max_lines_count=500, max_boxes_count=200)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  INPUTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// ─── Keltner Channel ───────────────────────────────────────────────────────────
+i_kcLen        = input.int(20, "KC Length (Basis)", minval=5, maxval=100, group="Keltner Channel")
+i_kcATRLen     = input.int(10, "KC ATR Length", minval=5, maxval=50, group="Keltner Channel")
+i_kcMult       = input.float(2.0, "KC ATR Multiplier", minval=0.5, maxval=4.0, step=0.1, group="Keltner Channel")
+i_kcSource     = input.source(close, "KC Source", group="Keltner Channel")
+i_kcUseEMA     = input.bool(false, "Use Exponential MA (EMA)",
+                     tooltip="Unchecked = SMA basis. Checked = EMA basis",
+                     group="Keltner Channel")
+
+// ─── Band Fade Settings ────────────────────────────────────────────────────────
+i_fadePenetrate = input.float(0.5, "Fade: Max Band Penetration (ATR fraction)", minval=0.0, maxval=2.0, step=0.1,
+                     tooltip="0 = touch only. 0.5 = allow 50% ATR beyond band. Catches entries that slightly overshoot.",
+                     group="Band Fade")
+i_fadeWickPct  = input.float(0.15, "Fade: Min Wick Rejection Ratio", minval=0.0, maxval=0.8, step=0.05,
+                     tooltip="Candle wick as fraction of total range — confirms rejection off the band. 0 = disabled.",
+                     group="Band Fade")
+i_fadeRequireOpposite = input.bool(true, "Fade: Require Opposite Band Touch First",
+                     tooltip="Fade short at upper band only if price recently came from the LOWER band (full channel traverse). Vice versa for fade long. Eliminates fades where price hasn't traveled far enough.",
+                     group="Band Fade")
+i_fadeOppLookback = input.int(60, "Fade: Opposite Band Lookback (bars)", minval=10, maxval=300, step=10,
+                     tooltip="How many bars back to look for the opposite band touch. 60 = last hour on 1-min chart.",
+                     group="Band Fade")
+
+// ─── Basis Bounce Settings ─────────────────────────────────────────────────────
+i_basisProx    = input.float(0.7, "Bounce: Proximity to Basis (ATR fraction)", minval=0.1, maxval=2.0, step=0.1,
+                     tooltip="Price must come within this ATR fraction of the basis line. Wider = more signals.",
+                     group="Basis Bounce")
+i_requireBandTouch = input.bool(true, "Bounce: Require Prior Band Puncture",
+                     tooltip="Long bounce requires price touched/punctured the UPPER band first (trend proven). Short bounce requires prior LOWER band touch.",
+                     group="Basis Bounce")
+i_bandTouchLookback = input.int(50, "Band Touch Lookback (bars)", minval=5, maxval=200,
+                     tooltip="How many bars back to look for the prior band touch. 50 = last 50 minutes on 1-min chart.",
+                     group="Basis Bounce")
+i_useBounceBase = input.bool(true, "Bounce: Require Basing Structure",
+                     tooltip="Require some basing/consolidation before bounce signal fires",
+                     group="Basis Bounce")
+i_basingLookback = input.int(5, "Basing Lookback (candles)", minval=3, maxval=15, group="Basis Bounce")
+i_basingMinHL  = input.int(1, "Min Higher Lows for Long (of lookback)", minval=1, maxval=10,
+                     tooltip="How many of the last N candles need a higher low than the previous candle",
+                     group="Basis Bounce")
+i_basingMinLH  = input.int(1, "Min Lower Highs for Short (of lookback)", minval=1, maxval=10,
+                     tooltip="How many of the last N candles need a lower high than the previous candle",
+                     group="Basis Bounce")
+i_useBodyCompress = input.bool(true, "Also Accept Body Compression",
+                     tooltip="Pass if avg body of last N candles is smaller than the candle before the window (deceleration)",
+                     group="Basis Bounce")
+i_useRangeCompress = input.bool(true, "Also Accept Range Compression",
+                     tooltip="Pass if avg range of last N candles is smaller than the candle before the window",
+                     group="Basis Bounce")
+
+// ─── Candle Confirmation ───────────────────────────────────────────────────────
+i_requireConfirmCandle = input.bool(true, "Require Confirming Candle Direction",
+                     tooltip="Long needs bullish close, short needs bearish close",
+                     group="Candle Confirmation")
+i_minBodyPct   = input.float(0.1, "Min Body % of Candle Range", minval=0.0, maxval=0.8, step=0.05,
+                     tooltip="Filters out dojis / indecision candles. 0 = disabled.",
+                     group="Candle Confirmation")
+
+// ─── Session ───────────────────────────────────────────────────────────────────
+i_sessionMode  = input.string("RTH Only", "Session Mode",
+                     options=["RTH Only", "Custom HHMM", "All Hours"],
+                     tooltip="RTH Only = Regular Trading Hours only (9:30-4:00 ET for US equities). Custom = manual time window. All Hours = no filter.",
+                     group="Session")
+i_sessStart    = input.int(930, "Custom Start (HHMM ET)", group="Session",
+                     tooltip="Only used if Session Mode = Custom HHMM")
+i_sessEnd      = input.int(1545, "Custom End (HHMM ET)", group="Session",
+                     tooltip="Only used if Session Mode = Custom HHMM")
+
+// ─── Signal Control ────────────────────────────────────────────────────────────
+i_minBarGap    = input.int(5, "Min Bars Between Signals", minval=1, maxval=50, group="Signal Control")
+
+
+// ─── Display ───────────────────────────────────────────────────────────────────
+i_showLabels   = input.bool(true, "Show Entry Labels", group="Display")
+i_showZones    = input.bool(true, "Highlight Band Touch Zones", group="Display")
+i_showDebug    = input.bool(true, "Show Debug Dashboard",
+                     tooltip="Shows which conditions pass/fail on the current bar",
+                     group="Display")
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  CORE CALCULATIONS
+// ═══════════════════════════════════════════════════════════════════════════════
+float basis    = i_kcUseEMA ? ta.ema(i_kcSource, i_kcLen) : ta.sma(i_kcSource, i_kcLen)
+float kcATR    = ta.atr(i_kcATRLen)
+float upper    = basis + kcATR * i_kcMult
+float lower    = basis - kcATR * i_kcMult
+// Session — use Pine's built-in session.ismarket for reliable RTH detection
+int estH       = hour(time, "America/New_York")
+int estM       = minute(time, "America/New_York")
+int estHHMM    = estH * 100 + estM
+bool rthOnly   = session.ismarket
+bool customSess = estHHMM >= i_sessStart and estHHMM <= i_sessEnd
+bool inSession = i_sessionMode == "All Hours" ? true : i_sessionMode == "RTH Only" ? rthOnly : customSess
+
+// Candle metrics
+float candleRange = high - low
+float upperWick   = high - math.max(open, close)
+float lowerWick   = math.min(open, close) - low
+float bodySize    = math.abs(close - open)
+bool  bullClose   = close > open
+bool  bearClose   = close < open
+
+// Body size filter
+float bodyPct     = candleRange > 0 ? bodySize / candleRange : 0
+bool  bodyOk      = bodyPct >= i_minBodyPct
+
+// Trend from basis slope (for labeling only, not gating)
+float basisSlope = basis - basis[3]
+bool  trendUp    = basisSlope > 0
+bool  trendDown  = basisSlope < 0
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  BASING STRUCTURE DETECTION (used for Bounce signals only)
+// ═══════════════════════════════════════════════════════════════════════════════
+int higherLowCount = 0
+int lowerHighCount = 0
+float bodySum = 0.0
+float rangeSum = 0.0
+
+for i = 1 to i_basingLookback
+    if low[i] > low[i + 1]
+        higherLowCount += 1
+    if high[i] < high[i + 1]
+        lowerHighCount += 1
+    bodySum += math.abs(close[i] - open[i])
+    rangeSum += (high[i] - low[i])
+
+// Method 1: Higher Lows / Lower Highs count
+bool hlOk = higherLowCount >= i_basingMinHL
+bool lhOk = lowerHighCount >= i_basingMinLH
+
+// Method 2: Body compression — avg body smaller than reference candle before window
+float avgBody = bodySum / i_basingLookback
+float refBody = math.abs(close[i_basingLookback + 1] - open[i_basingLookback + 1])
+bool bodyCompressOk = i_useBodyCompress and refBody > 0 and avgBody < refBody * 0.8
+
+// Method 3: Range compression — avg range smaller than reference candle before window
+float avgRange = rangeSum / i_basingLookback
+float refRange = high[i_basingLookback + 1] - low[i_basingLookback + 1]
+bool rangeCompressOk = i_useRangeCompress and refRange > 0 and avgRange < refRange * 0.8
+
+// Combined: ANY method passing = basing detected
+bool longBasingOk  = hlOk or bodyCompressOk or rangeCompressOk
+bool shortBasingOk = lhOk or bodyCompressOk or rangeCompressOk
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  SIGNAL CONDITIONS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// --- Proximity calculations ---
+float proxDist   = not na(kcATR) ? kcATR * i_basisProx : 0
+float maxPenUp   = upper + kcATR * i_fadePenetrate
+float maxPenDn   = lower - kcATR * i_fadePenetrate
+
+// --- Candle confirmation ---
+bool longCandleOk  = (not i_requireConfirmCandle or bullClose) and bodyOk
+bool shortCandleOk = (not i_requireConfirmCandle or bearClose) and bodyOk
+
+// ─── BAND FADE: price touches/overshoots band, rejects, closes back inside ───
+// No basing required — the wick rejection IS the confirmation for fades
+bool upperTouch  = high >= upper and high <= maxPenUp
+bool lowerTouch  = low <= lower and low >= maxPenDn
+
+bool upperWickOk = candleRange > 0 and (upperWick / candleRange) >= i_fadeWickPct
+bool lowerWickOk = candleRange > 0 and (lowerWick / candleRange) >= i_fadeWickPct
+
+// ─── OPPOSITE BAND TRAVERSE CHECK (for fades) ──────────────────────────────
+// Fade long at lower band: did price recently touch the UPPER band? (came from top → stretched)
+// Fade short at upper band: did price recently touch the LOWER band? (came from bottom → stretched)
+bool priorOppUpper = false
+bool priorOppLower = false
+if i_fadeRequireOpposite
+    for i = 1 to i_fadeOppLookback
+        if high[i] >= upper[i]
+            priorOppUpper := true
+            break
+    for i = 1 to i_fadeOppLookback
+        if low[i] <= lower[i]
+            priorOppLower := true
+            break
+
+bool fadeOppOkLong  = not i_fadeRequireOpposite or priorOppUpper
+bool fadeOppOkShort = not i_fadeRequireOpposite or priorOppLower
+
+bool fadeLong    = lowerTouch and lowerWickOk and close > lower and longCandleOk and fadeOppOkLong and inSession
+bool fadeShort   = upperTouch and upperWickOk and close < upper and shortCandleOk and fadeOppOkShort and inSession
+
+// ─── PRIOR BAND PUNCTURE CHECK ────────────────────────────────────────────────
+// Long bounce: price must have touched UPPER band MORE RECENTLY than the lower band
+//   (trend went up first, now pulling back to basis — continuation long)
+// Short bounce: price must have touched LOWER band MORE RECENTLY than the upper band
+//   (trend went down first, now pulling back to basis — continuation short)
+// This prevents stale signals where the wrong band was touched most recently.
+int lastUpperBar = 0
+int lastLowerBar = 0
+if i_requireBandTouch
+    for i = 1 to i_bandTouchLookback
+        if high[i] >= upper[i] and lastUpperBar == 0
+            lastUpperBar := i
+        if low[i] <= lower[i] and lastLowerBar == 0
+            lastLowerBar := i
+        if lastUpperBar > 0 and lastLowerBar > 0
+            break
+
+// Long bounce: upper band must have been touched, AND more recently than lower band
+bool priorUpperValid = lastUpperBar > 0 and (lastLowerBar == 0 or lastUpperBar < lastLowerBar)
+// Short bounce: lower band must have been touched, AND more recently than upper band
+bool priorLowerValid = lastLowerBar > 0 and (lastUpperBar == 0 or lastLowerBar < lastUpperBar)
+
+bool bandTouchOkLong  = not i_requireBandTouch or priorUpperValid
+bool bandTouchOkShort = not i_requireBandTouch or priorLowerValid
+
+// ─── BASIS BOUNCE: price pulls back to basis, optional basing, then bounces ──
+bool basisTouchLong  = low <= basis + proxDist and close > basis
+bool basisTouchShort = high >= basis - proxDist and close < basis
+
+bool bounceBaseOkL = not i_useBounceBase or longBasingOk
+bool bounceBaseOkS = not i_useBounceBase or shortBasingOk
+
+bool bounceLong  = basisTouchLong and longCandleOk and bounceBaseOkL and bandTouchOkLong and inSession
+bool bounceShort = basisTouchShort and shortCandleOk and bounceBaseOkS and bandTouchOkShort and inSession
+
+// ─── Combined signals ─────────────────────────────────────────────────────────
+bool longSignal  = fadeLong or bounceLong
+bool shortSignal = fadeShort or bounceShort
+
+// Type tracking for labels
+bool isFadeLong   = fadeLong
+bool isFadeShort  = fadeShort
+bool isBounceLong = bounceLong and not fadeLong
+bool isBounceShort = bounceShort and not fadeShort
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  DEDUPLICATION
+// ═══════════════════════════════════════════════════════════════════════════════
+var int lastSigBar = 0
+
+bool gapOk = (bar_index - lastSigBar) >= i_minBarGap
+
+bool longFiltered  = longSignal and gapOk
+bool shortFiltered = shortSignal and gapOk
+
+if longFiltered or shortFiltered
+    lastSigBar := bar_index
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  PLOTTING — KELTNER CHANNEL
+// ═══════════════════════════════════════════════════════════════════════════════
+plot(basis, "Basis", color.new(#2196f3, 0), 2)
+pUpper = plot(upper, "Upper Band", color.new(color.white, 0), 1)
+pLower = plot(lower, "Lower Band", color.new(color.white, 0), 1)
+fill(pUpper, pLower, color=color.new(color.white, 95), title="KC Fill")
+
+// Band touch highlight zones
+if i_showZones and upperTouch and inSession
+    box.new(bar_index - 1, upper + kcATR * 0.1, bar_index + 1, upper,
+         bgcolor=color.new(#ef5350, 85), border_color=color.new(#ef5350, 70), border_width=1)
+if i_showZones and lowerTouch and inSession
+    box.new(bar_index - 1, lower, bar_index + 1, lower - kcATR * 0.1,
+         bgcolor=color.new(#26a69a, 85), border_color=color.new(#26a69a, 70), border_width=1)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  PLOTTING — ENTRY LABELS
+// ═══════════════════════════════════════════════════════════════════════════════
+if longFiltered and i_showLabels
+    bool isFade = isFadeLong
+    string mode = isFade ? "FADE ↑" : "BOUNCE ↑"
+    color clr   = isFade ? color.new(#9c27b0, 10) : color.new(#26a69a, 10)
+    label.new(bar_index, low, mode, style=label.style_label_up, color=clr, textcolor=color.white, size=size.normal)
+
+if shortFiltered and i_showLabels
+    bool isFade = isFadeShort
+    string mode = isFade ? "FADE ↓" : "BOUNCE ↓"
+    color clr   = isFade ? color.new(#9c27b0, 10) : color.new(#ef5350, 10)
+    label.new(bar_index, high, mode, style=label.style_label_down, color=clr, textcolor=color.white, size=size.normal)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  DEBUG DASHBOARD — shows per-condition pass/fail on current bar
+// ═══════════════════════════════════════════════════════════════════════════════
+var table dash = table.new(position.top_right, 3, 16, bgcolor=color.new(#1e222d, 0),
+                            frame_color=color.new(color.gray, 50), frame_width=1, border_width=1)
+
+checkIcon(bool ok) => ok ? "✓" : "✗"
+checkClr(bool ok) => ok ? #26a69a : #ef5350
+
+if barstate.islast and i_showDebug
+    int row = 0
+
+    // Header
+    table.cell(dash, 0, row, "Condition", text_color=color.yellow, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(dash, 1, row, "Long", text_color=color.yellow, text_size=size.tiny)
+    table.cell(dash, 2, row, "Short", text_color=color.yellow, text_size=size.tiny)
+    row += 1
+
+    // 1. Session
+    string sessInfo = i_sessionMode + " | " + str.tostring(estHHMM) + " ET"
+    table.cell(dash, 0, row, "Session", text_color=color.white, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(dash, 1, row, checkIcon(inSession), text_color=checkClr(inSession), text_size=size.small)
+    table.cell(dash, 2, row, sessInfo, text_color=color.gray, text_size=size.tiny)
+    row += 1
+
+    // 2. Band touch (fade)
+    table.cell(dash, 0, row, "Band Touch", text_color=color.white, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(dash, 1, row, checkIcon(lowerTouch), text_color=checkClr(lowerTouch), text_size=size.small)
+    table.cell(dash, 2, row, checkIcon(upperTouch), text_color=checkClr(upperTouch), text_size=size.small)
+    row += 1
+
+    // 3. Wick rejection (fade)
+    table.cell(dash, 0, row, "Wick Rej", text_color=color.white, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(dash, 1, row, checkIcon(lowerWickOk), text_color=checkClr(lowerWickOk), text_size=size.small)
+    table.cell(dash, 2, row, checkIcon(upperWickOk), text_color=checkClr(upperWickOk), text_size=size.small)
+    row += 1
+
+    // 4. Close inside (fade)
+    bool closeAboveLower = close > lower
+    bool closeBelowUpper = close < upper
+    table.cell(dash, 0, row, "Close Inside", text_color=color.white, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(dash, 1, row, checkIcon(closeAboveLower), text_color=checkClr(closeAboveLower), text_size=size.small)
+    table.cell(dash, 2, row, checkIcon(closeBelowUpper), text_color=checkClr(closeBelowUpper), text_size=size.small)
+    row += 1
+
+    // 5. Candle confirm
+    table.cell(dash, 0, row, "Candle OK", text_color=color.white, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(dash, 1, row, checkIcon(longCandleOk), text_color=checkClr(longCandleOk), text_size=size.small)
+    table.cell(dash, 2, row, checkIcon(shortCandleOk), text_color=checkClr(shortCandleOk), text_size=size.small)
+    row += 1
+
+    // 6. Opposite band traverse (fade)
+    table.cell(dash, 0, row, "Opp Band", text_color=color.white, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(dash, 1, row, checkIcon(fadeOppOkLong), text_color=checkClr(fadeOppOkLong), text_size=size.small)
+    table.cell(dash, 2, row, checkIcon(fadeOppOkShort), text_color=checkClr(fadeOppOkShort), text_size=size.small)
+    row += 1
+
+    // 7. FADE combined
+    table.cell(dash, 0, row, "═ FADE", text_color=color.yellow, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(dash, 1, row, checkIcon(fadeLong), text_color=checkClr(fadeLong), text_size=size.normal)
+    table.cell(dash, 2, row, checkIcon(fadeShort), text_color=checkClr(fadeShort), text_size=size.normal)
+    row += 1
+
+    // 7. Basis touch (bounce)
+    table.cell(dash, 0, row, "Basis Prox", text_color=color.white, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(dash, 1, row, checkIcon(basisTouchLong), text_color=checkClr(basisTouchLong), text_size=size.small)
+    table.cell(dash, 2, row, checkIcon(basisTouchShort), text_color=checkClr(basisTouchShort), text_size=size.small)
+    row += 1
+
+    // 8. Prior band puncture — show which band was last touched and how many bars ago
+    string lastBandInfo = lastUpperBar > 0 and lastLowerBar > 0 ? (lastUpperBar < lastLowerBar ? "Upper " + str.tostring(lastUpperBar) + "b ago" : "Lower " + str.tostring(lastLowerBar) + "b ago") : lastUpperBar > 0 ? "Upper " + str.tostring(lastUpperBar) + "b ago" : lastLowerBar > 0 ? "Lower " + str.tostring(lastLowerBar) + "b ago" : "None"
+    table.cell(dash, 0, row, "Prior Band", text_color=color.white, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(dash, 1, row, checkIcon(bandTouchOkLong), text_color=checkClr(bandTouchOkLong), text_size=size.small)
+    table.cell(dash, 2, row, lastBandInfo, text_color=color.gray, text_size=size.tiny)
+    row += 1
+
+    // 9. Basing structure
+    string baseL = "HL:" + str.tostring(higherLowCount) + "/" + str.tostring(i_basingLookback)
+    string baseS = "LH:" + str.tostring(lowerHighCount) + "/" + str.tostring(i_basingLookback)
+    table.cell(dash, 0, row, "Basing", text_color=color.white, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(dash, 1, row, checkIcon(bounceBaseOkL) + " " + baseL, text_color=checkClr(bounceBaseOkL), text_size=size.tiny)
+    table.cell(dash, 2, row, checkIcon(bounceBaseOkS) + " " + baseS, text_color=checkClr(bounceBaseOkS), text_size=size.tiny)
+    row += 1
+
+    // 10. BOUNCE combined
+    table.cell(dash, 0, row, "═ BOUNCE", text_color=color.yellow, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(dash, 1, row, checkIcon(bounceLong), text_color=checkClr(bounceLong), text_size=size.normal)
+    table.cell(dash, 2, row, checkIcon(bounceShort), text_color=checkClr(bounceShort), text_size=size.normal)
+    row += 1
+
+    // 11. Gap OK
+    table.cell(dash, 0, row, "Bar Gap", text_color=color.white, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(dash, 1, row, checkIcon(gapOk), text_color=checkClr(gapOk), text_size=size.small)
+    table.cell(dash, 2, row, str.tostring(bar_index - lastSigBar) + " bars", text_color=color.gray, text_size=size.tiny)
+    row += 1
+
+    // 12. Daily count
+    // Final signal
+    table.cell(dash, 0, row, "SIGNAL", text_color=color.yellow, text_size=size.tiny, text_halign=text.align_left)
+    string sigText = "—"
+    color sigClr = color.gray
+    if longFiltered
+        sigText := isFadeLong ? "FADE LONG" : "BOUNCE LONG"
+        sigClr := isFadeLong ? #9c27b0 : #26a69a
+    else if shortFiltered
+        sigText := isFadeShort ? "FADE SHORT" : "BOUNCE SHORT"
+        sigClr := isFadeShort ? #9c27b0 : #ef5350
+    table.cell(dash, 1, row, sigText, text_color=sigClr, text_size=size.normal)
+    table.cell(dash, 2, row, "", text_size=size.tiny)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  ALERTS
+// ═══════════════════════════════════════════════════════════════════════════════
+alertcondition(longFiltered and isFadeLong, title="Band Fade Long",
+     message="Keltner FADE LONG on {{ticker}} at {{close}} — price rejected lower band")
+
+alertcondition(shortFiltered and isFadeShort, title="Band Fade Short",
+     message="Keltner FADE SHORT on {{ticker}} at {{close}} — price rejected upper band")
+
+alertcondition(longFiltered and isBounceLong, title="Basis Bounce Long",
+     message="Keltner BOUNCE LONG on {{ticker}} at {{close}} — pullback to basis with basing structure")
+
+alertcondition(shortFiltered and isBounceShort, title="Basis Bounce Short",
+     message="Keltner BOUNCE SHORT on {{ticker}} at {{close}} — pullback to basis with basing structure")

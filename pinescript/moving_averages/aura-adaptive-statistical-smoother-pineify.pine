@@ -1,0 +1,131 @@
+// This source code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © Pineify
+
+//======================================================================//
+//                    ____  _            _  __                          //
+//                   |  _ \(_)_ __   ___(_)/ _|_   _                    //
+//                   | |_) | | '_ \ / _ \ | |_| | | |                   //
+//                   |  __/| | | | |  __/ |  _| |_| |                   //
+//                   |_|   |_|_| |_|\___|_|_|  \__, |                   //
+//                                             |___/                    //
+//======================================================================//
+
+//@version=6
+// Overlay indicator: the Aura MA line and volatility bands are drawn directly on the price chart.
+indicator("Aura: Adaptive Statistical Smoother [Pineify]", "Aura Trend [Pineify]", overlay = true, max_labels_count = 500)
+
+// =============================================================================
+// 1. Inputs
+// =============================================================================
+// `length`  — lookback window used for R-Squared calculation and standard deviation bands.
+// `smooth`  — EMA period for the forward-backward zero-lag approximation.
+// `mult`    — scalar applied to standard deviation to widen/narrow the volatility bands.
+// `src`     — price source (default: close).
+length = input.int(20, "Statistical Window", minval = 2, tooltip = "Lookback period for statistical R-Squared calculations")
+smooth = input.int(10, "Forward-Backward Smoothing", minval = 1, tooltip = "Smoothing factor for the zero-lag baseline")
+mult   = input.float(1.5, "Volatility Multiplier", step = 0.1, tooltip = "Multiplier for the dynamic volatility bands")
+src    = input.source(close, "Source")
+
+// --- Colors ---
+bullCss = input.color(#089981, "Bullish Color")
+bearCss = input.color(#F23645, "Bearish Color")
+
+// =============================================================================
+// 2. Forward-Backward Zero-Lag Approximation
+// =============================================================================
+// A standard EMA introduces phase lag proportional to its period.
+// This section approximates a zero-phase-shift (bidirectional) EMA:
+//   1. Compute a conventional forward EMA (`ema1`).
+//   2. Run a second pass (`ema2`) that iterates backward over the historical
+//      `ema1` values, applying the same EMA alpha `2/(smooth+1)` at each step.
+// The result (`target`) tracks price closely with minimal lag, serving as the
+// baseline that the adaptive Aura MA will converge toward during trending markets.
+float ema1 = ta.ema(src, smooth)
+float ema2 = ema1
+for i = 1 to length - 1
+    // Accumulate the backward EMA pass: each iteration blends the i-th
+    // historical forward-EMA value into `ema2` using the standard EMA alpha.
+    ema2 += (2 / (smooth + 1)) * (nz(ema1[i], ema1) - ema2)
+float target = ema2
+
+// =============================================================================
+// 3. Adaptive R-Squared Trend Filter
+// =============================================================================
+// R-Squared (coefficient of determination) measures how well a linear regression
+// fits the recent price data.  Values near 1.0 indicate a strong linear trend;
+// values near 0.0 indicate a ranging / mean-reverting market.
+// Here we square the Pearson correlation between `close` and `bar_index` over
+// the lookback `length` to obtain R².
+float r2 = nz(math.pow(ta.correlation(close, bar_index, length), 2), 0)
+
+// `aura_ma` — the adaptive moving average that is the core output of this indicator.
+// `os`      — oscillation state (+1 or -1), records the last known directional bias
+//             and is held constant during ranging periods to steer the MA away from
+//             the price, reducing whipsaw.
+var float aura_ma = 0.0
+var float os = 0.0
+
+// `abs_diff` — magnitude of the most recent change in the zero-lag target.
+// Used during ranging regimes to push the Aura MA away from price.
+float abs_diff = math.abs(target - nz(target, target))
+
+// Update oscillation state only when the market is trending (R² > 0.5).
+// During ranging periods, the last known direction is preserved.
+os := r2 > 0.5 ? math.sign(nz(src, src) - nz(target, target)) : nz(os, 0)
+
+// Core adaptive logic:
+//   • Trending (R² > 0.5): blend the zero-lag target into `aura_ma` proportionally
+//     to R² — stronger trends make the MA track the target more tightly.
+//   • Ranging  (R² ≤ 0.5): push `aura_ma` away from price in the direction of `os`
+//     by the magnitude `abs_diff`, creating a buffer zone that prevents false
+//     crossover signals during choppy, sideways price action.
+aura_ma := r2 > 0.5 ? (r2 * target + (1 - r2) * nz(aura_ma, target)) : (nz(aura_ma, target) - abs_diff * os)
+
+// =============================================================================
+// 4. Dynamic Volatility Bands
+// =============================================================================
+// Standard deviation of the source over the lookback window, scaled by `mult`.
+// The bands expand during volatile periods and contract during quiet ones,
+// providing a visual envelope around the Aura MA.
+float stdev = ta.stdev(src, length) * mult
+float upper = aura_ma + stdev
+float lower = aura_ma - stdev
+
+// =============================================================================
+// 5. Signals, State & Coloring
+// =============================================================================
+// Trend state: +1 (bullish) when price is above the Aura MA, -1 (bearish) when
+// below. The `var` keyword persists the last state when price equals the MA.
+var int trend = 1
+trend := close > aura_ma ? 1 : close < aura_ma ? -1 : nz(trend, 1)
+
+// Dynamic coloring: bullish color when trend == 1, bearish otherwise.
+// `areaColor` is the same hue at 85% transparency for the volatility cloud fill.
+color lineColor = trend == 1 ? bullCss : bearCss
+color areaColor = color.new(lineColor, 85)
+
+// =============================================================================
+// 6. Plots & Visuals
+// =============================================================================
+// Plot the upper and lower volatility bands with 70% transparency.
+p_upper = plot(upper, "Upper Band", color = color.new(lineColor, 70))
+p_lower = plot(lower, "Lower Band", color = color.new(lineColor, 70))
+// Plot the Aura MA as a thick line for easy identification.
+p_ma    = plot(aura_ma, "Aura MA", color = lineColor, linewidth = 3)
+
+// Fill the area between the upper and lower bands to form the volatility cloud.
+fill(p_upper, p_lower, areaColor, title = "Volatility Cloud")
+
+// Buy/Sell signal conditions:
+//   • BUY  — price crosses above the Aura MA AND R² > 0.3 (minimum trend strength).
+//   • SELL — price crosses below the Aura MA AND R² > 0.3.
+// The R² > 0.3 filter suppresses signals during flat, trendless markets where
+// crossovers are most likely to be noise.
+bool buySig  = ta.crossover(close, aura_ma) and r2 > 0.3
+bool sellSig = ta.crossunder(close, aura_ma) and r2 > 0.3
+
+plotshape(buySig,  "Buy Signal",  shape.labelup,   location.belowbar, bullCss, text = "BUY",  textcolor = color.white, size = size.small)
+plotshape(sellSig, "Sell Signal", shape.labeldown, location.abovebar, bearCss, text = "SELL", textcolor = color.white, size = size.small)
+
+// Color each bar according to the current trend direction for quick visual scanning.
+barcolor(trend == 1 ? bullCss : bearCss)

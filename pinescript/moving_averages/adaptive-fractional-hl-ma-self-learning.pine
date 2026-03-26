@@ -1,0 +1,500 @@
+// © 2026 @issei0008 / Antigravity AI
+// Adaptive Fractional HL-MA with Self-Learning τ  [AFL-MA v1]
+//
+// ─── Theory ──────────────────────────────────────────────────────────────────
+//
+//  1. FRACTIONAL-ORDER EMA  (long-memory moving average)
+//     Standard EMA:      alpha = 2 / (L + 1)
+//     Fractional EMA:    alpha = 2 / (L + 1) × d,   d ∈ (0, 1]
+//     When d < 1 the MA responds more slowly and retains longer memory of past
+//     prices, reducing false signals during choppy or mean-reverting periods.
+//     Two independent FMAs are computed: one tracking High, one tracking Low.
+//
+//  2. SELF-LEARNING CONFIRMATION DELAY τ  (continuous, Lagrange-interpolated)
+//     Bull cross:  low_MA(now)  > high_MA(τ bars ago)  — lows surpassed former highs
+//     Bear cross:  high_MA(now) < low_MA(τ bars ago)   — highs fell below former lows
+//     τ is a continuous (non-integer) value implemented via Lagrange linear
+//     interpolation so that τ = 7.3 is computed precisely:
+//         ref(τ) = MA[floor(τ)] × (1 − frac) + MA[floor(τ)+1] × frac
+//     Separate τ values for bull and bear directions.  Both self-update after
+//     each confirmed compression → cross event:
+//         Confirmed in time:  τ ← τ·(1 − lr) + T_actual·lr   (tracks actual lag)
+//         Timeout (no cross): τ ← τ·(1 + lr·0.5)              (was too short → extend)
+//         Adverse cross:      τ unchanged (direction error, not timing error)
+//
+//  3. VOLUME DELTA ACCELERATION τ-MULTIPLIER  (∂J/∂t)
+//     Probability current J = signed directional volume flow (buy − sell volume).
+//     ∂J/∂t  = second derivative of J  = acceleration of momentum.
+//     When momentum is accelerating against the anticipated signal direction,
+//     the effective τ is stretched to prevent premature confirmation:
+//         τ_eff = τ × (1 + opposing_accel_component × gain)
+//     The gain itself self-learns from actual cross outcomes (circular learning):
+//         Adverse cross + high opposing acceleration  → gain ↑ (stretch more next time)
+//         Correct cross + high opposing acceleration  → gain ↓ (prevent over-extension)
+//
+//  4. COMPRESSION PHASE DETECTION
+//     When the ATR-normalized HL-MA spread falls below its historical N-th
+//     percentile, the indicator enters "compression phase" (blue background).
+//     This is the primary trigger for the τ-learning feedback queue:
+//     the bar of compression entry is recorded together with a direction hint
+//     (close above/below MA midpoint).  The subsequent HL cross measures how
+//     many bars elapsed → τ updates accordingly.
+//
+// ─── Visual Guide ────────────────────────────────────────────────────────────
+//   High MA line  (bear color)  — fractional EMA of highs
+//   Low  MA line  (bull color)  — fractional EMA of lows
+//   Dotted ref lines             — high/low MA as they were τ bars ago
+//   Band fill                    — gray=neutral, green=bull confirmed, red=bear confirmed
+//   ▲ signal                    — bull cross confirmed (larger when band is wide)
+//   ▼ signal                    — bear cross confirmed (larger when band is wide)
+//   Blue background              — compression phase (band tight, potential breakout)
+//   Info table (bottom-right)    — live τ, VDA gain, spread, cross state
+//
+// ─── Quick Start ─────────────────────────────────────────────────────────────
+//   1. Watch for blue background (MA band compresses).
+//   2. ▲ or ▼ fires when the cross confirms the breakout direction.
+//   3. Larger triangle = cross occurred during an already-wide (trending) band.
+//   4. Monitor τ in the table: it will converge to the instrument's natural lag.
+//   5. VDA Gain > 1 means heavy momentum is delaying confirmation — be patient.
+
+//@version=6
+indicator("Adaptive Fractional HL-MA [Self-Learning τ]",
+     shorttitle = "AFL-MA",
+     overlay    = true,
+     max_lines_count = 100)
+
+// ══════════════════════════════════════════════════════════════════════════════
+// INPUT GROUPS
+// ══════════════════════════════════════════════════════════════════════════════
+G_FMA  = "① Fractional HL-MA"
+G_TAU  = "② Self-Learning τ"
+G_VDA  = "③ Volume Delta Acceleration (∂J/∂t)"
+G_SEC  = "④ Secondary Timeframe (ΔV Resolution)"
+G_DISP = "⑤ Display"
+
+// ── Group ①: Fractional HL-MA ─────────────────────────────────────────────
+int   fma_base  = input.int(21, "Base Smoothing Period (L)",
+     minval=5, maxval=100, group=G_FMA,
+     tooltip="Base period for the fractional EMA.\nEffective alpha = 2/(L+1) × d.\nIndependent of the confirmation delay τ.\nSmaller L → faster (but noisier) MA.\nRecommended: 14–30.")
+
+float fma_d     = input.float(0.7, "Fractional Order d",
+     minval=0.3, maxval=1.0, step=0.05, group=G_FMA,
+     tooltip="Fractional decay exponent.\nd = 1.0 → standard EMA.\nd < 1.0 → long-memory MA: reacts more slowly, retains past price influence longer.\nSmaller d → stronger false-signal resistance, but slower reaction.\nRecommended: 0.5–0.8 for trending markets.")
+
+int   adapt_len = input.int(200, "Adaptive Statistics Period",
+     minval=50, maxval=500, group=G_FMA,
+     tooltip="Lookback window for percentile calculations.\nUsed for: spread compression threshold, VDA normalization (75th %ile of |∂J/∂t|).\nLonger → stable baseline. Shorter → faster regime adaptation.")
+
+// ── Group ②: Self-Learning τ ──────────────────────────────────────────────
+float tau_init  = input.float(14.0, "Initial τ (bars)",
+     minval=2.0, maxval=100.0, step=0.5, group=G_TAU,
+     tooltip="Starting value for the confirmation delay τ.\nτ defines how many bars back to compare the current HL-MA against.\n  Bull cross: low_MA(now) > high_MA(τ ago)\n  Bear cross: high_MA(now) < low_MA(τ ago)\nτ self-updates toward the actual observed confirmation time.\nSet this to the typical number of bars from compression to the cross on your instrument.")
+
+float learn_rate = input.float(0.05, "Learning Rate",
+     minval=0.01, maxval=0.20, step=0.01, group=G_TAU,
+     tooltip="Speed at which τ and VDA gain adapt.\nHigh → fast adaptation (risk of instability/overfitting).\nLow  → slow, stable convergence.\nRecommended: 0.03–0.08.")
+
+float comp_pctile = input.float(30.0, "Compression Trigger Percentile",
+     minval=5.0, maxval=60.0, step=5.0, group=G_TAU,
+     tooltip="When the ATR-normalized HL-MA spread falls below this historical percentile,\na compression event is recorded and added to the τ-learning queue.\nLower value → only very tight compressions trigger learning.\nHigher value → more frequent triggers.\nRecommended: 20–35.")
+
+float spread_wide_pctile = input.float(75.0, "Wide Spread Percentile (Signal Size Gate)",
+     minval=50.0, maxval=95.0, step=5.0, group=G_TAU,
+     tooltip="When the spread exceeds this percentile, the band is 'wide' (trending).\nCross signals during a wide band are displayed at NORMAL size.\nCross signals during a narrow/neutral band are displayed at SMALL size.\nUsed only for visual sizing — does not suppress signals.")
+
+// ── Group ③: Volume Delta Acceleration ────────────────────────────────────
+bool  use_vda       = input.bool(true, "Enable ∂J/∂t τ-Multiplier",
+     group=G_VDA,
+     tooltip="Enable dynamic τ stretching based on volume delta acceleration.\nJ = directional volume (buy vol − sell vol).  ∂J/∂t = second derivative of J.\nWhen momentum is accelerating against the signal direction, τ_eff is extended:\n  τ_eff = τ × (1 + opposing_component × gain)\nThis prevents the MA cross from confirming while the market is still moving hard in the opposite direction.\nDisable to use a pure fixed-gain τ without VDA modulation.")
+
+float vda_gain_init = input.float(0.5, "Initial VDA Gain",
+     minval=0.0, maxval=3.0, step=0.1, group=G_VDA,
+     tooltip="Starting value for the τ-multiplier gain.\nGain self-learns from actual cross outcomes:\n  Adverse cross + high opposing acceleration → gain ↑ (τ stretches more aggressively)\n  Correct cross  + high opposing acceleration → gain ↓ (prevent over-extension)\nHigher initial gain → more cautious from the start.\nRecommended: 0.3–0.8.")
+
+// ── Group ④: Secondary Timeframe ──────────────────────────────────────────
+bool   use_sec_tf  = input.bool(true, "Enable Secondary Timeframe",
+     group=G_SEC,
+     tooltip="Use a finer timeframe to compute intra-bar volume delta more precisely.\nInstead of a single bar's close vs open, sub-bar ticks are aggregated for a\nmore accurate directional volume (J) and its acceleration (∂J/∂t).\nIf you hit TradingView's 40-second compute limit, disable this or select a coarser resolution.")
+
+string sec_tf_mode = input.string("Auto", "Resolution",
+     options=["Auto","1","3","5","10","15","30","60"],
+     group=G_SEC,
+     tooltip="Timeframe resolution for sub-bar volume delta.\nAuto selects based on your chart timeframe:\n  ≤10 min  → 1 min\n  15 min   → 3 min\n  30 min   → 5 min\n  1 hour   → 10 min\n  4 hours  → 15 min\n  Daily    → 30 min\n  Weekly   → 60 min\nManually select a coarser resolution if the 40-second limit is hit.")
+
+// ── Group ⑤: Display ──────────────────────────────────────────────────────
+color  col_bull     = input.color(color.new(color.lime,   0), "Bull Color", group=G_DISP,
+     tooltip="Color for: Low MA line, bull ▲ signals, bull band fill, bull cross reference dots.")
+color  col_bear     = input.color(color.new(color.orange, 0), "Bear Color", group=G_DISP,
+     tooltip="Color for: High MA line, bear ▼ signals, bear band fill, bear cross reference dots.")
+bool   show_cross   = input.bool(true, "Show Cross Gradient", group=G_DISP,
+     tooltip="Enable gradient coloring on the MA band and lines to visualize cross proximity.\nAs low_MA approaches ref_high, band and lines shift toward bull color.\nAs high_MA approaches ref_low, band and lines shift toward bear color.\nActive cross = solid opaque color.  Far from cross = transparent gray.\nHelps you see the cross building before it fires — without discrete triangle markers.")
+bool   show_ref     = input.bool(true, "Show Reference Lines (τ bars ago)", group=G_DISP,
+     tooltip="Show dotted lines for high_MA[τ_bull_eff] and low_MA[τ_bear_eff] — the reference values the current MA is compared against.\nHelps visualize how far back τ is looking and how close the cross is.")
+bool   show_band    = input.bool(true, "Show MA Band Fill", group=G_DISP,
+     tooltip="Fill the area between High MA and Low MA.\nColor: gray=neutral, bull-color=bull cross active, bear-color=bear cross active.\nNarrow band = compression phase. Wide band = trending phase.")
+bool   show_comp_bg = input.bool(true, "Show Compression Background", group=G_DISP,
+     tooltip="Highlight bars where the MA band is in compression (spread < compression %ile threshold) with a faint blue background.\nThis is the zone where breakout signals are most likely to form.")
+bool   show_table   = input.bool(true, "Show Info Table", group=G_DISP,
+     tooltip="Display a data table (bottom-right) showing:\n  τ Bull / Bear (learned delay values)\n  τ eff (τ after VDA modulation)\n  VDA Gain ▲/▼ (self-learned τ-multiplier gains)\n  Spread and compression threshold\n  ∂J/∂t components (volume delta acceleration)\n  Cross state and pending learning events")
+
+// ══════════════════════════════════════════════════════════════════════════════
+// SECONDARY TIMEFRAME DATA  (must be at global scope — Pine Script constraint)
+// ══════════════════════════════════════════════════════════════════════════════
+// Auto-select finer timeframe based on chart resolution
+string _sec_tf_auto = timeframe.in_seconds() <= 600   ? "1"  :
+                      timeframe.in_seconds() <= 900   ? "3"  :
+                      timeframe.in_seconds() <= 1800  ? "5"  :
+                      timeframe.in_seconds() <= 3600  ? "10" :
+                      timeframe.in_seconds() <= 14400 ? "15" :
+                      timeframe.in_seconds() <= 86400 ? "30" :
+                      "60"
+string _sec_tf = sec_tf_mode == "Auto" ? _sec_tf_auto : sec_tf_mode
+
+float[] _ltf_vols   = request.security_lower_tf(syminfo.tickerid, _sec_tf, volume)
+float[] _ltf_closes = request.security_lower_tf(syminfo.tickerid, _sec_tf, close)
+float[] _ltf_opens  = request.security_lower_tf(syminfo.tickerid, _sec_tf, open)
+
+// ══════════════════════════════════════════════════════════════════════════════
+// BASE CALCULATIONS
+// ══════════════════════════════════════════════════════════════════════════════
+float atr_val = ta.atr(14)
+float vol_sma = ta.sma(volume, adapt_len)
+
+// ── Fractional EMA alpha ──────────────────────────────────────────────────────
+// alpha = 2/(L+1) × d   where d ∈ (0.3, 1.0]
+// d = 1 → standard EMA.  d < 1 → slower response, long memory (fractional-order decay)
+float _fma_alpha = 2.0 / (fma_base + 1.0) * math.max(math.min(fma_d, 1.0), 0.3)
+
+// ── Fractional HL-MA ──────────────────────────────────────────────────────────
+var float fma_high = na
+var float fma_low  = na
+fma_high := na(fma_high) ? high : fma_high * (1.0 - _fma_alpha) + high * _fma_alpha
+fma_low  := na(fma_low)  ? low  : fma_low  * (1.0 - _fma_alpha) + low  * _fma_alpha
+
+// Ensure sufficient bar history for dynamic τ indexing (τ max = 100)
+max_bars_back(fma_high, 110)
+max_bars_back(fma_low,  110)
+
+// ── ATR-normalized spread ─────────────────────────────────────────────────────
+float fma_spread      = (fma_high - fma_low) / math.max(atr_val, 1e-10)
+float spread_comp_thr = ta.percentile_nearest_rank(fma_spread, adapt_len, comp_pctile)
+float spread_wide_thr = ta.percentile_nearest_rank(fma_spread, adapt_len, spread_wide_pctile)
+bool  in_compression  = fma_spread < spread_comp_thr   // band is tight
+bool  band_is_wide    = fma_spread > spread_wide_thr   // band is wide (trending)
+
+// ── Self-learning τ (separate for bull and bear) ──────────────────────────────
+var float tau_bull = tau_init
+var float tau_bear = tau_init
+
+// ══════════════════════════════════════════════════════════════════════════════
+// VOLUME DELTA ACCELERATION  ∂J/∂t
+// ══════════════════════════════════════════════════════════════════════════════
+// J = directional volume flow per bar (positive = buy-side, negative = sell-side)
+// ∂J/∂t = second derivative = acceleration of momentum
+
+// Aggregate sub-bar volume delta from secondary timeframe (if enabled)
+int   _ltf_n    = array.size(_ltf_vols)
+float _ltf_vd   = 0.0
+float _ltf_vtot = 0.0
+if use_sec_tf and _ltf_n > 0
+    for _i = 0 to _ltf_n - 1
+        float _lv = array.get(_ltf_vols,   _i)
+        float _lc = array.get(_ltf_closes, _i)
+        float _lo = array.get(_ltf_opens,  _i)
+        _ltf_vd   += (_lc >= _lo ? _lv : -_lv)
+        _ltf_vtot += _lv
+    _ltf_vd := _ltf_vd / math.max(_ltf_vtot, 1e-10)
+
+// Fallback: chart-bar close vs open when secondary TF is disabled or unavailable
+float _vd_raw = use_sec_tf and _ltf_n > 0 ?
+              _ltf_vd :
+              (close >= open ? volume : -volume) / math.max(vol_sma, 1e-10)
+
+// Smooth with the same alpha as the FMA (coherent timescale)
+var float _vd_smooth = na
+_vd_smooth := na(_vd_smooth) ? _vd_raw :
+              _vd_smooth * (1.0 - _fma_alpha) + _vd_raw * _fma_alpha
+
+// First and second derivatives of J
+float _vd_vel   = _vd_smooth - nz(_vd_smooth[1], _vd_smooth)   // velocity  (∂J/∂t first order)
+float _vd_accel = _vd_vel    - nz(_vd_vel[1],    0.0)          // acceleration (∂J/∂t)
+
+// Normalize by the 75th percentile of |acceleration| over adapt_len
+float _vda_p75  = ta.percentile_nearest_rank(math.abs(_vd_accel), adapt_len, 75)
+float _vda_norm = _vd_accel / math.max(_vda_p75, 1e-10)
+float _vda_c    = math.max(math.min(_vda_norm, 3.0), -3.0)     // clamp to [-3, +3]
+
+// Decompose into directional components
+float _vda_bear_comp = math.max(-_vda_c, 0.0)   // bear-direction acceleration [0, 3]
+float _vda_bull_comp = math.max( _vda_c, 0.0)   // bull-direction acceleration [0, 3]
+
+// Self-learned VDA gain (separate for bull and bear τ)
+var float vd_gain_bull = vda_gain_init
+var float vd_gain_bear = vda_gain_init
+
+// Effective τ: base τ stretched by opposing acceleration × gain
+// Bear acceleration during bull anticipation → stretch τ_bull (harder to confirm bull)
+// Bull acceleration during bear anticipation → stretch τ_bear (harder to confirm bear)
+float tau_bull_eff = use_vda ?
+     math.min(tau_bull * (1.0 + _vda_bear_comp * vd_gain_bull), 100.0) :
+     tau_bull
+float tau_bear_eff = use_vda ?
+     math.min(tau_bear * (1.0 + _vda_bull_comp * vd_gain_bear), 100.0) :
+     tau_bear
+
+// ══════════════════════════════════════════════════════════════════════════════
+// LAGRANGE LINEAR INTERPOLATION  (non-integer τ → precise fractional delay)
+// ══════════════════════════════════════════════════════════════════════════════
+// For τ = 7.3:  ref = MA[7] × 0.7 + MA[8] × 0.3
+int   _tb_k0   = int(math.floor(tau_bull_eff))
+float _tb_frac = tau_bull_eff - _tb_k0
+float ref_high = nz(fma_high[_tb_k0],     fma_high) * (1.0 - _tb_frac)
+               + nz(fma_high[_tb_k0 + 1], fma_high) * _tb_frac
+
+int   _ts_k0   = int(math.floor(tau_bear_eff))
+float _ts_frac = tau_bear_eff - _ts_k0
+float ref_low  = nz(fma_low[_ts_k0],     fma_low) * (1.0 - _ts_frac)
+               + nz(fma_low[_ts_k0 + 1], fma_low) * _ts_frac
+
+// ══════════════════════════════════════════════════════════════════════════════
+// CROSS DETECTION
+// ══════════════════════════════════════════════════════════════════════════════
+// Bull: low_MA now > high_MA[τ] → current lows have risen above former highs → confirmed uptrend
+// Bear: high_MA now < low_MA[τ] → current highs have fallen below former lows → confirmed downtrend
+bool fma_bull_cross = fma_low  > ref_high
+bool fma_bear_cross = fma_high < ref_low
+
+// ══════════════════════════════════════════════════════════════════════════════
+// SELF-LEARNING FEEDBACK: τ UPDATE VIA COMPRESSION → CROSS TIMING
+// ══════════════════════════════════════════════════════════════════════════════
+// When the MA band compresses (spread crosses below compression threshold),
+// record the event with a direction hint (close vs MA midpoint).
+// When the corresponding HL cross arrives, measure elapsed bars → update τ.
+// Evaluation window = max(τ_bull, τ_bear) × 3 bars.
+
+var int[] pend_bar = array.new<int>()    // bar_index at compression event
+var int[] pend_dir = array.new<int>()    // +1=bull candidate, -1=bear candidate
+
+// Compression entry event: spread just dropped below threshold
+bool _comp_entry = ta.crossunder(fma_spread, spread_comp_thr)
+
+// Direction hint: close position relative to MA midpoint
+float _fma_mid   = (fma_high + fma_low) * 0.5
+int   _hint_dir  = close >= _fma_mid ? 1 : -1
+
+if _comp_entry
+    array.push(pend_bar, bar_index)
+    array.push(pend_dir, _hint_dir)
+
+// Evaluate pending queue
+int _eval_win = int(math.max(tau_bull, tau_bear) * 3.0)
+int _qi = array.size(pend_bar) - 1
+while _qi >= 0
+    int  _pb      = array.get(pend_bar, _qi)
+    int  _pd      = array.get(pend_dir, _qi)
+    int  _elapsed = bar_index - _pb
+    bool _correct = _pd == 1 ? fma_bull_cross : fma_bear_cross  // direction matched
+    bool _adverse = _pd == 1 ? fma_bear_cross : fma_bull_cross  // opposite cross
+
+    if _correct and _elapsed <= _eval_win
+        // Confirmed: exponentially smooth τ toward actual elapsed time
+        float _t_actual = float(_elapsed)
+        if _pd == 1
+            tau_bull := math.max(math.min(
+                tau_bull * (1.0 - learn_rate) + _t_actual * learn_rate, 100.0), 2.0)
+        else
+            tau_bear := math.max(math.min(
+                tau_bear * (1.0 - learn_rate) + _t_actual * learn_rate, 100.0), 2.0)
+        array.remove(pend_bar, _qi)
+        array.remove(pend_dir, _qi)
+
+    else if _adverse or _elapsed > _eval_win
+        // Timeout: τ was likely too short — gently extend it
+        if _elapsed > _eval_win
+            if _pd == 1
+                tau_bull := math.min(tau_bull * (1.0 + learn_rate * 0.5), 100.0)
+            else
+                tau_bear := math.min(tau_bear * (1.0 + learn_rate * 0.5), 100.0)
+        // Adverse cross: direction error, not timing → τ unchanged, remove from queue
+        array.remove(pend_bar, _qi)
+        array.remove(pend_dir, _qi)
+
+    _qi -= 1
+
+// ══════════════════════════════════════════════════════════════════════════════
+// SELF-CIRCULAR GAIN LEARNING  (VDA gain update from cross outcomes)
+// ══════════════════════════════════════════════════════════════════════════════
+// Edge detection: fire only on the first bar of a new cross state
+var bool _bull_cross_prev = false
+var bool _bear_cross_prev = false
+bool _bull_edge = fma_bull_cross and not _bull_cross_prev
+bool _bear_edge = fma_bear_cross and not _bear_cross_prev
+_bull_cross_prev := fma_bull_cross
+_bear_cross_prev := fma_bear_cross
+
+float _vd_lr = learn_rate * 0.5   // gain learns slower than τ
+
+if use_vda
+    // Bull τ gain: bull cross during strong bear acceleration = premature → gain up
+    //              bear cross during strong bear acceleration = τ worked    → gain down
+    if _bull_edge and _vda_bear_comp > 1.0
+        vd_gain_bull := math.min(vd_gain_bull * (1.0 + _vd_lr), 3.0)
+    if _bear_edge and _vda_bear_comp > 1.0
+        vd_gain_bull := math.max(vd_gain_bull * (1.0 - _vd_lr * 0.5), 0.1)
+    // Bear τ gain: symmetric
+    if _bear_edge and _vda_bull_comp > 1.0
+        vd_gain_bear := math.min(vd_gain_bear * (1.0 + _vd_lr), 3.0)
+    if _bull_edge and _vda_bull_comp > 1.0
+        vd_gain_bear := math.max(vd_gain_bear * (1.0 - _vd_lr * 0.5), 0.1)
+
+// ══════════════════════════════════════════════════════════════════════════════
+// CROSS PROXIMITY GRADIENT
+// ══════════════════════════════════════════════════════════════════════════════
+// bull_ratio: how close low_MA is to ref_high  (1.0 = exactly at cross threshold)
+// bear_ratio: how close ref_low  is to fma_high (1.0 = exactly at cross threshold)
+// Gradient starts when the ratio exceeds _GRAD_START (20% away from cross).
+float _GRAD_START = 0.80
+
+float _bull_ratio = math.min(fma_low  / math.max(ref_high, 1e-10), 1.0)
+float _bear_ratio = math.min(ref_low  / math.max(fma_high, 1e-10), 1.0)
+
+// Normalize to [0, 1]: 0 = far (_GRAD_START), 1 = at/past cross
+float _bull_prox  = math.max((_bull_ratio - _GRAD_START) / (1.0 - _GRAD_START), 0.0)
+float _bear_prox  = math.max((_bear_ratio - _GRAD_START) / (1.0 - _GRAD_START), 0.0)
+
+// ── Band fill color ───────────────────────────────────────────────────────────
+// Neutral (far)  → semi-transparent direction color (approaching) → opaque (active cross)
+color _neutral       = color.new(color.gray, 92)
+color _bull_approach = color.from_gradient(_bull_prox, 0.0, 1.0, _neutral, color.new(col_bull, 60))
+color _bear_approach = color.from_gradient(_bear_prox, 0.0, 1.0, _neutral, color.new(col_bear, 60))
+
+color _band_color = show_cross ?
+     (fma_bull_cross ? color.new(col_bull, 18) :
+      fma_bear_cross ? color.new(col_bear, 18) :
+      _bull_prox >= _bear_prox ? _bull_approach : _bear_approach) :
+     _neutral
+
+// ── MA line colors ────────────────────────────────────────────────────────────
+// Lines shift from gray → direction color as proximity increases, solid when crossed
+color _low_ma_col  = show_cross ?
+     (fma_bull_cross ? col_bull :
+      color.from_gradient(_bull_prox, 0.0, 1.0, color.new(color.gray, 30), col_bull)) :
+     col_bull
+color _high_ma_col = show_cross ?
+     (fma_bear_cross ? col_bear :
+      color.from_gradient(_bear_prox, 0.0, 1.0, color.new(color.gray, 30), col_bear)) :
+     col_bear
+
+// ── Reference line colors (τ bars ago) ───────────────────────────────────────
+// Ref lines brighten as the current MA approaches them
+color _ref_high_col = color.from_gradient(_bull_prox, 0.0, 1.0,
+     color.new(col_bear, 75), color.new(col_bear, 20))
+color _ref_low_col  = color.from_gradient(_bear_prox, 0.0, 1.0,
+     color.new(col_bull, 75), color.new(col_bull, 20))
+
+// ══════════════════════════════════════════════════════════════════════════════
+// PLOTS
+// ══════════════════════════════════════════════════════════════════════════════
+
+// ── MA lines (gradient: gray when neutral → direction color when approaching/crossed) ──
+plot(fma_high, "High MA", color=_high_ma_col, linewidth=2)
+plot(fma_low,  "Low MA",  color=_low_ma_col,  linewidth=2)
+
+// ── Reference lines (τ bars ago): brighten as current MA closes in ───────────
+plot(show_ref ? ref_high : na, "Ref High (τ_bull ago)",
+     color=_ref_high_col, linewidth=1, style=plot.style_line)
+plot(show_ref ? ref_low  : na, "Ref Low  (τ_bear ago)",
+     color=_ref_low_col,  linewidth=1, style=plot.style_line)
+
+// ── Band fill (gradient: neutral → bull/bear as cross approaches, solid on cross) ──
+_p_high = plot(show_band ? fma_high : na, display=display.none)
+_p_low  = plot(show_band ? fma_low  : na, display=display.none)
+fill(_p_high, _p_low, _band_color, title="Band Fill")
+
+// ── Direction background (very subtle, active cross only) ─────────────────────
+bgcolor(fma_bull_cross ? color.new(col_bull, 93) :
+        fma_bear_cross ? color.new(col_bear, 93) : na,
+        title="Cross Direction BG")
+
+// ── Compression background ────────────────────────────────────────────────────
+bgcolor(show_comp_bg and in_compression ? color.new(color.blue, 90) : na,
+     title="Compression Phase BG")
+
+// ══════════════════════════════════════════════════════════════════════════════
+// INFO TABLE
+// ══════════════════════════════════════════════════════════════════════════════
+var table tbl = table.new(position.bottom_right, 2, 9,
+     bgcolor=color.new(color.black, 55),
+     border_color=color.gray, border_width=1)
+
+if barstate.islast and show_table
+    color _th = color.white
+    color _tv = color.new(color.gray, 0)
+    color _hn = color.new(color.gray, 40)
+
+    // Row 0: header
+    table.cell(tbl, 0, 0, "AFL-MA  v1",
+         bgcolor=color.new(color.navy, 40), text_color=_th, text_size=size.small)
+    table.cell(tbl, 1, 0, "L=" + str.tostring(fma_base) + "  d=" + str.tostring(fma_d, "#.##")
+         + "  α=" + str.tostring(_fma_alpha, "#.####"),
+         bgcolor=color.new(color.navy, 40), text_color=_hn, text_size=size.small)
+
+    // Row 1: τ (base learned values)
+    table.cell(tbl, 0, 1, "τ Bull / Bear", text_color=_th, text_size=size.small)
+    table.cell(tbl, 1, 1,
+         str.tostring(tau_bull, "#.#") + " / " + str.tostring(tau_bear, "#.#") + " bars",
+         text_color=col_bull, text_size=size.small)
+
+    // Row 2: τ effective (after VDA modulation)
+    table.cell(tbl, 0, 2, "τ eff ▲/▼  (+VDA)", text_color=_th, text_size=size.small)
+    bool _tau_stretched = tau_bull_eff > tau_bull * 1.05 or tau_bear_eff > tau_bear * 1.05
+    table.cell(tbl, 1, 2,
+         str.tostring(tau_bull_eff, "#.#") + " / " + str.tostring(tau_bear_eff, "#.#"),
+         text_color=_tau_stretched ? color.yellow : _tv, text_size=size.small)
+
+    // Row 3: VDA gain
+    table.cell(tbl, 0, 3, "VDA Gain ▲/▼", text_color=_th, text_size=size.small)
+    table.cell(tbl, 1, 3,
+         str.tostring(vd_gain_bull, "#.##") + " / " + str.tostring(vd_gain_bear, "#.##"),
+         text_color=_tv, text_size=size.small)
+
+    // Row 4: Spread
+    color _sc = band_is_wide ? col_bull : in_compression ? color.new(color.blue, 0) : _tv
+    string _sl = band_is_wide ? " [WIDE]" : in_compression ? " [COMP]" : ""
+    table.cell(tbl, 0, 4, "Spread" + _sl, text_color=_th, text_size=size.small)
+    table.cell(tbl, 1, 4,
+         str.tostring(fma_spread, "#.##")
+         + "  thr=" + str.tostring(spread_comp_thr, "#.##"),
+         text_color=_sc, text_size=size.small)
+
+    // Row 5: ∂J/∂t components
+    color _vc = _vda_c > 0.5 ? col_bull : _vda_c < -0.5 ? col_bear : _tv
+    table.cell(tbl, 0, 5, "∂J/∂t (VDA)", text_color=_th, text_size=size.small)
+    table.cell(tbl, 1, 5,
+         str.tostring(_vda_c, "#.##")
+         + "  ▲" + str.tostring(_vda_bull_comp, "#.##")
+         + " ▼" + str.tostring(_vda_bear_comp, "#.##"),
+         text_color=_vc, text_size=size.small)
+
+    // Row 6: Cross state
+    string _cs = fma_bull_cross ? "▲ BULL  CONFIRMED" :
+                 fma_bear_cross ? "▼ BEAR  CONFIRMED" :
+                 "—  neutral"
+    color  _cc = fma_bull_cross ? col_bull : fma_bear_cross ? col_bear : _tv
+    color  _bg6 = fma_bull_cross ? color.new(col_bull, 60) :
+                  fma_bear_cross ? color.new(col_bear, 60) :
+                  color.new(color.black, 80)
+    table.cell(tbl, 0, 6, "Cross State", bgcolor=_bg6, text_color=_th, text_size=size.small)
+    table.cell(tbl, 1, 6, _cs, bgcolor=_bg6, text_color=_cc, text_size=size.small)
+
+    // Row 7: Pending learning events
+    int _pq = array.size(pend_bar)
+    table.cell(tbl, 0, 7, "Pending (τ queue)", text_color=_th, text_size=size.small)
+    table.cell(tbl, 1, 7, str.tostring(_pq) + " event" + (_pq == 1 ? "" : "s"),
+         text_color=_pq > 0 ? color.yellow : _tv, text_size=size.small)
+
+    // Row 8: Ref levels
+    table.cell(tbl, 0, 8, "Ref High / Low", text_color=_th, text_size=size.small)
+    table.cell(tbl, 1, 8,
+         str.tostring(ref_high, "#.####") + " / " + str.tostring(ref_low, "#.####"),
+         text_color=_hn, text_size=size.small)

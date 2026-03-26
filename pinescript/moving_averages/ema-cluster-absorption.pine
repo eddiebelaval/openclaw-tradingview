@@ -1,0 +1,214 @@
+//@version=6
+indicator("EMA Cluster Absorption Engine", overlay=false, max_bars_back=4000)
+
+// =========================================================================
+// GLOBAL SETTINGS
+// =========================================================================
+grp_global = "Global Settings"
+src        = input.source(ohlc4, title="Source", group=grp_global)
+lookback   = input.time(timestamp("21 Mar 2024 00:00 -0400"), title="Maximum Lookback", group=grp_global)
+
+grp_anomaly = "Liquidity Anomaly Triggers (The Anchor)"
+vol_length      = input.int(50, "Volume Baseline Length", minval=10, group=grp_anomaly)
+vol_z_threshold = input.float(2.5, "Anomaly Z-Score Threshold", step=0.1, group=grp_anomaly)
+max_anchors     = input.int(24, "Max Cluster Anchors", minval=1, maxval=24, group=grp_anomaly)
+anchor_cooldown = input.int(5, "Anchor Cooldown (Bars)", minval=1, group=grp_anomaly)
+
+grp_osc = "Oscillator Visuals"
+agg_method     = input.string("Average", "Aggregation Method", options=["Average", "Median"], group=grp_osc)
+color_smooth   = input.int(1, "Color Smoothing (Bars)", minval=1, maxval=10, group=grp_osc)
+show_ribbons   = input.bool(true, "Show Individual EMA Ribbons", group=grp_osc)
+show_mean_line = input.bool(true, "Show Signal Line (SMA of Z-Score)", group=grp_osc)
+mean_length    = input.int(9, "Signal Length", minval=1, group=grp_osc)
+streak_window  = input.int(14, "Streak Lookback Window", minval=1, group=grp_osc)
+
+grp_bands = "Cluster Envelope Settings"
+show_cluster_bands = input.bool(true, "Show Rolling High/Low Cluster Channels", group=grp_bands)
+show_sd_bands      = input.bool(true, "Show Cluster StdDev Bands", group=grp_bands)
+sd_mult            = input.float(2.0, "StdDev Multiplier", step=0.1, group=grp_bands)
+show_intersections = input.bool(true, "Show Line Intersections", group=grp_bands)
+
+// =========================================================================
+// ANOMALY DETECTION LOGIC
+// =========================================================================
+bool is_within_lookback = time >= lookback
+
+float vol_sma = ta.sma(volume, vol_length)
+float vol_sd  = ta.stdev(volume, vol_length)
+float vol_z   = vol_sd > 0 ? (volume - vol_sma) / vol_sd : 0
+
+var int bars_since_last_anchor = anchor_cooldown
+bars_since_last_anchor += 1
+
+bool is_anomaly = (vol_z >= vol_z_threshold) and is_within_lookback and (bars_since_last_anchor >= anchor_cooldown)
+
+// =========================================================================
+// DYNAMIC EMA CLUSTER ARRAYS (Anchored Expanding EMA)
+// =========================================================================
+// For an EMA, we need to track the previous value per anchor to maintain recursion
+var float[] ema_prev_arr = array.new_float(max_anchors, na)
+var int[]   count_arr    = array.new_int(max_anchors, 0)
+
+if is_anomaly
+    bars_since_last_anchor := 0
+    array.unshift(ema_prev_arr, src)
+    array.unshift(count_arr, 1)
+    array.pop(ema_prev_arr)
+    array.pop(count_arr)
+
+// Update recursive EMA for all 24 slots
+var float[] active_ema_vals = array.new_float(0)
+array.clear(active_ema_vals)
+
+for i = 0 to max_anchors - 1
+    int   cnt = array.get(count_arr, i)
+    float prev_ema = array.get(ema_prev_arr, i)
+    
+    if cnt > 0
+        // Calculate dynamic alpha based on bars since anchor (Expanding EMA)
+        float alpha = 2.0 / (cnt + 1.0)
+        float current_ema = (src - prev_ema) * alpha + prev_ema
+        
+        array.set(ema_prev_arr, i, current_ema)
+        array.set(count_arr, i, cnt + 1)
+        array.push(active_ema_vals, current_ema)
+
+// =========================================================================
+// CLUSTER AGGREGATION & Z-SCORE CONVERSION
+// =========================================================================
+float cluster_center = na
+float cluster_high   = na
+float cluster_low    = na
+
+int sz = array.size(active_ema_vals)
+if sz > 0
+    cluster_high := array.max(active_ema_vals)
+    cluster_low  := array.min(active_ema_vals)
+    
+    if agg_method == "Average"
+        cluster_center := array.avg(active_ema_vals)
+    else if agg_method == "Median"
+        cluster_center := array.median(active_ema_vals)
+
+float cluster_sd = sz > 1 ? array.stdev(active_ema_vals) : 0
+
+// Z-SCORE CONVERSION
+float osc_val    = cluster_sd > 0 ? (src - cluster_center) / cluster_sd : 0
+float env_top    = cluster_sd > 0 ? (cluster_high - cluster_center) / cluster_sd : 0
+float env_bottom = cluster_sd > 0 ? (cluster_low - cluster_center) / cluster_sd : 0
+
+f_get_z(int rank) =>
+    float val = array.size(active_ema_vals) >= rank ? array.get(active_ema_vals, rank-1) : na
+    float z   = (not na(val) and cluster_sd > 0) ? (val - cluster_center) / cluster_sd : na
+    z
+
+float z1  = f_get_z(1),  float z2  = f_get_z(2),  float z3  = f_get_z(3),  float z4  = f_get_z(4)
+float z5  = f_get_z(5),  float z6  = f_get_z(6),  float z7  = f_get_z(7),  float z8  = f_get_z(8)
+float z9  = f_get_z(9),  float z10 = f_get_z(10), float z11 = f_get_z(11), float z12 = f_get_z(12)
+float z13 = f_get_z(13), float z14 = f_get_z(14), float z15 = f_get_z(15), float z16 = f_get_z(16)
+float z17 = f_get_z(17), float z18 = f_get_z(18), float z19 = f_get_z(19), float z20 = f_get_z(20)
+float z21 = f_get_z(21), float z22 = f_get_z(22), float z23 = f_get_z(23), float z24 = f_get_z(24)
+
+float sd_upper = env_top + sd_mult
+float sd_lower = env_bottom - sd_mult
+float signal = ta.sma(osc_val, mean_length)
+
+// =========================================================================
+// INSTITUTIONAL CONSENSUS BACKGROUND (IGNITION)
+// =========================================================================
+bool all_above = sz > 0 and cluster_low > src
+bool all_below = sz > 0 and cluster_high < src
+
+var int bg_streak_count = 0
+var int last_consensus_bar = -100
+
+if all_above or all_below
+    if bar_index - last_consensus_bar <= streak_window
+        bg_streak_count += 1
+    else
+        bg_streak_count := 1
+    last_consensus_bar := bar_index
+else
+    if bar_index - last_consensus_bar > streak_window
+        bg_streak_count := 0
+
+float intensity_ratio = math.min(bg_streak_count, 50) / 50.0
+int dynamic_transp = int(70 + (intensity_ratio * 25))
+
+bgcolor(all_above ? color.new(color.lime, dynamic_transp) : all_below ? color.new(color.red, dynamic_transp) : na, title="Consensus Ignition")
+
+// =========================================================================
+// MOMENTUM HEATMAP LOGIC
+// =========================================================================
+bool is_expanding_up = osc_val >= 0 and ta.rising(osc_val, color_smooth)
+bool is_expanding_dn = osc_val <  0 and ta.falling(osc_val, color_smooth)
+
+f_apply_momentum(color base_c, bool expanding) =>
+    expanding ? base_c : color.new(base_c, 50)
+
+float ratio_top = not na(env_top) and env_top != 0 ? math.abs(osc_val / env_top) : 0
+float ratio_bot = not na(env_bottom) and env_bottom != 0 ? math.abs(osc_val / env_bottom) : 0
+
+color hist_color = na
+if osc_val >= 0
+    color base_c = color.from_gradient(math.min(ratio_top, 1.25), 0, 1.25, color.blue, color.lime)
+    hist_color := f_apply_momentum(base_c, is_expanding_up)
+else
+    color base_c = color.from_gradient(math.min(ratio_bot, 1.25), 0, 1.25, color.yellow, color.red)
+    hist_color := f_apply_momentum(base_c, is_expanding_dn)
+
+// =========================================================================
+// INTERSECTION DETECTION
+// =========================================================================
+bool cross_sig_env = ta.cross(signal, env_top) or ta.cross(signal, env_bottom)
+bool cross_sig_sd  = ta.cross(signal, sd_upper) or ta.cross(signal, sd_lower)
+float intersect_y = (cross_sig_env or cross_sig_sd) ? signal : na
+
+// =========================================================================
+// RENDERING (Z-ORDER: Histogram -> Bands -> Signal -> Ribbons)
+// =========================================================================
+hline(0, "Meta-EMA Equilibrium", color.gray, linestyle=hline.style_dashed)
+
+// 1. Plot Histogram (Background Layer)
+plot(osc_val, "EMA Cluster Deviation", color=hist_color, style=plot.style_columns)
+
+// 2. Plot Cluster Range and Boundaries
+p_top = plot(show_cluster_bands ? env_top : na, "EMA High", color=color.new(color.red, 20), style=plot.style_linebr, linewidth=2)
+p_bot = plot(show_cluster_bands ? env_bottom : na, "EMA Low", color=color.new(color.green, 20), style=plot.style_linebr, linewidth=2)
+fill(p_top, p_bot, color.new(color.gray, 85), title="EMA Range Fill")
+
+// 3. Plot Volatility Bands
+plot(show_sd_bands ? sd_upper : na, "SD Upper", color=color.new(color.aqua, 40), style=plot.style_linebr)
+plot(show_sd_bands ? sd_lower : na, "SD Lower", color=color.new(color.red, 40), style=plot.style_linebr)
+
+// 4. Plot Signal Line
+plot(show_mean_line ? signal : na, "Signal Line", color=color.new(color.white, 20), linewidth=2)
+plotchar(show_intersections ? intersect_y : na, "Exhaustion Star", char="✧", location=location.absolute, color=color.white, size=size.tiny)
+
+// 5. Plot Individual EMA Ribbons (Professional Palette)
+int transp = 50
+color c1 = color.new(#F48FB1, transp), color c2 = color.new(#EF5350, transp), color c3 = color.new(#E53935, transp)
+color c4 = color.new(#FFCC80, transp), color c5 = color.new(#FFB74D, transp), color c6 = color.new(#FF9800, transp)
+color c7 = color.new(#FFF59D, transp), color c8 = color.new(#FFF176, transp), color c9 = color.new(#FFEB3B, transp)
+color c10 = color.new(#A5D6A7, transp), color c11 = color.new(#81C784, transp), color c12 = color.new(#66BB6A, transp)
+color c13 = color.new(#80CBC4, transp), color c14 = color.new(#4DB6AC, transp), color c15 = color.new(#26A69A, transp)
+color c16 = color.new(#81D4FA, transp), color c17 = color.new(#4FC3F7, transp), color c18 = color.new(#29B6F6, transp)
+color c19 = color.new(#90CAF9, transp), color c20 = color.new(#64B5F6, transp), color c21 = color.new(#42A5F5, transp)
+color c22 = color.new(#B39DDB, transp), color c23 = color.new(#9575CD, transp), color c24 = color.new(#7E57C2, transp)
+
+plot(show_ribbons ? z1 : na, "E1", color=c1, linewidth=1), plot(show_ribbons ? z2 : na, "E2", color=c2, linewidth=1)
+plot(show_ribbons ? z3 : na, "E3", color=c3, linewidth=1), plot(show_ribbons ? z4 : na, "E4", color=c4, linewidth=1)
+plot(show_ribbons ? z5 : na, "E5", color=c5, linewidth=1), plot(show_ribbons ? z6 : na, "E6", color=c6, linewidth=1)
+plot(show_ribbons ? z7 : na, "E7", color=c7, linewidth=1), plot(show_ribbons ? z8 : na, "E8", color=c8, linewidth=1)
+plot(show_ribbons ? z9 : na, "E9", color=c9, linewidth=1), plot(show_ribbons ? z10 : na, "E10", color=c10, linewidth=1)
+plot(show_ribbons ? z11 : na, "E11", color=c11, linewidth=1), plot(show_ribbons ? z12 : na, "E12", color=c12, linewidth=1)
+plot(show_ribbons ? z13 : na, "E13", color=c13, linewidth=1), plot(show_ribbons ? z14 : na, "E14", color=c14, linewidth=1)
+plot(show_ribbons ? z15 : na, "E15", color=c15, linewidth=1), plot(show_ribbons ? z16 : na, "E16", color=c16, linewidth=1)
+plot(show_ribbons ? z17 : na, "E17", color=c17, linewidth=1), plot(show_ribbons ? z18 : na, "E18", color=c18, linewidth=1)
+plot(show_ribbons ? z19 : na, "E19", color=c19, linewidth=1), plot(show_ribbons ? z20 : na, "E20", color=c20, linewidth=1)
+plot(show_ribbons ? z21 : na, "E21", color=c21, linewidth=1), plot(show_ribbons ? z22 : na, "E22", color=c22, linewidth=1)
+plot(show_ribbons ? z23 : na, "E23", color=c23, linewidth=1), plot(show_ribbons ? z24 : na, "E24", color=c24, linewidth=1)
+
+// Mark Anomaly Triggers
+color trigger_color = is_anomaly ? (close >= open ? color.blue : color.yellow) : na
+plotchar(is_anomaly ? 0 : na, "Liquidity Event", char="▲", location=location.absolute, color=trigger_color, size=size.tiny)

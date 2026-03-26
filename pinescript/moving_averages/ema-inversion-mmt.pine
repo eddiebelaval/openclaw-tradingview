@@ -1,0 +1,170 @@
+//@version=5
+indicator("EMA Inversion [MMT]", overlay=true, max_lines_count=500, max_boxes_count=500)
+
+// ==========================================
+// 1. INPUTS & CUSTOMIZATION
+// ==========================================
+grp_emas = "EMA Settings"
+lenFast  = input.int(33, title="Fast EMA", group=grp_emas)
+lenMed   = input.int(50, title="Medium EMA", group=grp_emas)
+lenSlow  = input.int(200, title="Slow EMA", group=grp_emas)
+
+grp_vis  = "EMA Visuals"
+colFast  = input.color(color.blue, title="Fast EMA", group=grp_vis)
+colMed   = input.color(color.red, title="Medium EMA", group=grp_vis)
+colSlow  = input.color(color.green, title="Slow EMA", group=grp_vis)
+bandCol  = input.color(color.new(color.gray, 85), title="33-50 Band", group=grp_vis)
+
+grp_fvg  = "FVG Visuals"
+showFVG  = input.bool(true, title="Show Normal FVGs?", group=grp_fvg)
+bullFvgC = input.color(color.new(color.green, 85), title="Bullish FVG", group=grp_fvg)
+bearFvgC = input.color(color.new(color.red, 85), title="Bearish FVG", group=grp_fvg)
+extLimit = input.int(0, title="Extend Boxes Limit", tooltip = "In bars, 0 = Indefinite", minval=0, group=grp_fvg)
+maxFvgBoxes = input.int(1, title="Max Recent FVGs to Show", minval=1, maxval=100, group=grp_fvg)
+
+grp_ifvg = "iFVG Visuals"
+showIFVG  = input.bool(true, title="Turn FVG into iFVG on Close?", group=grp_ifvg)
+bullIFvgC = input.color(color.new(color.orange, 85), title="Bearish iFVG", group=grp_ifvg)
+bearIFvgC = input.color(color.new(color.blue, 85), title="Bullish iFVG", group=grp_ifvg)
+maxIFvgBoxes = input.int(1, title="Max Recent iFVGs to Show", minval=1, maxval=100, group=grp_ifvg)
+
+// ==========================================
+// 2. HELPER FUNCTIONS
+// ==========================================
+// Adds a new box to an array and strictly manages the historical size limit
+f_addBox(box[] boxArray, box newBox, int maxSize) =>
+    array.push(boxArray, newBox)
+    if array.size(boxArray) > maxSize
+        box.delete(array.shift(boxArray))
+
+// Converts standard FVG visuals, removes it from the FVG array, and pushes to iFVG array
+f_invertBox(box fvgBox, box[] sourceArray, box[] targetArray, int maxSize, color iFvgColor) =>
+    if not na(fvgBox)
+        box.set_bgcolor(fvgBox, iFvgColor)
+        box.set_border_color(fvgBox, color.new(iFvgColor, 50))
+        int idx = array.indexof(sourceArray, fvgBox)
+        if idx >= 0
+            array.remove(sourceArray, idx)
+        f_addBox(targetArray, fvgBox, maxSize)
+
+// Iterates through any provided box array and extends active boxes to the current bar
+f_extendBoxes(box[] boxArray, int limitVal) =>
+    if array.size(boxArray) > 0
+        for i = 0 to array.size(boxArray) - 1
+            b = array.get(boxArray, i)
+            if limitVal == 0 or (bar_index - box.get_left(b) <= limitVal)
+                box.set_right(b, bar_index)
+
+// ==========================================
+// 3. INDICATOR CALCULATIONS
+// ==========================================
+emaFast = ta.ema(close, lenFast)
+emaMed  = ta.ema(close, lenMed)
+emaSlow = ta.ema(close, lenSlow)
+
+p1 = plot(emaFast, color=colFast, title="Fast EMA")
+p2 = plot(emaMed, color=colMed, title="Medium EMA")
+plot(emaSlow, color=colSlow, title="Slow EMA")
+fill(p1, p2, color=bandCol, title="EMA Pullback Zone")
+
+// ==========================================
+// 4. IMBALANCE (FVG) & INVERSION VISUALS
+// ==========================================
+isBullFVG = low > high[2] and close[1] > open[1]
+isBearFVG = high < low[2] and close[1] < open[1]
+
+var float lastBullFvgLow  = na
+var float lastBullFvgTop  = na
+var int   bullStartBar    = na
+var bool  bullInverted    = true 
+
+var float lastBearFvgHigh = na
+var float lastBearFvgBot  = na
+var int   bearStartBar    = na
+var bool  bearInverted    = true 
+
+var box bullBox = na
+var box bearBox = na
+
+var box[] bullBoxesArray = array.new_box()
+var box[] bearBoxesArray = array.new_box()
+
+var box[] bullIFvgBoxesArray = array.new_box()
+var box[] bearIFvgBoxesArray = array.new_box()
+
+// FVG Creation
+if isBullFVG
+    lastBullFvgLow := high[2]
+    lastBullFvgTop := low
+    bullStartBar   := bar_index[2]
+    bullInverted   := false
+    if showFVG
+        bullBox := box.new(left=bullStartBar, top=lastBullFvgTop, right=bar_index, bottom=lastBullFvgLow, border_color=color.new(bullFvgC, 50), bgcolor=bullFvgC)
+        f_addBox(bullBoxesArray, bullBox, maxFvgBoxes)
+
+if isBearFVG
+    lastBearFvgHigh := low[2]
+    lastBearFvgBot  := high
+    bearStartBar    := bar_index[2]
+    bearInverted    := false
+    if showFVG
+        bearBox := box.new(left=bearStartBar, top=lastBearFvgHigh, right=bar_index, bottom=lastBearFvgBot, border_color=color.new(bearFvgC, 50), bgcolor=bearFvgC)
+        f_addBox(bearBoxesArray, bearBox, maxFvgBoxes)
+
+// ==========================================
+// 5. STRATEGY LOGIC & INVERSION TRIGGERS
+// ==========================================
+shortTrend = close < emaFast and close < emaMed and close < emaSlow
+longTrend  = close > emaFast and close > emaMed and close > emaSlow
+
+var int setupState = 0 
+
+// Detect Pullbacks into the EMA band
+if shortTrend and high >= emaFast
+    setupState := 1
+else if not shortTrend and setupState == 1
+    setupState := 0
+
+if longTrend and low <= emaFast
+    setupState := -1
+else if not longTrend and setupState == -1
+    setupState := 0
+
+isBullFlippedNow = not bullInverted and close < lastBullFvgLow
+isBearFlippedNow = not bearInverted and close > lastBearFvgHigh
+
+// Signal Triggers
+shortTrigger = setupState == 1 and isBullFlippedNow and close < emaFast
+longTrigger  = setupState == -1 and isBearFlippedNow and close > emaFast
+
+// Reset State & Update Inversion Variables
+if isBullFlippedNow
+    bullInverted := true
+    setupState := 0 // Reset pullback state
+    if showIFVG
+        f_invertBox(bullBox, bullBoxesArray, bullIFvgBoxesArray, maxIFvgBoxes, bullIFvgC)
+
+if isBearFlippedNow
+    bearInverted := true
+    setupState := 0 // Reset pullback state
+    if showIFVG
+        f_invertBox(bearBox, bearBoxesArray, bearIFvgBoxesArray, maxIFvgBoxes, bearIFvgC)
+
+// Box Extension Logic
+if showFVG
+    f_extendBoxes(bullBoxesArray, extLimit)
+    f_extendBoxes(bearBoxesArray, extLimit)
+
+if showIFVG
+    f_extendBoxes(bullIFvgBoxesArray, extLimit)
+    f_extendBoxes(bearIFvgBoxesArray, extLimit)
+
+// ==========================================
+// 6. EXECUTION VISUALS & ALERTS
+// ==========================================
+plotshape(shortTrigger, title="Short Entry", style=shape.triangledown, location=location.abovebar, color=color.red, size=size.small, text="SHORT")
+plotshape(longTrigger, title="Long Entry", style=shape.triangleup, location=location.belowbar, color=color.green, size=size.small, text="LONG")
+
+// Webhook Alerts
+alertcondition(shortTrigger, title="Short Setup Triggered", message='{"side": "sell", "ticker": "{{ticker}}", "price": "{{close}}"}')
+alertcondition(longTrigger, title="Long Setup Triggered", message='{"side": "buy", "ticker": "{{ticker}}", "price": "{{close}}"}')

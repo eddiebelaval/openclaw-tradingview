@@ -1,0 +1,306 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+//@author exlux
+//@version=6
+indicator("Adaptive Regime Compass MA Suite", overlay=true, max_lines_count=500, max_labels_count=500)
+
+//=============================================================================
+// PURPOSE
+//  Fast Medium Slow adaptive moving average suite designed to generalize across
+//  markets and timeframes by combining
+//   1) optional robust outlier clipping
+//   2) efficiency ratio driven adaptive alpha
+//   3) optional controlled zero lag assist
+//   4) reliability scoring so the user can gate decisions in chop
+//   5) optional higher timeframe panel for regime confirmation
+//
+// NOTES
+//  - No lookahead used anywhere.
+//  - All plots are in global scope.
+//=============================================================================
+
+//====================
+// inputs
+//====================
+
+// Source selection
+src = input.source(close, "Source", tooltip=
+     "Input series used by the engine. Default is close. For futures intraday you can test hlc3 or ohlc4.")
+
+// Three speed horizons
+len_fast = input.int(14, "Fast Length", minval=2, tooltip=
+     "Controls the fast line response. Smaller values react quicker but can amplify noise.")
+len_med  = input.int(34, "Medium Length", minval=2, tooltip=
+     "Controls the medium line. Used as the primary regime baseline for trend and panel.")
+len_slow = input.int(89, "Slow Length", minval=2, tooltip=
+     "Controls the slow line. Acts as structural bias filter. Larger values reduce whipsaws but add lag.")
+
+// Adaptive engine controls
+er_len = input.int(34, "Efficiency Length", minval=2, tooltip=
+     "Window used to measure directionality vs noise. Higher values make adaptation slower but more stable.")
+fast_alpha_len = input.int(2, "Alpha Fast Anchor", minval=1, tooltip=
+     "Fast alpha anchor for the adaptive engine. Lower is faster.")
+slow_alpha_len = input.int(30, "Alpha Slow Anchor", minval=2, tooltip=
+     "Slow alpha anchor for the adaptive engine. Higher is smoother in chop.")
+
+// Robust clip controls
+use_robust_clip = input.bool(true, "Robust Clip", tooltip=
+     "If enabled, extreme deviations from a rolling baseline are clipped before updating MA state. Reduces spike poisoning.")
+clip_len = input.int(34, "Clip Length", minval=5, tooltip=
+     "Window used for robust clipping baseline and deviation. Larger values are more conservative.")
+clip_k = input.float(3.0, "Clip Strength", minval=0.5, step=0.25, tooltip=
+     "How aggressively to clip outliers. Higher values clip less. Lower values clip more.")
+
+// Zero lag assist controls
+use_zero_lag = input.bool(true, "Zero Lag Assist", tooltip=
+     "If enabled, adds a controlled phase compensation to reduce lag. Can overshoot in chop if set too high.")
+zl_strength = input.float(0.6, "Zero Lag Strength", minval=0.0, maxval=1.0, step=0.05, tooltip=
+     "How much phase compensation to apply. Higher reduces lag more but increases overshoot risk.")
+
+// Coloring
+color_by_close = input.bool(true, "Color By Close Position", tooltip=
+     "If enabled, each line is green when close is above it and red when below it. If disabled, fixed colors are used.")
+
+// Reliability scoring controls
+rel_slope_len = input.int(14, "Reliability Slope Window", minval=2, tooltip=
+     "Window used to normalize slope strength. Helps distinguish real trend from minor drift.")
+rel_min = input.float(0.55, "Reliability Threshold", minval=0.0, maxval=1.0, step=0.01, tooltip=
+     "Suggested gating threshold. Above this value, regime confidence is higher. Below it, chop risk is higher.")
+
+// Directional reliable regime background
+show_rel_bg = input.bool(false, "Directional Reliable Background", tooltip=
+     "If enabled, background turns green or red only when reliability is above threshold AND MA alignment is consistent.")
+
+// HTF panel
+panel_enable = input.bool(true, "HTF Panel", tooltip=
+     "Shows the same engine state on higher timeframes. Useful for avoiding low timeframe chop against HTF direction.")
+tf_1 = input.timeframe("60", "Panel TF 1", tooltip="First higher timeframe for confirmation. Example 60 for 1H.")
+tf_2 = input.timeframe("240", "Panel TF 2", tooltip="Second higher timeframe for confirmation. Example 240 for 4H.")
+tf_3 = input.timeframe("D", "Panel TF 3", tooltip="Third higher timeframe for confirmation. Example D for daily.")
+
+//=============================================================================
+// helpers
+//=============================================================================
+
+// Simple SMA using math.sum to keep sliding sum behavior explicit
+f_sma(series float x, int n) =>
+    math.sum(x, n) / n
+
+// Robust clip using rolling baseline plus MAD like deviation scale
+f_robust_clip(series float x, int n, float k) =>
+    float base = f_sma(x, n)
+    float dev = math.abs(x - base)
+    float mad = f_sma(dev, n)
+    float scale = math.max(mad * 1.4826, syminfo.mintick)
+    float lo = base - k * scale
+    float hi = base + k * scale
+    math.min(math.max(x, lo), hi)
+
+// Efficiency ratio: directional change divided by path length
+f_er(series float x, int n) =>
+    float change = math.abs(x - x[n])
+    float vol = 0.0
+    for i = 0 to n - 1
+        vol += math.abs(x[i] - x[i + 1])
+    vol := math.max(vol, syminfo.mintick)
+    change / vol
+
+// ER to alpha mapping, squared smoothing constant like KAMA
+f_alpha_from_er(float er, int fast_n, int slow_n) =>
+    float fast_sc = 2.0 / (fast_n + 1.0)
+    float slow_sc = 2.0 / (slow_n + 1.0)
+    float sc = slow_sc + (fast_sc - slow_sc) * er
+    sc * sc
+
+// Adaptive MA with a second shaping stage tied to base_len
+f_adaptive_ma(series float x, int base_len, int er_n, int fast_n, int slow_n) =>
+    var float ma = na
+    float erv = f_er(x, er_n)
+    float a = f_alpha_from_er(erv, fast_n, slow_n)
+
+    if na(ma)
+        ma := x
+    else
+        ma := ma + a * (x - ma)
+
+    float a2 = 2.0 / (base_len + 1.0)
+    var float shaped = na
+    shaped := na(shaped) ? ma : shaped + a2 * (ma - shaped)
+
+    [shaped, erv, a]
+
+// Controlled phase compensation
+f_zero_lag(series float ma_line, float strength) =>
+    float diff = ma_line - ma_line[1]
+    ma_line + strength * diff
+
+//=============================================================================
+// engine bundle
+//=============================================================================
+
+// Bundle the full output so HTF request.security can reuse it consistently
+f_calc_bundle(series float in_src) =>
+    float x_in = use_robust_clip ? f_robust_clip(in_src, clip_len, clip_k) : in_src
+
+    [ma_f_raw, er_f, a_f] = f_adaptive_ma(x_in, len_fast, er_len, fast_alpha_len, slow_alpha_len)
+    [ma_m_raw, er_m, a_m] = f_adaptive_ma(x_in, len_med,  er_len, fast_alpha_len, slow_alpha_len)
+    [ma_s_raw, er_s, a_s] = f_adaptive_ma(x_in, len_slow, er_len, fast_alpha_len, slow_alpha_len)
+
+    float ma_f = use_zero_lag ? f_zero_lag(ma_f_raw, zl_strength) : ma_f_raw
+    float ma_m = use_zero_lag ? f_zero_lag(ma_m_raw, zl_strength * 0.7) : ma_m_raw
+    float ma_s = use_zero_lag ? f_zero_lag(ma_s_raw, zl_strength * 0.4) : ma_s_raw
+
+    float slope_m = ma_m - ma_m[1]
+    float slope_abs_base = f_sma(math.abs(slope_m), rel_slope_len)
+    float slope_strength = slope_abs_base > 0 ? math.min(1.0, math.abs(slope_m) / (slope_abs_base * 2.0)) : 0.0
+
+    bool align_bull = (ma_f >= ma_m) and (ma_m >= ma_s)
+    bool align_bear = (ma_f <= ma_m) and (ma_m <= ma_s)
+    float align_score = (align_bull or align_bear) ? 1.0 : 0.0
+
+    float rel = 0.55 * er_m + 0.25 * align_score + 0.20 * slope_strength
+    rel := math.max(0.0, math.min(1.0, rel))
+
+    [ma_f, ma_m, ma_s, rel, er_m, align_bull, align_bear, slope_m]
+
+//=============================================================================
+// current timeframe calc
+//=============================================================================
+[ma_fast, ma_med, ma_slow, rel, er_med, align_bull, align_bear, slope_med] = f_calc_bundle(src)
+
+//=============================================================================
+// plotting
+//=============================================================================
+color c_fast_fixed = color.new(color.lime, 0)
+color c_med_fixed  = color.new(color.silver, 0)
+color c_slow_fixed = color.new(color.orange, 0)
+
+color c_fast = color_by_close ? (close >= ma_fast ? color.new(color.lime, 0) : color.new(color.red, 0)) : c_fast_fixed
+color c_med  = color_by_close ? (close >= ma_med  ? color.new(color.lime, 0) : color.new(color.red, 0)) : c_med_fixed
+color c_slow = color_by_close ? (close >= ma_slow ? color.new(color.lime, 0) : color.new(color.red, 0)) : c_slow_fixed
+
+plot(ma_fast, "Compass Fast", linewidth=2, color=c_fast)
+plot(ma_med,  "Compass Medium", linewidth=2, color=c_med)
+plot(ma_slow, "Compass Slow", linewidth=2, color=c_slow)
+
+//=============================================================================
+// Reliable Regime Background (Directional)
+//=============================================================================
+bool reliable = rel >= rel_min
+
+color bg_regime =
+     (show_rel_bg and reliable and align_bull) ? color.new(color.lime, 85) :
+     (show_rel_bg and reliable and align_bear) ? color.new(color.red, 85) :
+     na
+
+bgcolor(bg_regime, title="Directional Reliable Regime Background")
+
+//=============================================================================
+// HTF panel
+//  Improvements:
+//   - Shows: Trend, Close vs Medium, Stack (Fast vs Med and Med vs Slow), Reliability
+//   - Consensus row: Majority trend + Avg reliability + Avg medium across 3 TFs and Close vs that avg
+//=============================================================================
+f_tf_state(string tf) =>
+    [h_f, h_m, h_s, h_rel, h_er_m, h_align_bull, h_align_bear, h_slope_m] =
+         request.security(syminfo.tickerid, tf, f_calc_bundle(src), barmerge.gaps_off, barmerge.lookahead_off)
+
+    float h_close = request.security(syminfo.tickerid, tf, close, barmerge.gaps_off, barmerge.lookahead_off)
+
+    bool c_above_m = h_close >= h_m
+    bool f_above_m = h_f >= h_m
+    bool m_above_s = h_m >= h_s
+
+    bool trend_up = c_above_m and (h_slope_m > 0)
+    bool trend_dn = (not c_above_m) and (h_slope_m < 0)
+
+    string trend_txt = trend_up ? "UP" : trend_dn ? "DOWN" : "NEUTRAL"
+    color trend_col = trend_up ? color.new(color.lime, 0) : trend_dn ? color.new(color.red, 0) : color.new(color.gray, 0)
+
+    string cpos_txt = c_above_m ? "ABOVE" : "BELOW"
+    color cpos_col = c_above_m ? color.new(color.lime, 0) : color.new(color.red, 0)
+
+    // Stack is more informative than a single bull bear tag
+    // "F>M, M>S" are the two key relationships in a 3 MA stack
+    string stack_txt = (f_above_m ? "F>M" : "F<M") + " " + (m_above_s ? "M>S" : "M<S")
+    color stack_col =
+         (f_above_m and m_above_s) ? color.new(color.lime, 0) :
+         ((not f_above_m) and (not m_above_s)) ? color.new(color.red, 0) :
+         color.new(color.gray, 0)
+
+    string rel_txt = str.tostring(h_rel, "#.###")
+    color rel_col = (h_rel >= rel_min) ? color.new(color.lime, 0) : color.new(color.gray, 0)
+
+    // Return includes h_m so we can compute avg medium across TFs
+    [trend_txt, trend_col, cpos_txt, cpos_col, stack_txt, stack_col, rel_txt, rel_col, h_rel, h_m]
+
+// Table: header + 3 TF rows + consensus row
+var table p = table.new(position.top_right, 6, 5)
+
+f_cell(int col, int row, string txt, color tcol) =>
+    table.cell(p, col, row, txt, text_color=tcol)
+
+if barstate.islast and panel_enable
+    // Header
+    f_cell(0, 0, "TF", color.white)
+    f_cell(1, 0, "TREND", color.white)
+    f_cell(2, 0, "C VS MED", color.white)
+    f_cell(3, 0, "STACK", color.white)
+    f_cell(4, 0, "REL", color.white)
+    f_cell(5, 0, "C VS AVG", color.white)
+
+    [t1, t1c, cp1, cp1c, st1, st1c, rt1, rt1c, r1v, m1] = f_tf_state(tf_1)
+    [t2, t2c, cp2, cp2c, st2, st2c, rt2, rt2c, r2v, m2] = f_tf_state(tf_2)
+    [t3, t3c, cp3, cp3c, st3, st3c, rt3, rt3c, r3v, m3] = f_tf_state(tf_3)
+
+    // Per TF rows (no C VS AVG in these rows, keep it for consensus)
+    f_cell(0, 1, tf_1, color.new(color.silver, 0))
+    f_cell(1, 1, t1, t1c)
+    f_cell(2, 1, cp1, cp1c)
+    f_cell(3, 1, st1, st1c)
+    f_cell(4, 1, rt1, rt1c)
+    f_cell(5, 1, "", color.new(color.silver, 0))
+
+    f_cell(0, 2, tf_2, color.new(color.silver, 0))
+    f_cell(1, 2, t2, t2c)
+    f_cell(2, 2, cp2, cp2c)
+    f_cell(3, 2, st2, st2c)
+    f_cell(4, 2, rt2, rt2c)
+    f_cell(5, 2, "", color.new(color.silver, 0))
+
+    f_cell(0, 3, tf_3, color.new(color.silver, 0))
+    f_cell(1, 3, t3, t3c)
+    f_cell(2, 3, cp3, cp3c)
+    f_cell(3, 3, st3, st3c)
+    f_cell(4, 3, rt3, rt3c)
+    f_cell(5, 3, "", color.new(color.silver, 0))
+
+    // Consensus
+    int up_count = (t1 == "UP" ? 1 : 0) + (t2 == "UP" ? 1 : 0) + (t3 == "UP" ? 1 : 0)
+    int dn_count = (t1 == "DOWN" ? 1 : 0) + (t2 == "DOWN" ? 1 : 0) + (t3 == "DOWN" ? 1 : 0)
+
+    string consensus = up_count >= 2 ? "UP BIAS" : dn_count >= 2 ? "DOWN BIAS" : "MIXED"
+    color consensus_col = up_count >= 2 ? color.new(color.lime, 0) : dn_count >= 2 ? color.new(color.red, 0) : color.new(color.gray, 0)
+
+    float rel_avg = (r1v + r2v + r3v) / 3.0
+    string rel_avg_txt = str.tostring(rel_avg, "#.###")
+    color rel_avg_col = (rel_avg >= rel_min) ? color.new(color.lime, 0) : color.new(color.gray, 0)
+
+    // Average of all 3 HTF medium values
+    float med_avg = (m1 + m2 + m3) / 3.0
+
+    // Compare current chart close to the avg HTF medium
+    bool c_above_avg = close >= med_avg
+    string cavg_txt = c_above_avg ? "ABOVE" : "BELOW"
+    color cavg_col = c_above_avg ? color.new(color.lime, 0) : color.new(color.red, 0)
+
+    // Consensus stack based on current timeframe alignment for quick read
+    bool aligned_now = align_bull or align_bear
+    string stack_now = align_bull ? "BULL" : align_bear ? "BEAR" : "MIXED"
+    color stack_now_col = align_bull ? color.new(color.lime, 0) : align_bear ? color.new(color.red, 0) : color.new(color.gray, 0)
+
+    f_cell(0, 4, "ALL", color.new(color.silver, 0))
+    f_cell(1, 4, consensus, consensus_col)
+    f_cell(2, 4, "AVG MED", color.new(color.silver, 0))
+    f_cell(3, 4, stack_now, stack_now_col)
+    f_cell(4, 4, rel_avg_txt, rel_avg_col)
+    f_cell(5, 4, cavg_txt, cavg_col)

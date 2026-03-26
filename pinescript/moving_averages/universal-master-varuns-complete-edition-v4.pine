@@ -1,0 +1,601 @@
+// This work is licensed under Creative Commons Attribution-NonCommercial-ShareAlike 4.0 International
+// © VarunKorlapati
+
+//@version=6
+indicator("Universal Master [Varun's Complete Edition v4]", overlay = true, max_labels_count = 500, max_lines_count = 500, max_boxes_count = 500)
+
+// ════════════════════════════════════════════════════════════════════════════════════════════════════════
+// 1. ADVANCED SR LEVELS
+// ════════════════════════════════════════════════════════════════════════════════════════════════════════
+const bool DEBUG = false
+const bool fixSRs = true
+const int maxSRInfoListSize = 10
+const int maxBarInfoListSize = 5000 
+const int maxDistanceToLastBar = 500
+const int minSRSize = 5
+const float tooCloseATR = 1.0 / 12.0 
+const int labelOffsetBars = 20
+
+// --- SR Settings ---
+grpSR = "SR Levels: Configuration"
+srPivotLength = input.int(10, "Pivot Length", minval = 3, maxval = 50, group = grpSR)
+srStrength = input.int(1, "Strength", [1, 2, 3], group = grpSR)
+srInvalidation = input.string("Close", "Invalidation", ["Wick", "Close"], group = grpSR)
+expandZones = input.string("Only Valid", "Expand", options = ["All", "Only Valid", "None"], group = grpSR)
+showInvalidated = input.bool(false, "Show Invalidated", group = grpSR)
+
+// --- NEW FILTER INPUT ---
+useRangeFilter = input.bool(false, "Hide SR Inside Chop (Pre/Yest)", group=grpSR, tooltip="Hides SR levels that are stuck inside Yesterday's Range or Today's Premarket Range.")
+// ------------------------
+
+// --- SR Timeframes ---
+grpTF = "SR Levels: Timeframes"
+timeframe1Enabled = input.bool(false, "TF 1", group = grpTF, inline="tf1")
+timeframe1 = input.timeframe("5", "", group = grpTF, inline="tf1")
+timeframe2Enabled = input.bool(true, "TF 2", group = grpTF, inline="tf2")
+timeframe2 = input.timeframe("15", "", group = grpTF, inline="tf2")
+timeframe3Enabled = input.bool(true, "TF 3", group = grpTF, inline="tf3")
+timeframe3 = input.timeframe("60", "", group = grpTF, inline="tf3")
+timeframe4Enabled = input.bool(true, "TF 4", group = grpTF, inline="tf4")
+timeframe4 = input.timeframe("240", "", group = grpTF, inline="tf4")
+
+// --- SR Styling ---
+grpStyle = "SR Levels: Visuals"
+styleMode = input.string("Zones", "Mode", ["Lines", "Zones"], group = grpStyle)
+zoneSize = input.float(1.0, "Zone Width", minval = 0.1, maxval = 10, step = 0.1, group = grpStyle)
+zoneSizeATR = zoneSize * 0.075
+supportColor = input.color(color.new(#089981, 80), "Sup Color", group = grpStyle, inline="c1")
+resistanceColor = input.color(color.new(#f23645, 80), "Res Color", group = grpStyle, inline="c1")
+textColor = input.color(color.new(#ffffff, 30), "Text Color", group = grpStyle)
+inverseBrokenLineColor = input.bool(true, "Inverse on Break", group = grpStyle)
+srLineWidth = input.int(2, "Line Width", minval=1, group=grpStyle)
+srLineStyleInput = input.string("Solid", "Line Style", ["Solid", "Dotted", "Dashed"], group=grpStyle)
+srTextSizeInput = input.string("Normal", "Text Size", ["Tiny", "Small", "Normal", "Large"], group=grpStyle)
+
+srLineStyle = srLineStyleInput == "Dotted" ? line.style_dotted : srLineStyleInput == "Dashed" ? line.style_dashed : line.style_solid
+srTextSize = srTextSizeInput == "Tiny" ? size.tiny : srTextSizeInput == "Small" ? size.small : srTextSizeInput == "Large" ? size.large : size.normal
+
+// ════════════════════════════════════════════════════════════════════════════════════════════════════════
+// 2. THE CUSTOM MA STACK
+// ════════════════════════════════════════════════════════════════════════════════════════════════════════
+
+// JMA Function
+f_jma(_src, _len, _phase, _power) =>
+    float phaseRatio = _phase < -100 ? 0.5 : _phase > 100 ? 2.5 : _phase / 100 + 1.5
+    float beta = 0.45 * (_len - 1) / (0.45 * (_len - 1) + 2)
+    float alpha = math.pow(beta, _power)
+    var float e0 = 0.0, var float e1 = 0.0, var float e2 = 0.0, var float jma = 0.0
+    e0 := (1 - alpha) * _src + alpha * nz(e0[1])
+    e1 := (_src - e0) * (1 - beta) + beta * nz(e1[1])
+    e2 := (e0 + phaseRatio * e1 - nz(jma[1])) * math.pow(1 - alpha, 2) + math.pow(alpha, 2) * nz(e2[1])
+    jma := e2 + nz(jma[1])
+    jma
+
+// --- Current Timeframe ---
+grpCur = "Stack: Current Timeframe"
+show_c_ema = input.bool(true, "EMA", inline="c1", group=grpCur)
+len_c_ema  = input.int(21, "Len", inline="c1", group=grpCur)
+col_c_ema  = input.color(color.yellow, "", inline="c1", group=grpCur)
+wid_c_ema  = input.int(1, "Width", minval=1, inline="c1", group=grpCur)
+
+show_c_jma = input.bool(true, "JMA", inline="c2", group=grpCur)
+len_c_jma  = input.int(7, "Len", inline="c2", group=grpCur)
+col_c_jma  = input.color(color.lime, "", inline="c2", group=grpCur)
+wid_c_jma  = input.int(1, "Width", minval=1, inline="c2", group=grpCur)
+ph_c_jma   = input.int(100, "Phase", inline="c2b", group=grpCur)
+pow_c_jma  = input.float(2.0, "Power", inline="c2b", group=grpCur)
+
+show_c_sma = input.bool(false, "SMA", inline="c3", group=grpCur)
+len_c_sma  = input.int(200, "Len", inline="c3", group=grpCur)
+col_c_sma  = input.color(color.blue, "", inline="c3", group=grpCur)
+wid_c_sma  = input.int(2, "Width", minval=1, inline="c3", group=grpCur)
+
+// --- Higher Timeframe ---
+grpHTF = "Stack: Higher Timeframe (HTF)"
+htf_tf     = input.timeframe("5", "Timeframe", group=grpHTF)
+
+show_h_ema = input.bool(true, "EMA 1", inline="h1", group=grpHTF)
+len_h_ema  = input.int(21, "Len", inline="h1", group=grpHTF)
+col_h_ema  = input.color(color.orange, "", inline="h1", group=grpHTF)
+wid_h_ema  = input.int(2, "Width", minval=1, inline="h1", group=grpHTF)
+
+show_h_ema2 = input.bool(true, "EMA 2", inline="h1b", group=grpHTF)
+len_h_ema2  = input.int(50, "Len", inline="h1b", group=grpHTF)
+col_h_ema2  = input.color(color.purple, "", inline="h1b", group=grpHTF)
+wid_h_ema2  = input.int(2, "Width", minval=1, inline="h1b", group=grpHTF)
+
+show_h_jma = input.bool(true, "JMA", inline="h2", group=grpHTF)
+len_h_jma  = input.int(7, "Len", inline="h2", group=grpHTF)
+col_h_jma  = input.color(color.green, "", inline="h2", group=grpHTF)
+wid_h_jma  = input.int(2, "Width", minval=1, inline="h2", group=grpHTF)
+ph_h_jma   = input.int(100, "Phase", inline="h2b", group=grpHTF)
+pow_h_jma  = input.float(2.0, "Power", inline="h2b", group=grpHTF)
+
+show_h_sma = input.bool(true, "SMA", inline="h3", group=grpHTF)
+len_h_sma  = input.int(200, "Len", inline="h3", group=grpHTF)
+col_h_sma  = input.color(color.red, "", inline="h3", group=grpHTF)
+wid_h_sma  = input.int(3, "Width", minval=1, inline="h3", group=grpHTF)
+
+grpExtra = "Stack: Extra"
+show_vwap  = input.bool(true, "Show VWAP", inline="v", group=grpExtra)
+col_vwap   = input.color(color.white, "VWAP Color", inline="v", group=grpExtra)
+wid_vwap   = input.int(1, "Width", inline="v", group=grpExtra)
+
+// CALCULATION
+v_c_ema = ta.ema(close, len_c_ema)
+v_c_jma = f_jma(close, len_c_jma, ph_c_jma, pow_c_jma)
+v_c_sma = ta.sma(close, len_c_sma)
+
+v_h_ema  = request.security(syminfo.tickerid, htf_tf, ta.ema(close, len_h_ema))
+v_h_ema2 = request.security(syminfo.tickerid, htf_tf, ta.ema(close, len_h_ema2))
+v_h_jma  = request.security(syminfo.tickerid, htf_tf, f_jma(close, len_h_jma, ph_h_jma, pow_h_jma))
+v_h_sma  = request.security(syminfo.tickerid, htf_tf, ta.sma(close, len_h_sma))
+
+plot(show_c_ema ? v_c_ema : na, "Current EMA", col_c_ema, wid_c_ema)
+plot(show_c_jma ? v_c_jma : na, "Current JMA", col_c_jma, wid_c_jma)
+plot(show_c_sma ? v_c_sma : na, "Current SMA", col_c_sma, wid_c_sma)
+
+plot(show_h_ema ? v_h_ema : na, "HTF EMA 1", col_h_ema, wid_h_ema)
+plot(show_h_ema2 ? v_h_ema2 : na, "HTF EMA 2", col_h_ema2, wid_h_ema2)
+plot(show_h_jma ? v_h_jma : na, "HTF JMA", col_h_jma, wid_h_jma, plot.style_circles)
+plot(show_h_sma ? v_h_sma : na, "HTF SMA", col_h_sma, wid_h_sma, plot.style_circles)
+
+plot(show_vwap ? ta.vwap(close) : na, "VWAP", col_vwap, wid_vwap)
+
+// ════════════════════════════════════════════════════════════════════════════════════════════════════════
+// 3. SESSION LOGIC & PRECISE OPEN
+// ════════════════════════════════════════════════════════════════════════════════════════════════════════
+grpSess = "Sessions: Configuration"
+marketMode = input.string("Auto-Detect", "Market Mode", ["Auto-Detect", "US Stocks", "India (NSE)"], group=grpSess)
+string detectedMode = syminfo.timezone == "Asia/Kolkata" ? "India (NSE)" : "US Stocks"
+finalMode = marketMode == "Auto-Detect" ? detectedMode : marketMode
+
+// ORB Settings
+showOrb = input.bool(true, "Show ORB", inline="orb", group=grpSess)
+orbDur  = input.int(15, "Mins", inline="orb", group=grpSess)
+orbCol  = input.color(color.new(color.blue, 90), "", inline="orb", group=grpSess)
+orbBord = input.color(color.blue, "Border", inline="orb", group=grpSess)
+orbWid  = input.int(1, "Width", inline="orb", group=grpSess)
+orbSty  = input.string("Dotted", "Style", ["Solid", "Dotted", "Dashed"], inline="orb", group=grpSess)
+
+grpLev = "Sessions: Levels Styling"
+showOpen = input.bool(true, "Daily Open", inline="op", group=grpLev)
+c_open   = input.color(color.white, "", inline="op", group=grpLev)
+w_open   = input.int(2, "Width", inline="op", group=grpLev)
+s_open   = input.string("Dotted", "Style", ["Solid", "Dotted", "Dashed"], inline="op", group=grpLev)
+
+showYest = input.bool(true, "Yesterday H/L", inline="y", group=grpLev)
+c_yest   = input.color(color.yellow, "", inline="y", group=grpLev)
+w_yest   = input.int(1, "Width", inline="y", group=grpLev)
+s_yest   = input.string("Dashed", "Style", ["Solid", "Dotted", "Dashed"], inline="y", group=grpLev)
+
+showPre  = input.bool(true, "Pre-Market H/L", inline="p", group=grpLev)
+c_pre    = input.color(color.orange, "", inline="p", group=grpLev)
+w_pre    = input.int(1, "Width", inline="p", group=grpLev)
+s_pre    = input.string("Dashed", "Style", ["Solid", "Dotted", "Dashed"], inline="p", group=grpLev)
+
+getLineStyle(s) => s == "Solid" ? line.style_solid : s == "Dashed" ? line.style_dashed : line.style_dotted
+
+string tz = syminfo.timezone
+if finalMode == "US Stocks"
+    tz := "America/New_York"
+else
+    tz := "Asia/Kolkata"
+
+int startMins = (09 * 60) + 30 
+if finalMode == "India (NSE)"
+    startMins := (09 * 60) + 15
+
+int endMins   = startMins + orbDur
+int endH = math.floor(endMins / 60)
+int endM = endMins % 60
+f_fmt(val) => val < 10 ? "0" + str.tostring(val) : str.tostring(val)
+string s_Orb = finalMode == "US Stocks" ? "0930-" + f_fmt(endH) + f_fmt(endM) : "0915-" + f_fmt(endH) + f_fmt(endM)
+
+string us_Pre = "0400-0930"
+string us_Reg = "0930-1600"
+string us_Post = "1600-2000"
+
+calc_sess(string mode, string tzStr) =>
+    var float _pH = na, var float _pL = na
+    var float _rH = na, var float _rL = na
+    var float _dO = na
+    var int _dOTime = na
+    
+    bool _newDay = ta.change(dayofmonth(time, timezone=tzStr)) != 0
+    
+    if _newDay
+        _pH := na, _pL := na, _rH := na, _rL := na
+        _dO := na, _dOTime := na
+        
+    if mode == "US Stocks"
+        bool _inPre = not na(time(timeframe.period, us_Pre + ":1234567", timezone=tzStr))
+        bool _inReg = not na(time(timeframe.period, us_Reg + ":1234567", timezone=tzStr))
+        
+        if _inPre
+            _pH := na(_pH) ? high : math.max(_pH, high)
+            _pL := na(_pL) ? low : math.min(_pL, low)
+        if _inReg
+            if na(_dO) 
+                _dO := open
+                _dOTime := time
+            _rH := na(_rH) ? high : math.max(_rH, high)
+            _rL := na(_rL) ? low : math.min(_rL, low)
+    
+    else
+        if na(_dO) and _newDay 
+            _dO := open
+            _dOTime := time
+        _rH := na(_rH) ? high : math.max(_rH, high)
+        _rL := na(_rL) ? low : math.min(_rL, low)
+        
+    [_pH, _pL, _rH, _rL, _dO, _dOTime]
+
+[m_pH, m_pL, m_rH, m_rL, m_dO, m_dOTime] = request.security(syminfo.tickerid, "1", calc_sess(finalMode, tz), lookahead=barmerge.lookahead_on)
+
+var float y_rH = na
+var float y_rL = na
+var float y_pH = na
+var float y_pL = na
+
+isNewDay = ta.change(dayofmonth(time, timezone=tz)) != 0
+if isNewDay
+    y_rH := m_rH[1]
+    y_rL := m_rL[1]
+    y_pH := m_pH[1]
+    y_pL := m_pL[1]
+
+draw_anchored(float price, int start_t, color col, string txt, string styleStr, int wid) =>
+    var line l = na
+    var label lb = na
+    _style = getLineStyle(styleStr)
+    
+    if isNewDay or (not na(price) and na(l))
+        l := line.new(start_t, price, time + 60000 * 30, price, xloc=xloc.bar_time, color=col, style=_style, width=wid)
+        lb := label.new(time + 60000 * 30, price, txt, xloc=xloc.bar_time, style=label.style_none, textcolor=col, size=size.small, textalign=text.align_left)
+    
+    if not na(l) and not na(price)
+        line.set_y1(l, price)
+        line.set_y2(l, price)
+        line.set_x1(l, start_t) 
+        line.set_x2(l, time + 60000 * 15)
+        label.set_x(lb, time + 60000 * 15)
+        label.set_y(lb, price)
+
+if showOpen and not na(m_dO) and not na(m_dOTime)
+    draw_anchored(m_dO, m_dOTime, c_open, "Open", s_open, w_open)
+
+var int t_today = na
+if isNewDay
+    t_today := time
+if showYest
+    draw_anchored(y_rH, t_today, c_yest, "Yest High", s_yest, w_yest)
+    draw_anchored(y_rL, t_today, c_yest, "Yest Low", s_yest, w_yest)
+
+var int t_session = na
+isSessionStart = not na(time(timeframe.period, s_Orb + ":1234567", timezone=tz)) and na(time(timeframe.period, s_Orb + ":1234567", timezone=tz)[1])
+if isSessionStart
+    t_session := time
+
+if showPre and not na(m_pH)
+    if not na(t_session)
+        draw_anchored(m_pH, t_session, c_pre, "Pre High", s_pre, w_pre)
+        draw_anchored(m_pL, t_session, c_pre, "Pre Low", s_pre, w_pre)
+
+var float orbHigh = na
+var float orbLow = na
+var box orbBox = na
+isOrbSession = not na(time(timeframe.period, s_Orb + ":1234567", timezone=tz))
+
+if isNewDay
+    orbHigh := na
+    orbLow := na
+    
+if isOrbSession and showOrb
+    if na(orbHigh)
+        orbHigh := high
+        orbLow := low
+        orbBox := box.new(bar_index, orbHigh, bar_index, orbLow, border_color=orbBord, border_style=getLineStyle(orbSty), border_width=orbWid, bgcolor=orbCol)
+    else
+        orbHigh := math.max(orbHigh, high)
+        orbLow := math.min(orbLow, low)
+        box.set_top(orbBox, orbHigh)
+        box.set_bottom(orbBox, orbLow)
+        box.set_right(orbBox, bar_index)
+        
+if not isOrbSession and not isNewDay and not na(orbHigh) and showOrb
+    box.set_right(orbBox, bar_index)
+
+// ════════════════════════════════════════════════════════════════════════════════════════════════════════
+// 4. SR RENDERING
+// ════════════════════════════════════════════════════════════════════════════════════════════════════════
+
+type srInfo
+    int startTime
+    float price
+    string srType
+    int strength
+    string timeframeStr
+    bool ephemeral = false
+    int breakTime
+    array<int> retestTimes
+    bool isFlip = false 
+
+type srObj
+    srInfo info
+    bool startFixed
+    bool breakFixed
+    bool rendered
+    string combinedTimeframeStr
+    line srLine
+    box srBox
+    label srLabel
+    array<label> retestLabels
+
+type barInfo
+    int t
+    int tc
+    float c
+    float h
+    float l
+
+var allSRList = array.new<srObj>()
+
+findValRtnTime (barInfo[] biList, valToFind, toSearch, searchMode, minTime, maxTime, int defVal = na) =>
+    int rtnTime = defVal
+    float minDiff = na
+    if biList.size() > 0
+        for i = biList.size() - 1 to 0
+            curBI = biList.get(i)
+            if curBI.t >= minTime and curBI.t < maxTime
+                toLook = (toSearch == "Low" ? curBI.l : toSearch == "High" ? curBI.h : curBI.c)
+                if searchMode == "Nearest"
+                    curDiff = math.abs(valToFind - toLook)
+                    if na(minDiff)
+                        rtnTime := curBI.t
+                        minDiff := curDiff
+                    else
+                        if curDiff <= minDiff
+                            minDiff := curDiff
+                            rtnTime := curBI.t
+                if searchMode == "Higher"
+                    if toLook >= valToFind
+                        rtnTime := curBI.t
+                        break
+                if searchMode == "Lower"
+                    if toLook <= valToFind
+                        rtnTime := curBI.t
+                        break
+    rtnTime
+
+formatTimeframeString (string formatTimeframe, bool short = false) =>
+    timeframeF = (formatTimeframe == "" ? timeframe.period : formatTimeframe)
+    if str.contains(timeframeF, "D") or str.contains(timeframeF, "W") or str.contains(timeframeF, "S") or str.contains(timeframeF, "M")
+        timeframe.from_seconds(timeframe.in_seconds(timeframeF))
+    else
+        seconds = timeframe.in_seconds(timeframeF)
+        if seconds >= 3600
+            hourCount = int(seconds / 3600)
+            if short
+                str.tostring(hourCount) + "h"
+            else
+                str.tostring(hourCount) + " Hour" + (hourCount > 1 ? "s" : "")
+        else
+            if short
+                timeframeF + "m"
+            else
+                timeframeF + " Min"
+
+renderSRObj (srObj sr) =>
+    if na(sr.info.breakTime) or showInvalidated
+        sr.rendered := true
+        endTime = nz(sr.info.breakTime, time + 1000 * timeframe.in_seconds(timeframe.period) * labelOffsetBars)
+        extendType = extend.none
+        if na(sr.info.breakTime)
+            extendType := extend.right
+        if expandZones == "Only Valid" and na(sr.info.breakTime)
+            extendType := extend.both
+        else if expandZones == "All"
+            extendType := extend.both
+            endTime := time + 1000 * timeframe.in_seconds(timeframe.period) * labelOffsetBars
+        
+        labelTitle = formatTimeframeString(sr.info.timeframeStr)
+        if not na(sr.combinedTimeframeStr)
+            labelTitle := sr.combinedTimeframeStr
+        labelTitle += " | " + str.tostring(sr.info.price, format.mintick)
+
+        isRes = sr.info.srType == "Resistance"
+        useResColor = sr.info.isFlip ? not isRes : isRes
+        finalColor = useResColor ? resistanceColor : supportColor
+
+        if styleMode == "Lines"
+            sr.srLine := line.new(sr.info.startTime, sr.info.price, endTime, sr.info.price, xloc = xloc.bar_time, color = finalColor, width = srLineWidth, style = srLineStyle, extend = extendType)
+            sr.srLabel := label.new(extendType == extend.none ? ((sr.info.startTime + endTime) / 2) : endTime, sr.info.price, xloc = xloc.bar_time, text = labelTitle, textcolor = textColor, style = label.style_none, size = srTextSize)
+        else
+            sr.srBox := box.new(sr.info.startTime, sr.info.price + (ta.atr(20) * zoneSizeATR), endTime, sr.info.price - (ta.atr(20) * zoneSizeATR), xloc = xloc.bar_time, bgcolor = finalColor, border_color = na, text = labelTitle, text_color = textColor, extend = extendType, text_size = srTextSize, text_halign = (extendType != extend.none) ? text.align_right : text.align_center)
+    true 
+
+safeDeleteSRObj (srObj sr) =>
+    if sr.rendered
+        line.delete(sr.srLine)
+        box.delete(sr.srBox)
+        label.delete(sr.srLabel)
+        sr.rendered := false
+
+var allSRInfoList = array.new<srInfo>()
+var barInfoList = array.new<barInfo>()
+pivotHigh = ta.pivothigh(srPivotLength, srPivotLength)
+pivotLow = ta.pivotlow(srPivotLength, srPivotLength)
+barInfoList.unshift(barInfo.new(time, time_close, close, high, low))
+if barInfoList.size() > maxBarInfoListSize
+    barInfoList.pop()
+
+if (bar_index > last_bar_index - maxDistanceToLastBar) and barstate.isconfirmed
+    if not na(pivotLow)
+        validSR = true
+        if allSRInfoList.size() > 0
+            for i = 0 to allSRInfoList.size() - 1
+                curRSInfo = allSRInfoList.get(i)
+                if (math.abs(curRSInfo.price - pivotLow) < ta.atr(20) * tooCloseATR) and na(curRSInfo.breakTime)
+                    validSR := false
+                    break
+        if validSR
+            newSRInfo = srInfo.new(barInfoList.get(srPivotLength).t, pivotLow, "Support", 1, timeframe.period, false, na, array.new<int>(), false)
+            allSRInfoList.unshift(newSRInfo)
+            while allSRInfoList.size() > maxSRInfoListSize
+                allSRInfoList.pop()
+    if not na(pivotHigh)
+        validSR = true
+        if allSRInfoList.size() > 0
+            for i = 0 to allSRInfoList.size() - 1
+                curRSInfo = allSRInfoList.get(i)
+                if (math.abs(curRSInfo.price - pivotLow) < ta.atr(20) * tooCloseATR) and na(curRSInfo.breakTime)
+                    validSR := false
+                    break
+        if validSR
+            newSRInfo = srInfo.new(barInfoList.get(srPivotLength).t, pivotHigh, "Resistance", 1, timeframe.period, false, na, array.new<int>(), false)
+            allSRInfoList.unshift(newSRInfo)
+            if allSRInfoList.size() > maxSRInfoListSize
+                allSRInfoList.pop()
+
+fixSRToTimeframe (srObj sr) =>
+    srMS = math.max(timeframe.in_seconds(sr.info.timeframeStr), timeframe.in_seconds()) * 1000
+    if (not sr.startFixed)
+        if not sr.info.ephemeral
+            if sr.info.srType == "Resistance"
+                sr.info.startTime := findValRtnTime(barInfoList, sr.info.price, "High", "Nearest", sr.info.startTime - srMS, sr.info.startTime + srMS, sr.info.startTime)
+            else
+                sr.info.startTime := findValRtnTime(barInfoList, sr.info.price, "Low", "Nearest", sr.info.startTime - srMS, sr.info.startTime + srMS, sr.info.startTime)
+            sr.startFixed := true
+        else
+            if allSRList.size() > 0
+                for i = 0 to allSRList.size() - 1
+                    curSR = allSRList.get(i)
+                    if (not curSR.info.ephemeral) and (not na(curSR.info.breakTime)) and curSR.info.price == sr.info.price and ((sr.info.srType == "Resistance" and curSR.info.srType == "Support") or (sr.info.srType == "Support" and curSR.info.srType == "Resistance"))
+                        if curSR.breakFixed
+                            sr.info.startTime := curSR.info.breakTime
+                            sr.startFixed := true
+                        break
+    if not na(sr.info.breakTime)
+        if (not sr.breakFixed)
+            if sr.info.srType == "Resistance"
+                sr.info.breakTime := findValRtnTime(barInfoList, sr.info.price, srInvalidation == "Wick" ? "High" : "Close", "Higher", sr.info.breakTime - srMS, sr.info.breakTime + srMS, sr.info.breakTime)
+            else
+                sr.info.breakTime := findValRtnTime(barInfoList, sr.info.price, srInvalidation == "Wick" ? "Low" : "Close", "Lower", sr.info.breakTime - srMS, sr.info.breakTime + srMS, sr.info.breakTime)
+            sr.breakFixed := true
+
+getSR (srObj[] list, srPrice, eph, srType, timeframeStr) =>
+    srObj rtnSR = na
+    if list.size() > 0
+        for i = 0 to list.size() - 1
+            curSR = list.get(i)
+            if curSR.info.price == srPrice and curSR.info.ephemeral == eph and curSR.info.srType == srType and curSR.info.timeframeStr == timeframeStr
+                rtnSR := curSR
+                break
+    rtnSR
+
+handleTF (tfStr, tfEnabled) =>
+    if tfEnabled
+        tfSRInfoList = request.security(syminfo.tickerid, tfStr, allSRInfoList)
+        if not na(tfSRInfoList) and tfSRInfoList.size() > 0
+            for i = 0 to tfSRInfoList.size() - 1
+                srInfo curSRInfo = tfSRInfoList.get(i)
+                if fixSRs
+                    currentSameSR = getSR(allSRList, curSRInfo.price, curSRInfo.ephemeral, curSRInfo.srType, curSRInfo.timeframeStr)
+                    if not na(currentSameSR)
+                        if currentSameSR.startFixed
+                            curSRInfo.startTime := currentSameSR.info.startTime
+                        if currentSameSR.breakFixed
+                            curSRInfo.breakTime := currentSameSR.info.breakTime
+                        curSRInfo.retestTimes := currentSameSR.info.retestTimes
+                        currentSameSR.info := curSRInfo
+                        if not currentSameSR.breakFixed
+                            fixSRToTimeframe(currentSameSR)
+                    else
+                        srObj newSRObj = srObj.new(curSRInfo)
+                        newSRObj.info.retestTimes := array.new<int>()
+                        newSRObj.retestLabels := array.new<label>()
+                        fixSRToTimeframe(newSRObj)
+                        allSRList.unshift(newSRObj)
+                else
+                    srObj newSRObj = srObj.new(curSRInfo)
+                    newSRObj.retestLabels := array.new<label>()
+                    allSRList.unshift(newSRObj)
+    true
+
+if (bar_index > last_bar_index - maxDistanceToLastBar * 8) and barstate.isconfirmed
+    if not fixSRs
+        if allSRList.size() > 0
+            for i = 0 to allSRList.size() - 1
+                srObj curSRObj = allSRList.get(i)
+                safeDeleteSRObj(curSRObj)
+        allSRList.clear()
+        
+    handleTF(timeframe1, timeframe1Enabled)
+    handleTF(timeframe2, timeframe2Enabled)
+    handleTF(timeframe3, timeframe3Enabled)
+    handleTF(timeframe4, timeframe4Enabled)
+    
+    if allSRList.size() > 0
+        var newFlips = array.new<srObj>()
+        newFlips.clear()
+        
+        for i = 0 to allSRList.size() - 1
+            srObj curSRObj = allSRList.get(i)
+            
+            if na(curSRObj.info.breakTime)
+                invHigh = (srInvalidation == "Close" ? close : high)
+                invLow = (srInvalidation == "Close" ? close : low)
+                
+                if curSRObj.info.srType == "Resistance" and invHigh > curSRObj.info.price
+                    if inverseBrokenLineColor
+                        curSRObj.info.breakTime := time
+                        newFlipInfo = srInfo.new(time, curSRObj.info.price, "Support", curSRObj.info.strength, curSRObj.info.timeframeStr, true, na, array.new<int>(), true)
+                        newSRObj = srObj.new(newFlipInfo)
+                        newFlips.push(newSRObj)
+                
+                else if curSRObj.info.srType == "Support" and invLow < curSRObj.info.price
+                    if inverseBrokenLineColor
+                        curSRObj.info.breakTime := time
+                        newFlipInfo = srInfo.new(time, curSRObj.info.price, "Resistance", curSRObj.info.strength, curSRObj.info.timeframeStr, true, na, array.new<int>(), true)
+                        newSRObj = srObj.new(newFlipInfo)
+                        newFlips.push(newSRObj)
+        
+        if newFlips.size() > 0
+            for i = 0 to newFlips.size() - 1
+                allSRList.unshift(newFlips.get(i))
+
+    if allSRList.size() > 0
+        for i = 0 to allSRList.size() - 1
+            srObj curSRObj = allSRList.get(i)
+            safeDeleteSRObj(curSRObj)
+            tooClose = false
+            for j = 0 to allSRList.size() - 1
+                closeSR = allSRList.get(j)
+                if i != j and closeSR.rendered and math.abs(closeSR.info.price - curSRObj.info.price) <= tooCloseATR * ta.atr(20) 
+                    if closeSR.info.srType == curSRObj.info.srType and closeSR.info.ephemeral == curSRObj.info.ephemeral
+                        if closeSR.info.isFlip == curSRObj.info.isFlip
+                            tooClose := true
+                            if not str.contains((na(closeSR.combinedTimeframeStr) ? formatTimeframeString(closeSR.info.timeframeStr) : closeSR.combinedTimeframeStr), formatTimeframeString(curSRObj.info.timeframeStr))
+                                if na(closeSR.combinedTimeframeStr)
+                                    closeSR.combinedTimeframeStr := formatTimeframeString(closeSR.info.timeframeStr) + " & " + formatTimeframeString(curSRObj.info.timeframeStr)
+                                else
+                                    closeSR.combinedTimeframeStr += " & " + formatTimeframeString(curSRObj.info.timeframeStr)
+                            break
+            
+            // --- NEW FILTER LOGIC START ---
+            bool isInsideChop = false
+            if useRangeFilter
+                float p = curSRObj.info.price
+                // 1. Check Yesterday Range
+                if not na(y_rH) and not na(y_rL)
+                    if p <= y_rH and p >= y_rL
+                        isInsideChop := true
+                // 2. Check Current Premarket Range
+                if not na(m_pH) and not na(m_pL)
+                    if p <= m_pH and p >= m_pL
+                        isInsideChop := true
+            // --- NEW FILTER LOGIC END ---
+
+            if (not isInsideChop) and (curSRObj.info.strength >= srStrength) and (na(curSRObj.info.breakTime) or (curSRObj.info.breakTime - curSRObj.info.startTime) >= minSRSize * 1000 * timeframe.in_seconds(timeframe.period)) and (not tooClose)
+                renderSRObj(curSRObj)

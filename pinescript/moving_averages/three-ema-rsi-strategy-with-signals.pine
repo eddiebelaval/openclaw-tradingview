@@ -1,0 +1,437 @@
+// This Pine Script™ is subject to the terms of the Mozilla Public License 2.0
+// https://mozilla.org/MPL/2.0/
+// © 3 EMA + RSI Strategy v3
+
+//@version=5
+indicator("3 EMA + RSI Strategy v3", overlay=true, max_labels_count=500, max_lines_count=500, max_bars_back=500)
+
+// ═══════════════════════════════════════════════════════════════
+// ██  INPUTS
+// ═══════════════════════════════════════════════════════════════
+
+// --- EMA Settings ---
+emaFastLen    = input.int(3,   "EMA Fast Length",        minval=1, group="EMA Settings")
+emaMedLen     = input.int(21,  "EMA Medium Length",      minval=1, group="EMA Settings")
+emaSlowMedLen = input.int(50,  "EMA Slow Medium Length", minval=1, group="EMA Settings")
+emaSlowLen    = input.int(200, "EMA Slow Length",        minval=1, group="EMA Settings")
+
+// --- RSI Settings ---
+rsiResOption     = input.string("5 Min", "RSI Resolution", options=["From Chart", "5 Min", "10 Min", "15 Min"], group="RSI Settings")
+rsiAvgPeriod     = input.int(20, "RSI Average Period (Multiplier)", minval=1, group="RSI Settings")
+rsiThreshLong    = input.float(55.0, "RSI Threshold Long",  minval=0, maxval=100, step=0.5, group="RSI Settings")
+rsiThreshShort   = input.float(45.0, "RSI Threshold Short", minval=0, maxval=100, step=0.5, group="RSI Settings")
+
+// --- EMA Slope Settings ---
+emaSlopeLookback  = input.int(3, "EMA Slope Lookback Periods", minval=1, maxval=50, group="EMA Slope Settings", tooltip="Number of RSI-resolution bars to look back for slope calculation. Slope = (current - N bars ago) / N bars ago × 100")
+emaSlopeLongTh    = input.float(0.05, "EMA Long Slope Threshold (>=)",  step=0.01, group="EMA Slope Settings")
+emaSlopeShortTh   = input.float(-0.05, "EMA Short Slope Threshold (<=)", step=0.01, group="EMA Slope Settings")
+emaSlopeFlatTh    = input.float(0.02, "EMA Flat Threshold (|slope| <)", minval=0.001, step=0.005, group="EMA Slope Settings", tooltip="Slope is considered flat/ranging when absolute value is below this threshold")
+emaSlopeFlatCount = input.int(3, "Ranging Confirmation (consecutive HTF bars)", minval=1, maxval=20, group="EMA Slope Settings", tooltip="Number of consecutive flat slope readings required to confirm ranging condition")
+
+// --- Strong Candle Settings ---
+strongBodyMultiplier = input.float(1.5, "Strong Candle: Body > Avg Body × This", minval=1.0, maxval=5.0, step=0.1, group="Strong Candle Settings", tooltip="Candle body must be this many times larger than average body over lookback period")
+strongLookback       = input.int(20, "Strong Candle: Average Lookback Bars", minval=5, maxval=100, group="Strong Candle Settings", tooltip="Number of bars to average body size over")
+strongBodyPct        = input.float(50.0, "Strong Candle: Min Body % of Range", minval=20, maxval=95, step=5, group="Strong Candle Settings", tooltip="Minimum body-to-range percentage (filters out dojis/spinning tops)")
+
+// ═══════════════════════════════════════════════════════════════
+// ██  RSI RESOLUTION MAPPING
+// ═══════════════════════════════════════════════════════════════
+
+f_rsiTF() =>
+    switch rsiResOption
+        "5 Min"  => "5"
+        "10 Min" => "10"
+        "15 Min" => "15"
+        => timeframe.period
+
+rsiTF = f_rsiTF()
+
+f_rsiResMins() =>
+    switch rsiResOption
+        "5 Min"  => 5
+        "10 Min" => 10
+        "15 Min" => 15
+        => timeframe.in_seconds() / 60
+
+rsiResMins = f_rsiResMins()
+
+// Multiplied time display: RSI Resolution × RSI Average Period
+totalMins   = rsiResMins * rsiAvgPeriod
+dispHours   = math.floor(totalMins / 60)
+dispMins    = math.floor(totalMins % 60)
+rsiTimeStr  = str.format("{0,number,00}:{1,number,00}:{2,number,00}", dispHours, dispMins, 0)
+
+// ═══════════════════════════════════════════════════════════════
+// ██  EMA CALCULATIONS
+// ═══════════════════════════════════════════════════════════════
+
+emaFast    = ta.ema(close, emaFastLen)
+emaMed     = ta.ema(close, emaMedLen)
+emaSlowMed = ta.ema(close, emaSlowMedLen)
+emaSlow    = ta.ema(close, emaSlowLen)
+
+// Plot EMAs — pFast & pSlow also used for cloud fill
+pFast = plot(emaFast,    "EMA Fast",        color=color.new(color.yellow, 0), linewidth=1)
+plot(emaMed,             "EMA Medium",      color=color.new(color.orange, 0), linewidth=1)
+plot(emaSlowMed,         "EMA Slow Medium", color=color.new(color.blue, 0),   linewidth=2)
+pSlow = plot(emaSlow,    "EMA Slow",        color=color.new(color.white, 0),  linewidth=2)
+
+// ═══════════════════════════════════════════════════════════════
+// ██  CLOUD BETWEEN FAST EMA & SLOW EMA
+// ═══════════════════════════════════════════════════════════════
+
+// Cloud color: green when Slow Medium crosses above Slow, red when below
+var color cloudCol = color.new(color.gray, 70)
+
+if ta.crossover(emaSlowMed, emaSlow)
+    cloudCol := color.new(color.green, 75)
+if ta.crossunder(emaSlowMed, emaSlow)
+    cloudCol := color.new(color.red, 75)
+
+fill(pFast, pSlow, color=cloudCol, title="EMA Cloud")
+
+// ═══════════════════════════════════════════════════════════════
+// ██  RSI CALCULATION (Multi-Timeframe)
+// ═══════════════════════════════════════════════════════════════
+
+rsiSource = ta.rsi(close, rsiAvgPeriod)
+rsiMTF    = request.security(syminfo.tickerid, rsiTF, rsiSource, barmerge.gaps_off, barmerge.lookahead_off)
+
+// ═══════════════════════════════════════════════════════════════
+// ██  STRONG CANDLE DETECTION
+// ═══════════════════════════════════════════════════════════════
+// A "strong candle" satisfies ALL of:
+//   1. Body size > average body over N bars × multiplier
+//   2. Body % of total range ≥ threshold (filters dojis)
+//   3. Total range > 0
+
+bodySize    = math.abs(close - open)
+totalRange  = high - low
+bodyPct     = totalRange > 0 ? (bodySize / totalRange) * 100 : 0.0
+avgBody     = ta.sma(bodySize, strongLookback)
+
+isStrong     = totalRange > 0 and bodySize > avgBody * strongBodyMultiplier and bodyPct >= strongBodyPct
+isBullStrong = isStrong and close > open
+isBearStrong = isStrong and close < open
+
+// ═══════════════════════════════════════════════════════════════
+// ██  HTF BAR CHANGE DETECTION (for slope & RSI updates)
+// ═══════════════════════════════════════════════════════════════
+
+htfTime     = request.security(syminfo.tickerid, rsiTF, time, barmerge.gaps_off, barmerge.lookahead_off)
+isNewHTFBar = ta.change(htfTime) != 0
+
+// ═══════════════════════════════════════════════════════════════
+// ██  EMA SLOPE CALCULATION (Lookback-based)
+// ═══════════════════════════════════════════════════════════════
+
+var float[] slopeHistory = array.new_float(0)
+var float lastEmaSlope   = 0.0
+var bool  slopeReady     = false
+var int   flatCounter    = 0
+var bool  isRanging      = false
+
+if isNewHTFBar
+    array.push(slopeHistory, emaSlowMed)
+    while array.size(slopeHistory) > emaSlopeLookback + 1
+        array.shift(slopeHistory)
+    if array.size(slopeHistory) > emaSlopeLookback
+        pastVal      = array.get(slopeHistory, 0)
+        lastEmaSlope := pastVal != 0 ? (emaSlowMed - pastVal) / pastVal * 100 : 0.0
+        slopeReady   := true
+
+        // Flat/Ranging detection
+        if math.abs(lastEmaSlope) < emaSlopeFlatTh
+            flatCounter += 1
+        else
+            flatCounter := 0
+
+        isRanging := flatCounter >= emaSlopeFlatCount
+
+// ═══════════════════════════════════════════════════════════════
+// ██  STATE VARIABLES
+// ═══════════════════════════════════════════════════════════════
+
+var bool emaCrossLong        = false
+var bool emaCrossShort       = false
+var bool emaCrossLongStrong  = false
+var bool emaCrossShortStrong = false
+var bool isLongMode          = false
+var bool isShortMode         = false
+
+// ═══════════════════════════════════════════════════════════════
+// ██  LONG LOGIC
+// ═══════════════════════════════════════════════════════════════
+
+// --- EMA Cross Long ---
+crossLongSignal = ta.crossover(emaSlowMed, emaSlow)
+
+if crossLongSignal
+    emaCrossLong        := true
+    emaCrossShort       := false
+    emaCrossShortStrong := false
+    isLongMode          := true
+    isShortMode         := false
+
+// --- Entry: Strong bullish candle closes above Medium AND Slow Medium (market must NOT be ranging) ---
+longEntrySignal = false
+if emaCrossLong and isBullStrong and close > emaMed and close > emaSlowMed and not emaCrossLongStrong and not isRanging
+    emaCrossLongStrong := true
+    longEntrySignal    := true
+
+// --- Exit: Strong bearish candle closes below Medium ---
+longExitNow = false
+if emaCrossLongStrong and isBearStrong and close < emaMed
+    emaCrossLongStrong := false
+    longExitNow        := true
+
+// ═══════════════════════════════════════════════════════════════
+// ██  SHORT LOGIC
+// ═══════════════════════════════════════════════════════════════
+
+// --- EMA Cross Short ---
+crossShortSignal = ta.crossunder(emaSlowMed, emaSlow)
+
+if crossShortSignal
+    emaCrossShort      := true
+    emaCrossLong       := false
+    emaCrossLongStrong := false
+    isShortMode        := true
+    isLongMode         := false
+
+// --- Entry: Strong bearish candle closes below Medium AND Slow Medium (market must NOT be ranging) ---
+shortEntrySignal = false
+if emaCrossShort and isBearStrong and close < emaMed and close < emaSlowMed and not emaCrossShortStrong and not isRanging
+    emaCrossShortStrong := true
+    shortEntrySignal    := true
+
+// --- Exit: Strong bullish candle closes above Medium ---
+shortExitNow = false
+if emaCrossShortStrong and isBullStrong and close > emaMed
+    emaCrossShortStrong := false
+    shortExitNow        := true
+
+// ═══════════════════════════════════════════════════════════════
+// ██  CHART MARKERS — STARS & TRIANGLES
+// ═══════════════════════════════════════════════════════════════
+
+// --- Yellow Stars (EMA Cross Signals) ---
+plotshape(crossLongSignal,  title="Long EMA Cross ★",  style=shape.diamond, location=location.abovebar, color=color.yellow, size=size.normal, text="★")
+plotshape(crossShortSignal, title="Short EMA Cross ★", style=shape.diamond, location=location.belowbar, color=color.yellow, size=size.normal, text="★")
+
+// --- Green Triangle Up (Long Entry) ---
+plotshape(longEntrySignal, title="Long Entry ▲", style=shape.triangleup, location=location.belowbar, color=color.green, size=size.small, text="Long")
+
+// --- Red Triangle Down (Short Entry) ---
+plotshape(shortEntrySignal, title="Short Entry ▼", style=shape.triangledown, location=location.abovebar, color=color.red, size=size.small, text="Short")
+
+// --- Violet Triangles (Exit Signals) ---
+plotshape(longExitNow,  title="Long Exit ▼",  style=shape.triangledown, location=location.abovebar, color=#9B30FF, size=size.small, text="Exit")
+plotshape(shortExitNow, title="Short Exit ▲", style=shape.triangleup,   location=location.belowbar, color=#9B30FF, size=size.small, text="Exit")
+
+// ═══════════════════════════════════════════════════════════════
+// ██  SLOPE LINE — Below Cloud (Green=Up / Red=Down / Yellow=Flat)
+// ═══════════════════════════════════════════════════════════════
+
+slopeLongOk  = lastEmaSlope >= emaSlopeLongTh
+slopeShortOk = lastEmaSlope <= emaSlopeShortTh
+rsiLongOk    = rsiMTF >= rsiThreshLong
+rsiShortOk   = rsiMTF <= rsiThreshShort
+
+atrVal      = ta.atr(14)
+cloudBottom = math.min(emaFast, emaSlow)
+slopeLineY  = slopeReady ? cloudBottom - atrVal * 1.5 : na
+
+// Slope line: Green = Uptrend (slope > 0) | Red = Downtrend (slope < 0) | Yellow = Ranging (flat)
+slopeLineCol = isRanging ? color.yellow : (lastEmaSlope >= 0 ? color.green : color.red)
+
+plot(slopeLineY, "EMA Slope Line (Green=Up | Red=Down | Yellow=Ranging)", color=slopeLineCol, linewidth=3, style=plot.style_line)
+
+// Persistent label on the slope line identifying what it is
+var label slopeLabelTag = na
+if barstate.islast and slopeReady
+    if not na(slopeLabelTag)
+        label.delete(slopeLabelTag)
+    slopeTagText = "EMA Slope: " + str.tostring(lastEmaSlope, "#.####") + "%" + (isRanging ? "  [RANGING]" : (lastEmaSlope >= 0 ? "  [UP]" : "  [DOWN]"))
+    slopeTagCol  = isRanging ? color.yellow : (lastEmaSlope >= 0 ? color.green : color.red)
+    slopeLabelTag := label.new(bar_index + 3, slopeLineY, slopeTagText,
+         color     = color.new(#1a1a2e, 20),
+         textcolor = slopeTagCol,
+         style     = label.style_label_left,
+         size      = size.small)
+
+// Tooltip labels per HTF bar (clickable for slope details)
+if isNewHTFBar and bar_index > 50 and slopeReady
+    label.new(bar_index, slopeLineY, "",
+         color     = color.new(color.white, 100),
+         textcolor = color.new(color.white, 100),
+         style     = label.style_none,
+         size      = size.tiny,
+         tooltip   = "EMA Slope: " + str.tostring(lastEmaSlope, "#.####") + "%" + (isRanging ? " [RANGING]" : "") + "\nRanging Count: " + str.tostring(flatCounter) + "/" + str.tostring(emaSlopeFlatCount) + "\nThreshold Long: " + str.tostring(emaSlopeLongTh) + " | Short: " + str.tostring(emaSlopeShortTh) + " | Flat: ±" + str.tostring(emaSlopeFlatTh))
+
+// ═══════════════════════════════════════════════════════════════
+// ██  DYNAMIC RSI ● LABELS (above/below wick per HTF bar)
+// ═══════════════════════════════════════════════════════════════
+
+offsetRSI = atrVal * 0.5
+
+if isNewHTFBar and bar_index > 50
+
+    if isLongMode
+        crCol = rsiLongOk ? color.green : color.red
+        label.new(bar_index, high + offsetRSI, "●",
+             color       = color.new(color.white, 100),
+             textcolor   = crCol,
+             style       = label.style_none,
+             size        = size.normal,
+             tooltip     = "RSI Avg: " + str.tostring(rsiMTF, "#.##") + "\nThreshold: " + str.tostring(rsiThreshLong))
+
+    if isShortMode
+        crCol2 = rsiShortOk ? color.green : color.red
+        label.new(bar_index, low - offsetRSI, "●",
+             color       = color.new(color.white, 100),
+             textcolor   = crCol2,
+             style       = label.style_none,
+             size        = size.normal,
+             tooltip     = "RSI Avg: " + str.tostring(rsiMTF, "#.##") + "\nThreshold: " + str.tostring(rsiThreshShort))
+
+// ═══════════════════════════════════════════════════════════════
+// ██  INFORMATION TABLE (top-right)
+// ═══════════════════════════════════════════════════════════════
+
+var table infoTable = table.new(position.top_right, 2, 20,
+     bgcolor      = color.new(#1a1a2e, 10),
+     border_width = 1,
+     border_color = color.gray,
+     frame_width  = 1,
+     frame_color  = color.gray)
+
+if barstate.islast
+
+    // --- Header ---
+    table.cell(infoTable, 0, 0, "Parameter", text_color=color.white, text_size=size.small, bgcolor=color.new(#16213e, 0))
+    table.cell(infoTable, 1, 0, "Value",     text_color=color.white, text_size=size.small, bgcolor=color.new(#16213e, 0))
+
+    // --- RSI Info ---
+    table.cell(infoTable, 0, 1, "RSI Resolution",  text_color=color.silver, text_size=size.tiny)
+    table.cell(infoTable, 1, 1, rsiResOption,       text_color=color.white,  text_size=size.tiny)
+
+    table.cell(infoTable, 0, 2, "RSI Res × Avg",   text_color=color.silver, text_size=size.tiny)
+    table.cell(infoTable, 1, 2, rsiTimeStr,          text_color=color.aqua,   text_size=size.tiny)
+
+    // --- Current Mode ---
+    modeStr   = isLongMode ? "LONG" : isShortMode ? "SHORT" : "NONE"
+    modeColor = isLongMode ? color.green : isShortMode ? color.red : color.gray
+    table.cell(infoTable, 0, 3, "Active Mode",      text_color=color.silver, text_size=size.tiny)
+    table.cell(infoTable, 1, 3, modeStr,             text_color=modeColor,    text_size=size.tiny)
+
+    // --- Market Condition ---
+    mktStr   = isRanging ? "RANGING ↔" : (lastEmaSlope >= 0 ? "TRENDING ↑" : "TRENDING ↓")
+    mktColor = isRanging ? color.yellow : (lastEmaSlope >= 0 ? color.green : color.red)
+    table.cell(infoTable, 0, 4, "Market Condition",  text_color=color.silver, text_size=size.tiny)
+    table.cell(infoTable, 1, 4, mktStr,              text_color=mktColor,     text_size=size.tiny)
+
+    // --- Ranging Counter ---
+    flatStr   = str.tostring(flatCounter) + " / " + str.tostring(emaSlopeFlatCount)
+    flatColor = isRanging ? color.yellow : color.silver
+    table.cell(infoTable, 0, 5, "Ranging Count",     text_color=color.silver, text_size=size.tiny)
+    table.cell(infoTable, 1, 5, flatStr,             text_color=flatColor,    text_size=size.tiny)
+
+    // --- Warning Signal ---
+    // Conditions: Long regime + slope down | Short regime + slope up | Ranging
+    warnLongSlopeDown  = isLongMode  and not isRanging and lastEmaSlope < 0
+    warnShortSlopeUp   = isShortMode and not isRanging and lastEmaSlope >= 0
+    warnRanging        = isRanging
+
+    warnStr  = ""
+    if warnRanging
+        warnStr := "⚠ RANGING — Entries Blocked"
+    else if warnLongSlopeDown
+        warnStr := "⚠ Slope DOWN vs LONG Regime"
+    else if warnShortSlopeUp
+        warnStr := "⚠ Slope UP vs SHORT Regime"
+
+    warnActive = warnRanging or warnLongSlopeDown or warnShortSlopeUp
+    warnColor  = warnRanging ? color.yellow : color.new(color.orange, 0)
+    warnBg     = warnActive ? color.new(#4a3000, 0) : color.new(#1a1a2e, 10)
+    warnTxt    = warnActive ? warnStr : "None"
+    warnTxtCol = warnActive ? warnColor : color.new(color.green, 0)
+
+    table.cell(infoTable, 0, 6, "⚠ Warning",         text_color=warnActive ? warnColor : color.silver, text_size=size.tiny, bgcolor=warnBg)
+    table.cell(infoTable, 1, 6, warnTxt,              text_color=warnTxtCol,  text_size=size.tiny, bgcolor=warnBg)
+
+    // ───────── LONG SECTION ─────────
+    table.cell(infoTable, 0, 7, "── LONG ──",       text_color=color.green,  text_size=size.tiny, bgcolor=color.new(#0a3d0a, 0))
+    table.cell(infoTable, 1, 7, "",                  text_color=color.white,  text_size=size.tiny, bgcolor=color.new(#0a3d0a, 0))
+
+    ecLC   = isLongMode ? (emaCrossLong ? color.green : color.red) : color.gray
+    ecLS   = isLongMode ? (emaCrossLong ? "TRUE" : "FALSE") : "N/A (Short Active)"
+    table.cell(infoTable, 0, 8, "EMA Cross Long",    text_color=color.silver, text_size=size.tiny)
+    table.cell(infoTable, 1, 8, ecLS,                text_color=ecLC,         text_size=size.tiny)
+
+    emLC   = isLongMode ? (emaCrossLongStrong ? color.green : color.red) : color.gray
+    emLS   = isLongMode ? (emaCrossLongStrong ? "TRUE" : "FALSE") : "N/A (Short Active)"
+    table.cell(infoTable, 0, 9, "Long Strong Entry", text_color=color.silver, text_size=size.tiny)
+    table.cell(infoTable, 1, 9, emLS,                text_color=emLC,         text_size=size.tiny)
+
+    slLC   = isLongMode ? (isRanging ? color.yellow : (lastEmaSlope >= 0 ? color.green : color.red)) : color.gray
+    slLS   = isLongMode ? str.tostring(lastEmaSlope, "#.####") + "%" : "N/A (Short Active)"
+    table.cell(infoTable, 0, 10, "EMA Slope",        text_color=color.silver, text_size=size.tiny)
+    table.cell(infoTable, 1, 10, slLS,               text_color=slLC,         text_size=size.tiny)
+
+    rlLC   = isLongMode ? (rsiLongOk ? color.green : color.red) : color.gray
+    rlLS   = isLongMode ? str.tostring(rsiMTF, "#.##") : "N/A (Short Active)"
+    table.cell(infoTable, 0, 11, "RSI Avg",          text_color=color.silver, text_size=size.tiny)
+    table.cell(infoTable, 1, 11, rlLS,               text_color=rlLC,         text_size=size.tiny)
+
+    // ───────── SHORT SECTION ─────────
+    table.cell(infoTable, 0, 12, "── SHORT ──",      text_color=color.red,    text_size=size.tiny, bgcolor=color.new(#3d0a0a, 0))
+    table.cell(infoTable, 1, 12, "",                  text_color=color.white,  text_size=size.tiny, bgcolor=color.new(#3d0a0a, 0))
+
+    ecSC   = isShortMode ? (emaCrossShort ? color.green : color.red) : color.gray
+    ecSS   = isShortMode ? (emaCrossShort ? "TRUE" : "FALSE") : "N/A (Long Active)"
+    table.cell(infoTable, 0, 13, "EMA Cross Short",   text_color=color.silver, text_size=size.tiny)
+    table.cell(infoTable, 1, 13, ecSS,               text_color=ecSC,         text_size=size.tiny)
+
+    emSC   = isShortMode ? (emaCrossShortStrong ? color.green : color.red) : color.gray
+    emSS   = isShortMode ? (emaCrossShortStrong ? "TRUE" : "FALSE") : "N/A (Long Active)"
+    table.cell(infoTable, 0, 14, "Short Strong Entry", text_color=color.silver, text_size=size.tiny)
+    table.cell(infoTable, 1, 14, emSS,                text_color=emSC,         text_size=size.tiny)
+
+    slSC   = isShortMode ? (isRanging ? color.yellow : (lastEmaSlope >= 0 ? color.green : color.red)) : color.gray
+    slSS   = isShortMode ? str.tostring(lastEmaSlope, "#.####") + "%" : "N/A (Long Active)"
+    table.cell(infoTable, 0, 15, "EMA Slope",         text_color=color.silver, text_size=size.tiny)
+    table.cell(infoTable, 1, 15, slSS,               text_color=slSC,         text_size=size.tiny)
+
+    rlSC   = isShortMode ? (rsiShortOk ? color.green : color.red) : color.gray
+    rlSS   = isShortMode ? str.tostring(rsiMTF, "#.##") : "N/A (Long Active)"
+    table.cell(infoTable, 0, 16, "RSI Avg",           text_color=color.silver, text_size=size.tiny)
+    table.cell(infoTable, 1, 16, rlSS,               text_color=rlSC,         text_size=size.tiny)
+
+    // ───────── CONFIG SECTION ─────────
+    table.cell(infoTable, 0, 17, "── CONFIG ──",      text_color=color.aqua,   text_size=size.tiny, bgcolor=color.new(#0a2a3d, 0))
+    table.cell(infoTable, 1, 17, "",                   text_color=color.white,  text_size=size.tiny, bgcolor=color.new(#0a2a3d, 0))
+
+    table.cell(infoTable, 0, 18, "Slope Lookback",     text_color=color.silver, text_size=size.tiny)
+    table.cell(infoTable, 1, 18, str.tostring(emaSlopeLookback) + " HTF bars", text_color=color.aqua, text_size=size.tiny)
+
+    table.cell(infoTable, 0, 19, "Strong Candle?",     text_color=color.silver, text_size=size.tiny)
+    scCol = isStrong ? color.green : color.gray
+    scStr = isStrong ? (isBullStrong ? "BULL ✓" : "BEAR ✓") : "No"
+    table.cell(infoTable, 1, 19, scStr,                text_color=scCol,        text_size=size.tiny)
+
+// ═══════════════════════════════════════════════════════════════
+// ██  ALERTS
+// ═══════════════════════════════════════════════════════════════
+
+alertcondition(crossLongSignal,  title="EMA Cross Long",       message="EMA Slow Medium crossed ABOVE EMA Slow — Long Setup Active")
+alertcondition(crossShortSignal, title="EMA Cross Short",      message="EMA Slow Medium crossed BELOW EMA Slow — Short Setup Active")
+alertcondition(longEntrySignal,  title="Long Strong Entry",    message="Strong Candle Long Entry — Close above Medium and Slow Medium EMA")
+alertcondition(shortEntrySignal, title="Short Strong Entry",   message="Strong Candle Short Entry — Close below Medium and Slow Medium EMA")
+alertcondition(longExitNow,      title="Long Exit Signal",     message="Long Exit — Strong candle closed below Medium EMA")
+alertcondition(shortExitNow,     title="Short Exit Signal",    message="Short Exit — Strong candle closed above Medium EMA")
+alertcondition(isRanging and not isRanging[1], title="Ranging Detected", message="Market is RANGING — Slope flat for configured consecutive HTF bars")
+
+// ═══════════════════════════════════════════════════════════════
+// ██  END
+// ═══════════════════════════════════════════════════════════════

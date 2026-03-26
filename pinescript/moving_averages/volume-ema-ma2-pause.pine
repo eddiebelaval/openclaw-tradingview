@@ -1,0 +1,159 @@
+//@version=6
+indicator("Volume EMA & MA2 (Pause)", shorttitle="Vol MAs Pause", overlay=false, precision=0)
+
+// ========================================================================= //
+// 1. INPUTS
+// ========================================================================= //
+grp_main = "Volume MA Settings"
+emaLen     = input.int(10, "EMA Length", minval=1, group=grp_main, tooltip="Lookback period for the base Exponential Moving Average.")
+ma2Type    = input.string("HMA", "MA 2 Type", options=["SMA", "EMA", "HMA", "WMA", "RMA"], group=grp_main, tooltip="Select the type of the second Moving Average.")
+ma2Len     = input.int(10, "MA 2 Length", minval=1, group=grp_main, tooltip="Lookback period for the second Moving Average.")
+volProxPct = input.float(30.0, "Max Distance from EMA (%)", minval=0.0, group=grp_main, tooltip="Signal only triggers if current volume is within this % of the EMA.")
+
+grp_scale = "Y-Axis Scaling"
+capYAxis   = input.bool(true, "Cap Active Visual Volume?", group=grp_scale, tooltip="Limits the visual height of active volume spikes to prevent the MAs from flattening out.")
+capMult    = input.float(5.0, "Cap Multiplier (x EMA)", minval=1.0, group=grp_scale, tooltip="Visually caps volume bars at this multiple of the current EMA.")
+capPause   = input.bool(false, "Apply Cap to Paused Volume?", group=grp_scale, tooltip="If disabled, exclusion zone volume plots at true height. If enabled, it squashes morning volume so it doesn't stretch your chart.")
+
+grp_time = "Exclusion Zones (Freeze Data)"
+useTime1  = input.bool(true, "Enable Exclusion Zone 1?", group=grp_time)
+timeFrom1 = input.session("0915-0930", "Exclusion Session 1", group=grp_time)
+
+useTime2  = input.bool(true, "Enable Exclusion Zone 2?", group=grp_time)
+timeFrom2 = input.session("1515-1530", "Exclusion Session 2", group=grp_time)
+
+// --- Colors ---
+c_vol_up   = #26A69A       
+c_vol_dn   = #EF5350       
+c_ema_line = #FF9800       
+c_ma2_line = #9C27B0       
+c_frozen   = #FF5252       
+c_ghost    = color.new(color.gray, 70) 
+
+// ========================================================================= //
+// 2. CUSTOM TRUE-PAUSE MA FUNCTIONS
+// ========================================================================= //
+f_ema(src, len, pause) =>
+    var float val = na
+    alpha = 2 / (len + 1)
+    if not pause
+        val := na(val) ? src : (src - val) * alpha + val
+    val
+
+f_rma(src, len, pause) =>
+    var float val = na
+    alpha = 1 / len
+    if not pause
+        val := na(val) ? src : (src - val) * alpha + val
+    val
+
+f_sma(src, len, pause) =>
+    var float[] history = array.new_float(0)
+    var float val = na
+    if not pause and not na(src)
+        array.unshift(history, src)
+        if array.size(history) > len
+            array.pop(history)
+        val := array.sum(history) / array.size(history)
+    val
+
+f_wma(src, len, pause) =>
+    var float[] history = array.new_float(0)
+    var float val = na
+    if not pause and not na(src)
+        array.unshift(history, src)
+        if array.size(history) > len
+            array.pop(history)
+        sum = 0.0
+        norm = 0.0
+        n = array.size(history)
+        for i = 0 to n - 1
+            weight = n - i
+            sum += array.get(history, i) * weight
+            norm += weight
+        val := norm == 0 ? na : sum / norm
+    val
+
+f_hma(src, len, pause) =>
+    halfLen = math.floor(len / 2)
+    sqLen = math.floor(math.sqrt(len))
+    wmaHalf = f_wma(src, halfLen, pause)
+    wmaFull = f_wma(src, len, pause)
+    rawHma = (wmaHalf * 2) - wmaFull
+    val = f_wma(na(rawHma) ? src : rawHma, sqLen, pause)
+    val
+
+// ========================================================================= //
+// 3. LOGIC: TRUE PAUSE EXECUTION
+// ========================================================================= //
+isInSession(sess) => 
+    not na(time(timeframe.period, sess + ":1234567", "Asia/Kolkata"))
+
+isExclude = (useTime1 and isInSession(timeFrom1)) or (useTime2 and isInSession(timeFrom2))
+
+float volEMA = f_ema(volume, emaLen, isExclude)
+
+float volMA2 = switch ma2Type
+    "SMA" => f_sma(volume, ma2Len, isExclude)
+    "EMA" => f_ema(volume, ma2Len, isExclude)
+    "WMA" => f_wma(volume, ma2Len, isExclude)
+    "RMA" => f_rma(volume, ma2Len, isExclude)
+    => f_hma(volume, ma2Len, isExclude) 
+
+// ========================================================================= //
+// 4. CROSSOVER SIGNALS & PROXIMITY FILTER
+// ========================================================================= //
+bool crossUp = ta.crossover(volMA2, volEMA)
+bool crossDn = ta.crossunder(volMA2, volEMA)
+
+float lowerBound = volEMA * (1 - volProxPct / 100.0)
+float upperBound = volEMA * (1 + volProxPct / 100.0)
+bool isVolNearEMA = (volume >= lowerBound) and (volume <= upperBound)
+
+bool validCrossUp = crossUp and isVolNearEMA
+bool validCrossDn = crossDn and isVolNearEMA
+
+// ========================================================================= //
+// 5. VISUALS & SCALING
+// ========================================================================= //
+// Y-Axis Scaling Logic: By default, ignores the pause zone to show true morning volume
+float visualVolume = volume
+if capYAxis and not na(volEMA)
+    if not isExclude or (isExclude and capPause)
+        visualVolume := math.min(volume, volEMA * capMult)
+
+volColor = isExclude ? c_ghost : (close > open ? c_vol_up : c_vol_dn)
+plot(visualVolume, "Volume Bars", color=volColor, style=plot.style_columns)
+
+lineColorEMA = isExclude ? c_frozen : c_ema_line
+lineColorMA2 = isExclude ? c_frozen : c_ma2_line
+
+plot(volEMA, "Volume EMA", color=lineColorEMA, linewidth=2)
+plot(volMA2, "Volume MA 2", color=lineColorMA2, linewidth=2)
+
+plotshape(validCrossUp ? volMA2 : na, title="Bullish Cross", style=shape.triangleup, location=location.absolute, color=color.green, size=size.normal)
+plotshape(validCrossDn ? volMA2 : na, title="Bearish Cross", style=shape.triangledown, location=location.absolute, color=color.red, size=size.normal)
+
+bgcolor(isExclude ? color.new(c_frozen, 90) : na, title="Exclusion Zone Highlight")
+
+// ========================================================================= //
+// 6. LABELS
+// ========================================================================= //
+var label statusLabel = na
+
+if barstate.islast
+    if not na(statusLabel)
+        label.delete(statusLabel)
+    
+    string statusText = isExclude ? " (PAUSED)" : ""
+    color statusColor = isExclude ? c_frozen : c_ema_line
+    
+    // The label strictly shows the TRUE volume values, independent of visual scaling
+    string lblText = "EMA: " + str.tostring(volEMA, format.volume) + statusText + "\n" + ma2Type + ": " + str.tostring(volMA2, format.volume)
+    
+    statusLabel := label.new(bar_index + 3, math.max(volEMA, volMA2), 
+                             lblText, 
+                             color=color.new(color.black, 100), 
+                             style=label.style_label_left, 
+                             textcolor=statusColor, 
+                             size=size.small)

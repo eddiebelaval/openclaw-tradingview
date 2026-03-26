@@ -1,0 +1,164 @@
+// This source code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+//======================================================================//
+//                    ____  _            _  __                          //
+//                   |  _ \(_)_ __   ___(_)/ _|_   _                    //
+//                   | |_) | | '_ \ / _ \ | |_| | | |                   //
+//                   |  __/| | | | |  __/ |  _| |_| |                   //
+//                   |_|   |_|_| |_|\___|_|_|  \__, |                   //
+//                                             |___/                    //
+//======================================================================//
+
+//@version=6
+
+// Nebula Volatility Matrix: A dynamic volatility-based trend indicator that uses
+// Hull Moving Average (HMA) as a zero-lag baseline and ATR-derived inner/outer bands
+// to create a layered "nebula" volatility envelope. Signals are generated when price
+// crosses the HMA baseline during periods of expanding volatility, filtering out
+// low-conviction moves in quiet markets.
+indicator("Nebula Volatility Matrix [Pineify]", overlay=true, max_labels_count=500, max_lines_count=500)
+
+//---------------------------------------------------------------------------------------------------------------------
+// CONSTANTS & INPUTS
+//---------------------------------------------------------------------------------------------------------------------
+
+// Neon color palette for the space-themed visual design
+NEON_GREEN  = #00E676
+NEON_RED    = #FF1744
+NEON_BLUE   = #2962FF
+GALAXY_PURP = #AA00FF
+
+SETTINGS_GROUP  = "Matrix Settings"
+STYLE_GROUP     = "Nebula Aesthetics"
+
+// Baseline Length: Controls the period of the Hull Moving Average.
+// Shorter values make the baseline more reactive to price changes;
+// longer values produce a smoother, more stable trend line.
+lengthInput    = input.int(24, "Baseline Length", minval=1, group=SETTINGS_GROUP, tooltip="Smoothness of the trend baseline.")
+
+// Volatility Length: Lookback period for the ATR calculation.
+// Determines how many bars are used to measure average volatility,
+// which directly affects the width and responsiveness of the nebula bands.
+atrLengthInput = input.int(14, "Volatility Length", minval=1, group=SETTINGS_GROUP, tooltip="Lookback for the ATR volatility measurement.")
+
+// Inner/Outer Band Multipliers: Scale the ATR to create two concentric band layers.
+// The inner band (1.2x ATR) represents the normal volatility zone;
+// the outer band (2.4x ATR) represents the extended volatility zone.
+// The gap between them forms the visible "nebula cloud" on the chart.
+innerMultInput = input.float(1.2, "Inner Band Multiplier", step=0.1, group=SETTINGS_GROUP)
+outerMultInput = input.float(2.4, "Outer Band Multiplier", step=0.1, group=SETTINGS_GROUP)
+
+// User-customizable colors for the three market states:
+// bullish (trending up + volatile), bearish (trending down + volatile), and neutral (low volatility)
+bullColor     = input.color(NEON_GREEN, "Bullish Burst", group=STYLE_GROUP)
+bearColor     = input.color(NEON_RED, "Bearish Burst", group=STYLE_GROUP)
+neutralColor  = input.color(color.gray, "Low Volatility (Dim)", group=STYLE_GROUP)
+
+//---------------------------------------------------------------------------------------------------------------------
+// CALCULATIONS
+//---------------------------------------------------------------------------------------------------------------------
+
+// Hull Moving Average (HMA) baseline:
+// HMA = WMA(2 * WMA(n/2) - WMA(n), sqrt(n))
+// This weighted construction heavily reduces lag compared to SMA/EMA of the same period,
+// making it ideal for detecting trend direction changes with minimal delay.
+basis = ta.hma(close, lengthInput)
+
+// Average True Range (ATR): Measures the average bar-to-bar volatility over the lookback period.
+// ATR accounts for gaps by using the true range (max of high-low, |high-prevClose|, |low-prevClose|),
+// providing a more accurate volatility reading than simple high-low range.
+atr = ta.atr(atrLengthInput)
+
+// Nebula Bands: Four dynamic levels derived from the HMA baseline offset by ATR multiples.
+// These bands expand when volatility increases and contract when it decreases,
+// creating a breathing envelope that adapts to current market conditions.
+upperOuter = basis + (atr * outerMultInput)  // Upper extreme boundary (2.4x ATR above baseline)
+upperInner = basis + (atr * innerMultInput)  // Upper normal boundary (1.2x ATR above baseline)
+lowerInner = basis - (atr * innerMultInput)  // Lower normal boundary (1.2x ATR below baseline)
+lowerOuter = basis - (atr * outerMultInput)  // Lower extreme boundary (2.4x ATR below baseline)
+
+// Volatility State Detection:
+// Compares current ATR against its own simple moving average over the baseline length.
+// When current ATR > its SMA, volatility is expanding (market is becoming more active);
+// when ATR <= its SMA, volatility is contracting (market is quieting down).
+// This filter ensures signals only fire during periods of increasing market activity.
+volExpanding = atr > ta.sma(atr, lengthInput)
+
+// Trend Direction Tracker:
+// Uses `var` for state persistence across bars. The trend variable holds:
+//   1 = bullish (price above HMA baseline)
+//  -1 = bearish (price below HMA baseline)
+//   0 = initial/undefined state
+// When price is exactly at the baseline, the previous trend state is preserved via nz(trend[1]),
+// preventing unnecessary trend flips during brief touches of the baseline.
+var int trend = 0
+trend := close > basis ? 1 : close < basis ? -1 : nz(trend[1], 0)
+
+// Trading Signal Generation:
+// BUY: Price crosses above the HMA baseline AND volatility is expanding.
+//      The crossover confirms a directional shift; the volatility filter ensures
+//      the move has momentum behind it, not just a low-volatility drift.
+// SELL: Price crosses below the HMA baseline AND volatility is expanding.
+//       Same dual-condition logic applied to the bearish direction.
+// By requiring both conditions, the indicator avoids generating signals during
+// quiet, range-bound markets where crossovers are unreliable.
+buySignal  = ta.crossover(close, basis) and volExpanding
+sellSignal = ta.crossunder(close, basis) and volExpanding
+
+//---------------------------------------------------------------------------------------------------------------------
+// VISUALS & PLOTS
+//---------------------------------------------------------------------------------------------------------------------
+
+// Dynamic Bar Coloring:
+// Three-state color logic based on trend direction and volatility expansion:
+//   - Bullish + expanding volatility → bright neon green (active uptrend)
+//   - Bearish + expanding volatility → bright neon red (active downtrend)
+//   - Any other state (contracting volatility or no clear trend) → dim gray (resting/consolidation)
+// This gives traders an instant visual scan of which bars represent high-conviction trending moves.
+barCss = switch
+    trend ==  1 and volExpanding => bullColor
+    trend == -1 and volExpanding => bearColor
+    => neutralColor
+barcolor(barCss, title="Nebula Candle Colors")
+
+// Nebula Matrix Line Plots:
+// Five lines form the matrix structure. Outer bands use higher transparency (70)
+// for a faded edge effect; inner bands use moderate transparency (50);
+// the central baseline uses full opacity with a thicker line width (2) and
+// changes color based on trend direction (green for bullish, red for bearish).
+pOuterUp = plot(upperOuter, "Outer Upper Band", color=color.new(NEON_BLUE, 70), style=plot.style_line)
+pInnerUp = plot(upperInner, "Inner Upper Band", color=color.new(NEON_BLUE, 50), style=plot.style_line)
+pBasis   = plot(basis, "Nebula Baseline", color=trend == 1 ? bullColor : bearColor, linewidth=2)
+pInnerDn = plot(lowerInner, "Inner Lower Band", color=color.new(GALAXY_PURP, 50), style=plot.style_line)
+pOuterDn = plot(lowerOuter, "Outer Lower Band", color=color.new(GALAXY_PURP, 70), style=plot.style_line)
+
+// Nebula Cloud Fills:
+// Four gradient-like fill zones between adjacent band lines create the layered nebula effect.
+// Upper bands use blue tones; lower bands use purple tones.
+// Higher transparency values (85-90) ensure the fills don't obscure price action,
+// while still providing a clear visual representation of the volatility envelope.
+// The asymmetric color scheme (blue above, purple below) helps traders instantly
+// distinguish the upper and lower halves of the volatility matrix.
+fill(pOuterUp, pInnerUp, color.new(NEON_BLUE, 85), title="Upper Outer Nebula")
+fill(pInnerUp, pBasis,   color.new(NEON_BLUE, 90), title="Upper Inner Nebula")
+fill(pBasis,   pInnerDn, color.new(GALAXY_PURP, 90), title="Lower Inner Nebula")
+fill(pInnerDn, pOuterDn, color.new(GALAXY_PURP, 85), title="Lower Outer Nebula")
+
+// Trading Signal Labels:
+// BUY labels are placed at the outer lower band level (below price) with an upward arrow shape,
+// using bullish color with black text for high contrast.
+// SELL labels are placed at the outer upper band level (above price) with a downward arrow shape,
+// using bearish color with white text.
+// Positioning labels at the outer bands rather than at price keeps them visually separated
+// from the candles, improving chart readability.
+plotshape(buySignal ? lowerOuter : na, "Buy Signal", shape.labelup, location.absolute, bullColor, text="BUY", textcolor=color.black, size=size.small)
+plotshape(sellSignal ? upperOuter : na, "Sell Signal", shape.labeldown, location.absolute, bearColor, text="SELL", textcolor=color.white, size=size.small)
+
+//---------------------------------------------------------------------------------------------------------------------
+// ALERTS
+//---------------------------------------------------------------------------------------------------------------------
+
+// Alert conditions allow traders to receive notifications without watching the chart.
+// Both alerts fire only when the dual-condition (crossover + expanding volatility) is met,
+// matching the visual signal logic exactly.
+alertcondition(buySignal, title="Nebula Buy Alert", message="Volatility expanding! BUY signal generated.")
+alertcondition(sellSignal, title="Nebula Sell Alert", message="Volatility expanding! SELL signal generated.")

@@ -1,0 +1,375 @@
+//@version=6
+indicator(
+     title            = "ORCB Strategy Indicator",
+     shorttitle       = "ORCB",
+     overlay          = true,
+     max_lines_count  = 500,
+     max_boxes_count  = 200,
+     max_labels_count = 500
+ )
+
+// ═══════════════════════════════════════════════════════════════════
+// SECTION 1 — INPUTS
+// ═══════════════════════════════════════════════════════════════════
+
+i_orStartHour = input.int(7,  "OR Start Hour",   minval=0, maxval=23, group="⏰ Opening Range Time",
+     tooltip="All times use London (Europe/London) timezone.")
+i_orStartMin  = input.int(0,  "OR Start Minute", minval=0, maxval=59, group="⏰ Opening Range Time")
+i_orEndHour   = input.int(8,  "OR End Hour",     minval=0, maxval=23, group="⏰ Opening Range Time")
+i_orEndMin    = input.int(0,  "OR End Minute",   minval=0, maxval=59, group="⏰ Opening Range Time")
+
+i_slBuffer = input.float(0.25, "SL Buffer (points)", step=0.05, minval=0.0, group="📊 Trade Settings")
+i_rrRatio  = input.float(2.0,  "Risk:Reward Ratio",  step=0.5,  minval=0.5, group="📊 Trade Settings")
+
+i_showBox   = input.bool(true, "Show OR Box", group="🎨 OR Box Visuals")
+i_orDays    = input.int(10,   "Max OR Days to Show", minval=1, maxval=30, group="🎨 OR Box Visuals")
+i_boxColor  = input.color(color.new(color.blue, 80), "Box Fill Colour",         group="🎨 OR Box Visuals")
+i_lineColor = input.color(color.new(color.blue, 20), "OR High/Low Line Colour", group="🎨 OR Box Visuals")
+i_lineWidth = input.int(1, "Line Width", minval=1, maxval=4,                    group="🎨 OR Box Visuals")
+
+i_showArrows = input.bool(true, "Show Entry Arrows",               group="📍 Signal Visuals")
+i_showTPSL   = input.bool(true, "Show TP & SL Lines (today only)", group="📍 Signal Visuals")
+i_tpColor    = input.color(color.new(color.green, 0), "TP Line Colour", group="📍 Signal Visuals")
+i_slColor    = input.color(color.new(color.red,   0), "SL Line Colour", group="📍 Signal Visuals")
+
+i_emaFastLen   = input.int(8,  "Fast EMA Length", minval=1, group="📈 EMA Settings")
+i_emaSlowLen   = input.int(20, "Slow EMA Length", minval=1, group="📈 EMA Settings")
+i_emaFastColor = input.color(color.new(color.green,  0), "Fast EMA Colour", group="📈 EMA Settings")
+i_emaSlowColor = input.color(color.new(color.orange, 0), "Slow EMA Colour", group="📈 EMA Settings")
+
+i_showON      = input.bool(false, "Show Overnight High/Low", group="🌙 Overnight Range")
+i_onStartHour = input.int(0, "Overnight Start Hour",   minval=0, maxval=23, group="🌙 Overnight Range")
+i_onStartMin  = input.int(0, "Overnight Start Minute", minval=0, maxval=59, group="🌙 Overnight Range")
+i_onEndHour   = input.int(7, "Overnight End Hour",     minval=0, maxval=23, group="🌙 Overnight Range")
+i_onEndMin    = input.int(0, "Overnight End Minute",   minval=0, maxval=59, group="🌙 Overnight Range")
+i_onColor     = input.color(color.new(color.yellow, 0), "Overnight Line Colour", group="🌙 Overnight Range")
+
+i_showPDHL = input.bool(false, "Show Previous Day High/Low", group="📅 Previous Day")
+i_pdColor  = input.color(color.new(color.purple, 0), "PDH/PDL Line Colour", group="📅 Previous Day")
+
+
+// ═══════════════════════════════════════════════════════════════════
+// SECTION 2 — EMA CALCULATIONS & PLOTS
+// ═══════════════════════════════════════════════════════════════════
+
+emaFast = ta.ema(close, i_emaFastLen)
+emaSlow = ta.ema(close, i_emaSlowLen)
+
+plot(emaFast, title="Fast EMA", color=i_emaFastColor, linewidth=1)
+plot(emaSlow, title="Slow EMA", color=i_emaSlowColor, linewidth=1)
+
+emaBullCross = ta.crossover(emaFast,  emaSlow)
+emaBearCross = ta.crossunder(emaFast, emaSlow)
+
+plotshape(emaBullCross, title="EMA Bull Cross",
+          style=shape.triangleup,   location=location.belowbar,
+          color=color.new(color.green, 0), size=size.tiny)
+plotshape(emaBearCross, title="EMA Bear Cross",
+          style=shape.triangledown, location=location.abovebar,
+          color=color.new(color.red, 0),   size=size.tiny)
+
+
+// ═══════════════════════════════════════════════════════════════════
+// SECTION 3 — TIME HELPERS
+// ═══════════════════════════════════════════════════════════════════
+
+TZ = "Europe/London"
+
+barH    = hour(time,   TZ)
+barM    = minute(time, TZ)
+barMins = barH * 60 + barM
+
+orStartMins = i_orStartHour * 60 + i_orStartMin
+orEndMins   = i_orEndHour   * 60 + i_orEndMin
+onStartMins = i_onStartHour * 60 + i_onStartMin
+onEndMins   = i_onEndHour   * 60 + i_onEndMin
+
+barDate = year(time, TZ) * 10000 + month(time, TZ) * 100 + dayofmonth(time, TZ)
+
+var int prevDate = 0
+isNewDay = barDate != prevDate
+if isNewDay
+    prevDate := barDate
+
+
+// ═══════════════════════════════════════════════════════════════════
+// SECTION 4 — OPENING RANGE TRACKING + LIVE BOX
+//
+// Box is created on the FIRST bar at 7:00am and updated live.
+// You see it forming in real time — no waiting until 8:00am.
+// ═══════════════════════════════════════════════════════════════════
+
+var float orHigh     = na
+var float orLow      = na
+var int   orStartBar = na
+var bool  orStarted  = false
+var bool  orDone     = false
+var bool  tradeFired = false
+var box   orLiveBox  = na
+
+if isNewDay
+    orHigh     := na
+    orLow      := na
+    orStartBar := na
+    orStarted  := false
+    orDone     := false
+    tradeFired := false
+    orLiveBox  := na
+
+inORWindow = barMins >= orStartMins and barMins < orEndMins
+
+if inORWindow
+    if not orStarted
+        orStarted  := true
+        orStartBar := bar_index
+        orHigh     := high
+        orLow      := low
+        if i_showBox
+            orLiveBox := box.new(
+                 left         = orStartBar,
+                 top          = orHigh,
+                 right        = bar_index + 1,
+                 bottom       = orLow,
+                 border_color = i_lineColor,
+                 border_width = i_lineWidth,
+                 bgcolor      = i_boxColor)
+    else
+        orHigh := math.max(orHigh, high)
+        orLow  := math.min(orLow,  low)
+        if i_showBox and not na(orLiveBox)
+            box.set_top(orLiveBox,    orHigh)
+            box.set_bottom(orLiveBox, orLow)
+            box.set_right(orLiveBox,  bar_index + 1)
+
+
+// ═══════════════════════════════════════════════════════════════════
+// SECTION 5 — FINALISE OR BOX & DRAW TODAY'S H/L LINES
+//
+// When OR window closes at 8:00am:
+//   • Live box right edge is locked
+//   • Box added to N-day array (oldest deleted if over limit)
+//   • OR H/L lines + labels drawn for today only
+// ═══════════════════════════════════════════════════════════════════
+
+var box[] orBoxes = array.new<box>()
+
+var line  todayORHiLine  = na
+var line  todayORLoLine  = na
+var label todayORHiLabel = na
+var label todayORLoLabel = na
+
+if isNewDay
+    if not na(todayORHiLine)
+        line.delete(todayORHiLine)
+        line.delete(todayORLoLine)
+        label.delete(todayORHiLabel)
+        label.delete(todayORLoLabel)
+        todayORHiLine  := na
+        todayORLoLine  := na
+        todayORHiLabel := na
+        todayORLoLabel := na
+
+orJustEnded = orStarted and not inORWindow and not orDone and not na(orHigh)
+
+if orJustEnded
+    orDone := true
+
+    if i_showBox and not na(orLiveBox)
+        box.set_right(orLiveBox, bar_index)
+        array.push(orBoxes, orLiveBox)
+        if array.size(orBoxes) > i_orDays
+            box.delete(array.shift(orBoxes))
+
+    todayORHiLine  := line.new(x1=bar_index, y1=orHigh, x2=bar_index+1, y2=orHigh,
+         color=i_lineColor, width=i_lineWidth, extend=extend.right)
+    todayORLoLine  := line.new(x1=bar_index, y1=orLow,  x2=bar_index+1, y2=orLow,
+         color=i_lineColor, width=i_lineWidth, extend=extend.right)
+    todayORHiLabel := label.new(bar_index+2, orHigh, "OR H",
+         style=label.style_label_left, color=i_lineColor,
+         textcolor=color.white, size=size.small)
+    todayORLoLabel := label.new(bar_index+2, orLow,  "OR L",
+         style=label.style_label_left, color=i_lineColor,
+         textcolor=color.white, size=size.small)
+
+
+// ═══════════════════════════════════════════════════════════════════
+// SECTION 6 — BREAK DETECTION & ENTRY SIGNALS
+// ═══════════════════════════════════════════════════════════════════
+
+emaIsBullish = emaFast > emaSlow
+emaIsBearish = emaFast < emaSlow
+
+isLongBreak  = orDone and not tradeFired and close > orHigh and emaIsBullish and barstate.isconfirmed
+isShortBreak = orDone and not tradeFired and close < orLow  and emaIsBearish and barstate.isconfirmed
+
+var line  tpLine  = na
+var line  slLine  = na
+var label tpLabel = na
+var label slLabel = na
+
+if isNewDay
+    if not na(tpLine)
+        line.delete(tpLine)
+        line.delete(slLine)
+        label.delete(tpLabel)
+        label.delete(slLabel)
+        tpLine  := na
+        slLine  := na
+        tpLabel := na
+        slLabel := na
+
+if isLongBreak
+    tradeFired := true
+    entryL = close
+    slL    = orLow  - i_slBuffer
+    riskL  = entryL - slL
+    tpL    = entryL + riskL * i_rrRatio
+
+    if i_showArrows
+        label.new(bar_index, low, "▲ LONG",
+                  style=label.style_label_up,
+                  color=color.green, textcolor=color.white, size=size.normal)
+    if i_showTPSL
+        tpLine  := line.new(x1=bar_index, y1=tpL, x2=bar_index+1, y2=tpL,
+                 color=i_tpColor, width=2, extend=extend.right, style=line.style_dashed)
+        slLine  := line.new(x1=bar_index, y1=slL, x2=bar_index+1, y2=slL,
+                 color=i_slColor, width=2, extend=extend.right, style=line.style_dashed)
+        tpLabel := label.new(bar_index+2, tpL, "TP",
+                 style=label.style_label_left, color=i_tpColor,
+                 textcolor=color.white, size=size.small)
+        slLabel := label.new(bar_index+2, slL, "SL",
+                 style=label.style_label_left, color=i_slColor,
+                 textcolor=color.white, size=size.small)
+
+if isShortBreak
+    tradeFired := true
+    entryS = close
+    slS    = orHigh + i_slBuffer
+    riskS  = slS    - entryS
+    tpS    = entryS - riskS * i_rrRatio
+
+    if i_showArrows
+        label.new(bar_index, high, "▼ SHORT",
+                  style=label.style_label_down,
+                  color=color.red, textcolor=color.white, size=size.normal)
+    if i_showTPSL
+        tpLine  := line.new(x1=bar_index, y1=tpS, x2=bar_index+1, y2=tpS,
+                 color=i_tpColor, width=2, extend=extend.right, style=line.style_dashed)
+        slLine  := line.new(x1=bar_index, y1=slS, x2=bar_index+1, y2=slS,
+                 color=i_slColor, width=2, extend=extend.right, style=line.style_dashed)
+        tpLabel := label.new(bar_index+2, tpS, "TP",
+                 style=label.style_label_left, color=i_tpColor,
+                 textcolor=color.white, size=size.small)
+        slLabel := label.new(bar_index+2, slS, "SL",
+                 style=label.style_label_left, color=i_slColor,
+                 textcolor=color.white, size=size.small)
+
+
+// ═══════════════════════════════════════════════════════════════════
+// SECTION 7 — ALERTS
+// ═══════════════════════════════════════════════════════════════════
+
+alertcondition(isLongBreak,
+     title   = "ORCB Long Break",
+     message = "ORCB ▲ LONG — Candle closed ABOVE the Opening Range. Check your chart.")
+
+alertcondition(isShortBreak,
+     title   = "ORCB Short Break",
+     message = "ORCB ▼ SHORT — Candle closed BELOW the Opening Range. Check your chart.")
+
+
+// ═══════════════════════════════════════════════════════════════════
+// SECTION 8 — OVERNIGHT HIGH / LOW
+// Mirrors PDH/PDL — stays visible all day, replaced each morning
+// ═══════════════════════════════════════════════════════════════════
+
+var float onHigh    = na
+var float onLow     = na
+var bool  onStarted = false
+var bool  onDone    = false
+var line  onHiLine  = na
+var line  onLoLine  = na
+var label onHiLabel = na
+var label onLoLabel = na
+
+if isNewDay
+    onHigh    := na
+    onLow     := na
+    onStarted := false
+    onDone    := false
+
+inONWindow = barMins >= onStartMins and barMins < onEndMins
+
+if inONWindow
+    if not onStarted
+        onStarted := true
+    onHigh := na(onHigh) ? high : math.max(onHigh, high)
+    onLow  := na(onLow)  ? low  : math.min(onLow,  low)
+
+onJustEnded = onStarted and not inONWindow and not onDone and not na(onHigh)
+
+if onJustEnded
+    onDone := true
+    if not na(onHiLine)
+        line.delete(onHiLine)
+        line.delete(onLoLine)
+        label.delete(onHiLabel)
+        label.delete(onLoLabel)
+    if i_showON
+        onHiLine  := line.new(x1=bar_index, y1=onHigh, x2=bar_index+1, y2=onHigh,
+             color=i_onColor, width=1, extend=extend.right, style=line.style_dotted)
+        onLoLine  := line.new(x1=bar_index, y1=onLow,  x2=bar_index+1, y2=onLow,
+             color=i_onColor, width=1, extend=extend.right, style=line.style_dotted)
+        onHiLabel := label.new(bar_index+2, onHigh, "ON H",
+             style=label.style_label_left, color=i_onColor,
+             textcolor=color.black, size=size.small)
+        onLoLabel := label.new(bar_index+2, onLow,  "ON L",
+             style=label.style_label_left, color=i_onColor,
+             textcolor=color.black, size=size.small)
+
+
+// ═══════════════════════════════════════════════════════════════════
+// SECTION 9 — PREVIOUS DAY HIGH / LOW
+// ═══════════════════════════════════════════════════════════════════
+
+var float todayHigh = na
+var float todayLow  = na
+var float pdHigh    = na
+var float pdLow     = na
+var line  pdHiLine  = na
+var line  pdLoLine  = na
+var label pdHiLabel = na
+var label pdLoLabel = na
+
+if isNewDay
+    if not na(todayHigh)
+        pdHigh := todayHigh
+        pdLow  := todayLow
+
+        if not na(pdHiLine)
+            line.delete(pdHiLine)
+            line.delete(pdLoLine)
+            label.delete(pdHiLabel)
+            label.delete(pdLoLabel)
+
+        if i_showPDHL
+            pdHiLine  := line.new(x1=bar_index, y1=pdHigh, x2=bar_index+1, y2=pdHigh,
+                 color=i_pdColor, width=1, extend=extend.right, style=line.style_dashed)
+            pdLoLine  := line.new(x1=bar_index, y1=pdLow,  x2=bar_index+1, y2=pdLow,
+                 color=color.new(color.purple, 40), width=1, extend=extend.right, style=line.style_dashed)
+            pdHiLabel := label.new(bar_index+2, pdHigh, "PDH",
+                 style=label.style_label_left, color=i_pdColor,
+                 textcolor=color.white, size=size.small)
+            pdLoLabel := label.new(bar_index+2, pdLow,  "PDL",
+                 style=label.style_label_left, color=color.new(color.purple, 40),
+                 textcolor=color.white, size=size.small)
+
+    todayHigh := high
+    todayLow  := low
+else
+    todayHigh := math.max(nz(todayHigh, high), high)
+    todayLow  := math.min(nz(todayLow,  low),  low)
+
+// ═══════════════════════════════════════════════════════════════════
+// END OF INDICATOR
+// ═══════════════════════════════════════════════════════════════════

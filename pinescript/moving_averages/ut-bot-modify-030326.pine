@@ -1,0 +1,124 @@
+// This source code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// Based on CDC ActionZone V3 2020 + UT Bot Strategy
+// Modified: UT Bot as core signal engine, with Ribbon and ATR Trailing Stop
+
+//@version=5
+indicator('UT bot modify 030326', overlay=true, precision=6)
+
+//****************************************************************************//
+// INPUTS
+//****************************************************************************//
+
+// UT Bot Parameters
+ut_src    = input.source(title='Source Data', defval=close)
+ut_preset = input.string(title='UT Bot Preset', defval='UT 1-1', options=['UT 1-1', 'CDC 12-26'])
+
+// แปลง preset เป็นค่า key และ atr
+ut_key = ut_preset == 'UT 1-1' ? 1.0 : 3.0
+ut_atr = ut_preset == 'UT 1-1' ? 1   : 2
+
+// ATR Trailing Stop (display line)
+atr_show  = input.bool(title='Show ATR Trailing Stop Line', defval=true)
+atr_multi = input.float(title='ATR Line Multiplier', defval=2.0, step=0.1)
+atr_len   = input.int(title='ATR Line Period', defval=10)
+
+// Fixed Timeframe (advanced)
+xfixtf = input.bool(title='** Use Fixed time frame Mode (advanced) **', defval=false)
+xtf    = input.timeframe(title='** Fix chart to which time frame ? **)', defval='60')
+
+// Ribbon
+plotRibsw     = input.bool(title='Plot Buy/Sell Ribbon', defval=true)
+plotRibbonPos = input.string(title='Ribbon Position', options=['Top', 'Bottom'], defval='Top')
+
+//****************************************************************************//
+// UT BOT CORE CALCULATION
+//****************************************************************************//
+
+// UT Bot calculation function — คืนค่า [buy, sell, bullish, bearish]
+f_utbot(_src, _key, _atr_len) =>
+    _xATR  = ta.atr(_atr_len)
+    _nLoss = _key * _xATR
+    _trail = 0.0
+    _trail := _src > nz(_trail[1], 0) and _src[1] > nz(_trail[1], 0) ? math.max(nz(_trail[1]), _src - _nLoss) :
+              _src < nz(_trail[1], 0) and _src[1] < nz(_trail[1], 0) ? math.min(nz(_trail[1]), _src + _nLoss) :
+              _src > nz(_trail[1], 0) ? _src - _nLoss : _src + _nLoss
+    _ema1  = ta.ema(_src, 1)
+    _above = ta.crossover(_ema1, _trail)
+    _below = ta.crossover(_trail, _ema1)
+    _buy   = _src > _trail and _above
+    _sell  = _src < _trail and _below
+    _bull  = ta.barssince(_buy)  < ta.barssince(_sell)
+    _bear  = ta.barssince(_sell) < ta.barssince(_buy)
+    [_buy, _sell, _bull, _bear, _trail]
+
+// Source — รองรับ Heikin Ashi
+haClose = request.security(ticker.heikinashi(syminfo.tickerid), timeframe.period, close, lookahead=barmerge.lookahead_off)
+src = haClose  // Fixed: always use Heikin Ashi
+
+// คำนวณบน Current TF
+[buy_cur, sell_cur, bull_cur, bear_cur, trail_cur] = f_utbot(src, ut_key, ut_atr)
+
+// คำนวณบน Fixed TF (ดึงผลลัพธ์จาก higher TF — non-repainting)
+[buy_ftf, sell_ftf, bull_ftf, bear_ftf, trail_ftf] = request.security(syminfo.tickerid, xtf, f_utbot(src, ut_key, ut_atr), lookahead=barmerge.lookahead_off)
+
+// เลือกใช้ค่าจาก Fixed TF หรือ Current TF
+buy     = xfixtf ? buy_ftf  : buy_cur
+sell    = xfixtf ? sell_ftf : sell_cur
+bullish = xfixtf ? bull_ftf : bull_cur
+bearish = xfixtf ? bear_ftf : bear_cur
+xATRTrailingStop = xfixtf ? trail_ftf : trail_cur
+
+//****************************************************************************//
+// ATR TRAILING STOP LINE (separate, for display)
+//****************************************************************************//
+
+SL_disp   = atr_multi * ta.atr(atr_len)
+ATRLine   = 0.0
+ATRLine  := close > nz(ATRLine[1], 0) and close[1] > nz(ATRLine[1], 0) ? math.max(nz(ATRLine[1]), close - SL_disp) :
+             close < nz(ATRLine[1], 0) and close[1] < nz(ATRLine[1], 0) ? math.min(nz(ATRLine[1]), close + SL_disp) :
+             close > nz(ATRLine[1], 0) ? close - SL_disp : close + SL_disp
+
+atrLineColor = close > ATRLine ? color.new(color.green, 0) : color.new(color.red, 0)
+plot(atr_show ? ATRLine : na, 'ATR Trailing Stop', color=atrLineColor, style=plot.style_line, linewidth=2)
+
+//****************************************************************************//
+
+//****************************************************************************//
+// BUY / SELL LABELS
+// เมื่อใช้ Fixed TF — แสดง label เฉพาะแท่งแรกของ TF ใหม่ ไม่ซ้ำในแท่งเดียวกัน
+//****************************************************************************//
+
+// ตรวจจับแท่งแรกของ fixed TF (เพื่อป้องกัน label ซ้ำ)
+is_new_tf_bar = xfixtf ? ta.change(time(xtf)) != 0 : true
+
+if buy and is_new_tf_bar
+    label.new(bar_index, low,
+         text='Buy',
+         color=color.new(color.teal, 0),
+         textcolor=color.white,
+         style=label.style_label_up,
+         yloc=yloc.belowbar,
+         size=size.normal)
+
+if sell and is_new_tf_bar
+    label.new(bar_index, high,
+         text='Sell',
+         color=color.new(color.orange, 0),
+         textcolor=color.white,
+         style=label.style_label_down,
+         yloc=yloc.abovebar,
+         size=size.normal)
+
+//****************************************************************************//
+// BUY / SELL RIBBON
+//****************************************************************************//
+
+bColor_BullBear = bullish ? color.green : bearish ? color.red : color.gray
+ribbonLoc = plotRibbonPos == 'Top' ? location.top : location.bottom
+plotshape(plotRibsw ? close : na,
+     style=shape.square,
+     title='Buy/Sell Ribbon',
+     location=ribbonLoc,
+     color=bColor_BullBear)
+
+//****************************************************************************//

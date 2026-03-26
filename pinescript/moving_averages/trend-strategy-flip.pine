@@ -1,0 +1,195 @@
+// © LuxAlgo — CC BY-NC-SA 4.0
+//@version=6
+strategy("Trend Strategy Flip", shorttitle="TSF", overlay=true,
+     initial_capital=100000, default_qty_type=strategy.percent_of_equity,
+     default_qty_value=10, pyramiding=0,
+     commission_type=strategy.commission.percent, commission_value=0.01)
+
+// Colors
+color BULL_COLOR = #089981
+color BEAR_COLOR = #f23645
+color FLIP_LONG  = color.new(BULL_COLOR, 0)
+color FLIP_SHORT = color.new(BEAR_COLOR, 0)
+
+// Inputs (defaults as agreed)
+srcInput      = input.source(close, "Source")
+atrMultInput  = input.float(1.5, "ATR Multiplier")
+muInput       = input.float(0.6, "Adaptation Rate (μ)")
+
+entryMode    = input.string("A",  "Entry Mode",       options=["A","B","C"])
+entrySubMode = input.string("B1", "Early Entry Type", options=["B1","B2"])
+
+exitMode  = input.string("Both", "Exit Mode", options=["By Trend Change","By Price Cross","Both"])
+useLongs  = input.bool(true,  "Enable Longs")
+useShorts = input.bool(true,  "Enable Shorts")
+
+useBreakeven  = input.bool(true,  "Use Breakeven")
+beTriggerPerc = input.float(1.0,  "BE Trigger %")
+beOffsetPerc  = input.float(0.0,  "BE Offset %")
+
+showHud      = input.bool(true,  "Show HUD")
+showTrendBg  = input.bool(true,  "Show Trend Background")
+
+// L1 Filter
+float atr200    = ta.atr(200)
+float threshold = atr200 * atrMultInput
+var float z = na
+var float v = 0.0
+
+if bar_index == 0
+    z := srcInput
+else
+    float zPrev = z[1]
+    float vPrev = v[1]
+    float zPred = zPrev + vPrev
+    float zTemp = zPred + muInput * (srcInput - zPred)
+    float diff  = zTemp - zPrev
+    v := math.abs(diff) > threshold ? math.sign(diff)*(math.abs(diff)-threshold) : 0
+    z := zPrev + v
+
+// Trend
+var int trend = 0
+if z > z[1]
+    trend := 1
+else if z < z[1]
+    trend := -1
+
+bool upChange   = trend == 1 and trend[1] == -1
+bool downChange = trend == -1 and trend[1] == 1
+
+// Entries
+bool longA  = upChange
+bool shortA = downChange
+
+bool longB1  = srcInput > z and srcInput[1] <= z[1]
+bool shortB1 = srcInput < z and srcInput[1] >= z[1]
+
+bool longB2  = v > 0 and v[1] <= 0
+bool shortB2 = v < 0 and v[1] >= 0
+
+bool longC  = upChange[1]
+bool shortC = downChange[1]
+
+bool longEntry  = entryMode == "A" ? longA  : entryMode == "B" ? (entrySubMode == "B1" ? longB1  : longB2) : longC
+bool shortEntry = entryMode == "A" ? shortA : entryMode == "B" ? (entrySubMode == "B1" ? shortB1 : shortB2) : shortC
+
+bool inLong  = strategy.position_size > 0
+bool inShort = strategy.position_size < 0
+
+// Exit logic
+bool priceAbove = srcInput > z
+bool priceBelow = srcInput < z
+
+bool exitLong =
+     exitMode == "By Trend Change" ? downChange :
+     exitMode == "By Price Cross"  ? priceBelow :
+                                     (downChange or priceBelow)
+
+bool exitShort =
+     exitMode == "By Trend Change" ? upChange :
+     exitMode == "By Price Cross"  ? priceAbove :
+                                     (upChange or priceAbove)
+
+// Breakeven
+float beLong  = na
+float beShort = na
+
+if useBreakeven and strategy.position_size != 0
+    float entry = strategy.position_avg_price
+    float profit = (close - entry) / entry * 100 * (inLong ? 1 : -1)
+
+    if inLong and profit >= beTriggerPerc
+        beLong := entry * (1 + beOffsetPerc / 100)
+
+    if inShort and profit >= beTriggerPerc
+        beShort := entry * (1 - beOffsetPerc / 100)
+
+// Flip + tracking last flip
+var string lastFlipDir = "None"
+bool flipLongToShort = inLong and downChange
+bool flipShortToLong = inShort and upChange
+
+if flipLongToShort
+    strategy.close("Long")
+    strategy.entry("Short", strategy.short)
+    lastFlipDir := "L→S"
+
+if flipShortToLong
+    strategy.close("Short")
+    strategy.entry("Long", strategy.long)
+    lastFlipDir := "S→L"
+
+// Track last entry info
+var float lastEntryPrice = na
+var int   lastEntryBar   = na
+
+bool newLongEntry  = longEntry  and not inLong  and not inShort
+bool newShortEntry = shortEntry and not inShort and not inLong
+
+if newLongEntry
+    strategy.entry("Long", strategy.long)
+    lastEntryPrice := close
+    lastEntryBar   := bar_index
+
+if newShortEntry
+    strategy.entry("Short", strategy.short)
+    lastEntryPrice := close
+    lastEntryBar   := bar_index
+
+// Breakeven exits
+if inLong and not na(beLong)
+    strategy.exit("Long BE", from_entry="Long", stop=beLong)
+
+if inShort and not na(beShort)
+    strategy.exit("Short BE", from_entry="Short", stop=beShort)
+
+// Breakeven line (semi-transparent)
+float beLine = inLong ? beLong : inShort ? beShort : na
+plot(beLine, "Breakeven", color=color.new(color.white, 70), style=plot.style_linebr, linewidth=2)
+
+// Visuals: trend line, entries, flips
+plot(z, "Trend Filter", color = trend == 1 ? BULL_COLOR : BEAR_COLOR, linewidth=3)
+
+plotshape(flipLongToShort, title="Flip L→S", style=shape.triangledown,
+     color=FLIP_SHORT, size=size.small, location=location.abovebar)
+
+plotshape(flipShortToLong, title="Flip S→L", style=shape.triangleup,
+     color=FLIP_LONG, size=size.small, location=location.belowbar)
+
+plotshape(longEntry,  title="Long Entry",  style=shape.triangleup,
+     color=BULL_COLOR, size=size.tiny, location=location.belowbar)
+
+plotshape(shortEntry, title="Short Entry", style=shape.triangledown,
+     color=BEAR_COLOR, size=size.tiny, location=location.abovebar)
+
+// Trend background (soft diagonal imitation)
+if showTrendBg
+    // вычисляем цвет заранее
+    int alpha = 92
+    color bgCol = trend == 1 ? color.new(BULL_COLOR, alpha) : color.new(BEAR_COLOR, alpha)
+
+// HUD (compact block, top-right)
+var table hud = na
+if showHud
+    if na(hud)
+        hud := table.new(position.top_right, 1, 4)
+
+    string posStr = inLong ? "Long" : inShort ? "Short" : "Flat"
+    float entryPrice = strategy.position_size != 0 ? strategy.position_avg_price : na
+    float pnlPerc = strategy.position_size != 0 ? (close - entryPrice) / entryPrice * 100 * (inLong ? 1 : -1) : na
+    string pnlStr = strategy.position_size != 0 ? str.tostring(pnlPerc, "#.##") + " %" : "n/a"
+    string entryStr = strategy.position_size != 0 ? str.tostring(entryPrice, format.mintick) : "n/a"
+    string beStr = useBreakeven ? "Yes" : "No"
+    string flipStr = lastFlipDir
+    string barsStr = not na(lastEntryBar) and strategy.position_size != 0 ? str.tostring(bar_index - lastEntryBar) : "n/a"
+
+    table.cell(hud, 0, 0, "Pos: " + posStr + " | Entry: " + entryStr)
+    table.cell(hud, 0, 1, "PnL: " + pnlStr)
+    table.cell(hud, 0, 2, "Flip: " + flipStr + " | BE: " + beStr)
+    table.cell(hud, 0, 3, "Bars since entry: " + barsStr)
+
+// Alerts
+alertcondition(longEntry,        "Long Entry",        "TSF LONG ENTRY")
+alertcondition(shortEntry,       "Short Entry",       "TSF SHORT ENTRY")
+alertcondition(flipLongToShort,  "Flip Long→Short",   "TSF FLIP SHORT")
+alertcondition(flipShortToLong,  "Flip Short→Long",   "TSF FLIP LONG")

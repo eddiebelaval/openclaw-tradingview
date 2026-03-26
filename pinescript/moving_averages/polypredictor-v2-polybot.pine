@@ -1,0 +1,393 @@
+// PolyPredictor Free v2 - Polymarket 5-Min BTC
+// 7 factors: Momentum, Trend, Order Flow, Volatility, Microstructure, Mean Reversion, Liquidity Sweep
+// SETUP: COINBASE:BTCUSD, 5-minute timeframe
+// ALERTS: STRONG UP Signal / STRONG DOWN Signal
+
+//@version=5
+indicator("PolyPredictor v2 [PolyBot]", overlay=false, max_bars_back=500)
+
+// ─────────────────────────────────────────────
+// INPUTS
+// ─────────────────────────────────────────────
+grp1 = "Signal Thresholds"
+strong_threshold = input.float(70.0, "Strong Signal Threshold (%)", minval=60, maxval=90, group=grp1,
+     tooltip="Raise this to get fewer but higher quality signals. 70%+ recommended.")
+normal_threshold = input.float(60.0, "Normal Signal Threshold (%)", minval=55, maxval=80, group=grp1)
+require_sweep    = input.bool(false, "Only signal when Liquidity Sweep confirmed", group=grp1,
+     tooltip="ON = very few signals but very high quality. OFF = all 7 factors vote normally.")
+
+grp2 = "Factor Weights"
+w_momentum   = input.float(15, "1. Momentum (RSI+MACD)",          minval=0, maxval=40, group=grp2)
+w_trend      = input.float(10, "2. Trend (EMA Slope)",             minval=0, maxval=40, group=grp2)
+w_orderflow  = input.float(20, "3. Order Flow (CVD+VWAP)",         minval=0, maxval=40, group=grp2)
+w_volatility = input.float(10, "4. Volatility (BB%B)",             minval=0, maxval=40, group=grp2)
+w_micro      = input.float(10, "5. Microstructure (Wicks)",        minval=0, maxval=40, group=grp2)
+w_meanrev    = input.float(20, "6. Mean Reversion (Z-Score)",      minval=0, maxval=40, group=grp2)
+w_sweep      = input.float(15, "7. Liquidity Sweep (NEW)",         minval=0, maxval=40, group=grp2,
+     tooltip="Detects stop hunts + reversals. Most powerful signal for 5-min BTC.")
+
+grp3 = "Indicator Settings"
+rsi_len      = input.int(14,   "RSI Length",       group=grp3)
+macd_fast    = input.int(12,   "MACD Fast",        group=grp3)
+macd_slow    = input.int(26,   "MACD Slow",        group=grp3)
+macd_sig     = input.int(9,    "MACD Signal",      group=grp3)
+ema_len      = input.int(20,   "EMA Length",       group=grp3)
+bb_len       = input.int(20,   "BB Length",        group=grp3)
+bb_mult      = input.float(2.0,"BB Multiplier",    group=grp3)
+zscore_len   = input.int(20,   "Z-Score Length",   group=grp3)
+
+grp4 = "Liquidity Sweep Settings"
+sweep_lookback = input.int(10,  "Swing Lookback (bars)", minval=3, maxval=30, group=grp4,
+     tooltip="How many bars back to look for swing high/low. 10 = ~50 mins on 5m chart.")
+sweep_wick_min = input.float(0.3, "Min Wick Ratio for Sweep", minval=0.1, maxval=0.8, group=grp4,
+     tooltip="Minimum wick size relative to candle range to confirm a sweep. 0.3 = 30%.")
+sweep_vol_mult = input.float(1.3, "Volume Spike Multiplier", minval=1.0, maxval=3.0, group=grp4,
+     tooltip="Volume must be X times the 20-bar average to confirm sweep.")
+
+grp5 = "Regime Detection"
+bw_squeeze   = input.float(0.04, "Squeeze Threshold (BW <)",   group=grp5)
+bw_expand    = input.float(0.12, "Expansion Threshold (BW >)", group=grp5)
+
+grp6 = "Display"
+show_meter   = input.bool(true,  "Show Probability Meter", group=grp6)
+show_signals = input.bool(true,  "Show Signal Labels",     group=grp6)
+show_tracker = input.bool(true,  "Show Accuracy Tracker",  group=grp6)
+show_sweep   = input.bool(true,  "Show Sweep Markers",     group=grp6)
+
+// ─────────────────────────────────────────────
+// FACTOR 1: MOMENTUM — RSI + MACD
+// ─────────────────────────────────────────────
+rsi_val = ta.rsi(close, rsi_len)
+[macd_line, macd_sig_line, macd_hist] = ta.macd(close, macd_fast, macd_slow, macd_sig)
+
+rsi_score = rsi_val
+
+macd_std = ta.stdev(macd_hist, 50)
+macd_score = macd_std != 0 ? math.max(0, math.min(100, 50 + (macd_hist / macd_std) * 15)) : 50.0
+
+// Penalize when RSI is mid-range (40-60) — weak signal zone
+rsi_conviction = (rsi_val > 60 or rsi_val < 40) ? 1.0 : 0.7
+momentum_score = ((rsi_score + macd_score) / 2) * rsi_conviction + 50 * (1 - rsi_conviction)
+
+// ─────────────────────────────────────────────
+// FACTOR 2: TREND — EMA Slope
+// Reduced weight — trend hurts on 5m ranging markets
+// ─────────────────────────────────────────────
+ema_val   = ta.ema(close, ema_len)
+ema_slope = ema_val - ema_val[1]
+slope_range = ta.highest(math.abs(ema_val - ema_val[1]), 50)
+trend_raw = slope_range != 0 ? 50 + (ema_slope / slope_range) * 50 : 50.0
+ema_pos   = close > ema_val ? 58 : 42
+trend_score = math.max(0, math.min(100, (trend_raw + ema_pos) / 2))
+
+// ─────────────────────────────────────────────
+// FACTOR 3: ORDER FLOW — CVD + VWAP
+// ─────────────────────────────────────────────
+bull_vol = close > open ? volume : 0.0
+bear_vol = close < open ? volume : 0.0
+cvd      = ta.cum(bull_vol - bear_vol)
+cvd_d    = cvd - cvd[1]
+cvd_std  = ta.stdev(cvd_d, 20)
+cvd_score = cvd_std != 0 ? math.max(0, math.min(100, 50 + (cvd_d / cvd_std) * 15)) : 50.0
+
+vwap_val  = ta.vwap(hlc3)
+vwap_dist = (close - vwap_val) / vwap_val * 100
+// Closer to VWAP = mean reversion likely. Far above = bearish, far below = bullish
+vwap_score = vwap_dist < -0.1 ? 65.0 : vwap_dist > 0.1 ? 35.0 : 50.0
+
+orderflow_score = (cvd_score * 0.6 + vwap_score * 0.4)
+
+// ─────────────────────────────────────────────
+// FACTOR 4: VOLATILITY — BB%B
+// ─────────────────────────────────────────────
+bb_basis  = ta.sma(close, bb_len)
+bb_dev    = ta.stdev(close, bb_len)
+bb_upper  = bb_basis + bb_mult * bb_dev
+bb_lower  = bb_basis - bb_mult * bb_dev
+bb_range  = bb_upper - bb_lower
+bb_pctb   = bb_range != 0 ? (close - bb_lower) / bb_range : 0.5
+bb_bw     = bb_range / bb_basis
+
+// Near lower band = bullish (oversold), near upper = bearish
+// But STRONG signal only near extremes (<0.15 or >0.85)
+volatility_score = (1 - bb_pctb) * 100
+volatility_score := math.max(0, math.min(100, volatility_score))
+
+// Reduce weight in mid-band (not useful signal)
+vol_conviction = (bb_pctb < 0.2 or bb_pctb > 0.8) ? 1.0 : 0.6
+volatility_score := volatility_score * vol_conviction + 50 * (1 - vol_conviction)
+
+// Regime
+is_squeeze   = bb_bw < bw_squeeze
+is_expansion = bb_bw > bw_expand
+
+// ─────────────────────────────────────────────
+// FACTOR 5: MICROSTRUCTURE — Wick Analysis
+// ─────────────────────────────────────────────
+c_range  = high - low
+body     = math.abs(close - open)
+up_wick  = high - math.max(close, open)
+dn_wick  = math.min(close, open) - low
+
+lo_ratio = c_range != 0 ? dn_wick / c_range : 0.0
+up_ratio = c_range != 0 ? up_wick / c_range : 0.0
+body_ratio = c_range != 0 ? body / c_range : 0.5
+
+// Strong lower wick = buyers absorbed sell pressure = bullish
+micro_score = 50.0 + (lo_ratio - up_ratio) * 80
+// Boost for strong bullish/bearish candle body
+micro_score := close > open ? micro_score + (body_ratio * 8) : micro_score - (body_ratio * 8)
+micro_score := math.max(0, math.min(100, micro_score))
+
+// ─────────────────────────────────────────────
+// FACTOR 6: MEAN REVERSION — Z-Score
+// Best factor in ranging 5m BTC markets
+// ─────────────────────────────────────────────
+z_mean   = ta.sma(close, zscore_len)
+z_std    = ta.stdev(close, zscore_len)
+z_val    = z_std != 0 ? (close - z_mean) / z_std : 0.0
+
+// z > +1.5 = overbought → likely DOWN
+// z < -1.5 = oversold  → likely UP
+// Nonlinear scoring — strong at extremes
+z_score_raw = -z_val * 22  // negative z = bullish
+meanrev_score = math.max(0, math.min(100, 50 + z_score_raw))
+
+// Boost conviction at extremes
+meanrev_conviction = math.abs(z_val) > 1.5 ? 1.3 : math.abs(z_val) > 1.0 ? 1.1 : 0.85
+meanrev_score := math.max(0, math.min(100, 50 + (meanrev_score - 50) * meanrev_conviction))
+
+// ─────────────────────────────────────────────
+// FACTOR 7: LIQUIDITY SWEEP + REVERSAL (NEW)
+// Detects: price spikes beyond swing high/low
+// then reverses back = stop hunt = strong signal
+//
+// Bullish Sweep: price dips below recent swing low
+//               then closes ABOVE it = stops swept, buyers win
+// Bearish Sweep: price spikes above recent swing high
+//               then closes BELOW it = stops swept, sellers win
+// ─────────────────────────────────────────────
+swing_high = ta.highest(high[1], sweep_lookback)
+swing_low  = ta.lowest(low[1],   sweep_lookback)
+avg_vol    = ta.sma(volume, 20)
+
+// Bullish sweep: wick below swing low + closes above + volume spike
+bull_sweep_wick   = low < swing_low
+bull_sweep_close  = close > swing_low
+bull_sweep_vol    = volume > avg_vol * sweep_vol_mult
+bull_sweep_body   = c_range != 0 ? dn_wick / c_range >= sweep_wick_min : false
+bull_sweep = bull_sweep_wick and bull_sweep_close and bull_sweep_vol and bull_sweep_body
+
+// Bearish sweep: wick above swing high + closes below + volume spike
+bear_sweep_wick   = high > swing_high
+bear_sweep_close  = close < swing_high
+bear_sweep_vol    = volume > avg_vol * sweep_vol_mult
+bear_sweep_body   = c_range != 0 ? up_wick / c_range >= sweep_wick_min : false
+bear_sweep = bear_sweep_wick and bear_sweep_close and bear_sweep_vol and bear_sweep_body
+
+// Sweep score
+// 80 = confirmed bullish sweep, 20 = confirmed bearish, 50 = no sweep
+sweep_score = bull_sweep ? 82.0 : bear_sweep ? 18.0 : 50.0
+
+// Track recent sweep (stays active for 2 bars)
+var float last_sweep_score = 50.0
+var int   sweep_bar        = 0
+if bull_sweep or bear_sweep
+    last_sweep_score := sweep_score
+    sweep_bar        := bar_index
+sweep_active = (bar_index - sweep_bar) <= 2
+sweep_final  = sweep_active ? last_sweep_score : 50.0
+
+// ─────────────────────────────────────────────
+// REGIME — Adjust weights dynamically
+// Squeeze  → boost mean reversion + sweep
+// Expansion → boost momentum + trend
+// ─────────────────────────────────────────────
+adj_w_momentum   = is_expansion ? w_momentum  * 1.4 : (is_squeeze ? w_momentum  * 0.6 : w_momentum)
+adj_w_trend      = is_expansion ? w_trend     * 1.3 : (is_squeeze ? w_trend     * 0.5 : w_trend)
+adj_w_orderflow  = w_orderflow
+adj_w_volatility = is_squeeze   ? w_volatility * 0.7 : w_volatility
+adj_w_micro      = w_micro
+adj_w_meanrev    = is_squeeze   ? w_meanrev   * 1.5 : (is_expansion ? w_meanrev * 0.7 : w_meanrev)
+adj_w_sweep      = sweep_active ? w_sweep * 2.0 : w_sweep * 0.5  // Double weight when sweep just happened
+
+total_w = adj_w_momentum + adj_w_trend + adj_w_orderflow + adj_w_volatility + adj_w_micro + adj_w_meanrev + adj_w_sweep
+
+// ─────────────────────────────────────────────
+// COMBINED SCORE
+// ─────────────────────────────────────────────
+raw_score = total_w > 0 ?
+     (momentum_score    * adj_w_momentum   +
+      trend_score       * adj_w_trend      +
+      orderflow_score   * adj_w_orderflow  +
+      volatility_score  * adj_w_volatility +
+      micro_score       * adj_w_micro      +
+      meanrev_score     * adj_w_meanrev    +
+      sweep_final       * adj_w_sweep) / total_w : 50.0
+
+// Polymarket >= rule: flat candle = UP → +0.5% bias
+final_score = math.min(99, math.max(1, raw_score + 0.5))
+
+// If require_sweep is ON: only signal when sweep confirmed
+effective_score = require_sweep ? (sweep_active ? final_score : 50.0) : final_score
+
+// Signal classification
+is_strong_up   = effective_score >= strong_threshold
+is_normal_up   = effective_score >= normal_threshold and effective_score < strong_threshold
+is_strong_down = effective_score <= (100 - strong_threshold)
+is_normal_down = effective_score <= (100 - normal_threshold) and effective_score > (100 - strong_threshold)
+
+// Numeric signal for webhook
+signal_num = is_strong_up ? 2 : is_normal_up ? 1 : is_strong_down ? -2 : is_normal_down ? -1 : 0
+
+// ─────────────────────────────────────────────
+// ACCURACY TRACKER
+// ─────────────────────────────────────────────
+var int total_sigs   = 0
+var int correct_sigs = 0
+var int strong_sigs  = 0
+var int strong_ok    = 0
+var int sweep_sigs   = 0
+var int sweep_ok     = 0
+
+prev_sig = signal_num[1]
+candle_up = close >= open  // Polymarket >= rule
+
+if prev_sig >= 1
+    total_sigs += 1
+    if candle_up
+        correct_sigs += 1
+if prev_sig == 2
+    strong_sigs += 1
+    if candle_up
+        strong_ok += 1
+if prev_sig <= -1
+    total_sigs += 1
+    if not candle_up
+        correct_sigs += 1
+if prev_sig == -2
+    strong_sigs += 1
+    if not candle_up
+        strong_ok += 1
+
+// Track sweep-only signals
+prev_sweep_active = (bar_index[1] - sweep_bar) <= 3
+if prev_sig != 0 and prev_sweep_active
+    sweep_sigs += 1
+    if (prev_sig > 0 and candle_up) or (prev_sig < 0 and not candle_up)
+        sweep_ok += 1
+
+overall_acc = total_sigs  > 0 ? (correct_sigs / total_sigs)  * 100 : 0.0
+strong_acc  = strong_sigs > 0 ? (strong_ok    / strong_sigs)  * 100 : 0.0
+sweep_acc   = sweep_sigs  > 0 ? (sweep_ok     / sweep_sigs)   * 100 : 0.0
+
+// ─────────────────────────────────────────────
+// PLOTS
+// ─────────────────────────────────────────────
+score_color = effective_score >= strong_threshold       ? color.new(color.green, 0)   :
+              effective_score >= normal_threshold       ? color.new(color.lime, 20)   :
+              effective_score <= (100-strong_threshold) ? color.new(color.red, 0)     :
+              effective_score <= (100-normal_threshold) ? color.new(color.orange, 20) :
+              color.new(color.gray, 60)
+
+plot(show_meter ? effective_score : na, "UP Probability %", color=score_color, linewidth=2, style=plot.style_area)
+
+hline(strong_threshold,       "Strong UP",   color=color.new(color.green,  50), linestyle=hline.style_dashed)
+hline(normal_threshold,       "Normal UP",   color=color.new(color.lime,   60), linestyle=hline.style_dotted)
+hline(50,                     "Neutral",     color=color.new(color.gray,   50))
+hline(100-normal_threshold,   "Normal DOWN", color=color.new(color.orange, 60), linestyle=hline.style_dotted)
+hline(100-strong_threshold,   "Strong DOWN", color=color.new(color.red,    50), linestyle=hline.style_dashed)
+
+// Signal labels
+plotshape(show_signals and is_strong_up,   title="STRONG UP",   style=shape.labelup,   location=location.bottom, color=color.green,  textcolor=color.white, text="▲ STRONG",  size=size.normal)
+plotshape(show_signals and is_normal_up,   title="UP",          style=shape.labelup,   location=location.bottom, color=color.lime,   textcolor=color.white, text="▲ UP",      size=size.small)
+plotshape(show_signals and is_strong_down, title="STRONG DOWN", style=shape.labeldown, location=location.top,    color=color.red,    textcolor=color.white, text="▼ STRONG",  size=size.normal)
+plotshape(show_signals and is_normal_down, title="DOWN",        style=shape.labeldown, location=location.top,    color=color.orange, textcolor=color.white, text="▼ DOWN",    size=size.small)
+
+// Liquidity sweep markers (on the meter panel)
+plotshape(show_sweep and bull_sweep, title="Bull Sweep", style=shape.triangleup,   location=location.bottom, color=color.new(color.aqua, 20),   textcolor=color.white, text="SWEEP↑", size=size.tiny)
+plotshape(show_sweep and bear_sweep, title="Bear Sweep", style=shape.triangledown, location=location.top,    color=color.new(color.fuchsia, 20), textcolor=color.white, text="SWEEP↓", size=size.tiny)
+
+// Regime background
+bgcolor(is_squeeze   ? color.new(color.blue,   92) : na, title="Squeeze")
+bgcolor(is_expansion ? color.new(color.yellow, 93) : na, title="Expansion")
+bgcolor(sweep_active ? color.new(color.aqua,   93) : na, title="Sweep Active")
+
+// Data window plots for webhook
+plot(signal_num,     "Signal (-2 to 2)", display=display.data_window)
+plot(effective_score,"Score (0-100)",    display=display.data_window)
+plot(sweep_final,    "Sweep Score",      display=display.data_window)
+
+// ─────────────────────────────────────────────
+// DASHBOARD
+// ─────────────────────────────────────────────
+var table dash = table.new(position.top_right, 2, 13,
+     bgcolor=color.new(color.black, 75),
+     border_color=color.new(color.gray, 60),
+     border_width=1, frame_color=color.new(color.gray, 40), frame_width=1)
+
+if barstate.islast and show_tracker
+    signal_str = is_strong_up ? "▲ STRONG UP" : is_normal_up ? "▲ UP" : is_strong_down ? "▼ STRONG DOWN" : is_normal_down ? "▼ DOWN" : "— NEUTRAL"
+    signal_col = (is_strong_up or is_normal_up) ? color.green : (is_strong_down or is_normal_down) ? color.red : color.gray
+    regime_str = is_squeeze ? "SQUEEZE" : is_expansion ? "EXPANSION" : "NORMAL"
+    regime_col = is_squeeze ? color.blue : is_expansion ? color.yellow : color.gray
+    sweep_str  = bull_sweep ? "BULL SWEEP ▲" : bear_sweep ? "BEAR SWEEP ▼" : sweep_active ? "RECENT SWEEP" : "none"
+    sweep_col  = bull_sweep ? color.aqua : bear_sweep ? color.fuchsia : sweep_active ? color.yellow : color.gray
+
+    table.cell(dash, 0, 0,  "POLYPREDICTOR v2",  text_color=color.white,  text_size=size.small, bgcolor=color.new(color.navy, 30))
+    table.cell(dash, 1, 0,  "[POLYBOT]",         text_color=color.gray,   text_size=size.tiny,  bgcolor=color.new(color.navy, 30))
+    table.cell(dash, 0, 1,  "SIGNAL",            text_color=color.gray,   text_size=size.tiny)
+    table.cell(dash, 1, 1,  signal_str,          text_color=signal_col,   text_size=size.small)
+    table.cell(dash, 0, 2,  "SCORE",             text_color=color.gray,   text_size=size.tiny)
+    table.cell(dash, 1, 2,  str.tostring(effective_score, "#.1") + "%", text_color=score_color, text_size=size.small)
+    table.cell(dash, 0, 3,  "REGIME",            text_color=color.gray,   text_size=size.tiny)
+    table.cell(dash, 1, 3,  regime_str,          text_color=regime_col,   text_size=size.small)
+    table.cell(dash, 0, 4,  "SWEEP",             text_color=color.gray,   text_size=size.tiny)
+    table.cell(dash, 1, 4,  sweep_str,           text_color=sweep_col,    text_size=size.small)
+    table.cell(dash, 0, 5,  "─ FACTORS ─",       text_color=color.gray,   text_size=size.tiny,  bgcolor=color.new(color.gray, 85))
+    table.cell(dash, 1, 5,  "score",             text_color=color.gray,   text_size=size.tiny,  bgcolor=color.new(color.gray, 85))
+    table.cell(dash, 0, 6,  "MOMENTUM",          text_color=color.gray,   text_size=size.tiny)
+    table.cell(dash, 1, 6,  str.tostring(momentum_score,   "#.0"), text_color=momentum_score   > 55 ? color.green : color.red, text_size=size.tiny)
+    table.cell(dash, 0, 7,  "ORDER FLOW",        text_color=color.gray,   text_size=size.tiny)
+    table.cell(dash, 1, 7,  str.tostring(orderflow_score,  "#.0"), text_color=orderflow_score  > 55 ? color.green : color.red, text_size=size.tiny)
+    table.cell(dash, 0, 8,  "MEAN REV",          text_color=color.gray,   text_size=size.tiny)
+    table.cell(dash, 1, 8,  str.tostring(meanrev_score,    "#.0"), text_color=meanrev_score    > 55 ? color.green : color.red, text_size=size.tiny)
+    table.cell(dash, 0, 9,  "LIQ SWEEP",         text_color=color.gray,   text_size=size.tiny)
+    table.cell(dash, 1, 9,  str.tostring(sweep_final,      "#.0"), text_color=sweep_final      > 55 ? color.green : color.red, text_size=size.tiny)
+    table.cell(dash, 0, 10, "─ ACCURACY ─",      text_color=color.gray,   text_size=size.tiny,  bgcolor=color.new(color.gray, 85))
+    table.cell(dash, 1, 10, "WR  (n)",           text_color=color.gray,   text_size=size.tiny,  bgcolor=color.new(color.gray, 85))
+    table.cell(dash, 0, 11, "OVERALL",           text_color=color.gray,   text_size=size.tiny)
+    table.cell(dash, 1, 11, str.tostring(overall_acc, "#.1") + "% (" + str.tostring(total_sigs)  + ")", text_color=overall_acc > 55.6 ? color.green : color.red, text_size=size.tiny)
+    table.cell(dash, 0, 12, "STRONG ONLY",       text_color=color.gray,   text_size=size.tiny)
+    table.cell(dash, 1, 12, str.tostring(strong_acc,  "#.1") + "% (" + str.tostring(strong_sigs) + ")", text_color=strong_acc  > 55.6 ? color.green : color.red, text_size=size.tiny)
+
+// ─────────────────────────────────────────────
+// ALERTS — Webhook ready
+// ─────────────────────────────────────────────
+alertcondition(is_strong_up,
+     title="STRONG UP Signal",
+     message='{"signal":"STRONG_UP","price":"{{close}}","score":"{{plot_1}}","sweep":"{{plot_2}}","time":"{{timenow}}"}')
+
+alertcondition(is_strong_down,
+     title="STRONG DOWN Signal",
+     message='{"signal":"STRONG_DOWN","price":"{{close}}","score":"{{plot_1}}","sweep":"{{plot_2}}","time":"{{timenow}}"}')
+
+alertcondition(is_normal_up,
+     title="UP Signal",
+     message='{"signal":"UP","price":"{{close}}","score":"{{plot_1}}","time":"{{timenow}}"}')
+
+alertcondition(is_normal_down,
+     title="DOWN Signal",
+     message='{"signal":"DOWN","price":"{{close}}","score":"{{plot_1}}","time":"{{timenow}}"}')
+
+alertcondition(bull_sweep,
+     title="Bullish Liquidity Sweep",
+     message='{"signal":"BULL_SWEEP","price":"{{close}}","score":"{{plot_1}}","time":"{{timenow}}"}')
+
+alertcondition(bear_sweep,
+     title="Bearish Liquidity Sweep",
+     message='{"signal":"BEAR_SWEEP","price":"{{close}}","score":"{{plot_1}}","time":"{{timenow}}"}')
+
+alertcondition(is_strong_up or is_strong_down,
+     title="ANY STRONG Signal",
+     message='{"signal":"{{plot_0}}","price":"{{close}}","score":"{{plot_1}}","sweep":"{{plot_2}}","time":"{{timenow}}"}')
