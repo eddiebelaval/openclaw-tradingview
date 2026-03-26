@@ -1,0 +1,1202 @@
+//@version=6
+//
+// Gannomat - Full Automated Gann Grids & Astro Cycles
+//
+// Author: djmad
+// Description:
+//     A comprehensive indicator for generating Gann grids and astronomical cycle analysis.
+//     Features include:
+//     - Dynamic Gann Box sizing based on Timeframes or Planetary Cycles
+//     - Advanced Astro-event detection (Geocentric & Heliocentric)
+//     - Automated Quadrant Scaling (Pivots, Donchian, ATR, etc.)
+//     - Geometric Arc Projections
+//
+// Dependencies:
+//     - AstroLib (BarefootJoey)
+//     - MAD_MATH
+//     - Mad_Standardparts
+//
+indicator(shorttitle='[Mad] Gann o Maticus', title='Gann o Maticus', overlay=true, max_polylines_count=100, max_lines_count=500, max_bars_back=5000)
+
+import djmad/MAD_MATH/5 as mathematics
+import djmad/Mad_Standardparts/10 as stdp
+import BarefootJoey/AstroLib/2 as AL
+
+//Blockmarker TYPE_DEFINITIONS {
+type arc_def
+    float f_xFactor // Multiplier for Width
+    float f_yFactor // Multiplier for Height
+    color c_col
+// }
+
+//Blockmarker INPUTS {
+i_lineWidth = input.int(1, minval=1, title="Line Width", tooltip="Width of all drawn lines and arcs", group="General")
+i_boxColor = input.color(color.new(color.gray, 50), "Box Color", tooltip="Color of the Gann box outline and diagonals", group="General")
+i_circlesColor = input.color(color.new(color.blue, 0), "Gann Circles Color", tooltip="Color used for Gann circle overlays", group="General")
+b_cleanup = input.bool(true, "Cleanup Old Drawings", tooltip="Remove previous drawings on each new bar update", group="General")
+
+// Timeframe Configuration
+string i_tf_str = input.string("1 Day", "Timeframe / Cycle", options=["15 Min", "1 Hour", "4 Hours", "6 Hours", "8 Hours", "12 Hours", "1 Day", "1 Week", "2 Weeks", "3 Weeks", "4 Weeks", "1 Month", "3 Months", "6 Months", "Astrocycles"], group="Time Settings", tooltip="Select standard timeframe or Astrocycles for planetary based periods.")
+
+// Astronomical Cycle Configuration
+string i_astro_planet = input.string("Moon", "Astro Planet", options=["Mercury", "Venus", "Moon", "Mars", "Jupiter", "Saturn", "Uranus", "Neptune", "Pluto"], group="Astro Settings", tooltip="Select Planet for Cycle")
+string i_astro_cycle = input.string("High Latitude", "Astro Cycle", options=["High Latitude", "Low Latitude", "High Longitude", "Low Longitude", "Heliocentric Conjunction", "Heliocentric Opposition"], group="Astro Settings", tooltip="High/Low Latitude (Ecliptic). High/Low Longitude (Geocentric Stationary Points, not for Sun/Moon).")
+bool b_showTable = input.bool(true, "Show Info Table", tooltip="Toggle the Astro Cycle info table on/off", group="Astro Settings")
+
+// Quadrant Scaling Configuration
+string i_scale_mode = input.string("Classic Pivots", "Scale Mode", options=["Classic Pivots", "Prev Cycle Range", "Donchian Channel", "ATR Bands", "StdDev Bands", "Percentile Channel"], group="Quadrant Scaling", tooltip="Method to determine the Y-axis range (y1, y2) for the Quadrant.\n• Classic Pivots: Uses standard or Astro pivots (R1, S1, etc).\n• Prev Cycle Range: Uses the High/Low of the previous cycle.\n• Donchian: Highest High / Lowest Low over rolling window.\n• ATR Bands: Base +/- ATR * Mult.\n• StdDev: Base +/- StDev * Mult (Bollinger).\n• Percentile: Statistical High/Low percentiles.")
+
+// Classic Pivots
+i_upperPivot = input.string("R3", "Upper Pivot (Classic Only)", options=["R3", "R2", "R1", "PP", "S1", "S2", "S3"], group="Quadrant Scaling", inline="Classic", tooltip="Source for y2 (Top) when Mode is 'Classic Pivots'.")
+i_lowerPivot = input.string("S1", "Lower Pivot (Classic Only)", options=["R3", "R2", "R1", "PP", "S1", "S2", "S3"], group="Quadrant Scaling", inline="Classic", tooltip="Source for y1 (Bottom) when Mode is 'Classic Pivots'.")
+
+// Common Base (For ATR / StdDev)
+string i_base = input.string("Close", "Base Source (ATR/StdDev)", options=["Close", "HL2", "EMA"], group="Quadrant Scaling", tooltip="Center line source for Band-based modes (ATR, StdDev).")
+
+// Scaling parameters
+int i_dc_len = input.int(20, "Donchian Len", minval=1, group="Quadrant Scaling", inline="DC", tooltip="Lookback length for Donchian Channel High/Low.")
+int i_atr_len = input.int(14, "ATR Len", minval=1, group="Quadrant Scaling", inline="ATR", tooltip="Lookback length for Average True Range.")
+float i_atr_mult = input.float(2.0, "Mult", minval=0.1, group="Quadrant Scaling", inline="ATR", tooltip="Multiplier for ATR Bands.")
+int i_sd_len = input.int(20, "StdDev Len", minval=1, group="Quadrant Scaling", inline="SD", tooltip="Lookback length for Standard Deviation.")
+float i_sd_mult = input.float(2.0, "Mult", minval=0.1, group="Quadrant Scaling", inline="SD", tooltip="Multiplier for StdDev Bands.")
+int i_pct_len = input.int(50, "Pct Len", minval=1, group="Quadrant Scaling", inline="PCT", tooltip="Lookback length for Percentile calculation.")
+float i_pct_low = input.float(10.0, "Low %", minval=0, maxval=49, group="Quadrant Scaling", inline="PCT", tooltip="Lower Percentile (0-49).")
+float i_pct_high = input.float(90.0, "High %", minval=51, maxval=100, group="Quadrant Scaling", inline="PCT", tooltip="Upper Percentile (51-100).")
+float i_min_height_atr_mult = input.float(0.5, "Min Height (ATR Mult)", minval=0.0, step=0.1, group="Quadrant Scaling", tooltip="Minimum height of the quadrant expressed as ATR multiple. Prevents collapsed boxes during low volatility.")
+
+// Pivot Colors
+color c_r3Color = input.color(#004900, "R3 Color", group="Pivot Colors", tooltip="Color for R3 pivot level")
+color c_r2Color = input.color(#006F00, "R2 Color", group="Pivot Colors", tooltip="Color for R2 pivot level")
+color c_r1Color = input.color(#009600, "R1 Color", group="Pivot Colors", tooltip="Color for R1 pivot level")
+color c_ppColor = input.color(#555555, "PP Color", group="Pivot Colors", tooltip="Color for Pivot Point level")
+color c_s1Color = input.color(#ff0000, "S1 Color", group="Pivot Colors", tooltip="Color for S1 pivot level")
+color c_s2Color = input.color(#ff002a, "S2 Color", group="Pivot Colors", tooltip="Color for S2 pivot level")
+color c_s3Color = input.color(#ff014a, "S3 Color", group="Pivot Colors", tooltip="Color for S3 pivot level")
+
+// Arc Colors
+color c_arc1Color = input.color(color.orange, "Arc Level 1 Color", group="Arc Colors", tooltip="Color for 1x0 and 1x1 arc levels")
+color c_arc2Color = input.color(color.lime, "Arc Level 2 Color", group="Arc Colors", tooltip="Color for 2x0 and 2x1 arc levels")
+color c_arc3Color = input.color(color.green, "Arc Level 3 Color", group="Arc Colors", tooltip="Color for 3x0 and 3x1 arc levels")
+color c_arc4Color = input.color(#40826D, "Arc Level 4 Color", group="Arc Colors", tooltip="Color for 4x0 and 4x1 arc levels")
+color c_arc5Color = input.color(color.blue, "Arc Level 5 Color", group="Arc Colors", tooltip="Color for 5x0 and 5x1 arc levels")
+color c_arcInvColor = input.color(color.aqua, "Arc Inv 4x0 Color", group="Arc Colors", tooltip="Color for 4x0 inverted arc level")
+// }
+
+//Blockmarker FUNCTIONS {
+
+// @function    f_str_to_tf
+// @description Converts a readable timeframe string to Pine Script timeframe format
+// @param       s_input  string  Readable timeframe string (e.g. "1 Day")
+// @returns     string   Pine Script timeframe string (e.g. "D")
+f_str_to_tf(string s_input) =>
+    switch s_input
+        "15 Min"   => "15"
+        "1 Hour"   => "60"
+        "4 Hours"  => "240"
+        "6 Hours"  => "360"
+        "8 Hours"  => "480"
+        "12 Hours" => "720"
+        "1 Day"    => "D"
+        "1 Week"   => "W"
+        "2 Weeks"  => "2W"
+        "3 Weeks"  => "3W"
+        "4 Weeks"  => "4W"
+        "1 Month"  => "M"
+        "3 Months" => "3M"
+        "6 Months" => "6M"
+        => "D"
+
+// @function    f_planet_id
+// @description Converts planet name string to its numeric ID for AstroLib
+// @param       s_name  string  Planet name (e.g. "Moon")
+// @returns     int     Planet ID (1-9)
+f_planet_id(string s_name) =>
+    switch s_name
+        "Mercury" => 1
+        "Venus"   => 2
+        "Moon"    => 3
+        "Mars"    => 4
+        "Jupiter" => 5
+        "Saturn"  => 6
+        "Uranus"  => 7
+        "Neptune" => 8
+        "Pluto"   => 9
+        => 3
+
+// Data Fetching Timeframe Resolution
+// When 'Astrocycles' is selected, the pivot calculation defaults to '1 Day' (D)
+// to ensure stable price pivots, while the cycle width is determined by astronomical events.
+string i_tf = i_tf_str == "Astrocycles" ? "D" : f_str_to_tf(i_tf_str)
+
+// @function    f_tf_in_minutes
+// @description Converts a Pine timeframe string to its duration in minutes
+// @param       s_tf  string  Pine timeframe string
+// @returns     float  Duration in minutes
+f_tf_in_minutes(string s_tf) =>
+    float f_mins = timeframe.in_seconds(s_tf) / 60
+    f_mins
+
+float f_minInPeriod = f_tf_in_minutes(i_tf)
+
+// Variable to store the *actual* duration of the current box (for Astro this varies)
+var float f_boxDurationMins = f_minInPeriod
+
+// @function    f_get_pivots
+// @description Fetches pivot point data (R3-S3) from a higher timeframe via request.security
+// @param       s_tf  string  Pine timeframe string
+// @returns     [float, float, float, float, float, float, float]  R3, R2, R1, PP, S1, S2, S3
+f_get_pivots(string s_tf) =>
+    [h, l, c] = request.security(syminfo.tickerid, s_tf, [high[1], low[1], close[1]], barmerge.gaps_off, barmerge.lookahead_on)
+    f_pp = (h + l + c) / 3
+    f_r1 = f_pp + (f_pp - l)
+    f_s1 = f_pp - (h - f_pp)
+    f_r2 = f_pp + (h - l)
+    f_s2 = f_pp - (h - l)
+    f_r3 = h + 2 * (f_pp - l)
+    f_s3 = l - 2 * (h - f_pp)
+    [f_r3, f_r2, f_r1, f_pp, f_s1, f_s2, f_s3]
+
+// @function    f_get_declination
+// @description Computes the declination of a planet at a given Unix timestamp
+// @param       i_t     int    Unix timestamp in milliseconds
+// @param       i_pId   int    Planet ID
+// @returns     float   Declination in degrees
+f_get_declination(int i_t, int i_pId) =>
+    float f_jdn = AL.JDNv2(i_t, true)
+    float f_decl = AL.planet(AL.J2K(f_jdn), i_pId, 2)
+    f_decl
+
+// @function    f_get_helio_lon
+// @description Computes the heliocentric ecliptic longitude of a planet
+// @param       f_jdn   float  Julian Day Number
+// @param       i_pId   int    Planet ID
+// @returns     float   Longitude in degrees (0-360)
+f_get_helio_lon(float f_jdn, int i_pId) =>
+    float f_d = AL.J2K(f_jdn)
+    float f_x = AL.rplanet(f_d, i_pId, 1)
+    float f_y = AL.rplanet(f_d, i_pId, 2)
+
+    float f_theta = 0.0
+    if f_x > 0
+        f_theta := math.atan(f_y / f_x)
+    else if f_x < 0
+        if f_y >= 0
+            f_theta := math.atan(f_y / f_x) + math.pi
+        else
+            f_theta := math.atan(f_y / f_x) - math.pi
+    else
+        if f_y > 0
+            f_theta := math.pi / 2
+        else if f_y < 0
+            f_theta := -math.pi / 2
+
+    float f_lon = math.todegrees(f_theta)
+    if f_lon < 0
+        f_lon := f_lon + 360
+    f_lon
+
+// @function    f_angle_diff
+// @description Computes the shortest angular difference between two angles (0-180)
+// @param       f_a1  float  First angle in degrees
+// @param       f_a2  float  Second angle in degrees
+// @returns     float  Difference in degrees (0-180)
+f_angle_diff(float f_a1, float f_a2) =>
+    float f_diff = math.abs(f_a1 - f_a2)
+    if f_diff > 180
+        f_diff := 360 - f_diff
+    f_diff
+
+// @function    f_wrap180
+// @description Wraps an angle to the range (-180, +180]
+// @param       f_x  float  Input angle in degrees
+// @returns     float  Wrapped angle
+f_wrap180(float f_x) =>
+    float f_y = (f_x + 180.0) % 360.0
+    f_y := f_y < 0 ? f_y + 360.0 : f_y
+    f_y - 180.0
+
+// @function    f_lon_step
+// @description Computes the wrapped longitude step between two consecutive readings
+// @param       f_lonNow   float  Current longitude
+// @param       f_lonPrev  float  Previous longitude
+// @returns     float  Wrapped step in degrees
+f_lon_step(float f_lonNow, float f_lonPrev) =>
+    f_wrap180(f_lonNow - f_lonPrev)
+
+// @function    f_helio_score
+// @description Computes heliocentric alignment score: +1 at conjunction, -1 at opposition
+// @param       f_jdn   float  Julian Day Number
+// @param       i_pId   int    Planet ID
+// @returns     float  Score from -1 to +1
+f_helio_score(float f_jdn, int i_pId) =>
+    float f_lonP = f_get_helio_lon(f_jdn, i_pId)
+    float f_lonE = f_get_helio_lon(f_jdn, 3)  // Earth is 3
+    float f_delta = f_wrap180(f_lonP - f_lonE)
+    math.cos(math.toradians(f_delta))
+
+// @function    f_refine_helio_extreme
+// @description Ternary search refinement to find precise helio score extremum in [a,b]
+// @param       f_jdnA    float  Left bracket JDN
+// @param       f_jdnB    float  Right bracket JDN
+// @param       i_pId     int    Planet ID
+// @param       b_findMax bool   True for maximum (conjunction), false for minimum (opposition)
+// @returns     float  Refined JDN of the extremum
+f_refine_helio_extreme(float f_jdnA, float f_jdnB, int i_pId, bool b_findMax) =>
+    float f_a = f_jdnA
+    float f_b = f_jdnB
+    for _ = 0 to 21
+        float f_m1 = f_a + (f_b - f_a) / 3.0
+        float f_m2 = f_b - (f_b - f_a) / 3.0
+        float f_f1 = f_helio_score(f_m1, i_pId)
+        float f_f2 = f_helio_score(f_m2, i_pId)
+        if b_findMax
+            if f_f1 < f_f2
+                f_a := f_m1
+            else
+                f_b := f_m2
+        else
+            if f_f1 > f_f2
+                f_a := f_m1
+            else
+                f_b := f_m2
+    (f_a + f_b) / 2.0
+
+// @function    f_synodic_days
+// @description Computes the synodic period between a planet and Earth
+// @param       f_planetPeriodDays  float  Orbital period of the planet in days
+// @returns     float  Synodic period in days
+f_synodic_days(float f_planetPeriodDays) =>
+    float f_earth = 365.25
+    1.0 / math.abs(1.0/f_earth - 1.0/f_planetPeriodDays)
+
+// @function    f_get_geo_coords
+// @description Gets geocentric ecliptic coordinates (longitude, latitude) for a planet
+// @param       f_jdn  float  Julian Day Number
+// @param       i_pId  int    Planet ID
+// @returns     [float, float]  [longitude, latitude] in degrees
+f_get_geo_coords(float f_jdn, int i_pId) =>
+    float f_lon = na
+    float f_lat = na
+    float f_d = AL.J2K(f_jdn)
+
+    if i_pId == 3
+        f_lon := AL.moon(f_d, 3)
+        f_lat := AL.moon(f_d, 2)
+    else
+        f_lon := AL.planet(f_d, i_pId, 3)
+        f_lat := AL.planet(f_d, i_pId, 2)
+
+    if f_lon < 0
+        f_lon := f_lon + 360
+
+    [f_lon, f_lat]
+
+// @function    f_avg_period_days
+// @description Returns the average orbital period in days for a given planet
+// @param       i_pId  int  Planet ID
+// @returns     float  Orbital period in days
+f_avg_period_days(int i_pId) =>
+    switch i_pId
+        3 => 27.32    // Moon (Sidereal)
+        1 => 88.0     // Mercury
+        2 => 225.0    // Venus
+        4 => 687.0    // Mars
+        5 => 4333.0   // Jupiter (11.86y)
+        6 => 10759.0  // Saturn (29.46y)
+        7 => 30685.0  // Uranus (84y)
+        8 => 60190.0  // Neptune (164.8y)
+        9 => 90560.0  // Pluto (248y)
+        => 365.25
+
+// @function    f_find_next_helio_event
+// @description Locates the next heliocentric conjunction or opposition after a given JDN
+// @param       f_startJdn  float  Start Julian Day Number
+// @param       i_pId       int    Planet ID
+// @param       b_wantConj  bool   True for conjunction, false for opposition
+// @returns     float  JDN of the found event, or na if not found
+f_find_next_helio_event(float f_startJdn, int i_pId, bool b_wantConj) =>
+    float f_pDays = f_avg_period_days(i_pId)
+    float f_syn = f_synodic_days(f_pDays)
+    float f_step = f_syn / 240.0
+
+    float f_t0 = f_startJdn
+    float f_t1 = f_t0 + f_step
+    float f_t2 = f_t1 + f_step
+
+    float f_s0 = f_helio_score(f_t0, i_pId)
+    float f_s1 = f_helio_score(f_t1, i_pId)
+    float f_s2 = f_helio_score(f_t2, i_pId)
+
+    int i_maxSteps = 800
+    float f_foundA = na
+    float f_foundB = na
+
+    for i = 0 to i_maxSteps
+        bool b_turnMax = (f_s1 > f_s0) and (f_s1 > f_s2)
+        bool b_turnMin = (f_s1 < f_s0) and (f_s1 < f_s2)
+        bool b_ok = (b_wantConj and b_turnMax) or ((not b_wantConj) and b_turnMin)
+        if b_ok
+            f_foundA := f_t0
+            f_foundB := f_t2
+            break
+        f_t0 := f_t1
+        f_t1 := f_t2
+        f_t2 := f_t2 + f_step
+        f_s0 := f_s1
+        f_s1 := f_s2
+        f_s2 := f_helio_score(f_t2, i_pId)
+
+    if na(f_foundA)
+        na
+    else
+        float f_jdnEv = f_refine_helio_extreme(f_foundA, f_foundB, i_pId, b_wantConj)
+        f_jdnEv
+
+// @function    f_find_next_event
+// @description Finds the next astronomical event (lat/lon peak/trough or helio event) after a timestamp
+// @param       i_startT  int     Unix timestamp in ms
+// @param       i_pId     int     Planet ID
+// @param       s_mode    string  Cycle mode string
+// @returns     int  Unix timestamp of next event in ms, or na
+f_find_next_event(int i_startT, int i_pId, string s_mode) =>
+    float f_periodDays = f_avg_period_days(i_pId)
+    float f_stepDays = f_periodDays / 50.0
+
+    bool b_isHelio = s_mode == "Heliocentric Conjunction" or s_mode == "Heliocentric Opposition"
+    if b_isHelio
+        float f_tJdn = AL.JDNv2(i_startT, true)
+        float f_nextJdn = f_find_next_helio_event(f_tJdn + 0.01, i_pId, s_mode == "Heliocentric Conjunction")
+        int i_resMs = na(f_nextJdn) ? na : AL.J2KtoUnix(f_nextJdn)
+        i_resMs
+    else
+        float f_tCurr = AL.JDNv2(i_startT, true)
+        float f_valPrev = na
+
+        if s_mode == "High Latitude" or s_mode == "Low Latitude"
+            [_lon, _lat] = f_get_geo_coords(f_tCurr, i_pId)
+            f_valPrev := _lat
+        else if s_mode == "High Longitude" or s_mode == "Low Longitude"
+            [_lon, _lat] = f_get_geo_coords(f_tCurr, i_pId)
+            f_valPrev := _lon
+        else
+            [_lon, _lat] = f_get_geo_coords(f_tCurr, i_pId)
+            f_valPrev := _lat
+
+        int i_maxSteps = 100
+        float f_tFound = na
+        bool b_wasRising = false
+        bool b_firstStep = true
+
+        for i = 1 to i_maxSteps
+            f_tCurr := f_tCurr + f_stepDays
+            float f_valCurr = na
+            if s_mode == "High Latitude" or s_mode == "Low Latitude"
+                [_lon, _lat] = f_get_geo_coords(f_tCurr, i_pId)
+                f_valCurr := _lat
+            else if s_mode == "High Longitude" or s_mode == "Low Longitude"
+                [_lon, _lat] = f_get_geo_coords(f_tCurr, i_pId)
+                f_valCurr := _lon
+            else
+                [_lon, _lat] = f_get_geo_coords(f_tCurr, i_pId)
+                f_valCurr := _lat
+
+            float f_slope = f_valCurr - f_valPrev
+            bool b_isRising = f_slope > 0
+
+            if not b_firstStep
+                if s_mode == "High Latitude" or s_mode == "High Longitude"
+                    if b_wasRising and not b_isRising
+                        f_tFound := f_tCurr - (f_stepDays / 2.0)
+                        break
+                else
+                    if not b_wasRising and b_isRising
+                        f_tFound := f_tCurr - (f_stepDays / 2.0)
+                        break
+
+            b_wasRising := b_isRising
+            f_valPrev := f_valCurr
+            b_firstStep := false
+
+        int i_resTime = na(f_tFound) ? na : AL.J2KtoUnix(f_tFound)
+        i_resTime
+
+// @function    f_find_last_helio_event
+// @description Finds the last heliocentric conjunction or opposition before a given JDN (reverse search)
+// @param       f_startJdn  float  Start Julian Day Number
+// @param       i_pId       int    Planet ID
+// @param       b_wantConj  bool   True for conjunction, false for opposition
+// @returns     float  JDN of the found event, or na
+f_find_last_helio_event(float f_startJdn, int i_pId, bool b_wantConj) =>
+    float f_pDays = f_avg_period_days(i_pId)
+    float f_syn = f_synodic_days(f_pDays)
+    float f_step = f_syn / 240.0
+
+    float f_t0 = f_startJdn
+    float f_t1 = f_t0 - f_step
+    float f_t2 = f_t1 - f_step
+
+    float f_s0 = f_helio_score(f_t0, i_pId)
+    float f_s1 = f_helio_score(f_t1, i_pId)
+    float f_s2 = f_helio_score(f_t2, i_pId)
+
+    int i_maxSteps = 800
+    float f_foundA = na
+    float f_foundB = na
+
+    for i = 0 to i_maxSteps
+        bool b_turnMax = (f_s1 > f_s0) and (f_s1 > f_s2)
+        bool b_turnMin = (f_s1 < f_s0) and (f_s1 < f_s2)
+        bool b_ok = (b_wantConj and b_turnMax) or ((not b_wantConj) and b_turnMin)
+        if b_ok
+            f_foundA := f_t2
+            f_foundB := f_t0
+            break
+        f_t0 := f_t1
+        f_t1 := f_t2
+        f_t2 := f_t2 - f_step
+        f_s0 := f_s1
+        f_s1 := f_s2
+        f_s2 := f_helio_score(f_t2, i_pId)
+
+    if na(f_foundA)
+        na
+    else
+        float f_jdnEv = f_refine_helio_extreme(f_foundA, f_foundB, i_pId, b_wantConj)
+        f_jdnEv
+
+// @function    f_get_val
+// @description Gets the relevant coordinate value (lat or lon) based on the cycle mode
+// @param       f_jd    float   Julian Day Number
+// @param       s_mode  string  Cycle mode string
+// @param       i_pid   int     Planet ID
+// @returns     float  Latitude or longitude value depending on mode
+f_get_val(f_jd, s_mode, i_pid) =>
+    [f_ln, f_lt] = f_get_geo_coords(f_jd, i_pid)
+    s_mode == "High Latitude" or s_mode == "Low Latitude" ? f_lt : f_ln
+
+// @function    f_find_last_event
+// @description Finds the previous astronomical event before a timestamp (reverse search)
+// @param       i_startT  int     Unix timestamp in ms
+// @param       i_pId     int     Planet ID
+// @param       s_mode    string  Cycle mode string
+// @returns     int  Unix timestamp of previous event in ms, or na
+f_find_last_event(int i_startT, int i_pId, string s_mode) =>
+    float f_periodDays = f_avg_period_days(i_pId)
+    float f_stepDays = f_periodDays / 50.0
+
+    bool b_isHelio = s_mode == "Heliocentric Conjunction" or s_mode == "Heliocentric Opposition"
+    if b_isHelio
+        float f_tJdn = AL.JDNv2(i_startT, true)
+        float f_prevJdn = f_find_last_helio_event(f_tJdn - 0.01, i_pId, s_mode == "Heliocentric Conjunction")
+        int i_resMs = na(f_prevJdn) ? na : AL.J2KtoUnix(f_prevJdn)
+        i_resMs
+    else
+        float f_tCurr = AL.JDNv2(i_startT, true)
+        float f_valPrev = na
+        f_valPrev := f_get_val(f_tCurr, s_mode, i_pId)
+
+        int i_maxSteps = 100
+        float f_tFound = na
+        bool b_wasRising = false
+        bool b_wasFalling = false
+        bool b_firstStep = true
+
+        for i = 1 to i_maxSteps
+            f_tCurr := f_tCurr - f_stepDays
+            float f_valCurr = f_get_val(f_tCurr, s_mode, i_pId)
+            float f_delta = f_valCurr - f_valPrev
+            bool b_isRisingBack = f_delta > 0
+            bool b_isFallingBack = f_delta < 0
+
+            if not b_firstStep
+                if (s_mode == "High Latitude" or s_mode == "High Longitude")
+                    if b_wasRising and b_isFallingBack
+                        f_tFound := f_tCurr + (f_stepDays / 2.0)
+                        break
+                else
+                    if b_wasFalling and b_isRisingBack
+                        f_tFound := f_tCurr + (f_stepDays / 2.0)
+                        break
+
+            b_wasRising := b_isRisingBack
+            b_wasFalling := b_isFallingBack
+            f_valPrev := f_valCurr
+            b_firstStep := false
+
+        int i_resTime = na(f_tFound) ? na : AL.J2KtoUnix(f_tFound)
+        i_resTime
+
+// Variables that will hold the *active* pivots (either standard or Astro)
+var float f_vR3 = na
+var float f_vR2 = na
+var float f_vR1 = na
+var float f_vPP = na
+var float f_vS1 = na
+var float f_vS2 = na
+var float f_vS3 = na
+
+// @function    f_getPivotVal
+// @description Returns the current pivot value for a given pivot name string
+// @param       s_name  string  Pivot name ("R3", "R2", "R1", "PP", "S1", "S2", "S3")
+// @returns     float  Pivot value
+f_getPivotVal(s_name) =>
+    switch s_name
+        "R3" => f_vR3
+        "R2" => f_vR2
+        "R1" => f_vR1
+        "PP" => f_vPP
+        "S1" => f_vS1
+        "S2" => f_vS2
+        "S3" => f_vS3
+        => na
+
+// @function    f_arc_calc
+// @description Calculates the Y value of a Gann arc at a given X position using trigonometry
+// @param       f_factor     float  Arc radius factor (0-1+)
+// @param       b_isInv      bool   True for inverted (top-down) arc
+// @param       f_y1         float  Bottom of the quadrant
+// @param       f_dy2y1      float  Height of the quadrant (y2-y1)
+// @param       f_xx1        float  Squared x position (unused legacy param)
+// @param       f_x1         float  Current x position in minutes
+// @param       b_inPeriod   bool   Whether we are within the current box period
+// @param       f_periodLen  float  Total period length in minutes
+// @returns     float  Y value of the arc, or na if outside period
+f_arc_calc(f_factor, b_isInv, f_y1, f_dy2y1, f_xx1, f_x1, b_inPeriod, f_periodLen) =>
+    float f_radius = na
+    if not b_inPeriod
+        na
+    else
+        f_radius := f_periodLen * f_factor
+
+    float f_xClamped = math.min(f_x1, f_radius)
+    float f_ratio = f_xClamped / f_radius
+
+    if f_ratio > 1.0
+        na
+    else
+        float f_theta = math.acos(f_ratio)
+        float f_component = math.sin(f_theta) * f_radius
+        float f_valNorm = f_component / f_periodLen
+        float f_val = b_isInv ? f_y1 + f_dy2y1 - f_dy2y1 * f_valNorm : f_y1 + f_dy2y1 * f_valNorm
+        f_val
+
+// @function    f_index_to_time
+// @description Converts a bar index to a timestamp, handling both historical and future bars
+// @param       i_targetIdx  int  Target bar index
+// @returns     int  Unix timestamp in milliseconds
+f_index_to_time(int i_targetIdx) =>
+    int i_offset = i_targetIdx - bar_index
+    int i_resultTime = na
+    if i_offset <= 0 and math.abs(i_offset) <= 5000
+        i_resultTime := time[math.abs(i_offset)]
+    else
+        int i_tfMs = int(timeframe.in_seconds("") * 1000)
+        i_resultTime := time + i_offset * i_tfMs
+    i_resultTime
+// }
+
+//Blockmarker EXECUTION {
+
+// Indicator Calculations (Quadrant Scaling)
+float f_valDcHigh = ta.highest(high, i_dc_len)
+float f_valDcLow  = ta.lowest(low, i_dc_len)
+
+float f_atrSrc = switch i_base
+    "HL2" => hl2
+    "EMA" => ta.ema(close, i_atr_len)
+    => close
+float f_valAtr = ta.atr(i_atr_len)
+float f_valAtrHigh = f_atrSrc + f_valAtr * i_atr_mult
+float f_valAtrLow  = f_atrSrc - f_valAtr * i_atr_mult
+
+float f_sdBase = ta.sma(close, i_sd_len)
+float f_valSd  = ta.stdev(close, i_sd_len)
+float f_valSdHigh = f_sdBase + f_valSd * i_sd_mult
+float f_valSdLow  = f_sdBase - f_valSd * i_sd_mult
+
+float f_valPctHigh = ta.percentile_nearest_rank(high, i_pct_len, i_pct_high)
+float f_valPctLow  = ta.percentile_nearest_rank(low, i_pct_len, i_pct_low)
+
+// Initial Standard Fetch
+[f_stdR3, f_stdR2, f_stdR1, f_stdPP, f_stdS1, f_stdS2, f_stdS3] = f_get_pivots(i_tf)
+
+// Default to standard (will be overwritten by Astro logic if needed)
+if i_tf_str != "Astrocycles"
+    f_vR3 := f_stdR3
+    f_vR2 := f_stdR2
+    f_vR1 := f_stdR1
+    f_vPP := f_stdPP
+    f_vS1 := f_stdS1
+    f_vS2 := f_stdS2
+    f_vS3 := f_stdS3
+
+// Gann Logic & State Variables
+int I_GLOBAL_OFFSET = 0
+float f_minsPerBar = timeframe.in_seconds("") / 60
+
+var float f_x1 = 0.0
+var float f_xx1 = f_x1 * f_x1
+var int i_periodLenBars = int(f_minInPeriod / f_minsPerBar)
+var int i_x2 = -i_periodLenBars
+var int i_xx2 = i_x2 * i_x2
+
+var float f_offsY = 0.0
+var int i_dynamicOffset = 0
+
+var float f_y1 = na
+var float f_y2 = na
+var float f_lastY1 = na
+var float f_lastY2 = na
+var float f_lastDy2y1 = na
+var float f_dy2y1 = na
+
+var bool b_inFuture = false
+var int i_startIdx = na
+
+if barstate.isfirst
+    f_offsY := close * 1.01 - close
+
+if last_bar_index - bar_index < i_periodLenBars
+    b_inFuture := true
+
+bool b_newPeriod = false
+
+if i_tf_str == "Astrocycles"
+    // Astronomical Cycle Logic
+    int i_pId = f_planet_id(i_astro_planet)
+
+    bool b_useHelio = i_astro_cycle == "Heliocentric Conjunction" or i_astro_cycle == "Heliocentric Opposition"
+    if b_useHelio and i_astro_planet == "Moon"
+        runtime.error("Heliocentric modes are not supported for Moon (Pseudo-Earth). Please select a Planet.")
+
+    // Initialization: Pre-calculate cycle state on first bar
+    if barstate.isfirst
+        int i_lastEvT = f_find_last_event(time, i_pId, i_astro_cycle)
+        if not na(i_lastEvT)
+            int i_nextEvT = f_find_next_event(i_lastEvT, i_pId, i_astro_cycle)
+            if not na(i_nextEvT)
+                int i_durMs = i_nextEvT - i_lastEvT
+                float f_durMins = i_durMs / 1000.0 / 60.0
+                f_boxDurationMins := f_durMins
+                i_periodLenBars := int(f_durMins / f_minsPerBar)
+                if i_periodLenBars < 1
+                    i_periodLenBars := 1
+                log.info("First Bar Init: Cycle={0} | Last={1} | Next={2} | Duration={3}m", i_astro_cycle, str.format_time(i_lastEvT, "yyyy-MM-dd"), str.format_time(i_nextEvT, "yyyy-MM-dd"), f_durMins)
+
+    float f_jdnCurrBar = AL.JDNv2(time, true)
+    float f_currDecl = f_get_declination(time, i_pId)
+    [f_currLon, f_currLat] = f_get_geo_coords(f_jdnCurrBar, i_pId)
+
+    var float f_prevDecl = na
+    var float f_prevPrevDecl = na
+    var float f_prevLat = na
+    var float f_prevPrevLat = na
+    var float f_prevLon = na
+    var float f_prevPrevLon = na
+
+    // Unwrapped longitude tracking (for station detection)
+    var float f_lonU = na
+    if not na(f_currLon)
+        f_lonU := na(f_lonU[1]) or na(f_prevLon) ? f_currLon : f_lonU[1] + f_lon_step(f_currLon, f_prevLon)
+
+    // Event Detection Logic (State-Based)
+    var bool b_latWasRising = false
+    var bool b_latInit = false
+    var bool b_lonWasRising = false
+    var bool b_lonInit = false
+
+    float f_epsLL = 1e-10
+
+    // 1. Latitude Logic
+    float f_dLat = f_currLat - f_prevLat
+
+    if not b_latInit and not na(f_dLat)
+        if f_dLat > f_epsLL
+            b_latWasRising := true
+            b_latInit := true
+        else if f_dLat < -f_epsLL
+            b_latWasRising := false
+            b_latInit := true
+
+    bool b_latRisingBefore = b_latWasRising
+
+    if b_latInit
+        if f_dLat > f_epsLL
+            b_latWasRising := true
+        else if f_dLat < -f_epsLL
+            b_latWasRising := false
+
+    bool b_isLatHigh = b_latInit and (f_dLat < -f_epsLL) and (b_latRisingBefore == true)
+    bool b_isLatLow  = b_latInit and (f_dLat >  f_epsLL) and (b_latRisingBefore == false)
+
+    // 2. Longitude Logic (Stations)
+    float f_dLonU = f_lonU - f_lonU[1]
+
+    if not b_lonInit and not na(f_dLonU)
+        if f_dLonU > f_epsLL
+            b_lonWasRising := true
+            b_lonInit := true
+        else if f_dLonU < -f_epsLL
+            b_lonWasRising := false
+            b_lonInit := true
+
+    bool b_lonRisingBefore = b_lonWasRising
+
+    if b_lonInit
+        if f_dLonU > f_epsLL
+            b_lonWasRising := true
+        else if f_dLonU < -f_epsLL
+            b_lonWasRising := false
+
+    bool b_isLonHigh = b_lonInit and (f_dLonU < -f_epsLL) and (b_lonRisingBefore == true)
+    bool b_isLonLow  = b_lonInit and (f_dLonU >  f_epsLL) and (b_lonRisingBefore == false)
+
+    // Heliocentric Alignment Logic (Score Based)
+    bool b_isConjunction = false
+    bool b_isOpposition = false
+    var int i_lastHelioEventMs = na
+    var int i_refinedHelioEventTime = na
+    var bool b_helioWasRising = false
+    var bool b_helioInit = false
+
+    if b_useHelio
+        float f_jdnP  = AL.JDNv2(time[1], true)
+        float f_jdnC  = AL.JDNv2(time,   true)
+        float f_sP  = f_helio_score(f_jdnP,  i_pId)
+        float f_sC  = f_helio_score(f_jdnC,  i_pId)
+        bool b_wantConj = (i_astro_cycle == "Heliocentric Conjunction")
+        bool b_wantOpp  = (i_astro_cycle == "Heliocentric Opposition")
+
+        float f_epsS = 1e-12
+        float f_dS = f_sC - f_sP
+
+        if not b_helioInit and not na(f_dS)
+            if f_dS > f_epsS
+                b_helioWasRising := true
+                b_helioInit := true
+            else if f_dS < -f_epsS
+                b_helioWasRising := false
+                b_helioInit := true
+
+        bool b_risingBefore = b_helioWasRising
+
+        if b_helioInit
+            if f_dS > f_epsS
+                b_helioWasRising := true
+            else if f_dS < -f_epsS
+                b_helioWasRising := false
+
+        bool b_isPeak   = b_helioInit and (f_dS < -f_epsS) and (b_risingBefore == true)
+        bool b_isTrough = b_helioInit and (f_dS >  f_epsS) and (b_risingBefore == false)
+        bool b_refineThis = (b_wantConj and b_isPeak) or (b_wantOpp and b_isTrough)
+
+        if b_refineThis
+            float f_jdnEv = f_refine_helio_extreme(f_jdnP, f_jdnC, i_pId, b_wantConj)
+            int i_evMs = AL.J2KtoUnix(f_jdnEv)
+            int i_tfMs = int(timeframe.in_seconds("") * 1000)
+            bool b_evInWindow = (i_evMs > time[1] - 1) and (i_evMs <= time + 1)
+            int i_dupTol = math.max(1000, i_tfMs / 2)
+            bool b_notDup = na(i_lastHelioEventMs) or (math.abs(i_evMs - i_lastHelioEventMs) > i_dupTol)
+            if b_evInWindow and b_notDup
+                i_lastHelioEventMs := i_evMs
+                i_refinedHelioEventTime := i_evMs
+                if b_wantConj
+                    b_isConjunction := true
+                else
+                    b_isOpposition := true
+
+    // Determine if event matches requested cycle start
+    bool b_eventMatch = false
+
+    if i_astro_cycle == "High Latitude"
+        if b_isLatHigh
+            b_eventMatch := true
+    else if i_astro_cycle == "Low Latitude"
+        if b_isLatLow
+            b_eventMatch := true
+    else if i_astro_cycle == "High Longitude"
+        if b_isLonHigh
+            b_eventMatch := true
+    else if i_astro_cycle == "Low Longitude"
+        if b_isLonLow
+            b_eventMatch := true
+    else if i_astro_cycle == "Heliocentric Conjunction"
+        if b_isConjunction
+            b_eventMatch := true
+    else if i_astro_cycle == "Heliocentric Opposition"
+        if b_isOpposition
+            b_eventMatch := true
+
+    if b_eventMatch
+        log.info("Astro Event Triggered: {0} | Time: {1} | Lat: {2} -> {3} | Lon: {4} -> {5} | Helio Diff: {6}", i_astro_cycle, str.format_time(time, "yyyy-MM-dd HH:mm"), f_prevLat, f_currLat, f_prevLon, f_currLon, b_useHelio ? f_angle_diff(f_get_helio_lon(AL.JDNv2(time, true), i_pId), f_get_helio_lon(AL.JDNv2(time, true), 3)) : na)
+
+    var int i_lastGeoEventMs = na
+
+    if b_eventMatch
+        int i_evKeyTime = b_useHelio and not na(i_refinedHelioEventTime) ? i_refinedHelioEventTime : time[1]
+        bool b_isNew = false
+
+        if b_useHelio
+            b_isNew := true
+        else
+            if na(i_lastGeoEventMs) or i_evKeyTime != i_lastGeoEventMs
+                i_lastGeoEventMs := i_evKeyTime
+                b_isNew := true
+
+        if b_isNew
+            b_newPeriod := true
+            int i_nextEventTime = na
+
+            if b_useHelio
+                float f_refinedJdn = AL.JDNv2(i_refinedHelioEventTime, true)
+                float f_nextJdn = f_find_next_helio_event(f_refinedJdn + 0.01, i_pId, i_astro_cycle == "Heliocentric Conjunction")
+                i_nextEventTime := na(f_nextJdn) ? na : AL.J2KtoUnix(f_nextJdn)
+            else
+                i_nextEventTime := f_find_next_event(time, i_pId, i_astro_cycle)
+
+            if not na(i_nextEventTime)
+                int i_startMs = b_useHelio and not na(i_refinedHelioEventTime) ? i_refinedHelioEventTime : time[1]
+                int i_durationMs = i_nextEventTime - i_startMs
+                float f_durationMins = i_durationMs / 1000.0 / 60.0
+                f_boxDurationMins := f_durationMins
+                i_periodLenBars := int(f_durationMins / f_minsPerBar)
+                if i_periodLenBars < 1
+                    i_periodLenBars := 1
+            else
+                i_periodLenBars := 100
+                f_boxDurationMins := i_periodLenBars * f_minsPerBar
+
+    // Update History
+    f_prevPrevDecl := f_prevDecl
+    f_prevDecl := f_currDecl
+    f_prevPrevLat := f_prevLat
+    f_prevLat := f_currLat
+    f_prevPrevLon := f_prevLon
+    f_prevLon := f_currLon
+
+else
+    // Standard Timeframe Logic
+    b_newPeriod := ta.change(time(i_tf)) != 0
+    if b_newPeriod
+        f_boxDurationMins := f_minInPeriod
+
+// Astro Pivot Calculation & Tracking
+var float f_cycleHigh = high
+var float f_cycleLow = low
+var float f_cycleClose = close
+
+var float f_prevCycleHigh = na
+var float f_prevCycleLow = na
+var float f_prevCycleClose = na
+
+var float f_astroPP = na
+var float f_astroR1 = na
+var float f_astroR2 = na
+var float f_astroR3 = na
+var float f_astroS1 = na
+var float f_astroS2 = na
+var float f_astroS3 = na
+
+if b_newPeriod
+    i_startIdx := bar_index
+    f_x1 := 0
+    i_x2 := 0
+    f_lastY1 := f_y1
+    f_lastY2 := f_y2
+
+    if i_tf_str == "Astrocycles"
+        f_prevCycleHigh := f_cycleHigh
+        f_prevCycleLow := f_cycleLow
+        f_prevCycleClose := close[1]
+        f_cycleHigh := high
+        f_cycleLow := low
+        f_cycleClose := close
+
+        // Compute Astro Pivots immediately so quadrant bounds below can use them
+        if not na(f_prevCycleHigh)
+            f_astroPP := (f_prevCycleHigh + f_prevCycleLow + f_prevCycleClose) / 3
+            f_astroR1 := 2 * f_astroPP - f_prevCycleLow
+            f_astroS1 := 2 * f_astroPP - f_prevCycleHigh
+            f_astroR2 := f_astroPP + (f_prevCycleHigh - f_prevCycleLow)
+            f_astroS2 := f_astroPP - (f_prevCycleHigh - f_prevCycleLow)
+            f_astroR3 := f_prevCycleHigh + 2 * (f_astroPP - f_prevCycleLow)
+            f_astroS3 := f_prevCycleLow - 2 * (f_prevCycleHigh - f_astroPP)
+
+            f_vPP := f_astroPP
+            f_vR1 := f_astroR1
+            f_vS1 := f_astroS1
+            f_vR2 := f_astroR2
+            f_vS2 := f_astroS2
+            f_vR3 := f_astroR3
+            f_vS3 := f_astroS3
+    else
+        f_cycleHigh := high
+        f_cycleLow := low
+        f_cycleClose := close
+
+    // Select Quadrant Bounds (y1, y2) — locked per period so plot() and polyline stay aligned
+    float f_qLowClassic = na
+    float f_qHighClassic = na
+
+    if i_tf_str == "Astrocycles"
+        if i_lowerPivot == "PP"
+            f_qLowClassic := f_astroPP
+        else if i_lowerPivot == "R1"
+            f_qLowClassic := f_astroR1
+        else if i_lowerPivot == "R2"
+            f_qLowClassic := f_astroR2
+        else if i_lowerPivot == "R3"
+            f_qLowClassic := f_astroR3
+        else if i_lowerPivot == "S1"
+            f_qLowClassic := f_astroS1
+        else if i_lowerPivot == "S2"
+            f_qLowClassic := f_astroS2
+        else if i_lowerPivot == "S3"
+            f_qLowClassic := f_astroS3
+
+        if i_upperPivot == "PP"
+            f_qHighClassic := f_astroPP
+        else if i_upperPivot == "R1"
+            f_qHighClassic := f_astroR1
+        else if i_upperPivot == "R2"
+            f_qHighClassic := f_astroR2
+        else if i_upperPivot == "R3"
+            f_qHighClassic := f_astroR3
+        else if i_upperPivot == "S1"
+            f_qHighClassic := f_astroS1
+        else if i_upperPivot == "S2"
+            f_qHighClassic := f_astroS2
+        else if i_upperPivot == "S3"
+            f_qHighClassic := f_astroS3
+    else
+        f_qLowClassic := f_getPivotVal(i_lowerPivot)
+        f_qHighClassic := f_getPivotVal(i_upperPivot)
+
+    float f_qLow = na
+    float f_qHigh = na
+
+    if i_scale_mode == "Classic Pivots"
+        f_qLow := f_qLowClassic
+        f_qHigh := f_qHighClassic
+    else if i_scale_mode == "Prev Cycle Range"
+        if not na(f_prevCycleHigh)
+            f_qLow := f_prevCycleLow
+            f_qHigh := f_prevCycleHigh
+        else
+            f_qLow := f_qLowClassic
+            f_qHigh := f_qHighClassic
+    else if i_scale_mode == "Donchian Channel"
+        f_qLow := f_valDcLow
+        f_qHigh := f_valDcHigh
+    else if i_scale_mode == "ATR Bands"
+        f_qLow := f_valAtrLow
+        f_qHigh := f_valAtrHigh
+    else if i_scale_mode == "StdDev Bands"
+        f_qLow := f_valSdLow
+        f_qHigh := f_valSdHigh
+    else if i_scale_mode == "Percentile Channel"
+        f_qLow := f_valPctLow
+        f_qHigh := f_valPctHigh
+
+    if na(f_qLow) or na(f_qHigh)
+        f_qLow := f_qLowClassic
+        f_qHigh := f_qHighClassic
+
+    if f_qLow > f_qHigh
+        float f_tmp = f_qLow
+        f_qLow := f_qHigh
+        f_qHigh := f_tmp
+
+    float f_minH = i_min_height_atr_mult * f_valAtr
+    float f_currentH = f_qHigh - f_qLow
+
+    if f_currentH < f_minH
+        float f_mid = (f_qHigh + f_qLow) / 2
+        f_qHigh := f_mid + (f_minH / 2)
+        f_qLow := f_mid - (f_minH / 2)
+
+    f_y1 := f_qLow
+    f_y2 := f_qHigh
+    f_lastDy2y1 := f_y2 - f_y1
+    f_dy2y1 := f_y2 - f_y1
+else
+    f_cycleHigh := math.max(f_cycleHigh, high)
+    f_cycleLow := math.min(f_cycleLow, low)
+    f_cycleClose := close
+// }
+
+//Blockmarker PLOTTING {
+
+// Historical Plotting (Bar-by-Bar)
+f_xx1 := f_x1 * f_x1
+f_x1 := f_x1 + f_minsPerBar
+
+bool b_inPeriod = f_x1 <= f_boxDurationMins
+
+// Color Logic: Make the FIRST bar after b_newPeriod transparent to hide the "Jump" line
+bool b_isStart = b_newPeriod
+color c_arcOrange = b_isStart ? color.new(c_arc1Color, 100) : color.new(c_arc1Color, 0)
+color c_arcLime   = b_isStart ? color.new(c_arc2Color, 100) : color.new(c_arc2Color, 0)
+color c_arcGreen  = b_isStart ? color.new(c_arc3Color, 100) : color.new(c_arc3Color, 0)
+color c_arcTeal   = b_isStart ? color.new(c_arc4Color, 100) : color.new(c_arc4Color, 0)
+color c_arcBlue   = b_isStart ? color.new(c_arc5Color, 100) : color.new(c_arc5Color, 0)
+color c_arcAqua   = b_isStart ? color.new(c_arcInvColor, 100) : color.new(c_arcInvColor, 0)
+
+// Plot Standard Pivots
+plotshape(ta.change(f_vR3) != 0 ? f_vR3 : na, color=c_r3Color, title="R3", style=shape.circle, location=location.absolute, size=size.tiny)
+plotshape(ta.change(f_vR2) != 0 ? f_vR2 : na, color=c_r2Color, title="R2", style=shape.circle, location=location.absolute, size=size.tiny)
+plotshape(ta.change(f_vR1) != 0 ? f_vR1 : na, color=c_r1Color, title="R1", style=shape.circle, location=location.absolute, size=size.tiny)
+plotshape(ta.change(f_vPP) != 0 ? f_vPP : na, color=c_ppColor, title="PP", style=shape.circle, location=location.absolute, size=size.tiny)
+plotshape(ta.change(f_vS1) != 0 ? f_vS1 : na, color=c_s1Color, title="S1", style=shape.circle, location=location.absolute, size=size.tiny)
+plotshape(ta.change(f_vS2) != 0 ? f_vS2 : na, color=c_s2Color, title="S2", style=shape.circle, location=location.absolute, size=size.tiny)
+plotshape(ta.change(f_vS3) != 0 ? f_vS3 : na, color=c_s3Color, title="S3", style=shape.circle, location=location.absolute, size=size.tiny)
+
+// Quadrant Normal (Bottom-Up Arcs)
+plot(f_arc_calc(0.2, false, f_y1, f_dy2y1, f_xx1, f_x1, b_inPeriod, f_boxDurationMins), title='Arc 1x0', style=plot.style_linebr, color=c_arcOrange, offset=I_GLOBAL_OFFSET)
+plot(f_arc_calc(0.4, false, f_y1, f_dy2y1, f_xx1, f_x1, b_inPeriod, f_boxDurationMins), title='Arc 2x0', style=plot.style_linebr, color=c_arcLime, offset=I_GLOBAL_OFFSET)
+plot(f_arc_calc(0.6, false, f_y1, f_dy2y1, f_xx1, f_x1, b_inPeriod, f_boxDurationMins), title='Arc 3x0', style=plot.style_linebr, color=c_arcGreen, offset=I_GLOBAL_OFFSET)
+plot(f_arc_calc(0.8, false, f_y1, f_dy2y1, f_xx1, f_x1, b_inPeriod, f_boxDurationMins), title='Arc 4x0', style=plot.style_linebr, color=c_arcTeal, offset=I_GLOBAL_OFFSET)
+plot(f_arc_calc(1.0, false, f_y1, f_dy2y1, f_xx1, f_x1, b_inPeriod, f_boxDurationMins), title='Arc 5x0', style=plot.style_linebr, color=c_arcBlue, offset=I_GLOBAL_OFFSET)
+
+plot(f_arc_calc(0.3, false, f_y1, f_dy2y1, f_xx1, f_x1, b_inPeriod, f_boxDurationMins), title='Arc 1.5x0', style=plot.style_linebr, color=c_arcOrange, offset=I_GLOBAL_OFFSET)
+plot(f_arc_calc(0.2828, false, f_y1, f_dy2y1, f_xx1, f_x1, b_inPeriod, f_boxDurationMins), title='Arc 1x1', style=plot.style_linebr, color=c_arcOrange, offset=I_GLOBAL_OFFSET)
+plot(f_arc_calc(0.4472, false, f_y1, f_dy2y1, f_xx1, f_x1, b_inPeriod, f_boxDurationMins), title='Arc 2x1', style=plot.style_linebr, color=c_arcLime, offset=I_GLOBAL_OFFSET)
+plot(f_arc_calc(0.6324, false, f_y1, f_dy2y1, f_xx1, f_x1, b_inPeriod, f_boxDurationMins), title='Arc 3x1', style=plot.style_linebr, color=c_arcGreen, offset=I_GLOBAL_OFFSET)
+plot(f_arc_calc(0.8246, false, f_y1, f_dy2y1, f_xx1, f_x1, b_inPeriod, f_boxDurationMins), title='Arc 4x1', style=plot.style_linebr, color=c_arcTeal, offset=I_GLOBAL_OFFSET)
+plot(f_arc_calc(1.0198, false, f_y1, f_dy2y1, f_xx1, f_x1, b_inPeriod, f_boxDurationMins), title='Arc 5x1', style=plot.style_linebr, color=c_arcBlue, offset=I_GLOBAL_OFFSET)
+
+// Quadrant Inverted (Top-Down Arcs)
+plot(f_arc_calc(1.0, true, f_y1, f_dy2y1, f_xx1, f_x1, b_inPeriod, f_boxDurationMins), title='Arc 5x0 Inv', style=plot.style_linebr, color=c_arcBlue, offset=I_GLOBAL_OFFSET)
+plot(f_arc_calc(0.8, true, f_y1, f_dy2y1, f_xx1, f_x1, b_inPeriod, f_boxDurationMins), title='Arc 4x0 Inv', style=plot.style_linebr, color=c_arcAqua, offset=I_GLOBAL_OFFSET)
+plot(f_arc_calc(0.6, true, f_y1, f_dy2y1, f_xx1, f_x1, b_inPeriod, f_boxDurationMins), title='Arc 3x0 Inv', style=plot.style_linebr, color=c_arcGreen, offset=I_GLOBAL_OFFSET)
+plot(f_arc_calc(0.4, true, f_y1, f_dy2y1, f_xx1, f_x1, b_inPeriod, f_boxDurationMins), title='Arc 2x0 Inv', style=plot.style_linebr, color=c_arcLime, offset=I_GLOBAL_OFFSET)
+plot(f_arc_calc(0.2, true, f_y1, f_dy2y1, f_xx1, f_x1, b_inPeriod, f_boxDurationMins), title='Arc 1x0 Inv', style=plot.style_linebr, color=c_arcOrange, offset=I_GLOBAL_OFFSET)
+
+plot(f_arc_calc(0.3, true, f_y1, f_dy2y1, f_xx1, f_x1, b_inPeriod, f_boxDurationMins), title='Arc 1.5x0 Inv', style=plot.style_linebr, color=c_arcOrange, offset=I_GLOBAL_OFFSET)
+plot(f_arc_calc(0.2828, true, f_y1, f_dy2y1, f_xx1, f_x1, b_inPeriod, f_boxDurationMins), title='Arc 1x1 Inv', style=plot.style_linebr, color=c_arcOrange, offset=I_GLOBAL_OFFSET)
+plot(f_arc_calc(0.4472, true, f_y1, f_dy2y1, f_xx1, f_x1, b_inPeriod, f_boxDurationMins), title='Arc 2x1 Inv', style=plot.style_linebr, color=c_arcLime, offset=I_GLOBAL_OFFSET)
+plot(f_arc_calc(0.6324, true, f_y1, f_dy2y1, f_xx1, f_x1, b_inPeriod, f_boxDurationMins), title='Arc 3x1 Inv', style=plot.style_linebr, color=c_arcGreen, offset=I_GLOBAL_OFFSET)
+plot(f_arc_calc(0.8246, true, f_y1, f_dy2y1, f_xx1, f_x1, b_inPeriod, f_boxDurationMins), title='Arc 4x1 Inv', style=plot.style_linebr, color=c_arcTeal, offset=I_GLOBAL_OFFSET)
+plot(f_arc_calc(1.0198, true, f_y1, f_dy2y1, f_xx1, f_x1, b_inPeriod, f_boxDurationMins), title='Arc 5x1 Inv', style=plot.style_linebr, color=c_arcBlue, offset=I_GLOBAL_OFFSET)
+
+// Diagonal Reference Lines (Gann Cross)
+plot(b_inPeriod and f_x1 != 0 ? f_y1 + f_dy2y1 * (f_x1 / f_boxDurationMins) : na, title='Diagonal 1', color=i_boxColor, offset=I_GLOBAL_OFFSET)
+plot(b_inPeriod and f_x1 != 0 ? f_y2 - f_dy2y1 * (f_x1 / f_boxDurationMins) : na, title='Diagonal 2', color=i_boxColor, offset=I_GLOBAL_OFFSET)
+
+// Visualization & Drawing (Last bar only, with dirty-flag caching)
+var int i_drawnStartIdx = na
+var float f_drawnY1 = na
+var float f_drawnY2 = na
+var int i_drawnPeriodLen = na
+var array<line> a_boxLines = array.new<line>()
+var array<polyline> a_arcPolylines = array.new<polyline>()
+var arc_defs = array.from(arc_def.new(0.2, 0.2, color.new(c_arc1Color, 0)), arc_def.new(0.4, 0.4, color.new(c_arc2Color, 0)), arc_def.new(0.6, 0.6, color.new(c_arc3Color, 0)), arc_def.new(0.8, 0.8, color.new(c_arc4Color, 0)), arc_def.new(1.0, 1.0, color.new(c_arc5Color, 0)), arc_def.new(0.3, 0.3, color.new(c_arc1Color, 0)), arc_def.new(0.2828, 0.2828, color.new(c_arc1Color, 0)), arc_def.new(0.4472, 0.4472, color.new(c_arc2Color, 0)), arc_def.new(0.6324, 0.6324, color.new(c_arc3Color, 0)), arc_def.new(0.8246, 0.8246, color.new(c_arc4Color, 0)), arc_def.new(1.0198, 1.0198, color.new(c_arc5Color, 0)))
+
+if barstate.islast
+    bool b_needsRedraw = na(i_drawnStartIdx) or i_drawnStartIdx != i_startIdx or f_drawnY1 != f_y1 or f_drawnY2 != f_y2 or i_drawnPeriodLen != i_periodLenBars
+
+    if b_needsRedraw and not na(i_startIdx) and not na(f_y1) and not na(f_y2)
+        // Clean up previous drawings
+        for l in a_boxLines
+            line.delete(l)
+        a_boxLines.clear()
+        for p in a_arcPolylines
+            polyline.delete(p)
+        a_arcPolylines.clear()
+
+        // Update cache
+        i_drawnStartIdx := i_startIdx
+        f_drawnY1 := f_y1
+        f_drawnY2 := f_y2
+        i_drawnPeriodLen := i_periodLenBars
+
+        int i_drawStartIdx = i_startIdx + I_GLOBAL_OFFSET
+        int i_drawEndIdx = i_drawStartIdx + i_periodLenBars
+        int i_tStart = f_index_to_time(i_drawStartIdx)
+        int i_tEnd = f_index_to_time(i_drawEndIdx)
+
+        // Gann Box Construction
+        a_boxLines.push(line.new(i_tStart, f_y2, i_tEnd, f_y2, xloc=xloc.bar_time, color=i_boxColor, width=i_lineWidth))
+        a_boxLines.push(line.new(i_tStart, f_y1, i_tEnd, f_y1, xloc=xloc.bar_time, color=i_boxColor, width=i_lineWidth))
+        a_boxLines.push(line.new(i_tStart, f_y1, i_tStart, f_y2, xloc=xloc.bar_time, color=i_boxColor, width=i_lineWidth))
+        a_boxLines.push(line.new(i_tEnd, f_y1, i_tEnd, f_y2, xloc=xloc.bar_time, color=i_boxColor, width=i_lineWidth))
+        a_boxLines.push(line.new(i_tStart, f_y1, i_tEnd, f_y2, xloc=xloc.bar_time, color=i_boxColor, width=i_lineWidth))
+        a_boxLines.push(line.new(i_tStart, f_y2, i_tEnd, f_y1, xloc=xloc.bar_time, color=i_boxColor, width=i_lineWidth))
+
+        // Geometric Arc Rendering
+        float f_boxW = float(i_periodLenBars)
+        float f_boxH = f_dy2y1
+
+        for split in arc_defs
+            array<chart.point> pts_bl = array.new<chart.point>()
+            array<chart.point> pts_tl = array.new<chart.point>()
+            array<chart.point> pts_br = array.new<chart.point>()
+            array<chart.point> pts_tr = array.new<chart.point>()
+
+            int i_step = math.max(1, int(f_boxW / 500))
+            float f_xLimit = f_boxW * split.f_xFactor
+            float f_loopEnd = math.min(f_boxW, f_xLimit)
+
+            for i = 0 to int(f_loopEnd) by i_step
+                float f_xVal = float(i)
+                float f_a = f_xLimit
+                float f_b = f_boxH * split.f_yFactor
+                float f_ratio = f_xVal / f_a
+
+                if f_ratio > 1.0
+                    f_ratio := 1.0
+
+                if f_ratio <= 1.0
+                    float f_yOffset = f_b * math.sin(math.acos(f_ratio))
+                    int i_tLeft = f_index_to_time(i_drawStartIdx + i)
+                    int i_tRight = f_index_to_time(i_drawEndIdx - i)
+                    pts_bl.push(chart.point.from_time(i_tLeft, f_y1 + f_yOffset))
+                    pts_tl.push(chart.point.from_time(i_tLeft, f_y2 - f_yOffset))
+                    pts_br.push(chart.point.from_time(i_tRight, f_y1 + f_yOffset))
+                    pts_tr.push(chart.point.from_time(i_tRight, f_y2 - f_yOffset))
+
+            float f_finalX = split.f_xFactor > 1.0 ? f_boxW : f_xLimit
+            float f_aFinal = f_xLimit
+            float f_bFinal = f_boxH * split.f_yFactor
+            float f_ratioFinal = f_finalX / f_aFinal
+            if f_ratioFinal > 1.0
+                f_ratioFinal := 1.0
+            float f_yOffsetFinal = f_bFinal * math.sin(math.acos(f_ratioFinal))
+            int i_lastOffsetIdx = int(f_finalX)
+            int i_tLastLeft = f_index_to_time(i_drawStartIdx + i_lastOffsetIdx)
+            int i_tLastRight = f_index_to_time(i_drawEndIdx - i_lastOffsetIdx)
+            pts_bl.push(chart.point.from_time(i_tLastLeft, f_y1 + f_yOffsetFinal))
+            pts_tl.push(chart.point.from_time(i_tLastLeft, f_y2 - f_yOffsetFinal))
+            pts_br.push(chart.point.from_time(i_tLastRight, f_y1 + f_yOffsetFinal))
+            pts_tr.push(chart.point.from_time(i_tLastRight, f_y2 - f_yOffsetFinal))
+
+            if pts_bl.size() > 1
+                a_arcPolylines.push(polyline.new(pts_bl, line_color=split.c_col, line_width=i_lineWidth, xloc=xloc.bar_time))
+            if pts_tl.size() > 1
+                a_arcPolylines.push(polyline.new(pts_tl, line_color=split.c_col, line_width=i_lineWidth, xloc=xloc.bar_time))
+            if pts_br.size() > 1
+                a_arcPolylines.push(polyline.new(pts_br, line_color=split.c_col, line_width=i_lineWidth, xloc=xloc.bar_time))
+            if pts_tr.size() > 1
+                a_arcPolylines.push(polyline.new(pts_tr, line_color=split.c_col, line_width=i_lineWidth, xloc=xloc.bar_time))
+
+// Info Panel
+if i_tf_str == "Astrocycles" and b_showTable
+    var table info_table = table.new(position.top_right, 2, 6, bgcolor=color.new(color.black, 80), border_width=1, border_color=color.new(color.gray, 50))
+
+    if barstate.islast or b_newPeriod
+        table.cell(info_table, 0, 0, "Astro Cycle Info", text_color=color.white, text_size=size.normal, bgcolor=color.new(color.blue, 70))
+        table.merge_cells(info_table, 0, 0, 1, 0)
+        table.cell(info_table, 0, 1, "Cycle Type:", text_color=color.gray, text_size=size.small)
+        table.cell(info_table, 1, 1, i_astro_cycle, text_color=color.white, text_size=size.small)
+        table.cell(info_table, 0, 2, "Planet:", text_color=color.gray, text_size=size.small)
+        table.cell(info_table, 1, 2, i_astro_planet, text_color=color.white, text_size=size.small)
+        string s_durationStr = str.tostring(math.round(f_boxDurationMins / 1440, 1)) + " days"
+        table.cell(info_table, 0, 3, "Duration:", text_color=color.gray, text_size=size.small)
+        table.cell(info_table, 1, 3, s_durationStr, text_color=color.yellow, text_size=size.small)
+        string s_lastEvent = not na(i_startIdx) ? str.format_time(f_index_to_time(i_startIdx), "yyyy-MM-dd HH:mm", "UTC") : "N/A"
+        table.cell(info_table, 0, 4, "Last Event:", text_color=color.gray, text_size=size.small)
+        table.cell(info_table, 1, 4, s_lastEvent, text_color=color.lime, text_size=size.small)
+        string s_nextEvent = not na(i_startIdx) ? str.format_time(f_index_to_time(i_startIdx + i_periodLenBars), "yyyy-MM-dd HH:mm", "UTC") : "N/A"
+        table.cell(info_table, 0, 5, "Next Event:", text_color=color.gray, text_size=size.small)
+        table.cell(info_table, 1, 5, s_nextEvent, text_color=color.orange, text_size=size.small)
+// }

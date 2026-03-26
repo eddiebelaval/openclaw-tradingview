@@ -1,0 +1,335 @@
+//@version=5
+indicator("Matrix Liquidity Institutional Indicator — GÖKTUĞ ÖZIŞIK | Matrix Trading Lab", shorttitle="Matrix LII | GÖKTUĞ", overlay=true, max_lines_count=300, max_labels_count=300, max_boxes_count=200)
+
+//══════════════════════════════════════════════════════════════════════════════
+// MATRIX TRADING LAB
+// DEVELOPED BY GÖKTUĞ ÖZIŞIK
+//══════════════════════════════════════════════════════════════════════════════
+
+//──────────────────────────────────────────────────────────────────────────────
+// CONSTANTS
+//──────────────────────────────────────────────────────────────────────────────
+BULL = 1
+BEAR = -1
+NEUTRAL = 0
+
+PRESET_MANUAL   = "Manual"
+PRESET_SCALP    = "Scalp"
+PRESET_INTRADAY = "Intraday"
+PRESET_SWING    = "Swing"
+PRESET_CLEAN    = "Clean Chart"
+
+THEME_COLORED = "Colored"
+THEME_MONO    = "Monochrome"
+
+//──────────────────────────────────────────────────────────────────────────────
+// INPUTS
+//──────────────────────────────────────────────────────────────────────────────
+groupCore   = "1. Core Settings"
+groupLiq    = "2. Liquidity Engine"
+groupSweep  = "3. Sweep Logic"
+groupZones  = "4. Zones"
+groupDash   = "5. Dashboard"
+groupAlert  = "6. Alerts"
+
+presetInput = input.string(PRESET_INTRADAY, "Preset", options=[PRESET_MANUAL, PRESET_SCALP, PRESET_INTRADAY, PRESET_SWING, PRESET_CLEAN], group=groupCore)
+themeInput  = input.string(THEME_COLORED, "Theme", options=[THEME_COLORED, THEME_MONO], group=groupCore)
+colorBars   = input.bool(false, "Color Candles By Bias", group=groupCore)
+
+manualSwingLen = input.int(20, "Swing Length", minval=5, maxval=100, group=groupLiq)
+eqThresholdATR = input.float(0.10, "Equal High / Low Threshold (ATR)", step=0.01, minval=0.01, maxval=1.00, group=groupLiq)
+showEQH        = input.bool(true, "Show Equal Highs", group=groupLiq)
+showEQL        = input.bool(true, "Show Equal Lows", group=groupLiq)
+showLiquidityLines = input.bool(true, "Show Liquidity Lines", group=groupLiq)
+
+sweepConfirmMode = input.string("Wick Reclaim", "Sweep Confirmation", options=["Wick Reclaim", "Close Back Inside"], group=groupSweep)
+showBuySideSweeps  = input.bool(true, "Show Buy-Side Sweeps", group=groupSweep)
+showSellSideSweeps = input.bool(true, "Show Sell-Side Sweeps", group=groupSweep)
+
+showPremiumDiscount = input.bool(true, "Show Premium / Discount Zones", group=groupZones)
+
+showDashboard = input.bool(true, "Show Dashboard", group=groupDash)
+dashboardPos  = input.string("Top Right", "Dashboard Position", options=["Top Right", "Top Left", "Bottom Right", "Bottom Left"], group=groupDash)
+
+enableEQAlerts    = input.bool(true, "Enable EQH / EQL Alerts", group=groupAlert)
+enableSweepAlerts = input.bool(true, "Enable Sweep Alerts", group=groupAlert)
+
+//──────────────────────────────────────────────────────────────────────────────
+// COLORS
+//──────────────────────────────────────────────────────────────────────────────
+green    = #10b981
+red      = #ef4444
+blue     = #3b82f6
+orange   = #f59e0b
+gray     = #9ca3af
+monoBull = #c7cad1
+monoBear = #6b7280
+
+bullColor       = themeInput == THEME_MONO ? monoBull : green
+bearColor       = themeInput == THEME_MONO ? monoBear : red
+neutralColor    = gray
+liqHighColor    = themeInput == THEME_MONO ? monoBear : orange
+liqLowColor     = themeInput == THEME_MONO ? monoBull : blue
+premiumColor    = themeInput == THEME_MONO ? monoBear : red
+discountColor   = themeInput == THEME_MONO ? monoBull : green
+equilibriumColor= gray
+panelBg         = color.new(color.black, 12)
+
+//──────────────────────────────────────────────────────────────────────────────
+// PRESETS
+//──────────────────────────────────────────────────────────────────────────────
+swingLen = presetInput == PRESET_MANUAL ? manualSwingLen : presetInput == PRESET_SCALP ? 10 : presetInput == PRESET_INTRADAY ? 20 : presetInput == PRESET_SWING ? 40 : 18
+
+showEqPreset = presetInput == PRESET_CLEAN ? true : (showEQH or showEQL)
+
+//──────────────────────────────────────────────────────────────────────────────
+// HELPERS
+//──────────────────────────────────────────────────────────────────────────────
+f_dash_pos(_pos) =>
+    _pos == "Top Left" ? position.top_left : _pos == "Bottom Right" ? position.bottom_right : _pos == "Bottom Left" ? position.bottom_left : position.top_right
+
+f_bias_text(_bias) =>
+    _bias == BULL ? "Bullish" : _bias == BEAR ? "Bearish" : "Neutral"
+
+f_bias_color(_bias) =>
+    _bias == BULL ? bullColor : _bias == BEAR ? bearColor : neutralColor
+
+f_zone_status(_top, _bottom) =>
+    string result = "N/A"
+    if not na(_top) and not na(_bottom) and _top > _bottom
+        float rng = _top - _bottom
+        result := close >= _top - rng * 0.25 ? "Premium" : close <= _bottom + rng * 0.25 ? "Discount" : "Equilibrium"
+    result
+
+f_zone_color(_txt) =>
+    _txt == "Premium" ? premiumColor : _txt == "Discount" ? discountColor : equilibriumColor
+
+//──────────────────────────────────────────────────────────────────────────────
+// CORE DATA
+//──────────────────────────────────────────────────────────────────────────────
+atr = ta.atr(14)
+
+swingPH = ta.pivothigh(high, swingLen, swingLen)
+swingPL = ta.pivotlow(low, swingLen, swingLen)
+
+//──────────────────────────────────────────────────────────────────────────────
+// STATE
+//──────────────────────────────────────────────────────────────────────────────
+var float lastSwingHigh = na
+var float prevSwingHigh = na
+var int   lastSwingHighBar = na
+var int   prevSwingHighBar = na
+
+var float lastSwingLow = na
+var float prevSwingLow = na
+var int   lastSwingLowBar = na
+var int   prevSwingLowBar = na
+
+var int bias = NEUTRAL
+
+var float activeEQH = na
+var int   activeEQHBar = na
+var line  activeEQHLine = na
+var label activeEQHLabel = na
+var bool  activeEQHSwept = false
+
+var float activeEQL = na
+var int   activeEQLBar = na
+var line  activeEQLLine = na
+var label activeEQLLabel = na
+var bool  activeEQLSwept = false
+
+var float trailingTop = na
+var float trailingBottom = na
+
+var string lastEvent = "None"
+
+// Alerts
+var bool alertEQH = false
+var bool alertEQL = false
+var bool alertBuySideSweep = false
+var bool alertSellSideSweep = false
+
+alertEQH := false
+alertEQL := false
+alertBuySideSweep := false
+alertSellSideSweep := false
+
+//──────────────────────────────────────────────────────────────────────────────
+// SWING STORAGE
+//──────────────────────────────────────────────────────────────────────────────
+if not na(swingPH)
+    prevSwingHigh := lastSwingHigh
+    prevSwingHighBar := lastSwingHighBar
+    lastSwingHigh := swingPH
+    lastSwingHighBar := bar_index - swingLen
+
+    if na(trailingTop) or lastSwingHigh >= trailingTop
+        trailingTop := lastSwingHigh
+
+    if showEQH and not na(prevSwingHigh) and math.abs(lastSwingHigh - prevSwingHigh) <= atr * eqThresholdATR
+        activeEQH := math.max(lastSwingHigh, prevSwingHigh)
+        activeEQHBar := lastSwingHighBar
+        activeEQHSwept := false
+
+        if not na(activeEQHLine)
+            line.delete(activeEQHLine)
+        if not na(activeEQHLabel)
+            label.delete(activeEQHLabel)
+
+        if showLiquidityLines
+            activeEQHLine := line.new(prevSwingHighBar, activeEQH, bar_index, activeEQH, xloc=xloc.bar_index, extend=extend.right, color=liqHighColor, style=line.style_dotted, width=1)
+        activeEQHLabel := label.new(math.round((prevSwingHighBar + lastSwingHighBar) * 0.5), activeEQH, "EQH", xloc=xloc.bar_index, style=label.style_label_down, textcolor=liqHighColor, color=color.new(color.black, 100), size=size.tiny)
+
+        alertEQH := true
+        lastEvent := "Equal Highs Detected"
+
+if not na(swingPL)
+    prevSwingLow := lastSwingLow
+    prevSwingLowBar := lastSwingLowBar
+    lastSwingLow := swingPL
+    lastSwingLowBar := bar_index - swingLen
+
+    if na(trailingBottom) or lastSwingLow <= trailingBottom
+        trailingBottom := lastSwingLow
+
+    if showEQL and not na(prevSwingLow) and math.abs(lastSwingLow - prevSwingLow) <= atr * eqThresholdATR
+        activeEQL := math.min(lastSwingLow, prevSwingLow)
+        activeEQLBar := lastSwingLowBar
+        activeEQLSwept := false
+
+        if not na(activeEQLLine)
+            line.delete(activeEQLLine)
+        if not na(activeEQLLabel)
+            label.delete(activeEQLLabel)
+
+        if showLiquidityLines
+            activeEQLLine := line.new(prevSwingLowBar, activeEQL, bar_index, activeEQL, xloc=xloc.bar_index, extend=extend.right, color=liqLowColor, style=line.style_dotted, width=1)
+        activeEQLLabel := label.new(math.round((prevSwingLowBar + lastSwingLowBar) * 0.5), activeEQL, "EQL", xloc=xloc.bar_index, style=label.style_label_up, textcolor=liqLowColor, color=color.new(color.black, 100), size=size.tiny)
+
+        alertEQL := true
+        lastEvent := "Equal Lows Detected"
+
+//──────────────────────────────────────────────────────────────────────────────
+// BIAS
+//──────────────────────────────────────────────────────────────────────────────
+if not na(lastSwingHigh) and close > lastSwingHigh
+    bias := BULL
+if not na(lastSwingLow) and close < lastSwingLow
+    bias := BEAR
+
+//──────────────────────────────────────────────────────────────────────────────
+// SWEEP DETECTION
+//──────────────────────────────────────────────────────────────────────────────
+buySideSweep = false
+sellSideSweep = false
+
+if showBuySideSweeps and not na(activeEQH) and not activeEQHSwept
+    buySideSweep := sweepConfirmMode == "Wick Reclaim" ? (high > activeEQH and close < activeEQH) : (high > activeEQH and close <= activeEQH)
+    if buySideSweep
+        activeEQHSwept := true
+        label.new(bar_index, high, "BSL Sweep", xloc=xloc.bar_index, style=label.style_label_down, textcolor=bearColor, color=color.new(color.black, 100), size=size.small)
+        alertBuySideSweep := true
+        lastEvent := "Buy-Side Liquidity Sweep"
+
+if showSellSideSweeps and not na(activeEQL) and not activeEQLSwept
+    sellSideSweep := sweepConfirmMode == "Wick Reclaim" ? (low < activeEQL and close > activeEQL) : (low < activeEQL and close >= activeEQL)
+    if sellSideSweep
+        activeEQLSwept := true
+        label.new(bar_index, low, "SSL Sweep", xloc=xloc.bar_index, style=label.style_label_up, textcolor=bullColor, color=color.new(color.black, 100), size=size.small)
+        alertSellSideSweep := true
+        lastEvent := "Sell-Side Liquidity Sweep"
+
+// Extend liquidity lines
+if not na(activeEQHLine)
+    line.set_x2(activeEQHLine, bar_index + 1)
+if not na(activeEQLLine)
+    line.set_x2(activeEQLLine, bar_index + 1)
+
+//──────────────────────────────────────────────────────────────────────────────
+// PREMIUM / DISCOUNT
+//──────────────────────────────────────────────────────────────────────────────
+float premiumTopPlot = na
+float premiumBottomPlot = na
+float eqTopPlot = na
+float eqBottomPlot = na
+float discountTopPlot = na
+float discountBottomPlot = na
+
+if showPremiumDiscount and not na(trailingTop) and not na(trailingBottom) and trailingTop > trailingBottom
+    premiumTopPlot := trailingTop
+    premiumBottomPlot := trailingTop * 0.95 + trailingBottom * 0.05
+    eqTopPlot := trailingTop * 0.525 + trailingBottom * 0.475
+    eqBottomPlot := trailingBottom * 0.525 + trailingTop * 0.475
+    discountTopPlot := trailingBottom * 0.95 + trailingTop * 0.05
+    discountBottomPlot := trailingBottom
+
+pPremiumTop = plot(premiumTopPlot, title="Premium Top", display=display.none)
+pPremiumBot = plot(premiumBottomPlot, title="Premium Bottom", display=display.none)
+pEqTop      = plot(eqTopPlot, title="Equilibrium Top", display=display.none)
+pEqBot      = plot(eqBottomPlot, title="Equilibrium Bottom", display=display.none)
+pDiscTop    = plot(discountTopPlot, title="Discount Top", display=display.none)
+pDiscBot    = plot(discountBottomPlot, title="Discount Bottom", display=display.none)
+
+fill(pPremiumTop, pPremiumBot, color=color.new(premiumColor, 88), title="Premium Zone")
+fill(pEqTop, pEqBot, color=color.new(equilibriumColor, 90), title="Equilibrium Zone")
+fill(pDiscTop, pDiscBot, color=color.new(discountColor, 88), title="Discount Zone")
+
+//──────────────────────────────────────────────────────────────────────────────
+// CANDLE COLORING
+//──────────────────────────────────────────────────────────────────────────────
+barCol = bias == BULL ? bullColor : bias == BEAR ? bearColor : na
+plotcandle(colorBars ? open : na, high, low, close, color=barCol, wickcolor=barCol, bordercolor=barCol)
+
+//──────────────────────────────────────────────────────────────────────────────
+// DASHBOARD
+//──────────────────────────────────────────────────────────────────────────────
+var table dash = table.new(position.top_right, 2, 9, border_width=1)
+
+if barstate.islast
+    table.set_position(dash, f_dash_pos(dashboardPos))
+
+    if showDashboard
+        string zoneText = f_zone_status(trailingTop, trailingBottom)
+        string eqhStatus = na(activeEQH) ? "None" : activeEQHSwept ? "Swept" : "Active"
+        string eqlStatus = na(activeEQL) ? "None" : activeEQLSwept ? "Swept" : "Active"
+
+        table.cell(dash, 0, 0, "Matrix Trading Lab", text_color=color.white, bgcolor=color.new(color.black, 0))
+        table.cell(dash, 1, 0, "Liquidity", text_color=color.white, bgcolor=color.new(color.black, 0))
+
+        table.cell(dash, 0, 1, "Bias", text_color=color.white, bgcolor=panelBg)
+        table.cell(dash, 1, 1, f_bias_text(bias), text_color=f_bias_color(bias), bgcolor=panelBg)
+
+        table.cell(dash, 0, 2, "EQH", text_color=color.white, bgcolor=panelBg)
+        table.cell(dash, 1, 2, eqhStatus, text_color=na(activeEQH) ? neutralColor : activeEQHSwept ? bearColor : liqHighColor, bgcolor=panelBg)
+
+        table.cell(dash, 0, 3, "EQL", text_color=color.white, bgcolor=panelBg)
+        table.cell(dash, 1, 3, eqlStatus, text_color=na(activeEQL) ? neutralColor : activeEQLSwept ? bullColor : liqLowColor, bgcolor=panelBg)
+
+        table.cell(dash, 0, 4, "EQH Level", text_color=color.white, bgcolor=panelBg)
+        table.cell(dash, 1, 4, na(activeEQH) ? "N/A" : str.tostring(activeEQH, format.mintick), text_color=liqHighColor, bgcolor=panelBg)
+
+        table.cell(dash, 0, 5, "EQL Level", text_color=color.white, bgcolor=panelBg)
+        table.cell(dash, 1, 5, na(activeEQL) ? "N/A" : str.tostring(activeEQL, format.mintick), text_color=liqLowColor, bgcolor=panelBg)
+
+        table.cell(dash, 0, 6, "Top", text_color=color.white, bgcolor=panelBg)
+        table.cell(dash, 1, 6, na(trailingTop) ? "N/A" : str.tostring(trailingTop, format.mintick), text_color=liqHighColor, bgcolor=panelBg)
+
+        table.cell(dash, 0, 7, "Bottom", text_color=color.white, bgcolor=panelBg)
+        table.cell(dash, 1, 7, na(trailingBottom) ? "N/A" : str.tostring(trailingBottom, format.mintick), text_color=liqLowColor, bgcolor=panelBg)
+
+        table.cell(dash, 0, 8, "Zone", text_color=color.white, bgcolor=panelBg)
+        table.cell(dash, 1, 8, zoneText, text_color=f_zone_color(zoneText), bgcolor=panelBg)
+    else
+        for r = 0 to 8
+            table.cell(dash, 0, r, "", bgcolor=color.new(color.black, 100))
+            table.cell(dash, 1, r, "", bgcolor=color.new(color.black, 100))
+
+//──────────────────────────────────────────────────────────────────────────────
+// ALERTS
+//──────────────────────────────────────────────────────────────────────────────
+alertcondition(enableEQAlerts and alertEQH, "Equal Highs Detected", "Matrix Liquidity Indicator: Equal Highs detected")
+alertcondition(enableEQAlerts and alertEQL, "Equal Lows Detected", "Matrix Liquidity Indicator: Equal Lows detected")
+
+alertcondition(enableSweepAlerts and alertBuySideSweep, "Buy-Side Liquidity Sweep", "Matrix Liquidity Indicator: Buy-Side Liquidity Sweep")
+alertcondition(enableSweepAlerts and alertSellSideSweep, "Sell-Side Liquidity Sweep", "Matrix Liquidity Indicator: Sell-Side Liquidity Sweep")

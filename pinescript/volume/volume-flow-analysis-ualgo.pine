@@ -1,0 +1,262 @@
+// This work is licensed under Creative Commons Attribution-NonCommercial-ShareAlike 4.0 International  
+// https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © UAlgo
+//@version=6
+indicator("Volume Flow Analysis [UAlgo]", overlay = true, max_boxes_count = 1000, max_lines_count = 500, max_labels_count = 500)
+
+int i_buckets = input.int(50, "Price Levels", minval = 10, maxval = 200, group = "Core")
+float i_decay = input.float(0.98, "Decay Factor", minval = 0.5, maxval = 1.0, step = 0.01, group = "Core")
+int i_width = input.int(100, "Map Width", minval = 10, maxval = 500, group = "Core")
+int i_lookback = input.int(1000, "Max Lookback", minval = 10, maxval = 5000, group = "Core")
+
+bool i_showSt = input.bool(true, "Stealth Flow", group = "Display", inline = "d1")
+bool i_showRng = input.bool(true, "Range Box", group = "Display", inline = "d1")
+bool i_showPOC = input.bool(true, "POC", group = "Display", inline = "d2")
+bool i_extPOC = input.bool(true, "Extend POC", group = "Display", inline = "d2")
+bool i_showVA = input.bool(true, "Value Area", group = "Display", inline = "d3")
+bool i_showLeg = input.bool(true, "Legend", group = "Display", inline = "d3")
+
+float i_imbRatio = input.float(3.0, "Imbalance Ratio", minval = 1.5, step = 0.1, group = "Analysis")
+bool i_showImb = input.bool(true, "Show Imbalances", group = "Analysis", inline = "a1")
+bool i_showAbs = input.bool(true, "Show Absorption", group = "Analysis", inline = "a1")
+bool i_showShp = input.bool(true, "Show Profile Shape", group = "Analysis", inline = "a2")
+bool i_showZones = input.bool(true, "Extend Imbalances", group = "Analysis", inline = "a2")
+
+color c_sell = input.color(color.rgb(244, 67, 54, 65), "Sell", group = "Colors", inline = "c1")
+color c_buy = input.color(color.rgb(0, 230, 118, 65), "Buy", group = "Colors", inline = "c1")
+color c_stealth = input.color(color.rgb(255, 215, 0, 18), "Stealth", group = "Colors", inline = "c1")
+color c_range = input.color(color.rgb(97, 97, 97, 50), "Range", group = "Colors", inline = "c2")
+color c_border = input.color(color.rgb(33, 33, 33, 80), "Border", group = "Colors", inline = "c2")
+color c_poc = input.color(color.rgb(255, 255, 255, 30), "POC", group = "Colors", inline = "c3")
+color c_va = input.color(color.rgb(100, 181, 246, 50), "VA", group = "Colors", inline = "c3")
+
+var array<box> _boxes = array.new<box>()
+var array<line> _lines = array.new<line>()
+var array<label> _labels = array.new<label>()
+var table tb = na
+
+if barstate.islast
+    if _boxes.size() > 0
+        for b in _boxes
+            b.delete()
+        _boxes.clear()
+    if _lines.size() > 0
+        for l in _lines
+            l.delete()
+        _lines.clear()
+    if _labels.size() > 0
+        for lb in _labels
+            lb.delete()
+        _labels.clear()
+
+    int nCalc = i_decay == 1.0 ? i_lookback : int(math.ceil(math.log(0.01) / math.log(i_decay)))
+    int N = math.max(1, math.min(nCalc, i_lookback))
+    N := math.min(N, bar_index)
+    
+    float pH = high[0]
+    float pL = low[0]
+    for i = 0 to N - 1
+        pH := math.max(pH, high[i])
+        pL := math.min(pL, low[i])
+        
+    float bSz = (pH - pL) / i_buckets
+    
+    array<float> bVol = array.new<float>(i_buckets, 0.0)
+    array<float> sVol = array.new<float>(i_buckets, 0.0)
+    array<float> stV = array.new<float>(i_buckets, 0.0)
+    
+    if bSz > 0
+        for i = 0 to N - 1
+            float h_i = high[i]
+            float l_i = low[i]
+            float c_i = close[i]
+            float v_i = volume[i]
+            float rng = h_i - l_i
+            float d_m = math.pow(i_decay, i)
+            
+            float b_v = rng == 0 ? (v_i / 2) : (v_i * (c_i - l_i) / rng)
+            float s_v = v_i - b_v
+            float st_m = v_i == 0 ? rng : rng / v_i
+            
+            if rng > 0
+                int minIdx = math.max(0, math.floor((l_i - pL) / bSz))
+                int maxIdx = math.min(i_buckets - 1, math.floor((h_i - pL) / bSz))
+                for j = minIdx to maxIdx
+                    float b_min = pL + j * bSz
+                    float b_max = b_min + bSz
+                    float ovr = math.max(0, math.min(h_i, b_max) - math.max(l_i, b_min))
+                    if ovr > 0
+                        float prop = ovr / rng
+                        bVol.set(j, bVol.get(j) + b_v * prop * d_m)
+                        sVol.set(j, sVol.get(j) + s_v * prop * d_m)
+                        stV.set(j, stV.get(j) + st_m * prop * d_m)
+            else
+                int idx = math.max(0, math.min(i_buckets - 1, math.floor((c_i - pL) / bSz)))
+                bVol.set(idx, bVol.get(idx) + b_v * d_m)
+                sVol.set(idx, sVol.get(idx) + s_v * d_m)
+                stV.set(idx, stV.get(idx) + st_m * d_m)
+
+    float tVolMax = 0.0
+    float stMax = 0.0
+    float stMin = 1e10
+    int poc = 0
+    float pocV = 0.0
+    float sumV = 0.0
+    array<float> tVol = array.new<float>(i_buckets, 0.0)
+    
+    for j = 0 to i_buckets - 1
+        float t = bVol.get(j) + sVol.get(j)
+        float st = stV.get(j)
+        tVol.set(j, t)
+        sumV += t
+        if t > tVolMax
+            tVolMax := t
+        if t > pocV
+            pocV := t
+            poc := j
+        if st > stMax
+            stMax := st
+        if st < stMin and st > 0
+            stMin := st
+
+    float trg = sumV * 0.70
+    float cur = pocV
+    int vH = poc
+    int vL = poc
+    while cur < trg and (vH < i_buckets - 1 or vL > 0)
+        float vUp = vH < i_buckets - 1 ? tVol.get(vH + 1) : -1.0
+        float vDn = vL > 0 ? tVol.get(vL - 1) : -1.0
+        if vUp >= vDn and vUp >= 0
+            vH += 1
+            cur += vUp
+        else if vDn > vUp and vDn >= 0
+            vL -= 1
+            cur += vDn
+        else
+            break
+
+    float vTop = 0.0
+    float vMid = 0.0
+    float vBot = 0.0
+    int third = math.floor(i_buckets / 3)
+    for j = 0 to i_buckets - 1
+        float v = tVol.get(j)
+        if j < third
+            vBot += v
+        else if j < third * 2
+            vMid += v
+        else
+            vTop += v
+            
+    string shp = "D-Shape (Balanced)"
+    if vTop > sumV * 0.20 and vBot > sumV * 0.20 and vMid < sumV * 0.50
+        shp := "B-Shape (Double Dist)"
+    else if poc > i_buckets * 0.5 and vTop > vBot * 1.3
+        shp := "P-Shape (Short Covering)"
+    else if poc < i_buckets * 0.5 and vBot > vTop * 1.3
+        shp := "b-Shape (Long Liquidation)"
+
+    float avgV = sumV / i_buckets
+    float avgSt = 0.0
+    int stCnt = 0
+    for j = 0 to i_buckets - 1
+        if stV.get(j) > 0
+            avgSt += stV.get(j)
+            stCnt += 1
+    avgSt := stCnt > 0 ? avgSt / stCnt : 0.0
+
+    int xStart = bar_index + 1
+    
+    for j = 0 to i_buckets - 1
+        float t = tVol.get(j)
+        if t > 0
+            float b = bVol.get(j)
+            float s = sVol.get(j)
+            float st = stV.get(j)
+            float pLo = pL + j * bSz
+            float pHi = pLo + bSz
+            
+            bool imbB = i_showImb and s > 0 and b / s >= i_imbRatio
+            bool imbS = i_showImb and b > 0 and s / b >= i_imbRatio
+            bool absr = i_showAbs and t > avgV * 1.5 and st < avgSt * 0.5
+            
+            int wS = int((s / tVolMax) * i_width)
+            int wB = int((b / tVolMax) * i_width)
+            int wSt = int(((st - stMin) / math.max(1e-10, stMax - stMin)) * (i_width / 2))
+            
+            color cS = imbS ? color.new(c_sell, 0) : c_sell
+            color cB = imbB ? color.new(c_buy, 0) : c_buy
+            color bc = absr ? color.rgb(255, 0, 255) : c_border
+            int bw = absr ? 2 : 1
+            
+            if wS > 0
+                _boxes.push(box.new(xStart, pHi, xStart + wS, pLo, bgcolor = cS, border_color = bc, border_width = bw))
+            if wB > 0
+                _boxes.push(box.new(xStart + wS, pHi, xStart + wS + wB, pLo, bgcolor = cB, border_color = bc, border_width = bw))
+            if i_showSt and wSt > 0
+                _boxes.push(box.new(xStart + wS + wB, pHi, xStart + wS + wB + wSt, pLo, bgcolor = c_stealth, border_color = bc, border_width = 1))
+                
+            if i_showZones
+                if imbB
+                    _boxes.push(box.new(bar_index - N + 1, pHi, bar_index + 1, pLo, bgcolor = color.new(c_buy, 90), border_color = na))
+                if imbS
+                    _boxes.push(box.new(bar_index - N + 1, pHi, bar_index + 1, pLo, bgcolor = color.new(c_sell, 90), border_color = na))
+                if absr
+                    _boxes.push(box.new(bar_index - N + 1, pHi, bar_index + 1, pLo, bgcolor = color.new(color.rgb(255, 0, 255), 85), border_color = na))
+
+    if i_showRng
+        _boxes.push(box.new(bar_index - N + 1, pH, bar_index + 1, pL, bgcolor = na, border_color = c_range, border_style = line.style_dashed))
+        _labels.push(label.new(bar_index - int(N / 2) + 1, pH, "N: " + str.tostring(N), textcolor = c_range, style = label.style_label_down, color = color.new(color.black, 100), size = size.small))
+
+    if i_showPOC
+        float pPrice = pL + (poc + 0.5) * bSz
+        int endX = i_extPOC ? bar_index + i_width : bar_index + 1
+        _lines.push(line.new(bar_index - N + 1, pPrice, endX, pPrice, color = c_poc, width = 2))
+
+    if i_showVA
+        float vaTop = pL + (vH + 1) * bSz
+        float vaBot = pL + vL * bSz
+        _boxes.push(box.new(bar_index + 1, vaTop, bar_index + 1 + i_width, vaBot, border_color = c_va, bgcolor = color.new(c_va, 90), border_style = line.style_dashed))
+
+    if i_showShp
+        color shpCol = color.gray
+        if str.contains(shp, "P-Shape")
+            shpCol := c_buy
+        else if str.contains(shp, "b-Shape")
+            shpCol := c_sell
+        _labels.push(label.new(bar_index + i_width + 2, pH, shp, color = color.new(color.black, 100), textcolor = color.new(shpCol, 0), style = label.style_label_left, size = size.normal))
+
+    if i_showLeg
+        if na(tb)
+            tb := table.new(position.bottom_right, 2, 9, bgcolor = color.rgb(18, 18, 18, 20), border_width = 1, border_color = color.rgb(50, 50, 50))
+        table.cell(tb, 0, 0, "VFA", text_color = color.white, bgcolor = color.rgb(40, 40, 40), text_halign = text.align_center, text_size = size.small)
+        table.cell(tb, 1, 0, " UAlgo Flow Cheat Sheet", text_color = color.rgb(200, 200, 200), text_halign = text.align_left, text_size = size.small, bgcolor = color.rgb(40, 40, 40))
+        table.cell(tb, 0, 1, "▮", text_color = c_sell, text_halign = text.align_center)
+        table.cell(tb, 1, 1, " Sell Pressure", text_color = color.rgb(200, 200, 200), text_halign = text.align_left, text_size = size.small)
+        table.cell(tb, 0, 2, "▮", text_color = c_buy, text_halign = text.align_center)
+        table.cell(tb, 1, 2, " Buy Pressure", text_color = color.rgb(200, 200, 200), text_halign = text.align_left, text_size = size.small)
+        if i_showSt
+            table.cell(tb, 0, 3, "▮", text_color = c_stealth, text_halign = text.align_center)
+            table.cell(tb, 1, 3, " Stealth Flow", text_color = color.rgb(200, 200, 200), text_halign = text.align_left, text_size = size.small)
+        if i_showPOC or i_showVA
+            string info = (i_showPOC ? "POC" : "") + (i_showPOC and i_showVA ? " · " : "") + (i_showVA ? "VA 70%" : "")
+            table.cell(tb, 0, 4, "◇", text_color = color.rgb(100, 181, 246), text_halign = text.align_center, text_size = size.small)
+            table.cell(tb, 1, 4, " " + info, text_color = color.rgb(200, 200, 200), text_halign = text.align_left, text_size = size.small)
+        float tB = bVol.sum()
+        float tS = sVol.sum()
+        float tV = tB + tS
+        float pB = tV > 0 ? (tB / tV) * 100 : 0
+        float pS = tV > 0 ? (tS / tV) * 100 : 0
+        string dTxt = pB >= pS ? "Bullish " + str.tostring(pB, "#") + "%" : "Bearish " + str.tostring(pS, "#") + "%"
+        color dCol = pB >= pS ? c_buy : c_sell
+        table.cell(tb, 0, 5, "⚡", text_color = dCol, text_halign = text.align_center, text_size = size.small)
+        table.cell(tb, 1, 5, " " + dTxt, text_color = color.rgb(200, 200, 200), text_halign = text.align_left, text_size = size.small)
+        if i_showShp
+            table.cell(tb, 0, 6, "∑", text_color = color.rgb(156, 39, 176), text_halign = text.align_center, text_size = size.small)
+            table.cell(tb, 1, 6, " " + shp, text_color = color.rgb(200, 200, 200), text_halign = text.align_left, text_size = size.small)
+        if i_showImb
+            table.cell(tb, 0, 7, "━", text_color = color.new(c_buy, 0), text_halign = text.align_center, text_size = size.small)
+            table.cell(tb, 1, 7, " Imbalance Zones", text_color = color.rgb(200, 200, 200), text_halign = text.align_left, text_size = size.small)
+        if i_showAbs
+            table.cell(tb, 0, 8, "□", text_color = color.rgb(255, 0, 255), text_halign = text.align_center, text_size = size.small)
+            table.cell(tb, 1, 8, " Absorption (Magenta)", text_color = color.rgb(200, 200, 200), text_halign = text.align_left, text_size = size.small)

@@ -1,0 +1,132 @@
+// This Pine Script™ code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © CandleSyntax
+
+//@version=6
+indicator("[CS] Volume Spike Detector", overlay=true, max_labels_count=500)
+
+// ──────────────────────────────────────────────────────────────────────────────
+//  INPUTS
+// ──────────────────────────────────────────────────────────────────────────────
+
+grpDetection  = "Detection"
+lookback      = input.int(50, "Lookback Period", minval=10, maxval=500, tooltip="Bars used for average volume and standard deviation.", group=grpDetection)
+threshold     = input.float(2.0, "Spike Threshold (Z-Score)", minval=0.5, step=0.1, tooltip="Standard deviations above average to qualify as a spike.", group=grpDetection)
+majorMult     = input.float(1.5, "Major Spike Multiplier", minval=1.1, step=0.1, tooltip="Multiplied by threshold for Major classification.", group=grpDetection)
+
+grpSession    = "Session Filter"
+useSessionFilter = input.bool(true, "Enable Session-Aware Mode", tooltip="Excludes the first N minutes after market open from detection. Prevents false spikes at 9:30 AM open.", group=grpSession)
+openMinutes      = input.int(5, "Ignore First N Minutes", minval=1, maxval=30, tooltip="Minutes after session open to exclude. The opening burst is expected — not a true spike.", group=grpSession)
+sessionOpen      = input.int(930, "Session Open (HHMM)", tooltip="Session open time in HHMM format. Default 930 = 9:30 AM ET.", group=grpSession)
+utcOffset        = input.int(-5, "UTC Offset", minval=-12, maxval=12, tooltip="Your exchange timezone offset from UTC. ET = -5, CT = -6.", group=grpSession)
+
+grpDisplay    = "Display"
+showLabels    = input.bool(true, "Show Labels", tooltip="Small label on major spikes only.", group=grpDisplay)
+showTable     = input.bool(true, "Show Stats Table", group=grpDisplay)
+tablePos      = input.string("Bottom Right", "Table Position", options=["Top Left", "Top Right", "Bottom Left", "Bottom Right"], group=grpDisplay)
+
+grpColors     = "Colors"
+bullSpike     = input.color(#26a69a, "Bullish Spike", group=grpColors)
+bearSpike     = input.color(#ef5350, "Bearish Spike", group=grpColors)
+neutralColor  = input.color(#787b86, "Normal Candles", group=grpColors)
+
+// ──────────────────────────────────────────────────────────────────────────────
+//  SESSION FILTER — Ignore opening burst
+// ──────────────────────────────────────────────────────────────────────────────
+
+// Convert session open HHMM to hour/minute
+openHour   = math.floor(sessionOpen / 100)
+openMin    = sessionOpen % 100
+
+// Current bar time in exchange timezone
+barHour    = hour(time, syminfo.timezone)
+barMin     = minute(time, syminfo.timezone)
+barTimeMin = barHour * 60 + barMin
+openTimeMin = openHour * 60 + openMin
+
+// Is this bar within the "opening burst" window?
+inOpeningBurst = useSessionFilter and (barTimeMin >= openTimeMin) and (barTimeMin < openTimeMin + openMinutes)
+
+// ──────────────────────────────────────────────────────────────────────────────
+//  CALCULATIONS
+// ──────────────────────────────────────────────────────────────────────────────
+
+avgVol   = ta.sma(volume, lookback)
+stdVol   = ta.stdev(volume, lookback)
+
+// Z-Score
+zScore   = stdVol > 0 ? (volume - avgVol) / stdVol : 0.0
+
+// Spike classification — suppressed during opening burst
+isSpike   = zScore >= threshold and not inOpeningBurst
+isMajor   = zScore >= (threshold * majorMult) and not inOpeningBurst
+
+// Direction
+isBullish = close >= open
+
+// ──────────────────────────────────────────────────────────────────────────────
+//  CANDLE COLORING — The primary visual. Neutral chart, spikes pop.
+// ──────────────────────────────────────────────────────────────────────────────
+
+// Normal candles: muted neutral gray
+// Spike candles: teal (bull) or coral (bear)
+// Major spikes: same color, full opacity
+candleColor = isMajor  ? (isBullish ? bullSpike : bearSpike) :
+              isSpike  ? (isBullish ? color.new(bullSpike, 30) : color.new(bearSpike, 30)) :
+              neutralColor
+
+barcolor(candleColor, title="Candle Color")
+
+// ──────────────────────────────────────────────────────────────────────────────
+//  LABELS — Minimal. Major spikes only. Small, clean.
+// ──────────────────────────────────────────────────────────────────────────────
+
+if showLabels and isMajor
+    volRatio  = math.round(volume / avgVol, 1)
+    lblText   = str.tostring(volRatio) + "x"
+    lblY      = isBullish ? low : high
+    lblStyle  = isBullish ? label.style_label_up : label.style_label_down
+    lblColor  = isBullish ? bullSpike : bearSpike
+
+    label.new(bar_index, lblY, lblText, style=lblStyle, color=lblColor, textcolor=#131722, size=size.tiny)
+
+// ──────────────────────────────────────────────────────────────────────────────
+//  STATS TABLE — Compact, 3 rows
+// ──────────────────────────────────────────────────────────────────────────────
+
+tblPos = switch tablePos
+    "Top Left"     => position.top_left
+    "Top Right"    => position.top_right
+    "Bottom Left"  => position.bottom_left
+    => position.bottom_right
+
+var table tbl = table.new(tblPos, 2, 3, bgcolor=color.new(#131722, 5), border_color=color.new(#2a2e39, 0), border_width=1, frame_color=color.new(#2a2e39, 0), frame_width=1)
+
+if showTable and barstate.islast
+    volRatio = avgVol > 0 ? volume / avgVol : 0.0
+
+    // Row 0: Volume vs average
+    ratioColor = isSpike ? (isBullish ? bullSpike : bearSpike) : color.new(color.white, 50)
+    table.cell(tbl, 0, 0, "Vol", text_color=color.new(color.white, 60), text_size=size.tiny, text_halign=text.align_left)
+    table.cell(tbl, 1, 0, str.tostring(volRatio, "#.#") + "x", text_color=ratioColor, text_size=size.tiny, text_halign=text.align_right)
+
+    // Row 1: Z-Score
+    zColor = zScore >= threshold ? (isBullish ? bullSpike : bearSpike) : color.new(color.white, 50)
+    table.cell(tbl, 0, 1, "Z", text_color=color.new(color.white, 60), text_size=size.tiny, text_halign=text.align_left)
+    table.cell(tbl, 1, 1, str.tostring(zScore, "#.#"), text_color=zColor, text_size=size.tiny, text_halign=text.align_right)
+
+    // Row 2: Status
+    statusText  = inOpeningBurst ? "OPEN" : isMajor ? "MAJOR" : isSpike ? "SPIKE" : "—"
+    statusColor = inOpeningBurst ? color.new(color.white, 50) : isMajor ? (isBullish ? bullSpike : bearSpike) : isSpike ? (isBullish ? bullSpike : bearSpike) : color.new(color.white, 70)
+    table.cell(tbl, 0, 2, " ", text_color=color.new(color.white, 60), text_size=size.tiny, text_halign=text.align_left)
+    table.cell(tbl, 1, 2, statusText, text_color=statusColor, text_size=size.tiny, text_halign=text.align_right)
+
+// ──────────────────────────────────────────────────────────────────────────────
+//  ALERTS
+// ──────────────────────────────────────────────────────────────────────────────
+
+alertcondition(isSpike and isBullish,    title="Bullish Spike",  message="[CS] Bullish volume spike — {{plot_0}}x avg volume")
+alertcondition(isSpike and not isBullish, title="Bearish Spike",  message="[CS] Bearish volume spike — {{plot_0}}x avg volume")
+alertcondition(isMajor,                   title="Major Spike",    message="[CS] Major volume spike — {{plot_0}}x avg volume")
+
+plot(avgVol > 0 ? volume / avgVol : 0, "Vol Ratio", display=display.none)
+plot(zScore, "Z-Score", display=display.none)

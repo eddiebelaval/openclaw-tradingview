@@ -1,0 +1,159 @@
+// © ZakAlgoTrade
+//@version=6
+indicator("Adaptive Momentum Ribbon", shorttitle="AMR", overlay=true, max_labels_count=500, max_lines_count=500)
+
+// ─── INPUTS ──────────────────────────────────────────────────────────────────
+length       = input.int(20, "Momentum Period", minval=2, 
+     tooltip="Lookback period for the median deviation calculation. Higher values produce slower, smoother signals.")
+smoothLength = input.int(3, "Butterworth Smoothing", minval=1, 
+     tooltip="Controls the responsiveness of the Butterworth low-pass filter.")
+src          = input.source(close, "Source", 
+     tooltip="Price data used for all calculations.")
+
+bool   disp_lvl = input.bool(true, "Show Invalidation Levels", 
+     tooltip="When enabled, a dashed line marks the price level where the current signal becomes invalidated.")
+bool   disp_ch  = input.bool(true, "Show Keltner Channel", 
+     tooltip="Toggle the Keltner Channel envelope overlay.")
+bool   waitClose = input.bool(true, "Confirm Signals on Bar Close", 
+     tooltip="When enabled, signals only confirm after the bar closes, eliminating intrabar repainting.")
+
+color up_color = input.color(#55ffda, "Bullish", inline="color", group="Colors")
+color dn_color = input.color(#8c5bff, "Bearish", inline="color", group="Colors")
+
+// ─── KELTNER CHANNEL INPUTS ─────────────────────────────────────────────────
+lengthkc = input.int(20, "KC Length", minval=1, group="Keltner Channel")
+kcMaType = input.string("EMA", "KC MA Type", 
+     options=["SMA", "EMA", "SMMA (RMA)", "WMA", "VWMA"], group="Keltner Channel")
+atrLen   = input.int(14, "ATR Length", minval=1, group="Keltner Channel")
+mult_kc  = input.float(2.0, "ATR Multiplier", minval=0.1, maxval=10.0, step=0.1, group="Keltner Channel")
+kcOffset = input.int(0, "KC Offset", minval=-500, maxval=500, group="Keltner Channel", display=display.none)
+
+// ─── BUTTERWORTH LOW-PASS FILTER ────────────────────────────────────────────
+f_butterworth(float source, int len) =>
+    var float prev1 = na
+    var float prev2 = na
+    float pi_val = 3.14159265359
+    float safe_len = math.max(len, 1)
+    float a  = math.exp(-math.sqrt(2.0) * pi_val / safe_len)
+    float b  = 2.0 * a * math.cos(math.sqrt(2.0) * pi_val / safe_len)
+    float c2 = b
+    float c3 = -a * a
+    float c1 = 1.0 - c2 - c3
+    float result = na
+    if na(prev1) or na(prev2)
+        prev1 := source
+        prev2 := source
+        result := source
+    else
+        result := c1 * source + c2 * nz(prev1) + c3 * nz(prev2)
+    prev2 := prev1
+    prev1 := result
+    result
+
+// ─── CONFIRMED SOURCE (Anti-Repaint) ───────────────────────────────────────
+// Use previous bar's confirmed close to eliminate intrabar recalculation
+float conf_src = waitClose ? src[1] : src
+
+// ─── CORE OSCILLATOR: MAD Z-SCORE (Non-Repainting) ─────────────────────────
+median_val = ta.percentile_nearest_rank(conf_src, length, 50)
+deviation  = conf_src - median_val
+med_dev    = ta.percentile_nearest_rank(math.abs(deviation), length, 50)
+mad_scale  = med_dev == 0 ? ta.stdev(conf_src, length) : med_dev * 1.4826
+raw_osc    = mad_scale != 0 ? deviation / mad_scale : 0.0
+
+// Apply Butterworth smoothing
+signal_osc = f_butterworth(raw_osc, smoothLength)
+
+// ─── VOLATILITY ZONE ───────────────────────────────────────────────────────
+float vol_zone = ta.ema(ta.tr(true), 100)
+
+// ─── SIGNAL DETECTION (Confirmed) ──────────────────────────────────────────
+buy_sig  = ta.crossover(signal_osc, 0)
+sell_sig = ta.crossunder(signal_osc, 0)
+
+// ─── INVALIDATION TRACKING ─────────────────────────────────────────────────
+var float level_price = na
+var bool  active_buy  = false
+var bool  active_sell = false
+
+// Use confirmed bar data for invalidation levels
+if buy_sig
+    level_price := waitClose ? low[1] : low
+    active_buy  := true
+    active_sell := false
+
+if sell_sig
+    level_price := waitClose ? high[1] : high
+    active_sell := true
+    active_buy  := false
+
+// Invalidation check using confirmed data
+float check_low  = waitClose ? low[1]  : low
+float check_high = waitClose ? high[1] : high
+
+bool invalidated = false
+if active_buy and not na(level_price)
+    if check_low < level_price
+        invalidated := true
+if active_sell and not na(level_price)
+    if check_high > level_price
+        invalidated := true
+
+if invalidated
+    active_buy  := false
+    active_sell := false
+
+// ─── OVERLAY DRAWINGS ──────────────────────────────────────────────────────
+var line buy_line  = line.new(na, na, na, na)
+var line sell_line = line.new(na, na, na, na)
+
+// Offset labels/lines by 1 bar when using confirmed mode
+int sig_bar = waitClose ? bar_index - 1 : bar_index - 1
+float buy_level_price  = waitClose ? low[2]  - vol_zone : low[1]  - vol_zone
+float sell_level_price = waitClose ? high[2] + vol_zone : high[1] + vol_zone
+
+if buy_sig
+    line.delete(sell_line)
+    if disp_lvl
+        buy_line := line.new(sig_bar, buy_level_price, bar_index, buy_level_price,
+             force_overlay=true, color=up_color, style=line.style_dashed, width=1)
+    label.new(sig_bar, buy_level_price, color=up_color, style=label.style_label_up,
+             force_overlay=true, size=size.tiny, text="")
+
+if sell_sig
+    line.delete(buy_line)
+    if disp_lvl
+        sell_line := line.new(sig_bar, sell_level_price, bar_index, sell_level_price,
+             force_overlay=true, color=dn_color, style=line.style_dashed, width=1)
+    label.new(sig_bar, sell_level_price, color=dn_color, style=label.style_label_down,
+             force_overlay=true, size=size.tiny, text="")
+
+// Extend active invalidation line
+if not na(buy_line) and active_buy
+    line.set_x2(buy_line, bar_index)
+if not na(sell_line) and active_sell
+    line.set_x2(sell_line, bar_index)
+
+// ─── INVALIDATION MARKER ───────────────────────────────────────────────────
+plotshape(invalidated, title="Invalidated", location=location.belowbar,
+         color=color.new(color.red, 30), style=shape.xcross, size=size.tiny,
+         force_overlay=true)
+
+// ─── KELTNER CHANNEL ────────────────────────────────────────────────────────
+ma(float source, int _length, string _type) =>
+    switch _type
+        "SMA"        => ta.sma(source, _length)
+        "EMA"        => ta.ema(source, _length)
+        "SMMA (RMA)" => ta.rma(source, _length)
+        "WMA"        => ta.wma(source, _length)
+        "VWMA"       => ta.vwma(source, _length)
+
+float midline  = ma(src, lengthkc, kcMaType)
+float atr_val  = ta.atr(atrLen)
+float upper_kc = midline + mult_kc * atr_val
+float lower_kc = midline - mult_kc * atr_val
+
+plot(disp_ch ? midline  : na, "KC Midline", color=#2962FF,  offset=kcOffset)
+p1 = plot(disp_ch ? upper_kc : na, "KC Upper", color=#F23645, offset=kcOffset)
+p2 = plot(disp_ch ? lower_kc : na, "KC Lower", color=#089981, offset=kcOffset)
+fill(p1, p2, title="KC Fill", color=disp_ch ? color.rgb(33, 150, 243, 95) : na)

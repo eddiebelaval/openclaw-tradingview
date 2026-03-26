@@ -1,0 +1,368 @@
+// ============================================================
+// OB + Big Trades Signal Indicator
+// Kombiniert: Order Blocks with Volume + Big Trades Detector
+// Filter: Daily VWAP (Reset 00:00 UTC)
+//
+// LONG  -> Big Buy nahe Bullish OB + Preis UBER Daily VWAP
+// SHORT -> Big Sell nahe Bearish OB + Preis UNTER Daily VWAP
+// ============================================================
+
+//@version=6
+indicator("OB + Big Trades Signal", overlay=true, max_boxes_count=500)
+
+// ==========================================
+// INPUTS - ORDER BLOCKS
+// ==========================================
+grp_ob = "Order Blocks"
+i_lookback  = input.int(3,     "Consolidation Lookback",  minval=2,            group=grp_ob)
+i_threshold = input.float(0.5, "Breakout Threshold %",    minval=0.1,          group=grp_ob) / 100
+i_maxBlocks = input.int(10,    "Maximum Order Blocks",    minval=1, maxval=50, group=grp_ob)
+i_proximity = input.float(0.15,"OB Proximity %",          minval=0.01, step=0.01, group=grp_ob,
+     tooltip="Wie nah (in %) muss der Preis an einem OB sein, damit ein Signal entsteht?") / 100
+
+// ==========================================
+// INPUTS - VOLUME (Order Blocks)
+// ==========================================
+grp_vol = "Volume (Order Blocks)"
+var string VOL_CALC_METHOD = input.string("Relative","Volume Calculation Method",
+     options=["Simple","Relative","Weighted"], group=grp_vol)
+var int    VOL_LOOKBACK    = input.int(20,  "Volume Lookback Period",      minval=5,   maxval=100, group=grp_vol)
+var float  VOL_THRESHOLD   = input.float(1.2,"Volume Threshold Multiplier",minval=1.0, maxval=5.0, step=0.1, group=grp_vol)
+
+// ==========================================
+// INPUTS - BIG TRADES
+// ==========================================
+grp_bt = "Big Trades Detector"
+bt_lookback = input.int(5,    "Lookback Period",     minval=5,            group=grp_bt)
+bt_mult     = input.float(3.0,"Sensitivity (Sigma)", minval=1.0, step=0.1,
+     tooltip="2.0 = Signifikant | 4.0 = Extrem", group=grp_bt)
+
+// ==========================================
+// INPUTS - VWAP & DARSTELLUNG
+// ==========================================
+grp_sig   = "VWAP & Darstellung"
+show_vwap = input.bool(true, "Daily VWAP anzeigen",   group=grp_sig)
+c_vwap    = input.color(color.new(#9c27b0, 0), "VWAP Farbe", group=grp_sig)
+show_ob   = input.bool(true, "Order Blocks anzeigen", group=grp_sig)
+
+// ==========================================
+// INPUTS - SIGNAL LABELS
+// ==========================================
+grp_lbl     = "Signal Labels"
+c_long      = input.color(color.new(#00e676, 0), "Long Label Farbe",  group=grp_lbl)
+c_long_txt  = input.color(color.white,            "Long Text Farbe",   group=grp_lbl)
+c_short     = input.color(color.new(#f23645, 0), "Short Label Farbe", group=grp_lbl)
+c_short_txt = input.color(color.white,            "Short Text Farbe",  group=grp_lbl)
+i_lbl_size  = input.string("Normal","Label Groesse",
+     options=["Tiny","Small","Normal","Large","Huge"], group=grp_lbl)
+show_bg     = input.bool(true, "Hintergrund-Highlight bei Signal", group=grp_lbl)
+
+// ==========================================
+// DAILY VWAP (Reset 00:00 UTC)
+// ==========================================
+var float _cum_pv  = 0.0
+var float _cum_vol = 0.0
+
+bool new_day = ta.change(time("D")) != 0
+if new_day
+    _cum_pv  := 0.0
+    _cum_vol := 0.0
+
+float tp = (high + low + close) / 3
+_cum_pv  += tp * volume
+_cum_vol += volume
+float daily_vwap = _cum_pv / _cum_vol
+
+plot(show_vwap ? daily_vwap : na, "Daily VWAP", color=c_vwap, linewidth=2, style=plot.style_line)
+
+// ==========================================
+// ORDER BLOCKS - Hilfsfunktionen
+// ==========================================
+var color BULL_COLOR = #0b851e
+var color BEAR_COLOR = #f23645
+
+f_ob_volume(int len) =>
+    float vol = 0.0
+    if VOL_CALC_METHOD == "Simple"
+        vol := math.avg(volume, volume[1])
+    else if VOL_CALC_METHOD == "Relative"
+        float avg_v = ta.sma(volume, len)
+        vol := volume / avg_v
+    else
+        vol := (volume * 2.0 + volume[1] * 1.0) / 3.0
+    vol
+
+f_consolidation(int len) =>
+    float hr    = ta.highest(high, len) - ta.lowest(high, len)
+    float lr    = ta.highest(low,  len) - ta.lowest(low,  len)
+    float avg_r = (hr + lr) / 2
+    float cur_r = high[1] - low[1]
+    cur_r <= avg_r * (1 + i_threshold)
+
+f_breakout(int len) =>
+    bool bull_bo = close > high[2] and close > open
+    bool bear_bo = close < low[2]  and close < open
+    [bull_bo, bear_bo]
+
+// ==========================================
+// ORDER BLOCKS - Arrays & Erstellung
+// ==========================================
+var box[] bull_blocks = array.new_box()
+var box[] bear_blocks = array.new_box()
+
+bool  is_consol    = f_consolidation(i_lookback)
+[bull_break, bear_break] = f_breakout(i_lookback)
+float vol_strength = f_ob_volume(VOL_LOOKBACK)
+
+if is_consol and vol_strength >= VOL_THRESHOLD
+    string vol_txt = "  Vol: " + str.tostring(vol_strength, "#.##") + "x"
+
+    if bull_break and show_ob
+        box nb = box.new(
+             left=time[1], top=high[1], right=time, bottom=low[1],
+             border_color=BULL_COLOR,
+             bgcolor=color.new(BULL_COLOR, 100 - math.min(vol_strength * 10, 90)),
+             extend=extend.right, xloc=xloc.bar_time,
+             text=vol_txt, text_color=BULL_COLOR, text_size=size.small)
+        array.push(bull_blocks, nb)
+        if array.size(bull_blocks) > i_maxBlocks
+            box.delete(array.shift(bull_blocks))
+
+    if bear_break and show_ob
+        box nb = box.new(
+             left=time[1], top=high[1], right=time, bottom=low[1],
+             border_color=BEAR_COLOR,
+             bgcolor=color.new(BEAR_COLOR, 100 - math.min(vol_strength * 10, 90)),
+             extend=extend.right, xloc=xloc.bar_time,
+             text=vol_txt, text_color=BEAR_COLOR, text_size=size.small)
+        array.push(bear_blocks, nb)
+        if array.size(bear_blocks) > i_maxBlocks
+            box.delete(array.shift(bear_blocks))
+
+// ==========================================
+// ORDER BLOCKS - Mitigation
+// Vorwaerts iterieren, dann per Index loeschen
+// ==========================================
+var int[] bull_del = array.new_int()
+var int[] bear_del = array.new_int()
+
+array.clear(bull_del)
+for i = 0 to array.size(bull_blocks) - 1
+    if array.size(bull_blocks) == 0
+        break
+    box bx = array.get(bull_blocks, i)
+    if low <= box.get_bottom(bx)
+        array.push(bull_del, i)
+
+// Rueckwaerts loeschen damit Index korrekt bleibt
+for k = array.size(bull_del) - 1 to 0
+    if array.size(bull_del) == 0
+        break
+    idx = array.get(bull_del, k)
+    box.delete(array.get(bull_blocks, idx))
+    array.remove(bull_blocks, idx)
+
+array.clear(bear_del)
+for i = 0 to array.size(bear_blocks) - 1
+    if array.size(bear_blocks) == 0
+        break
+    box bx = array.get(bear_blocks, i)
+    if high >= box.get_top(bx)
+        array.push(bear_del, i)
+
+for k = array.size(bear_del) - 1 to 0
+    if array.size(bear_del) == 0
+        break
+    idx = array.get(bear_del, k)
+    box.delete(array.get(bear_blocks, idx))
+    array.remove(bear_blocks, idx)
+
+// ==========================================
+// BIG TRADES DETECTOR
+// ==========================================
+float rng      = high - low
+float raw_buy  = rng == 0 ? 0.0 : (close - low)  / rng * volume
+float raw_sell = rng == 0 ? 0.0 : (high - close) / rng * volume
+
+float avg_buy  = ta.sma(raw_buy,   bt_lookback)[1]
+float std_buy  = ta.stdev(raw_buy,  bt_lookback)[1]
+float avg_sell = ta.sma(raw_sell,  bt_lookback)[1]
+float std_sell = ta.stdev(raw_sell, bt_lookback)[1]
+
+bool is_big_buy  = raw_buy  > avg_buy  + std_buy  * bt_mult
+bool is_big_sell = raw_sell > avg_sell + std_sell * bt_mult
+
+// ==========================================
+// SIGNAL-LOGIK
+// ==========================================
+bool near_bull_ob = false
+for i = 0 to array.size(bull_blocks) - 1
+    if array.size(bull_blocks) == 0
+        break
+    box sbox    = array.get(bull_blocks, i)
+    float s_top = box.get_top(sbox)
+    float s_bot = box.get_bottom(sbox)
+    float s_prx = s_top * i_proximity
+    if close >= s_bot - s_prx and close <= s_top + s_prx
+        near_bull_ob := true
+
+bool near_bear_ob = false
+for i = 0 to array.size(bear_blocks) - 1
+    if array.size(bear_blocks) == 0
+        break
+    box sbox    = array.get(bear_blocks, i)
+    float s_top = box.get_top(sbox)
+    float s_bot = box.get_bottom(sbox)
+    float s_prx = s_top * i_proximity
+    if close >= s_bot - s_prx and close <= s_top + s_prx
+        near_bear_ob := true
+
+// LONG:  Big Buy  + nahe Bullish OB + UBER  VWAP
+// SHORT: Big Sell + nahe Bearish OB + UNTER VWAP
+bool long_signal  = is_big_buy  and near_bull_ob and close > daily_vwap
+bool short_signal = is_big_sell and near_bear_ob and close < daily_vwap
+
+// ==========================================
+// SIGNAL-VISUALISIERUNG
+// plotshape benoetigt const string fuer "size"
+// -> je ein plotshape pro Groessenstufe
+// ==========================================
+plotshape(long_signal and i_lbl_size == "Tiny",   "LONG Tiny",   shape.labelup, location.belowbar, color=c_long, textcolor=c_long_txt, text="LONG", size=size.tiny)
+plotshape(long_signal and i_lbl_size == "Small",  "LONG Small",  shape.labelup, location.belowbar, color=c_long, textcolor=c_long_txt, text="LONG", size=size.small)
+plotshape(long_signal and i_lbl_size == "Normal", "LONG Normal", shape.labelup, location.belowbar, color=c_long, textcolor=c_long_txt, text="LONG", size=size.normal)
+plotshape(long_signal and i_lbl_size == "Large",  "LONG Large",  shape.labelup, location.belowbar, color=c_long, textcolor=c_long_txt, text="LONG", size=size.large)
+plotshape(long_signal and i_lbl_size == "Huge",   "LONG Huge",   shape.labelup, location.belowbar, color=c_long, textcolor=c_long_txt, text="LONG", size=size.huge)
+
+plotshape(short_signal and i_lbl_size == "Tiny",   "SHORT Tiny",   shape.labeldown, location.abovebar, color=c_short, textcolor=c_short_txt, text="SHORT", size=size.tiny)
+plotshape(short_signal and i_lbl_size == "Small",  "SHORT Small",  shape.labeldown, location.abovebar, color=c_short, textcolor=c_short_txt, text="SHORT", size=size.small)
+plotshape(short_signal and i_lbl_size == "Normal", "SHORT Normal", shape.labeldown, location.abovebar, color=c_short, textcolor=c_short_txt, text="SHORT", size=size.normal)
+plotshape(short_signal and i_lbl_size == "Large",  "SHORT Large",  shape.labeldown, location.abovebar, color=c_short, textcolor=c_short_txt, text="SHORT", size=size.large)
+plotshape(short_signal and i_lbl_size == "Huge",   "SHORT Huge",   shape.labeldown, location.abovebar, color=c_short, textcolor=c_short_txt, text="SHORT", size=size.huge)
+
+bgcolor(show_bg and long_signal  ? color.new(c_long,  88) : na, title="Long BG")
+bgcolor(show_bg and short_signal ? color.new(c_short, 88) : na, title="Short BG")
+
+// ==========================================
+// INPUTS - ALERT OPTIONEN
+// ==========================================
+grp_alr = "Alert Optionen"
+
+// Richtungsfilter
+alr_dir = input.string("Long + Short", "Signalrichtung",
+     options=["Long + Short", "Nur Long", "Nur Short"],
+     tooltip="Welche Signale sollen einen Alert ausloesen?",
+     group=grp_alr)
+
+// Push-Benachrichtigung
+alr_push = input.bool(true, "Push-Benachrichtigung senden",
+     tooltip="Wenn aktiv: Bei Signal wird alert() mit notify_all aufgerufen (Push + Popup). Erfordert TradingView App.",
+     group=grp_alr)
+
+// Zeitfenster
+alr_time_on  = input.bool(true, "Zeitfenster aktivieren",
+     tooltip="Alerts nur innerhalb der eingestellten Uhrzeit ausloesen.",
+     group=grp_alr)
+alr_from_h   = input.int(8,  "Von Stunde (UTC)",  minval=0, maxval=23, group=grp_alr)
+alr_from_m   = input.int(0,  "Von Minute",        minval=0, maxval=59, group=grp_alr)
+alr_to_h     = input.int(22, "Bis Stunde (UTC)",  minval=0, maxval=23, group=grp_alr)
+alr_to_m     = input.int(0,  "Bis Minute",        minval=0, maxval=59, group=grp_alr)
+
+// ==========================================
+// ZEITFENSTER-LOGIK
+// ==========================================
+cur_h   = hour(time, "UTC")
+cur_m   = minute(time, "UTC")
+cur_min = cur_h * 60 + cur_m
+from_min = alr_from_h * 60 + alr_from_m
+to_min   = alr_to_h   * 60 + alr_to_m
+
+bool in_time_window = true
+if alr_time_on
+    if from_min <= to_min
+        in_time_window := cur_min >= from_min and cur_min < to_min
+    else
+        // Uebernacht-Fenster z.B. 22:00 - 06:00
+        in_time_window := cur_min >= from_min or cur_min < to_min
+
+// ==========================================
+// ANTI-SPAM: Nur einmal pro Balken feuern
+// ==========================================
+var bool _long_fired  = false
+var bool _short_fired = false
+
+bool bar_changed = ta.change(time) != 0
+if bar_changed
+    _long_fired  := false
+    _short_fired := false
+
+// Richtungsfilter anwenden
+bool dir_long  = alr_dir == "Long + Short" or alr_dir == "Nur Long"
+bool dir_short = alr_dir == "Long + Short" or alr_dir == "Nur Short"
+
+bool long_alert  = long_signal  and dir_long  and in_time_window and not _long_fired
+bool short_alert = short_signal and dir_short and in_time_window and not _short_fired
+
+if long_alert
+    _long_fired  := true
+if short_alert
+    _short_fired := true
+
+// ==========================================
+// PUSH-ALARM via alert()
+// Wird bei jedem Signal direkt ausgefuehrt.
+// Hinweis: alertcondition() UND alert() koennen
+// parallel genutzt werden.
+// ==========================================
+if alr_push and long_alert
+    alert("LONG Signal | " + syminfo.ticker + " (" + timeframe.period + ") | Kurs: " + str.tostring(close, "#.#####") + " | Big Buy nahe Bullish OB | Preis uber VWAP", alert.freq_once_per_bar)
+
+if alr_push and short_alert
+    alert("SHORT Signal | " + syminfo.ticker + " (" + timeframe.period + ") | Kurs: " + str.tostring(close, "#.#####") + " | Big Sell nahe Bearish OB | Preis unter VWAP", alert.freq_once_per_bar)
+
+// ==========================================
+// ALERTCONDITIONS (manuell im Alert-Dialog)
+// ==========================================
+
+// --- Long Signal ---
+alertcondition(long_alert,
+     "LONG - OB + Big Buy + VWAP",
+     "LONG Signal | {{ticker}} ({{interval}}) | Kurs: {{close}} | Big Buy nahe Bullish OB | Preis uber VWAP")
+
+// --- Short Signal ---
+alertcondition(short_alert,
+     "SHORT - OB + Big Sell + VWAP",
+     "SHORT Signal | {{ticker}} ({{interval}}) | Kurs: {{close}} | Big Sell nahe Bearish OB | Preis unter VWAP")
+
+// --- Beide kombiniert ---
+alertcondition(long_alert or short_alert,
+     "Signal (Long oder Short)",
+     "Signal | {{ticker}} ({{interval}}) | Kurs: {{close}}")
+
+// --- Big Buy ungefiltert ---
+alertcondition(is_big_buy and in_time_window,
+     "Big Buy erkannt (ungefiltert)",
+     "Big Buy | {{ticker}} ({{interval}}) | Kurs: {{close}}")
+
+// --- Big Sell ungefiltert ---
+alertcondition(is_big_sell and in_time_window,
+     "Big Sell erkannt (ungefiltert)",
+     "Big Sell | {{ticker}} ({{interval}}) | Kurs: {{close}}")
+
+// --- Preis in Bullish OB Zone ---
+alertcondition(near_bull_ob and close > daily_vwap and in_time_window,
+     "Preis in Bullish OB Zone (uber VWAP)",
+     "Bullish OB Zone | {{ticker}} ({{interval}}) | Kurs: {{close}}")
+
+// --- Preis in Bearish OB Zone ---
+alertcondition(near_bear_ob and close < daily_vwap and in_time_window,
+     "Preis in Bearish OB Zone (unter VWAP)",
+     "Bearish OB Zone | {{ticker}} ({{interval}}) | Kurs: {{close}}")
+
+// --- VWAP Kreuzungen ---
+alertcondition(ta.crossover(close, daily_vwap),
+     "Preis kreuzt VWAP aufwaerts",
+     "VWAP Kreuzung aufwaerts | {{ticker}} ({{interval}}) | Kurs: {{close}}")
+
+alertcondition(ta.crossunder(close, daily_vwap),
+     "Preis kreuzt VWAP abwaerts",
+     "VWAP Kreuzung abwaerts | {{ticker}} ({{interval}}) | Kurs: {{close}}")

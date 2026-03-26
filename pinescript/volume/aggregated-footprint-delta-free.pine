@@ -1,0 +1,171 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © Accuracy_Strategy
+
+//@version=6
+// @description Aggregated Footprint Delta using 1-minute Lower Timeframe (LTF) approximation from multiple exchanges.
+indicator("Aggregated Footprint Delta [FREE]", shorttitle="Agg Footprint LTF", overlay = true, max_boxes_count = 500, max_lines_count = 500)
+
+// ============================================================================
+// CONFIGURATION GROUPS
+// ============================================================================
+const string grpEx = "Exchanges (Aggregation)"
+const string grpGeneral = "General Settings"
+const string grpTools = "Analytical Tools"
+const string grpApp = "Appearance"
+
+// ============================================================================
+// INPUTS
+// ============================================================================
+// --- Calculation Mode ---
+calc_mode = input.string("USD ($)", "Volume Display Mode", options=["USD ($)", "Coins (Qty)"], group=grpGeneral, tooltip="Standardizes aggregated volume in USD or keeps the original coin quantity.")
+maxDivisoes = input.int(8, title="Number of Divisions (Clusters) per Bar", minval=2, maxval=30, group=grpGeneral)
+lowerTF     = input.timeframe("1", title="Lower Timeframe (Filter)", group=grpGeneral, tooltip="1 minute is recommended for higher order flow precision.")
+
+// --- Exchanges ---
+use_binance = input.bool(true, "Binance", group=grpEx, inline="bin")
+sym_binance = input.symbol("BINANCE:BTCUSDT", "", group=grpEx, inline="bin")
+use_bybit   = input.bool(true, "Bybit", group=grpEx, inline="by")
+sym_bybit   = input.symbol("BYBIT:BTCUSDT", "", group=grpEx, inline="by")
+use_okx     = input.bool(true, "OKX", group=grpEx, inline="okx")
+sym_okx     = input.symbol("OKX:BTCUSDT", "", group=grpEx, inline="okx")
+use_bitget  = input.bool(true, "Bitget", group=grpEx, inline="bit")
+sym_bitget  = input.symbol("BITGET:BTCUSDT.P", "", group=grpEx, inline="bit")
+
+// --- Analytical Tools ---
+showPOC       = input.bool(true, title="Show POC Line?", group=grpTools)
+showImbalance = input.bool(true, title="Highlight Imbalance?", group=grpTools)
+imbRatio      = input.float(3.0, title="Imbalance Multiplier (Ex: 3.0 = 300%)", step=0.5, group=grpTools)
+
+// --- Appearance ---
+colorPoc      = input.color(color.rgb(251, 251, 251), title="POC Color", group=grpApp)
+colorImbBuy   = input.color(color.rgb(64, 202, 211), title="Imbalance Color (Buy)", group=grpApp)
+colorImbSell  = input.color(color.rgb(255, 104, 104), title="Imbalance Color (Sell)", group=grpApp)
+
+// ============================================================================
+// HELPER FUNCTIONS
+// ============================================================================
+// Value Formatting (K, M, B)
+f_fmt(float val, string mode) =>
+    float v = math.abs(val)
+    string s = ""
+    if v >= 1e9
+        s := str.tostring(math.round(v/1e9, 2)) + "B"
+    else if v >= 1e6
+        s := str.tostring(math.round(v/1e6, 2)) + "M"
+    else if v >= 1e3
+        s := str.tostring(math.round(v/1e3, 2)) + "K"
+    else
+        s := str.tostring(math.round(v, 1))
+    
+    string sign = val < 0 ? "-" : ""
+    mode == "USD ($)" ? sign + "$" + s : sign + s
+
+// LTF Volume Distribution across Clusters
+f_distribute_ltf(array<float> _o, array<float> _c, array<float> _v, array<float> bDeltas, array<float> bBuys, array<float> bSells, array<float> bTotal, float _low, float _binSize, bool _is_usd, bool _is_okx) =>
+    if array.size(_c) > 0
+        for i = 0 to array.size(_c) - 1
+            float o_p = array.get(_o, i)
+            float c_p = array.get(_c, i)
+            float v_p = array.get(_v, i)
+            
+            if not na(v_p) and not na(c_p) and not na(o_p)
+                float price_avg = (o_p + c_p) / 2
+                int idx = int(math.floor((price_avg - _low) / _binSize))
+                
+                // Safety lock for array limits
+                idx := math.max(0, math.min(maxDivisoes - 1, idx))
+                
+                float val_calc = v_p
+                if _is_usd
+                    val_calc := _is_okx ? v_p : (v_p * c_p)
+                
+                if c_p > o_p
+                    array.set(bBuys, idx, array.get(bBuys, idx) + val_calc)
+                    array.set(bDeltas, idx, array.get(bDeltas, idx) + val_calc)
+                else if c_p < o_p
+                    array.set(bSells, idx, array.get(bSells, idx) + val_calc)
+                    array.set(bDeltas, idx, array.get(bDeltas, idx) - val_calc)
+                else
+                    array.set(bBuys, idx, array.get(bBuys, idx) + (val_calc / 2))
+                    array.set(bSells, idx, array.get(bSells, idx) + (val_calc / 2))
+                    
+                array.set(bTotal, idx, array.get(bTotal, idx) + val_calc)
+
+// ============================================================================
+// DATA REQUESTS (LTF)
+// ============================================================================
+[b_o, b_c, b_v]    = request.security_lower_tf(sym_binance, lowerTF, [open, close, volume], ignore_invalid_symbol=true)
+[by_o, by_c, by_v] = request.security_lower_tf(sym_bybit, lowerTF, [open, close, volume], ignore_invalid_symbol=true)
+[ok_o, ok_c, ok_v] = request.security_lower_tf(sym_okx, lowerTF, [open, close, volume], ignore_invalid_symbol=true)
+[bg_o, bg_c, bg_v] = request.security_lower_tf(sym_bitget, lowerTF, [open, close, volume], ignore_invalid_symbol=true)
+
+// ============================================================================
+// MAIN LOGIC & RENDERING
+// ============================================================================
+if barstate.isrealtime or barstate.ishistory
+    float barTimeDiff = nz(time - time[1], 60000)
+    int leftTime = int(time - (barTimeDiff * 0.4))
+    int rightTime = int(time + (barTimeDiff * 0.4))
+    
+    float barRange = math.max(high - low, syminfo.mintick)
+    float binSize = barRange / maxDivisoes
+    
+    array<float> binDeltas = array.new<float>(maxDivisoes, 0.0)
+    array<float> binBuys   = array.new<float>(maxDivisoes, 0.0)
+    array<float> binSells  = array.new<float>(maxDivisoes, 0.0)
+    array<float> binTotal  = array.new<float>(maxDivisoes, 0.0)
+    
+    bool is_usd_mode = calc_mode == "USD ($)"
+    
+    // Distribution per Exchange
+    if use_binance
+        f_distribute_ltf(b_o, b_c, b_v, binDeltas, binBuys, binSells, binTotal, low, binSize, is_usd_mode, false)
+    if use_bybit
+        f_distribute_ltf(by_o, by_c, by_v, binDeltas, binBuys, binSells, binTotal, low, binSize, is_usd_mode, false)
+    if use_okx
+        f_distribute_ltf(ok_o, ok_c, ok_v, binDeltas, binBuys, binSells, binTotal, low, binSize, is_usd_mode, true) 
+    if use_bitget
+        f_distribute_ltf(bg_o, bg_c, bg_v, binDeltas, binBuys, binSells, binTotal, low, binSize, is_usd_mode, false)
+
+    // POC Calculation
+    float maxVol = 0.0
+    int pocIdx = 0
+    for i = 0 to maxDivisoes - 1
+        float vol = array.get(binTotal, i)
+        if vol > maxVol
+            maxVol := vol
+            pocIdx := i
+
+    // Draw Clusters (Boxes)
+    for i = 0 to maxDivisoes - 1
+        float binDelta = array.get(binDeltas, i)
+        float binBuy   = array.get(binBuys, i)
+        float binSell  = array.get(binSells, i)
+        float binVol   = array.get(binTotal, i)
+        
+        if binVol > 0
+            float binBottom = low + (i * binSize)
+            float binTop = low + ((i + 1) * binSize)
+            
+            bool isBuyImb  = showImbalance and (binBuy >= binSell * imbRatio) and binBuy > 0
+            bool isSellImb = showImbalance and (binSell >= binBuy * imbRatio) and binSell > 0
+            
+            color boxBg       = binDelta > 0 ? color.new(color.green, 60) : binDelta < 0 ? color.new(color.red, 60) : color.new(color.gray, 60)
+            color borderColor = isBuyImb ? colorImbBuy : isSellImb ? colorImbSell : color.new(color.black, 100)
+            int borderWidth   = isBuyImb or isSellImb ? 2 : 0
+            
+            box.new(
+                left = leftTime, top = binTop, right = rightTime, bottom = binBottom, 
+                xloc = xloc.bar_time, border_color = borderColor, border_width = borderWidth, bgcolor = boxBg,
+                text = f_fmt(binDelta, calc_mode), text_color = color.white, text_size = size.tiny
+            )
+
+    // Draw POC Line
+    if showPOC and maxVol > 0
+        float pocCenterPrice = low + (pocIdx * binSize) + (binSize / 2)
+        
+        line.new(
+            x1 = leftTime, y1 = pocCenterPrice, 
+            x2 = rightTime, y2 = pocCenterPrice, 
+            xloc = xloc.bar_time, color = colorPoc, width = 2, style = line.style_solid
+        )

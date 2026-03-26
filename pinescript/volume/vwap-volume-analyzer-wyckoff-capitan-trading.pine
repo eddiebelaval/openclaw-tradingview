@@ -1,0 +1,196 @@
+//@version=6
+indicator("Anchored VWAP Volume Analyzer (Wyckoff Concept) | Capitan Trading", overlay=false, format=format.volume, max_labels_count=500, max_bars_back=1000)
+
+//====================================================================
+// 1) INPUTS - CALCULATION & RANGE
+//====================================================================
+grp_calc = "Anchored Range"
+useEnd   = input.bool(true, "Use End Date/Time", group=grp_calc)
+startT   = input.time(timestamp("2026-01-01 00:00"), "Start Date/Time", group=grp_calc)
+endT     = input.time(timestamp("2026-12-31 23:59"), "End Date/Time", group=grp_calc)
+
+grp_sens = "Reactivity Engine"
+recentLen = input.int(9, "Recent Lookback (Bars)", minval=3, group=grp_sens, tooltip="Length for the volume reactivity lookback.")
+
+//====================================================================
+// 2) INPUTS - BAR, CANDLES & VWAP RIBBON
+//====================================================================
+grp_style = "Volume Bar Style (Chart)"
+barBuy    = input.color(#00E676, "Bars: Buy Color", group=grp_style)
+barSell   = input.color(#FF1744, "Bars: Sell Color", group=grp_style)
+colTotal  = input.color(color.new(color.gray, 70), "Total Volume Background", group=grp_style)
+totTransp = input.int(75, "Total Transparency", minval=0, maxval=100, group=grp_style)
+
+grp_vwap = "VWAP Ribbon Style"
+showVwapBands = input.bool(true, "Show VWAP Value Area (Ribbon)", group=grp_vwap)
+bandMult      = input.float(0.05, "Ribbon Thickness", step=0.01, minval=0.01, group=grp_vwap, tooltip="Adjusts the visual thickness of the VWAP ribbon. Lower values = thinner ribbon.")
+colVwapBull   = input.color(#00E676, "VWAP Bullish (Price > VWAP)", group=grp_vwap)
+colVwapBear   = input.color(#FF1744, "VWAP Bearish (Price < VWAP)", group=grp_vwap)
+ribbonTransp  = input.int(85, "Ribbon Transparency", minval=0, maxval=100, group=grp_vwap)
+
+grp_fx = "Visual FX (Premium Candles)"
+colorCandles  = input.bool(true, "Colorize Chart Candles by Volume Bias", group=grp_fx)
+candleAccCol  = input.color(#00E676, "Candles: Accumulation", group=grp_fx)
+candleDistCol = input.color(#FF1744, "Candles: Distribution", group=grp_fx)
+candleNeutCol = input.color(color.rgb(120, 123, 134), "Candles: Neutral/Balanced", group=grp_fx)
+
+//====================================================================
+// 3) INPUTS - DASHBOARD COLORS 
+//====================================================================
+grp_db_col = "Dashboard Colors"
+dbColBuy   = input.color(#00ff08, "Dash: Buy Text", group=grp_db_col)
+dbColSell  = input.color(#ff0000, "Dash: Sell Text", group=grp_db_col)
+dbColGold  = input.color(color.rgb(255, 193, 7), "Dash: Accents/Gold", group=grp_db_col)
+dbColMuted = input.color(color.rgb(176, 190, 197), "Dash: Muted Data", group=grp_db_col)
+
+//====================================================================
+// 4) DASHBOARD OPTIONS
+//====================================================================
+grp_dash = "Dashboard Options"
+showTable   = input.bool(true, "Show Dashboard", group=grp_dash)
+tblPosInput = input.string("bottom_right", "Position", options=["top_left","top_right","bottom_left","bottom_right"], group=grp_dash)
+dbSizeInput = input.string("small", "Dashboard Size", options=["tiny","small","normal","large"], group=grp_dash)
+
+grp_vis = "Dashboard Visibility"
+showNet      = input.bool(true, "Show Net Volume", group=grp_vis)
+showBuySell  = input.bool(true, "Show Buy & Sell Volume", group=grp_vis)
+showVwapDist = input.bool(true, "Show VWAP Distance", group=grp_vis) 
+
+//====================================================================
+// HELPERS
+//====================================================================
+f_clamp(float _v, float _lo, float _hi) => math.max(_lo, math.min(_v, _hi))
+
+pos = tblPosInput == "top_left" ? position.top_left : tblPosInput == "top_right" ? position.top_right : tblPosInput == "bottom_left" ? position.bottom_left : position.bottom_right
+dbSize = dbSizeInput == "tiny" ? size.tiny : dbSizeInput == "small" ? size.small : dbSizeInput == "normal" ? size.normal : size.large
+
+// TRUE RANGE PROXY
+f_proxy_true(float _h, float _l, float _c, float _pc, float _v) =>
+    float trueHigh = math.max(_h, _pc)
+    float trueLow  = math.min(_l, _pc)
+    float d = math.max(trueHigh - trueLow, syminfo.mintick)
+    float b = _v * (_c - trueLow) / d
+    b := math.max(0.0, math.min(b, _v))
+    [b, _v - b]
+
+//====================================================================
+// BASE CALCULATION & VWAP BANDS
+//====================================================================
+bool inRange = time >= startT and (not useEnd or time <= endT)
+bool rangeStart = inRange and not inRange[1]
+
+float prevClose = na(close[1]) ? open : close[1]
+[buyBar, sellBar] = f_proxy_true(high, low, close, prevClose, volume)
+float netBar = buyBar - sellBar
+
+var float aBuy = 0.0, var float aSell = 0.0, var float aNet = 0.0, var float aTot = 0.0, var int aCnt = 0
+var float sumVol = 0.0
+var float vwapSum = 0.0, var float vwapVol = 0.0, var float vwapSumSq = 0.0
+
+if rangeStart
+    aBuy := 0.0, aSell := 0.0, aNet := 0.0, aTot := 0.0, aCnt := 0
+    sumVol := 0.0
+    vwapSum := 0.0, vwapVol := 0.0, vwapSumSq := 0.0
+
+if inRange and not na(volume)
+    aBuy += buyBar, aSell += sellBar, aNet += netBar, aTot += volume, aCnt += 1
+    sumVol += volume
+    float typPrice = hlc3 
+    vwapSum += typPrice * volume
+    vwapVol += volume
+    vwapSumSq += math.pow(typPrice, 2) * volume
+
+// VWAP & STANDARD DEVIATION CALCULATION
+float vwap = vwapVol > 0 ? (vwapSum / vwapVol) : na
+float expectedSq = vwapVol > 0 ? (vwapSumSq / vwapVol) : 0.0
+float vwapVariance = math.max(0.0, expectedSq - math.pow(vwap, 2))
+float vwapStDev = math.sqrt(vwapVariance)
+
+// VWAP Ribbon Bands (Adjusted by User Multiplier)
+float vwapUpper = vwap + (vwapStDev * bandMult)
+float vwapLower = vwap - (vwapStDev * bandMult)
+
+//====================================================================
+// REACTIVITY ENGINE & BIAS SCORE
+//====================================================================
+float recentNet = math.sum(netBar, recentLen) 
+float recentTot = math.sum(volume, recentLen)
+
+float pastBiasScore = (aTot > 0) ? (aNet / aTot * 100.0) : 0.0
+float recentBiasScore = (recentTot > 0) ? (recentNet / recentTot * 100.0) : 0.0
+float score = (pastBiasScore * 0.2) + (recentBiasScore * 0.8)
+
+float atr14 = ta.atr(14)
+float vwapDistPctDisplay = 0.0 
+
+if inRange and not na(vwap) and atr14 > 0
+    vwapDistPctDisplay := (close - vwap) / vwap * 100.0
+    float atrDist = (close - vwap) / atr14
+    float vwapGravity = f_clamp(atrDist * 8.0, -40.0, 40.0)
+    score += vwapGravity
+
+float confidence = f_clamp(math.abs(score), 0.0, 100.0)
+
+//====================================================================
+// DYNAMIC CANDLE COLORING
+//====================================================================
+color biasCandleCol = na
+if colorCandles
+    float maxGradientCeiling = 40.0 
+    if score > 5 
+        biasCandleCol := color.from_gradient(confidence, 0, maxGradientCeiling, candleNeutCol, candleAccCol) 
+    else if score < -5
+        biasCandleCol := color.from_gradient(confidence, 0, maxGradientCeiling, candleNeutCol, candleDistCol) 
+    else
+        biasCandleCol := candleNeutCol
+
+barcolor(colorCandles and inRange ? biasCandleCol : na, title="Bias Candle Color")
+
+//====================================================================
+// PLOTS (VOLUME PANE & VWAP RIBBON ON MAIN CHART)
+//====================================================================
+float dBar = math.max(buyBar, sellBar)
+float mBar = math.min(buyBar, sellBar)
+color dCol = buyBar >= sellBar ? barBuy : barSell
+color mCol = buyBar < sellBar ? barBuy : barSell
+
+plot(inRange ? volume : na, "Total", style=plot.style_columns, color=color.new(colTotal, totTransp))
+plot(inRange ? dBar : na, "Dominant", style=plot.style_columns, color=dCol)
+plot(inRange ? mBar : na, "Minor", style=plot.style_columns, color=mCol)
+
+// VWAP RIBBON LOGIC (DYNAMIC COLORS)
+color dynamicVwapCol = close >= vwap ? colVwapBull : colVwapBear
+color ribbonFillCol  = color.new(dynamicVwapCol, ribbonTransp)
+
+p_vwap  = plot(inRange ? vwap : na, "Anchored VWAP", color=dynamicVwapCol, linewidth=2, force_overlay=true)
+p_upper = plot(inRange and showVwapBands ? vwapUpper : na, "VWAP Upper", color=color.new(dynamicVwapCol, 100), linewidth=1, force_overlay=true)
+p_lower = plot(inRange and showVwapBands ? vwapLower : na, "VWAP Lower", color=color.new(dynamicVwapCol, 100), linewidth=1, force_overlay=true)
+
+fill(p_upper, p_lower, color=showVwapBands ? ribbonFillCol : na, title="VWAP Ribbon Fill")
+
+//====================================================================
+// OPTIMIZED DASHBOARD
+//====================================================================
+var table tb = table.new(pos, 2, 20, bgcolor=color.new(color.black, 0), border_width=1, border_color=color.gray)
+f_cell(int r, int c, string t, color tc, color bg) => table.cell(tb, c, r, t, text_color=tc, bgcolor=bg, text_size=dbSize)
+
+if barstate.islast and showTable
+    table.clear(tb, 0, 0)
+    int r = 0
+    color bg = color.new(color.black, 0)
+    color vwapColorTxt = math.abs(vwapDistPctDisplay) > 3.0 ? (vwapDistPctDisplay > 0 ? color.rgb(0, 255, 128) : color.rgb(255, 64, 129)) : (vwapDistPctDisplay > 0 ? dbColBuy : dbColSell)
+
+    f_cell(r, 0, "VOL ANALYZER", dbColGold, bg), table.merge_cells(tb, 0, r, 1, r), r += 1
+
+    if showNet
+        f_cell(r, 0, "NET VOL.", color.white, bg), f_cell(r, 1, inRange ? str.tostring(aNet, format.volume) : "NA", dbColMuted, bg), r += 1
+        f_cell(r, 0, "SMART NET", color.white, bg), f_cell(r, 1, inRange ? str.tostring(recentNet, format.volume) : "NA", dbColMuted, bg), r += 1
+
+    if showBuySell
+        f_cell(r, 0, "BUY VOL.", color.white, bg), f_cell(r, 1, inRange ? str.tostring(aBuy, format.volume) : "NA", dbColMuted, bg), r += 1
+        f_cell(r, 0, "SELL VOL.", color.white, bg), f_cell(r, 1, inRange ? str.tostring(aSell, format.volume) : "NA", dbColMuted, bg), r += 1
+    
+    if showVwapDist
+        f_cell(r, 0, "VWAP DIST.", color.white, bg), f_cell(r, 1, inRange and not na(vwap) ? str.tostring(vwapDistPctDisplay, "#.##") + "%" : "NA", vwapColorTxt, bg), r += 1
+
+    f_cell(r, 0, "by Capitan-Trading", dbColGold, bg), table.merge_cells(tb, 0, r, 1, r)

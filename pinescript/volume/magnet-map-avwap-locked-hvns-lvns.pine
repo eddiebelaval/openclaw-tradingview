@@ -1,0 +1,357 @@
+//@version=6
+indicator("Magnet Map: AVWAP + Locked HVNs & LVNs", overlay=true, max_lines_count=500, max_labels_count=500)
+
+//──────────────────────────────────────────────────────────────────────────────
+// INPUTS
+//──────────────────────────────────────────────────────────────────────────────
+grpA = "Daily VWAP"
+src        = input.source(hlc3, "VWAP Source", group=grpA)
+showVWAP   = input.bool(true, "Show Daily VWAP", group=grpA)
+vwapWidth  = input.int(2, "VWAP Line Width", minval=1, maxval=5, group=grpA)
+
+grpScan = "Volume Map Scan"
+lookback  = input.int(300, "Lookback Bars", minval=50, maxval=3000, group=grpScan)
+binsInput = input.int(30, "Price Bins (lower = cleaner nodes)", minval=12, maxval=200, group=grpScan)
+
+grpH = "HVNs (High-Volume Magnets)"
+showHVN     = input.bool(true, "Show HVNs", group=grpH)
+hvnCountInp = input.int(4, "HVNs to Plot", minval=1, maxval=12, group=grpH)
+hvnWidth    = input.int(2, "HVN Line Width", minval=1, maxval=5, group=grpH)
+hvnLabels   = input.bool(true, "Label HVNs", group=grpH)
+
+grpL = "LVNs (Low-Volume Air Pockets)"
+showLVN        = input.bool(true, "Show LVNs", group=grpL)
+lvnCountInp    = input.int(3, "LVNs to Plot", minval=0, maxval=12, group=grpL)
+lvnWidth       = input.int(1, "LVN Line Width", minval=1, maxval=5, group=grpL)
+lvnLabels      = input.bool(false, "Label LVNs", group=grpL)
+lvnIgnoreZeros = input.bool(true, "Ignore zero-volume bins", group=grpL)
+
+grpLock = "Locking"
+lockMode    = input.string("Lock after X minutes", "Lock Mode", options=["Lock after X minutes", "Lock after X bars", "Never lock"], group=grpLock)
+lockMinutes = input.int(45, "Lock Minutes", minval=1, maxval=390, group=grpLock)
+lockBars    = input.int(30, "Lock Bars", minval=1, maxval=500, group=grpLock)
+
+grpSnap = "Round/Strike Snap"
+snapToGrid = input.bool(true, "Snap levels to grid?", group=grpSnap)
+gridStep   = input.float(1.0, "Grid step ($0.5 / $1 / $2.5 / $5...)", minval=0.5, step=0.5, group=grpSnap)
+
+grpSpace = "Minimum Spacing"
+minSepMode      = input.string("Grid-multiple", "Min spacing mode", options=["Grid-multiple", "Fixed $", "ATR-based"], group=grpSpace)
+gridMultiple    = input.int(2, "Grid multiple (spacing = multiple * gridStep)", minval=1, maxval=20, group=grpSpace)
+minSepFixed     = input.float(1.0, "Min spacing ($)", minval=0.5, step=0.5, group=grpSpace)
+atrLen          = input.int(14, "ATR Length", minval=1, maxval=100, group=grpSpace)
+minSepAtr       = input.float(0.60, "Min spacing (ATR mult)", minval=0.05, step=0.05, group=grpSpace)
+enforceLVNvsHVN = input.bool(true, "Enforce LVN spacing vs HVNs?", group=grpSpace)
+
+grpZones = "Zones"
+showZones   = input.bool(true, "Show zones (ATR band)", group=grpZones)
+zoneAtrMult = input.float(0.10, "Zone half-width (ATR mult)", minval=0.01, step=0.01, group=grpZones)
+
+grpSafe = "Safety"
+maxPickTries = input.int(800, "Max attempts (prevents loops)", minval=50, maxval=8000, group=grpSafe)
+
+// loop-safe ints
+int bins     = binsInput
+int hvnCount = hvnCountInp
+int lvnCount = lvnCountInp
+
+//──────────────────────────────────────────────────────────────────────────────
+// DAILY VWAP
+//──────────────────────────────────────────────────────────────────────────────
+bool newDay = ta.change(time("D")) != 0
+
+var float cumPV = na
+var float cumV  = na
+
+if newDay
+    cumPV := na
+    cumV  := na
+
+cumPV := nz(cumPV) + (src * volume)
+cumV  := nz(cumV)  + volume
+
+float dailyVWAP = (cumV != 0) ? (cumPV / cumV) : na
+plot(showVWAP ? dailyVWAP : na, "Daily VWAP", linewidth=vwapWidth)
+
+//──────────────────────────────────────────────────────────────────────────────
+// LOCK STATE
+//──────────────────────────────────────────────────────────────────────────────
+float atr = ta.atr(atrLen)
+
+var int dayStartBarIndex = na
+var int dayStartTimeMs   = na
+
+if newDay or na(dayStartBarIndex)
+    dayStartBarIndex := bar_index
+    dayStartTimeMs   := time
+
+int barsSinceStart = bar_index - dayStartBarIndex
+int msSinceStart   = time - dayStartTimeMs
+
+bool lockCondition =
+     lockMode == "Lock after X minutes" ? (msSinceStart >= lockMinutes * 60 * 1000) :
+     lockMode == "Lock after X bars"    ? (barsSinceStart >= lockBars) :
+     false
+
+bool recalcAlways = (lockMode == "Never lock")
+
+var bool locked = false
+if newDay
+    locked := false
+if not locked and not recalcAlways and lockCondition
+    locked := true
+
+//──────────────────────────────────────────────────────────────────────────────
+// LEVEL STORAGE (persists when locked)
+//──────────────────────────────────────────────────────────────────────────────
+var float[] hvnLevels = array.new_float()
+var float[] lvnLevels = array.new_float()
+
+if newDay
+    array.clear(hvnLevels)
+    array.clear(lvnLevels)
+
+//──────────────────────────────────────────────────────────────────────────────
+// HELPERS
+//──────────────────────────────────────────────────────────────────────────────
+f_round_to_step(float x, float s) =>
+    s <= 0 ? x : math.round(x / s) * s
+
+f_min_sep() =>
+    minSepMode == "Grid-multiple" ? (gridStep * gridMultiple) : minSepMode == "Fixed $"       ? minSepFixed :
+                                   (atr * minSepAtr)
+
+f_far_from_arr(float lvl, float[] arr) =>
+    float sep = f_min_sep()
+    bool ok = true
+    int n = array.size(arr)
+    if n > 0
+        for i = 0 to n - 1
+            float ex = array.get(arr, i)
+            if math.abs(lvl - ex) < sep
+                ok := false
+    ok
+
+f_far_from_hvns(float lvl) =>
+    float sep = f_min_sep()
+    bool ok = true
+    int n = array.size(hvnLevels)
+    if n > 0
+        for i = 0 to n - 1
+            float ex = array.get(hvnLevels, i)
+            if math.abs(lvl - ex) < sep
+                ok := false
+    ok
+
+//──────────────────────────────────────────────────────────────────────────────
+// DRAWING STORAGE
+//──────────────────────────────────────────────────────────────────────────────
+var line[]  hvnLines = array.new_line()
+var line[]  hvnZT    = array.new_line()
+var line[]  hvnZB    = array.new_line()
+var label[] hvnLabs  = array.new_label()
+
+var line[]  lvnLines = array.new_line()
+var line[]  lvnZT    = array.new_line()
+var line[]  lvnZB    = array.new_line()
+var label[] lvnLabs  = array.new_label()
+
+f_clear_lines(line[] arr) =>
+    int n = array.size(arr)
+    if n > 0
+        for i = 0 to n - 1
+            line ln = array.get(arr, i)
+            if not na(ln)
+                line.delete(ln)
+    array.clear(arr)
+
+f_clear_labels(label[] arr) =>
+    int n = array.size(arr)
+    if n > 0
+        for i = 0 to n - 1
+            label lb = array.get(arr, i)
+            if not na(lb)
+                label.delete(lb)
+    array.clear(arr)
+
+f_draw_set(float[] levels, int leftX, bool isHVN) =>
+    // Clear the correct set
+    if isHVN
+        f_clear_lines(hvnLines)
+        f_clear_lines(hvnZT)
+        f_clear_lines(hvnZB)
+        f_clear_labels(hvnLabs)
+    else
+        f_clear_lines(lvnLines)
+        f_clear_lines(lvnZT)
+        f_clear_lines(lvnZB)
+        f_clear_labels(lvnLabs)
+
+    int n = array.size(levels)
+    if n > 0
+        for k = 0 to n - 1
+            float lvl = array.get(levels, k)
+
+            // Explicit colors (dark-chart friendly)
+            color lineCol = isHVN ? color.new(#4caf5b, 0) : color.new(color.orange, 0)
+            int w = isHVN ? hvnWidth : lvnWidth
+
+            line ln = line.new(leftX, lvl, bar_index, lvl, extend=extend.right, width=w, color=lineCol)
+            if isHVN
+                array.push(hvnLines, ln)
+            else
+                array.push(lvnLines, ln)
+
+            if showZones
+                float z = atr * zoneAtrMult
+                color zCol = isHVN ? color.new(#4caf5b, 0) : color.new(color.orange, 75)
+                line t = line.new(leftX, lvl + z, bar_index, lvl + z, extend=extend.right, width=1, style=line.style_dotted, color=zCol)
+                line b = line.new(leftX, lvl - z, bar_index, lvl - z, extend=extend.right, width=1, style=line.style_dotted, color=zCol)
+                if isHVN
+                    array.push(hvnZT, t)
+                    array.push(hvnZB, b)
+                else
+                    array.push(lvnZT, t)
+                    array.push(lvnZB, b)
+
+            bool doLabel = isHVN ? hvnLabels : lvnLabels
+            if doLabel
+                string tag = isHVN ? "HVN " : "LVN "
+                string txt = tag + str.tostring(k + 1) + "  " + str.tostring(lvl, format.mintick)
+                label lbx = label.new(bar_index, lvl, txt,
+     style=label.style_label_left, textalign=text.align_left, size=size.tiny,
+     textcolor=color.white, color=color.new(color.black, 30))
+                     
+                if isHVN
+                    array.push(hvnLabs, lbx)
+                else
+                    array.push(lvnLabs, lbx)
+
+//──────────────────────────────────────────────────────────────────────────────
+// COMPUTE HVNs + LVNs
+//──────────────────────────────────────────────────────────────────────────────
+f_compute_nodes(int lbBars) =>
+    array.clear(hvnLevels)
+    array.clear(lvnLevels)
+
+    float hi = ta.highest(high, lbBars)
+    float lo = ta.lowest(low, lbBars)
+    float rng = hi - lo
+
+    if rng > 0
+        float binSize = rng / bins
+        float[] binVol = array.new_float(bins, 0.0)
+
+        for i = 0 to lbBars - 1
+            float p = hlc3[i]
+            int idxRaw = int(math.floor((p - lo) / binSize))
+            int idx = math.max(0, math.min(bins - 1, idxRaw))
+            array.set(binVol, idx, array.get(binVol, idx) + volume[i])
+
+        // HVNs (highest bins)
+        float[] tmpMax = array.copy(binVol)
+        int pickedH = 0
+        int triesH  = 0
+        while pickedH < hvnCount and triesH < maxPickTries
+            triesH += 1
+
+            float bestV = -1.0
+            int bestI = -1
+            for j = 0 to bins - 1
+                float vj = array.get(tmpMax, j)
+                if vj > bestV
+                    bestV := vj
+                    bestI := j
+
+            if bestI == -1 or bestV <= 0
+                break
+
+            array.set(tmpMax, bestI, -1.0)
+
+            float lvl = lo + (bestI + 0.5) * binSize
+            if snapToGrid
+                lvl := f_round_to_step(lvl, gridStep)
+
+            if f_far_from_arr(lvl, hvnLevels)
+                array.push(hvnLevels, lvl)
+                pickedH += 1
+
+        // LVNs (lowest bins)
+        float[] tmpMin = array.copy(binVol)
+        int pickedL = 0
+        int triesL  = 0
+        while pickedL < lvnCount and triesL < maxPickTries
+            triesL += 1
+
+            float bestV = 1e100
+            int bestI = -1
+
+            for j = 0 to bins - 1
+                float vj = array.get(tmpMin, j)
+
+                bool masked = vj < 0
+                bool eligible = not masked
+                if lvnIgnoreZeros
+                    eligible := eligible and (vj > 0)
+
+                if eligible and vj < bestV
+                    bestV := vj
+                    bestI := j
+
+            if bestI == -1
+                break
+
+            array.set(tmpMin, bestI, -1.0)
+
+            float lvl = lo + (bestI + 0.5) * binSize
+            if snapToGrid
+                lvl := f_round_to_step(lvl, gridStep)
+
+            bool okSelf = f_far_from_arr(lvl, lvnLevels)
+            bool okVsH  = enforceLVNvsHVN ? f_far_from_hvns(lvl) : true
+
+            if okSelf and okVsH
+                array.push(lvnLevels, lvl)
+                pickedL += 1
+
+//──────────────────────────────────────────────────────────────────────────────
+// MAIN
+//──────────────────────────────────────────────────────────────────────────────
+if barstate.islast
+    int lbBars = int(math.min(lookback, bar_index + 1))
+    int leftX  = bar_index - (lbBars - 1)
+
+    bool shouldRecompute = recalcAlways ? true : (not locked)
+    if shouldRecompute
+        f_compute_nodes(lbBars)
+
+    // Draw HVNs
+    if showHVN
+        f_draw_set(hvnLevels, leftX, true)
+    else
+        f_clear_lines(hvnLines)
+        f_clear_lines(hvnZT)
+        f_clear_lines(hvnZB)
+        f_clear_labels(hvnLabs)
+
+    // Draw LVNs
+    if showLVN and lvnCount > 0
+        f_draw_set(lvnLevels, leftX, false)
+    else
+        f_clear_lines(lvnLines)
+        f_clear_lines(lvnZT)
+        f_clear_lines(lvnZB)
+        f_clear_labels(lvnLabs)
+
+// ─────────────────────────────
+// LOGO
+// ─────────────────────────────
+var table logo = table.new(position.bottom_right, 1, 1)
+if barstate.islast
+    table.cell(
+        logo,
+        0,
+        0,
+        "// © TylerisTrading",
+        text_color=color.teal
+    )

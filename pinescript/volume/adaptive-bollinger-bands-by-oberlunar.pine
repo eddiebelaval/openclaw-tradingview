@@ -1,0 +1,956 @@
+//@version=6
+indicator("Adaptive Bollinger Bands [by Oberlunar]", shorttitle="Adaptive Bollinger Bands [Oberlunar]", overlay=true, max_labels_count=200, max_boxes_count=140, dynamic_requests=true)
+
+//══════════════════════════════════════════════════════════════════════════════
+// CORE CONSTANTS
+//══════════════════════════════════════════════════════════════════════════════
+const int   LEN_A = 20
+const int   LEN_B = 25
+const float MULT  = 2.0
+
+//══════════════════════════════════════════════════════════════════════════════
+// HELPERS
+//══════════════════════════════════════════════════════════════════════════════
+f_clamp(float x, float lo, float hi) =>
+    math.min(hi, math.max(lo, x))
+
+f_ma(float src, int len, string maType) =>
+    float smaV  = ta.sma(src, len)
+    float wmaV  = ta.wma(src, len)
+    float emaV  = ta.ema(src, len)
+    float rmaV  = ta.rma(src, len)
+    float hmaV  = ta.hma(src, len)
+    float vwmaV = ta.vwma(src, len)
+
+    float out = smaV
+    if maType == "SMA"
+        out := smaV
+    else if maType == "WMA"
+        out := wmaV
+    else if maType == "EMA"
+        out := emaV
+    else if maType == "RMA"
+        out := rmaV
+    else if maType == "HMA"
+        out := hmaV
+    else if maType == "VWMA"
+        out := vwmaV
+    out
+
+f_alpha_from_strength(float s01, int alphaStrong, int alphaWeak) =>
+    float s = f_clamp(s01, 0.0, 1.0)
+    float a = float(alphaWeak) - s * float(alphaWeak - alphaStrong)
+    int(math.round(a))
+
+f_biasColor(int b) =>
+    b == 1 ? color.new(color.aqua, 0) :
+     b == -1 ? color.new(#ff0066, 0) :
+     color.new(color.yellow, 0)
+
+f_biasText(int b) =>
+    b == 1 ? "UP" :
+     b == -1 ? "DN" :
+     "NEU"
+
+f_spread_src(string mode) =>
+    bool hasBA = not na(bid) and not na(ask) and ask >= bid and bid > 0 and ask > 0
+    float s = na
+    if mode == "Range"
+        s := high - low
+    else if mode == "BidAsk"
+        s := hasBA ? (ask - bid) : na
+    else
+        s := hasBA ? (ask - bid) : (high - low)
+
+    if na(s)
+        s := high - low
+
+    math.max(s, 0.0)
+
+//══════════════════════════════════════════════════════════════════════════════
+// INPUTS
+//══════════════════════════════════════════════════════════════════════════════
+string G_EXEC = "0. Execution"
+string G_BB   = "1. Core Bands"
+string G_FLOW = "2. Flow Engine"
+string G_MTF  = "3. MTF Filter"
+string G_REG  = "4. Regime"
+string G_SR   = "5. S/R Zones"
+string G_PREM = "6. Premium Extras"
+string G_UI   = "7. Style + Dashboard"
+
+bool   safeMode           = input.bool(true, "Safe mode (confirmed bars only)", group=G_EXEC)
+
+string maType1            = input.string("EMA", "MA Type 1", options=["SMA","WMA","EMA","RMA","HMA","VWMA"], group=G_BB)
+string maType2            = input.string("WMA", "MA Type 2", options=["SMA","WMA","EMA","RMA","HMA","VWMA"], group=G_BB)
+string triggerSel         = input.string("Inner", "Trigger line", options=["Inner","Outer"], group=G_BB)
+bool   showRibbons        = input.bool(true, "Show ribbons", group=G_BB)
+bool   showTape           = input.bool(true, "Show flow tape", group=G_BB)
+bool   showHeatmap        = input.bool(true, "Show heatmap above/below price", group=G_BB)
+bool   showSignals        = input.bool(true, "Show signals", group=G_BB)
+
+bool   autoAdapt          = input.bool(true, "Auto adapt to asset type", group=G_FLOW)
+string autoMode           = input.string("Balanced", "Adapt mode", options=["Balanced","Aggressive","Conservative"], group=G_FLOW)
+string spreadMode         = input.string("Auto", "Spread source", options=["Auto","Range"], group=G_FLOW)
+string vpSmooth           = input.string("Adaptive", "Volumetric smoothing", options=["EMA","Adaptive"], group=G_FLOW)
+float  vpGamma            = input.float(1.20, "Flow gamma", minval=0.1, maxval=5.0, step=0.05, group=G_FLOW)
+float  trixWeight         = input.float(0.55, "TRIX weight", minval=0.0, maxval=2.0, step=0.05, group=G_FLOW)
+float  flowWeight         = input.float(1.00, "Volumetric weight", minval=0.0, maxval=2.0, step=0.05, group=G_FLOW)
+bool   trixGateSignals    = input.bool(true, "TRIX gates signals", group=G_FLOW)
+
+bool   useMTF             = input.bool(true, "Enable MTF filter", group=G_MTF)
+bool   neutralBoth        = input.bool(true, "Neutral allows both", group=G_MTF)
+string mtfMode            = input.string("MAJORITY", "Combine TFs", options=["ANY","MAJORITY","ALL"], group=G_MTF)
+string tf1                = input.timeframe("15",  "TF1", group=G_MTF)
+string tf2                = input.timeframe("30",  "TF2", group=G_MTF)
+string tf3                = input.timeframe("60", "TF3", group=G_MTF)
+string tf4                = input.timeframe("120",   "TF4", group=G_MTF)
+string tf5                = input.timeframe("240",   "TF5", group=G_MTF)
+string tf6                = input.timeframe("480",   "TF6", group=G_MTF)
+string maHTFType          = input.string("SMA", "HTF MA Type", options=["SMA","WMA","EMA","RMA","HMA","VWMA"], group=G_MTF)
+
+bool   enableRegime       = input.bool(true, "Enable regime engine", group=G_REG)
+string neutralPolicy      = input.string("MR", "Neutral policy", options=["MR","BO","None"], group=G_REG)
+string regSpreadSrc       = input.string("Auto", "Regime spread source", options=["Auto","BidAsk","Range"], group=G_REG)
+string regSampleTF        = input.timeframe("1", "Sampling TF", group=G_REG)
+bool   boCrossOnly        = input.bool(true, "Breakout first-cross only", group=G_REG)
+bool   requireCloseInside = input.bool(true, "Require close back inside channel", group=G_REG)
+
+bool   showSRZones        = input.bool(true, "Show S/R zones", group=G_SR)
+int    srExtendBars       = input.int(260, "Zone extend (bars)", minval=20, group=G_SR)
+int    srMaxZones         = input.int(10, "Max zones per side", minval=1, maxval=30, group=G_SR)
+bool   srRemoveBroken     = input.bool(true, "Remove broken zones", group=G_SR)
+
+bool   showCompression    = input.bool(true, "Show compression zones", group=G_PREM)
+int    maxCompression     = input.int(6, "Max compression zones", minval=1, maxval=20, group=G_PREM)
+bool   showSignalText     = input.bool(true, "Signal text MR/BO", group=G_PREM)
+
+color  cBuy               = input.color(#18d0b1, "Bull color", group=G_UI)
+color  cSell              = input.color(#c2185b, "Bear color", group=G_UI)
+int    ribbonAlpha        = input.int(88, "Ribbon alpha", minval=0, maxval=100, group=G_UI)
+int    heatAmin           = input.int(18, "Heat alpha MIN", minval=0, maxval=100, group=G_UI)
+int    heatAmax           = input.int(97, "Heat alpha MAX", minval=0, maxval=100, group=G_UI)
+int    tapeAmin           = input.int(24, "Tape alpha MIN", minval=0, maxval=100, group=G_UI)
+int    tapeAmax           = input.int(96, "Tape alpha MAX", minval=0, maxval=100, group=G_UI)
+bool   showDashboard      = input.bool(true, "Show dashboard", group=G_UI)
+string dashPosOpt         = input.string("Bottom Right", "Dashboard position", options=["Top Right","Top Left","Bottom Right","Bottom Left"], group=G_UI)
+
+//══════════════════════════════════════════════════════════════════════════════
+// RUNTIME MODE
+//══════════════════════════════════════════════════════════════════════════════
+bool doBar = not safeMode or barstate.isconfirmed
+
+//══════════════════════════════════════════════════════════════════════════════
+// THEME
+//══════════════════════════════════════════════════════════════════════════════
+color bullAccent = color.aqua
+color bearAccent = #ff0066
+color neutralAccent = color.yellow
+color uiBlack = color.new(color.black, 0)
+color uiPanel = color.new(color.black, 60)
+color uiPanel2 = color.new(color.black, 80)
+
+//══════════════════════════════════════════════════════════════════════════════
+// AUTO-ASSET PROFILE
+//══════════════════════════════════════════════════════════════════════════════
+string assetType = syminfo.type
+string assetLabel = "GENERIC"
+
+int   effAtrLen           = 14
+int   effVpLookBack       = 120
+int   effVpBins           = 60
+int   effVpSmoothLen      = 34
+float effVpDeadband       = 0.02
+float effWideSpreadThr    = 1.50
+float effTapeOffsetATR    = 0.32
+float effTapeHeightATR    = 0.78
+float effHeatOffsetATR    = 0.05
+float effHeatHeightATR    = 0.55
+float effTrixDeadband     = 0.05
+float effTrixGateThr      = 0.04
+int   effTrixLen          = 15
+int   effTrixSigLen       = 7
+int   effRegNormLen       = 160
+int   effRegSmoothLen     = 28
+float effRegDeadband      = 0.02
+float effRegRelSprThr     = 1.12
+float effRegBiasRelThr    = 1.18
+float effSRRelVol         = 1.15
+float effSRAbsorption     = 1.00
+float effSRFlowThr        = 0.05
+
+if autoAdapt
+    if assetType == "crypto"
+        assetLabel         := "CRYPTO"
+        effAtrLen          := 18
+        effVpLookBack      := 160
+        effVpBins          := 84
+        effVpSmoothLen     := 34
+        effVpDeadband      := 0.030
+        effWideSpreadThr   := 1.65
+        effTapeOffsetATR   := 0.42
+        effTapeHeightATR   := 1.05
+        effHeatOffsetATR   := 0.07
+        effHeatHeightATR   := 0.78
+        effTrixDeadband    := 0.06
+        effTrixGateThr     := 0.05
+        effTrixLen         := 12
+        effTrixSigLen      := 6
+        effRegNormLen      := 180
+        effRegSmoothLen    := 34
+        effRegDeadband     := 0.025
+        effRegRelSprThr    := 1.18
+        effRegBiasRelThr   := 1.24
+        effSRRelVol        := 1.20
+        effSRAbsorption    := 1.05
+        effSRFlowThr       := 0.07
+    else if assetType == "forex" or assetType == "cfd"
+        assetLabel         := "FOREX/CFD"
+        effAtrLen          := 12
+        effVpLookBack      := 90
+        effVpBins          := 44
+        effVpSmoothLen     := 24
+        effVpDeadband      := 0.015
+        effWideSpreadThr   := 1.32
+        effTapeOffsetATR   := 0.22
+        effTapeHeightATR   := 0.50
+        effHeatOffsetATR   := 0.03
+        effHeatHeightATR   := 0.36
+        effTrixDeadband    := 0.04
+        effTrixGateThr     := 0.03
+        effTrixLen         := 18
+        effTrixSigLen      := 9
+        effRegNormLen      := 140
+        effRegSmoothLen    := 24
+        effRegDeadband     := 0.015
+        effRegRelSprThr    := 1.08
+        effRegBiasRelThr   := 1.12
+        effSRRelVol        := 1.05
+        effSRAbsorption    := 0.95
+        effSRFlowThr       := 0.03
+    else if assetType == "stock" or assetType == "fund" or assetType == "dr"
+        assetLabel         := "STOCK"
+        effAtrLen          := 14
+        effVpLookBack      := 120
+        effVpBins          := 60
+        effVpSmoothLen     := 28
+        effVpDeadband      := 0.020
+        effWideSpreadThr   := 1.48
+        effTapeOffsetATR   := 0.30
+        effTapeHeightATR   := 0.72
+        effHeatOffsetATR   := 0.04
+        effHeatHeightATR   := 0.50
+        effTrixDeadband    := 0.05
+        effTrixGateThr     := 0.04
+        effTrixLen         := 15
+        effTrixSigLen      := 7
+        effRegNormLen      := 160
+        effRegSmoothLen    := 28
+        effRegDeadband     := 0.020
+        effRegRelSprThr    := 1.12
+        effRegBiasRelThr   := 1.18
+        effSRRelVol        := 1.12
+        effSRAbsorption    := 1.00
+        effSRFlowThr       := 0.05
+    else if assetType == "futures"
+        assetLabel         := "FUTURES"
+        effAtrLen          := 14
+        effVpLookBack      := 130
+        effVpBins          := 64
+        effVpSmoothLen     := 30
+        effVpDeadband      := 0.020
+        effWideSpreadThr   := 1.45
+        effTapeOffsetATR   := 0.28
+        effTapeHeightATR   := 0.72
+        effHeatOffsetATR   := 0.04
+        effHeatHeightATR   := 0.52
+        effTrixDeadband    := 0.05
+        effTrixGateThr     := 0.04
+        effTrixLen         := 14
+        effTrixSigLen      := 7
+        effRegNormLen      := 160
+        effRegSmoothLen    := 30
+        effRegDeadband     := 0.020
+        effRegRelSprThr    := 1.12
+        effRegBiasRelThr   := 1.18
+        effSRRelVol        := 1.12
+        effSRAbsorption    := 1.00
+        effSRFlowThr       := 0.05
+
+if autoAdapt
+    if autoMode == "Aggressive"
+        effVpDeadband    := effVpDeadband * 0.82
+        effWideSpreadThr := effWideSpreadThr * 0.96
+        effTrixDeadband  := effTrixDeadband * 0.85
+        effTrixGateThr   := effTrixGateThr * 0.85
+        effTapeHeightATR := effTapeHeightATR * 1.08
+        effHeatHeightATR := effHeatHeightATR * 1.12
+    else if autoMode == "Conservative"
+        effVpDeadband    := effVpDeadband * 1.18
+        effWideSpreadThr := effWideSpreadThr * 1.04
+        effTrixDeadband  := effTrixDeadband * 1.15
+        effTrixGateThr   := effTrixGateThr * 1.15
+        effTapeHeightATR := effTapeHeightATR * 0.92
+        effHeatHeightATR := effHeatHeightATR * 0.92
+
+//══════════════════════════════════════════════════════════════════════════════
+// BOLLINGER HL ZONES
+//══════════════════════════════════════════════════════════════════════════════
+float devH_A = ta.stdev(high, LEN_A)
+float devH_B = ta.stdev(high, LEN_B)
+
+float basisH1_A = f_ma(high, LEN_A, maType1)
+float basisH1_B = f_ma(high, LEN_B, maType1)
+float basisH2_A = f_ma(high, LEN_A, maType2)
+float basisH2_B = f_ma(high, LEN_B, maType2)
+
+float sellU1_A = basisH1_A + MULT * devH_A
+float sellU1_B = basisH1_B + MULT * devH_B
+float sellU2_A = basisH2_A + MULT * devH_A
+float sellU2_B = basisH2_B + MULT * devH_B
+
+float sellU1_top = math.max(sellU1_A, sellU1_B)
+float sellU1_bot = math.min(sellU1_A, sellU1_B)
+float sellU2_top = math.max(sellU2_A, sellU2_B)
+float sellU2_bot = math.min(sellU2_A, sellU2_B)
+
+float sellTop = math.max(math.max(sellU1_A, sellU1_B), math.max(sellU2_A, sellU2_B))
+float sellBot = math.min(math.min(sellU1_A, sellU1_B), math.min(sellU2_A, sellU2_B))
+float sellTrig = triggerSel == "Inner" ? sellBot : sellTop
+
+float devL_A = ta.stdev(low, LEN_A)
+float devL_B = ta.stdev(low, LEN_B)
+
+float basisL1_A = f_ma(low, LEN_A, maType1)
+float basisL1_B = f_ma(low, LEN_B, maType1)
+float basisL2_A = f_ma(low, LEN_A, maType2)
+float basisL2_B = f_ma(low, LEN_B, maType2)
+
+float buyL1_A = basisL1_A - MULT * devL_A
+float buyL1_B = basisL1_B - MULT * devL_B
+float buyL2_A = basisL2_A - MULT * devL_A
+float buyL2_B = basisL2_B - MULT * devL_B
+
+float buyL1_top = math.max(buyL1_A, buyL1_B)
+float buyL1_bot = math.min(buyL1_A, buyL1_B)
+float buyL2_top = math.max(buyL2_A, buyL2_B)
+float buyL2_bot = math.min(buyL2_A, buyL2_B)
+
+float buyTop = math.max(math.max(buyL1_A, buyL1_B), math.max(buyL2_A, buyL2_B))
+float buyBot = math.min(math.min(buyL1_A, buyL1_B), math.min(buyL2_A, buyL2_B))
+float buyTrig = triggerSel == "Inner" ? buyTop : buyBot
+
+float channelLow  = buyTop
+float channelHigh = sellBot
+bool  channelValid = channelLow < channelHigh
+
+//══════════════════════════════════════════════════════════════════════════════
+// ENVELOPE PROXIMITY
+//══════════════════════════════════════════════════════════════════════════════
+float atrV = ta.atr(effAtrLen)
+
+float proxSell = 1.0 - f_clamp(math.abs(high - sellTrig) / math.max(atrV, syminfo.mintick), 0.0, 1.0)
+float proxBuy  = 1.0 - f_clamp(math.abs(low  - buyTrig ) / math.max(atrV, syminfo.mintick), 0.0, 1.0)
+
+int aSellEnv = f_alpha_from_strength(proxSell, 14, 96)
+int aBuyEnv  = f_alpha_from_strength(proxBuy,  14, 96)
+
+color sellFillColor = color.new(cSell, aSellEnv)
+color buyFillColor  = color.new(cBuy,  aBuyEnv)
+
+//══════════════════════════════════════════════════════════════════════════════
+// MTF BIAS
+//══════════════════════════════════════════════════════════════════════════════
+f_htfBias() =>
+    float b = f_ma(close, LEN_A, maHTFType)
+    float s = b - b[1]
+    bool up = close > b and s >= 0
+    bool dn = close < b and s <= 0
+    up ? 1 : dn ? -1 : 0
+
+int bias1 = request.security(syminfo.tickerid, tf1, f_htfBias(), barmerge.gaps_off, barmerge.lookahead_off)
+int bias2 = request.security(syminfo.tickerid, tf2, f_htfBias(), barmerge.gaps_off, barmerge.lookahead_off)
+int bias3 = request.security(syminfo.tickerid, tf3, f_htfBias(), barmerge.gaps_off, barmerge.lookahead_off)
+int bias4 = request.security(syminfo.tickerid, tf4, f_htfBias(), barmerge.gaps_off, barmerge.lookahead_off)
+int bias5 = request.security(syminfo.tickerid, tf5, f_htfBias(), barmerge.gaps_off, barmerge.lookahead_off)
+int bias6 = request.security(syminfo.tickerid, tf6, f_htfBias(), barmerge.gaps_off, barmerge.lookahead_off)
+
+int sumBias = bias1 + bias2 + bias3 + bias4 + bias5 + bias6
+
+bool allowLong = true
+bool allowShort = true
+
+if useMTF
+    if mtfMode == "ANY"
+        allowLong  := bias1 == 1 or bias2 == 1 or bias3 == 1 or bias4 == 1 or bias5 == 1 or bias6 == 1
+        allowShort := bias1 == -1 or bias2 == -1 or bias3 == -1 or bias4 == -1 or bias5 == -1 or bias6 == -1
+    else if mtfMode == "ALL"
+        allowLong  := bias1 == 1 and bias2 == 1 and bias3 == 1 and bias4 == 1 and bias5 == 1 and bias6 == 1
+        allowShort := bias1 == -1 and bias2 == -1 and bias3 == -1 and bias4 == -1 and bias5 == -1 and bias6 == -1
+    else
+        allowLong  := sumBias >= 1
+        allowShort := sumBias <= -1
+
+    if neutralBoth and sumBias == 0
+        allowLong  := true
+        allowShort := true
+
+//══════════════════════════════════════════════════════════════════════════════
+// SPREAD / ABSORPTION
+//══════════════════════════════════════════════════════════════════════════════
+float rngBar = math.max(high - low, syminfo.mintick)
+bool hasBidAsk = not na(bid) and not na(ask) and ask >= bid and bid > 0 and ask > 0
+
+float spreadPx = spreadMode == "Range" ? rngBar : (hasBidAsk ? (ask - bid) : rngBar)
+float spreadMA = ta.sma(spreadPx, effVpLookBack)
+float relSpread = spreadMA > 0 ? spreadPx / spreadMA : 1.0
+
+float volMA = ta.sma(volume, effVpLookBack)
+float relVol = volMA > 0 ? volume / volMA : 1.0
+
+float absorption = relSpread > 0 ? relVol / relSpread : 0.0
+bool  wideSpread = relSpread >= effWideSpreadThr
+
+float upperWick = high - math.max(open, close)
+float lowerWick = math.min(open, close) - low
+float upperWickRatio = upperWick / rngBar
+float lowerWickRatio = lowerWick / rngBar
+
+//══════════════════════════════════════════════════════════════════════════════
+// REGIME ENGINE
+//══════════════════════════════════════════════════════════════════════════════
+int chartTfSec = timeframe.in_seconds(timeframe.period)
+int regTfSec   = timeframe.in_seconds(regSampleTF)
+bool regLtfOK  = not na(chartTfSec) and not na(regTfSec) and regTfSec < chartTfSec
+
+float[] sprArr = regLtfOK ? request.security_lower_tf(syminfo.tickerid, regSampleTF, f_spread_src(regSpreadSrc)) : array.new_float(0)
+int nSpr = array.size(sprArr)
+
+float sprOpenW = na
+float sprCloseW = na
+float sprAvgReg = na
+float biasRaw = na
+
+if regLtfOK and nSpr > 0
+    float sumO = 0.0
+    float wO   = 0.0
+    float sumC = 0.0
+    float wC   = 0.0
+    float sumA = 0.0
+
+    for i = 0 to nSpr - 1
+        float t = (float(i) + 0.5) / float(nSpr)
+        float s = array.get(sprArr, i)
+
+        float wOpen  = 1.0 - t
+        float wClose = t
+
+        sumO += s * wOpen
+        wO   += wOpen
+
+        sumC += s * wClose
+        wC   += wClose
+
+        sumA += s
+
+    sprOpenW  := wO > 0 ? sumO / wO : na
+    sprCloseW := wC > 0 ? sumC / wC : na
+    sprAvgReg := sumA / float(nSpr)
+
+    float den = math.max(sprOpenW + sprCloseW, 1e-10)
+    biasRaw := (sprCloseW - sprOpenW) / den
+else
+    sprAvgReg := f_spread_src(regSpreadSrc)
+    biasRaw   := na
+
+float sprBaseReg = ta.ema(sprAvgReg, effRegNormLen)
+float relSprReg  = sprBaseReg > 0 ? sprAvgReg / sprBaseReg : 1.0
+
+float biasEma = ta.ema(biasRaw, effRegSmoothLen)
+var float biasAd = na
+
+float atrBaseReg = ta.ema(ta.atr(14), 100)
+float atrNormReg = atrBaseReg > 0 ? ta.atr(14) / atrBaseReg : 1.0
+
+float q_ad = relSprReg / math.max(atrNormReg, 1e-6)
+q_ad := f_clamp(q_ad, 0.0, 2.0)
+float alpha_ad = 0.03 + 0.22 * (q_ad / 2.0)
+
+if not na(biasRaw)
+    biasAd := na(biasAd[1]) ? biasRaw : biasAd[1] + alpha_ad * (biasRaw - biasAd[1])
+else
+    biasAd := na
+
+float biasSm = vpSmooth == "EMA" ? biasEma : biasAd
+float biasDB = na(biasSm) ? na : (math.abs(biasSm) <= effRegDeadband ? 0.0 : biasSm)
+biasDB := na(biasDB) ? na : f_clamp(biasDB, -1.0, 1.0)
+
+float biasAbs = na(biasDB) ? na : math.abs(biasDB)
+float biasAbsBase = ta.ema(nz(biasAbs, 0.0), effRegNormLen)
+float biasRel = (not na(biasAbs) and biasAbsBase > 0) ? (biasAbs / biasAbsBase) : na
+
+bool spreadHot  = relSprReg >= effRegRelSprThr
+bool persistHot = (not na(biasRel)) and (biasRel >= effRegBiasRelThr)
+
+bool isBO = enableRegime and regLtfOK and not na(biasDB) and spreadHot and persistHot and biasDB > effRegDeadband
+bool isMR = enableRegime and regLtfOK and not na(biasDB) and ((not spreadHot) or (persistHot and biasDB < -effRegDeadband))
+
+int regime = 0
+if not enableRegime
+    regime := -1
+else
+    regime := isBO ? 1 : isMR ? -1 : 0
+
+string regimeTxt = regime == 1 ? "BO" : regime == -1 ? "MR" : "NEU"
+
+bool mrActive = not enableRegime ? true : (regime == -1 or (regime == 0 and neutralPolicy == "MR"))
+bool boActive = enableRegime and (regime == 1 or (regime == 0 and neutralPolicy == "BO"))
+
+//══════════════════════════════════════════════════════════════════════════════
+// VOLUMETRIC ABOVE/BELOW PRICE OSCILLATORS
+//══════════════════════════════════════════════════════════════════════════════
+var float[] vpBuy  = array.new_float(0)
+var float[] vpSell = array.new_float(0)
+
+if array.size(vpBuy) != effVpBins
+    vpBuy  := array.new_float(effVpBins, 0.0)
+    vpSell := array.new_float(effVpBins, 0.0)
+
+bool enoughVP = bar_index >= effVpLookBack - 1
+
+float upperOscRaw = na
+float lowerOscRaw = na
+
+if enoughVP
+    float top = ta.highest(high, effVpLookBack)
+    float bot = ta.lowest(low, effVpLookBack)
+    float rngG = top - bot
+    float step = math.max(rngG > 0 ? rngG / effVpBins : syminfo.mintick, syminfo.mintick)
+
+    for k = 0 to effVpBins - 1
+        array.set(vpBuy,  k, 0.0)
+        array.set(vpSell, k, 0.0)
+
+    for i = 0 to effVpLookBack - 1
+        float px = close[i]
+        int idx = int(math.floor((px - bot) / step))
+        idx := idx < 0 ? 0 : idx > effVpBins - 1 ? effVpBins - 1 : idx
+
+        float v = nz(volume[i], 0.0)
+        bool bullBar = close[i] >= open[i]
+
+        if bullBar
+            array.set(vpBuy, idx, array.get(vpBuy, idx) + v)
+        else
+            array.set(vpSell, idx, array.get(vpSell, idx) + v)
+
+    float uBuy = 0.0
+    float uSell = 0.0
+    float lBuy = 0.0
+    float lSell = 0.0
+
+    for k = 0 to effVpBins - 1
+        float mid = bot + (float(k) + 0.5) * step
+        float bV = array.get(vpBuy, k)
+        float sV = array.get(vpSell, k)
+
+        if mid > close
+            uBuy  += bV
+            uSell += sV
+        else if mid < close
+            lBuy  += bV
+            lSell += sV
+
+    float upSum = math.max(uBuy + uSell, 1e-10)
+    float loSum = math.max(lBuy + lSell, 1e-10)
+
+    upperOscRaw := (uBuy - uSell) / upSum
+    lowerOscRaw := (lBuy - lSell) / loSum
+
+float upperEma = ta.ema(nz(upperOscRaw, 0.0), effVpSmoothLen)
+float lowerEma = ta.ema(nz(lowerOscRaw, 0.0), effVpSmoothLen)
+
+var float upperAd = na
+var float lowerAd = na
+
+float atrBaseFlow = ta.ema(ta.atr(14), 100)
+float atrNormFlow = atrBaseFlow > 0 ? ta.atr(14) / atrBaseFlow : 1.0
+
+float volBase2 = ta.ema(nz(volume, 0.0), effVpSmoothLen)
+float volNorm2 = volBase2 > 0 ? nz(volume, 0.0) / volBase2 : 1.0
+
+float quality = volNorm2 / math.max(atrNormFlow, 1e-6)
+quality := f_clamp(quality, 0.0, 2.0)
+float alphaFlow = 0.03 + 0.22 * (quality / 2.0)
+
+if enoughVP and not na(upperOscRaw)
+    upperAd := na(upperAd[1]) ? upperOscRaw : upperAd[1] + alphaFlow * (upperOscRaw - upperAd[1])
+else
+    upperAd := na
+
+if enoughVP and not na(lowerOscRaw)
+    lowerAd := na(lowerAd[1]) ? lowerOscRaw : lowerAd[1] + alphaFlow * (lowerOscRaw - lowerAd[1])
+else
+    lowerAd := na
+
+float upperOsc = vpSmooth == "EMA" ? upperEma : upperAd
+float lowerOsc = vpSmooth == "EMA" ? lowerEma : lowerAd
+
+float upperOscDB = (not na(upperOsc) and math.abs(upperOsc) <= effVpDeadband) ? 0.0 : nz(upperOsc, 0.0)
+float lowerOscDB = (not na(lowerOsc) and math.abs(lowerOsc) <= effVpDeadband) ? 0.0 : nz(lowerOsc, 0.0)
+
+//══════════════════════════════════════════════════════════════════════════════
+// TRIX
+//══════════════════════════════════════════════════════════════════════════════
+float trixE1 = ta.ema(close, effTrixLen)
+float trixE2 = ta.ema(trixE1, effTrixLen)
+float trixE3 = ta.ema(trixE2, effTrixLen)
+
+float trixRaw = 0.0
+if not na(trixE3[1]) and math.abs(trixE3[1]) > syminfo.mintick
+    trixRaw := 10000.0 * (trixE3 - trixE3[1]) / trixE3[1]
+
+float trixSignal = ta.ema(trixRaw, effTrixSigLen)
+float trixHist = trixRaw - trixSignal
+float trixBase = ta.ema(math.abs(trixHist), 100)
+
+float trixNorm = trixBase > 0 ? trixHist / (trixBase * 2.0) : 0.0
+trixNorm := f_clamp(trixNorm, -1.0, 1.0)
+
+float trixNormDB = math.abs(trixNorm) <= effTrixDeadband ? 0.0 : trixNorm
+
+//══════════════════════════════════════════════════════════════════════════════
+// FUSED FLOW
+//══════════════════════════════════════════════════════════════════════════════
+float blendDen = math.max(flowWeight + trixWeight, 1e-6)
+
+float upperBlendRaw = (flowWeight * upperOscDB + trixWeight * trixNormDB) / blendDen
+float lowerBlendRaw = (flowWeight * lowerOscDB + trixWeight * trixNormDB) / blendDen
+
+float upperBlend = f_clamp(upperBlendRaw, -1.0, 1.0)
+float lowerBlend = f_clamp(lowerBlendRaw, -1.0, 1.0)
+
+float upperBlendAbs = math.abs(upperBlend)
+float lowerBlendAbs = math.abs(lowerBlend)
+
+float netFlow = f_clamp((lowerBlend - upperBlend) * 0.5, -1.0, 1.0)
+
+//══════════════════════════════════════════════════════════════════════════════
+// SIGNALS
+//══════════════════════════════════════════════════════════════════════════════
+bool closeInside = channelValid and close >= channelLow and close <= channelHigh
+
+float buyOutsideLevel  = triggerSel == "Inner" ? buyTrig  : buyBot
+float sellOutsideLevel = triggerSel == "Inner" ? sellTrig : sellTop
+
+bool buyReject  = low  <= buyOutsideLevel  and (not requireCloseInside or closeInside)
+bool sellReject = high >= sellOutsideLevel and (not requireCloseInside or closeInside)
+
+float boUpLevel = sellTrig
+float boDnLevel = buyTrig
+
+bool boUpCond = not na(boUpLevel) and close > boUpLevel
+bool boDnCond = not na(boDnLevel) and close < boDnLevel
+
+bool boUpEvent = boCrossOnly ? (boUpCond and not boUpCond[1]) : boUpCond
+bool boDnEvent = boCrossOnly ? (boDnCond and not boDnCond[1]) : boDnCond
+
+bool trixLongOK  = not trixGateSignals or trixNormDB >= -effTrixGateThr
+bool trixShortOK = not trixGateSignals or trixNormDB <=  effTrixGateThr
+
+bool flowLongOK  = lowerBlend >  effSRFlowThr
+bool flowShortOK = upperBlend < -effSRFlowThr
+
+bool mrBuySignal  = doBar and mrActive and allowLong  and buyReject  and trixLongOK  and flowLongOK
+bool mrSellSignal = doBar and mrActive and allowShort and sellReject and trixShortOK and flowShortOK
+
+bool boBuySignal  = doBar and boActive and allowLong  and boUpEvent and trixLongOK  and netFlow >  0.0
+bool boSellSignal = doBar and boActive and allowShort and boDnEvent and trixShortOK and netFlow <  0.0
+
+bool buySignal  = mrBuySignal or boBuySignal
+bool sellSignal = mrSellSignal or boSellSignal
+
+//══════════════════════════════════════════════════════════════════════════════
+// HEATMAP GEOMETRY
+//══════════════════════════════════════════════════════════════════════════════
+float upperHeatStrength = f_clamp(math.pow(upperBlendAbs, vpGamma), 0.0, 1.0)
+float lowerHeatStrength = f_clamp(math.pow(lowerBlendAbs, vpGamma), 0.0, 1.0)
+
+int upperHeatAlpha = f_alpha_from_strength(upperHeatStrength, heatAmin, heatAmax)
+int lowerHeatAlpha = f_alpha_from_strength(lowerHeatStrength, heatAmin, heatAmax)
+
+color upperHeatColor = color.new(upperBlend >= 0 ? bullAccent : bearAccent, upperHeatAlpha)
+color lowerHeatColor = color.new(lowerBlend >= 0 ? bullAccent : bearAccent, lowerHeatAlpha)
+
+float upperHeatBase = high + atrV * effHeatOffsetATR
+float upperHeatTop  = upperHeatBase + atrV * effHeatHeightATR * upperHeatStrength
+
+float lowerHeatBase = low - atrV * effHeatOffsetATR
+float lowerHeatBot  = lowerHeatBase - atrV * effHeatHeightATR * lowerHeatStrength
+
+//══════════════════════════════════════════════════════════════════════════════
+// TAPE GEOMETRY
+//══════════════════════════════════════════════════════════════════════════════
+float tapeWeightNorm = math.min(1.0, absorption / 3.0)
+
+float upperTapeStrength = f_clamp(upperHeatStrength * tapeWeightNorm, 0.0, 1.0)
+float lowerTapeStrength = f_clamp(lowerHeatStrength * tapeWeightNorm, 0.0, 1.0)
+
+int upperTapeAlpha = f_alpha_from_strength(upperTapeStrength, tapeAmin, tapeAmax)
+int lowerTapeAlpha = f_alpha_from_strength(lowerTapeStrength, tapeAmin, tapeAmax)
+
+color upperTapeColor = color.new(upperBlend >= 0 ? cBuy : cSell, upperTapeAlpha)
+color lowerTapeColor = color.new(lowerBlend >= 0 ? cBuy : cSell, lowerTapeAlpha)
+
+float upperTapeBase = sellTop + atrV * effTapeOffsetATR
+float upperTapeTip  = upperTapeBase + atrV * effTapeHeightATR * upperTapeStrength
+
+float lowerTapeBase = buyBot - atrV * effTapeOffsetATR
+float lowerTapeTip  = lowerTapeBase - atrV * effTapeHeightATR * lowerTapeStrength
+
+//══════════════════════════════════════════════════════════════════════════════
+// SR ZONES
+//══════════════════════════════════════════════════════════════════════════════
+var box[] supBoxes = array.new_box()
+var box[] resBoxes = array.new_box()
+
+float supScore = absorption * lowerWickRatio * (1.0 + math.max(lowerBlend, 0.0))
+float resScore = absorption * upperWickRatio * (1.0 + math.max(-upperBlend, 0.0))
+
+bool supportEvent =
+     showSRZones and doBar and allowLong and buyReject and
+     relVol >= effSRRelVol and absorption >= effSRAbsorption and lowerBlend > effSRFlowThr
+
+bool resistEvent =
+     showSRZones and doBar and allowShort and sellReject and
+     relVol >= effSRRelVol and absorption >= effSRAbsorption and upperBlend < -effSRFlowThr
+
+if supportEvent
+    float zTop = buyTop
+    float zBot = buyBot
+    if zTop > zBot
+        float s = f_clamp(supScore / 3.0, 0.0, 1.0)
+        int a = f_alpha_from_strength(s, 24, 92)
+        box b = box.new(left=bar_index, right=bar_index + srExtendBars, top=zTop, bottom=zBot, bgcolor=color.new(cBuy, a), border_color=color.new(bullAccent, math.min(a + 8, 100)))
+        array.push(supBoxes, b)
+        if array.size(supBoxes) > srMaxZones
+            box old = array.shift(supBoxes)
+            box.delete(old)
+
+if resistEvent
+    float zTop = sellTop
+    float zBot = sellBot
+    if zTop > zBot
+        float s = f_clamp(resScore / 3.0, 0.0, 1.0)
+        int a = f_alpha_from_strength(s, 24, 92)
+        box b = box.new(left=bar_index, right=bar_index + srExtendBars, top=zTop, bottom=zBot, bgcolor=color.new(cSell, a), border_color=color.new(bearAccent, math.min(a + 8, 100)))
+        array.push(resBoxes, b)
+        if array.size(resBoxes) > srMaxZones
+            box old = array.shift(resBoxes)
+            box.delete(old)
+
+if showSRZones
+    int i = array.size(supBoxes) - 1
+    while i >= 0
+        box b = array.get(supBoxes, i)
+        box.set_right(b, bar_index + srExtendBars)
+        if srRemoveBroken and close < box.get_bottom(b)
+            box.delete(b)
+            array.remove(supBoxes, i)
+        i -= 1
+
+    int j = array.size(resBoxes) - 1
+    while j >= 0
+        box b = array.get(resBoxes, j)
+        box.set_right(b, bar_index + srExtendBars)
+        if srRemoveBroken and close > box.get_top(b)
+            box.delete(b)
+            array.remove(resBoxes, j)
+        j -= 1
+
+//══════════════════════════════════════════════════════════════════════════════
+// PREMIUM: COMPRESSION ZONES
+//══════════════════════════════════════════════════════════════════════════════
+var box[] compBoxes = array.new_box()
+
+bool compressionCond =
+     showCompression and channelValid and
+     relSpread < 0.92 and
+     math.abs(netFlow) < 0.10 and
+     math.abs(trixNormDB) < effTrixDeadband * 1.60
+
+if compressionCond and not compressionCond[1]
+    box cb = box.new(left=bar_index, right=bar_index, top=channelHigh, bottom=channelLow,
+         bgcolor=color.new(color.silver, 93), border_color=color.new(bullAccent, 86))
+    array.push(compBoxes, cb)
+    if array.size(compBoxes) > maxCompression
+        box oldC = array.shift(compBoxes)
+        box.delete(oldC)
+
+if array.size(compBoxes) > 0
+    box lastC = array.get(compBoxes, array.size(compBoxes) - 1)
+    if compressionCond
+        box.set_right(lastC, bar_index)
+        box.set_top(lastC, channelHigh)
+        box.set_bottom(lastC, channelLow)
+    else if not compressionCond and compressionCond[1]
+        box.set_right(lastC, bar_index)
+
+//══════════════════════════════════════════════════════════════════════════════
+// PLOTS
+//══════════════════════════════════════════════════════════════════════════════
+color sellRibbonColor = color.new(cSell, ribbonAlpha)
+color buyRibbonColor  = color.new(cBuy,  ribbonAlpha)
+
+// Ribbons
+p_sellU1Top = plot(showRibbons ? sellU1_top : na, "SELL MA1 Top", color=color.new(cSell, 100))
+p_sellU1Bot = plot(showRibbons ? sellU1_bot : na, "SELL MA1 Bot", color=color.new(cSell, 100))
+fill(p_sellU1Top, p_sellU1Bot, color=sellRibbonColor, title="SELL Ribbon 1")
+
+p_sellU2Top = plot(showRibbons ? sellU2_top : na, "SELL MA2 Top", color=color.new(cSell, 100))
+p_sellU2Bot = plot(showRibbons ? sellU2_bot : na, "SELL MA2 Bot", color=color.new(cSell, 100))
+fill(p_sellU2Top, p_sellU2Bot, color=sellRibbonColor, title="SELL Ribbon 2")
+
+p_buyL1Top = plot(showRibbons ? buyL1_top : na, "BUY MA1 Top", color=color.new(cBuy, 100))
+p_buyL1Bot = plot(showRibbons ? buyL1_bot : na, "BUY MA1 Bot", color=color.new(cBuy, 100))
+fill(p_buyL1Top, p_buyL1Bot, color=buyRibbonColor, title="BUY Ribbon 1")
+
+p_buyL2Top = plot(showRibbons ? buyL2_top : na, "BUY MA2 Top", color=color.new(cBuy, 100))
+p_buyL2Bot = plot(showRibbons ? buyL2_bot : na, "BUY MA2 Bot", color=color.new(cBuy, 100))
+fill(p_buyL2Top, p_buyL2Bot, color=buyRibbonColor, title="BUY Ribbon 2")
+
+// Triggers
+plot(sellTrig, "SELL Trigger", color=color.new(bearAccent, 0), linewidth=2)
+plot(buyTrig,  "BUY Trigger",  color=color.new(bullAccent, 0), linewidth=2)
+
+// Envelope fills
+p_sellTop = plot(sellTop, "SELL Envelope Top", color=color.new(cSell, 100))
+p_sellBot = plot(sellBot, "SELL Envelope Bot", color=color.new(cSell, 100))
+fill(p_sellTop, p_sellBot, color=sellFillColor, title="SELL Envelope Fill")
+
+p_buyTop = plot(buyTop, "BUY Envelope Top", color=color.new(cBuy, 100))
+p_buyBot = plot(buyBot, "BUY Envelope Bot", color=color.new(cBuy, 100))
+fill(p_buyTop, p_buyBot, color=buyFillColor, title="BUY Envelope Fill")
+
+// Channel flow fill
+color chColor = color.new(netFlow >= 0 ? bullAccent : bearAccent, f_alpha_from_strength(math.abs(netFlow), 72, 97))
+fill(p_buyTop, p_sellBot, color=channelValid ? chColor : na, title="Channel Flow Fill")
+
+// Heatmap
+p_heatUpBase = plot(showHeatmap ? upperHeatBase : na, "Upper Heat Base", color=color.new(cSell, 100))
+p_heatUpTop  = plot(showHeatmap ? upperHeatTop  : na, "Upper Heat Top",  color=color.new(cSell, 100))
+fill(p_heatUpBase, p_heatUpTop, color=showHeatmap ? upperHeatColor : na, title="Upper Heat")
+
+p_heatDnBase = plot(showHeatmap ? lowerHeatBase : na, "Lower Heat Base", color=color.new(cBuy, 100))
+p_heatDnBot  = plot(showHeatmap ? lowerHeatBot  : na, "Lower Heat Bot",  color=color.new(cBuy, 100))
+fill(p_heatDnBase, p_heatDnBot, color=showHeatmap ? lowerHeatColor : na, title="Lower Heat")
+
+// Tape
+p_tapeUpBase = plot(showTape ? upperTapeBase : na, "Upper Tape Base", color=color.new(cSell, 100))
+p_tapeUpTip  = plot(showTape ? upperTapeTip  : na, "Upper Tape Tip",  color=color.new(cSell, 100))
+fill(p_tapeUpBase, p_tapeUpTip, color=showTape ? upperTapeColor : na, title="Upper Tape")
+
+p_tapeDnBase = plot(showTape ? lowerTapeBase : na, "Lower Tape Base", color=color.new(cBuy, 100))
+p_tapeDnTip  = plot(showTape ? lowerTapeTip  : na, "Lower Tape Tip",  color=color.new(cBuy, 100))
+fill(p_tapeDnBase, p_tapeDnTip, color=showTape ? lowerTapeColor : na, title="Lower Tape")
+
+// Premium signals: MR vs BO separated
+plotshape(showSignals and mrBuySignal,  title="MR BUY",  style=shape.triangleup,   location=location.belowbar, size=size.tiny, color=color.new(cBuy, 0))
+plotshape(showSignals and mrSellSignal, title="MR SELL", style=shape.triangledown, location=location.abovebar, size=size.tiny, color=color.new(cSell, 0))
+plotshape(showSignals and boBuySignal,  title="BO BUY",  style=shape.circle,       location=location.belowbar, size=size.tiny, color=color.new(bullAccent, 0))
+plotshape(showSignals and boSellSignal, title="BO SELL", style=shape.circle,       location=location.abovebar, size=size.tiny, color=color.new(bearAccent, 0))
+
+float sigOff = atrV * 0.18
+
+if showSignals and showSignalText and mrBuySignal
+    label.new(bar_index, low - sigOff, "MR", yloc=yloc.price, style=label.style_none, textcolor=color.white, size=size.tiny)
+
+if showSignals and showSignalText and mrSellSignal
+    label.new(bar_index, high + sigOff, "MR", yloc=yloc.price, style=label.style_none, textcolor=color.white, size=size.tiny)
+
+if showSignals and showSignalText and boBuySignal
+    label.new(bar_index, low - sigOff, "BO", yloc=yloc.price, style=label.style_none, textcolor=color.black, size=size.tiny)
+
+if showSignals and showSignalText and boSellSignal
+    label.new(bar_index, high + sigOff, "BO", yloc=yloc.price, style=label.style_none, textcolor=color.white, size=size.tiny)
+// Alerts
+alertcondition(buySignal,  title="BUY",  message="BUY: adaptive flow + TRIX + regime + MTF")
+alertcondition(sellSignal, title="SELL", message="SELL: adaptive flow + TRIX + regime + MTF")
+
+//══════════════════════════════════════════════════════════════════════════════
+// DASHBOARD
+//══════════════════════════════════════════════════════════════════════════════
+ 
+//══════════════════════════════════════════════════════════════════════════════
+// DASHBOARD
+//══════════════════════════════════════════════════════════════════════════════
+dashPos = dashPosOpt == "Top Left"     ? position.top_left :
+          dashPosOpt == "Bottom Right" ? position.bottom_right :
+          dashPosOpt == "Bottom Left"  ? position.bottom_left :
+                                         position.top_right
+
+var table dash = table.new(dashPos, 7, 6, border_width=1)
+
+color regCol = regime == 1 ? color.aqua :
+               regime == -1 ? #ff0066 :
+               color.new(color.gray, 0)
+
+if showDashboard and barstate.islast
+    // Header
+    table.cell(dash, 0, 0, "ABB Premium", text_color=color.white, bgcolor=color.new(color.black, 0))
+    table.cell(dash, 1, 0, "TF1", text_color=color.white, bgcolor=color.new(color.black, 0))
+    table.cell(dash, 2, 0, "TF2", text_color=color.white, bgcolor=color.new(color.black, 0))
+    table.cell(dash, 3, 0, "TF3", text_color=color.white, bgcolor=color.new(color.black, 0))
+    table.cell(dash, 4, 0, "TF4", text_color=color.white, bgcolor=color.new(color.black, 0))
+    table.cell(dash, 5, 0, "TF5", text_color=color.white, bgcolor=color.new(color.black, 0))
+    table.cell(dash, 6, 0, "TF6", text_color=color.white, bgcolor=color.new(color.black, 0))
+
+    // Bias row
+    table.cell(dash, 0, 1, "Bias", text_color=color.white, bgcolor=color.new(color.black, 80))
+    table.cell(dash, 1, 1, f_biasText(bias1), text_color=color.black, bgcolor=f_biasColor(bias1))
+    table.cell(dash, 2, 1, f_biasText(bias2), text_color=color.black, bgcolor=f_biasColor(bias2))
+    table.cell(dash, 3, 1, f_biasText(bias3), text_color=color.black, bgcolor=f_biasColor(bias3))
+    table.cell(dash, 4, 1, f_biasText(bias4), text_color=color.black, bgcolor=f_biasColor(bias4))
+    table.cell(dash, 5, 1, f_biasText(bias5), text_color=color.black, bgcolor=f_biasColor(bias5))
+    table.cell(dash, 6, 1, f_biasText(bias6), text_color=color.black, bgcolor=f_biasColor(bias6))
+
+    // Flow row
+    table.cell(dash, 0, 2, "Flow", text_color=color.white, bgcolor=color.new(color.black, 80))
+    table.cell(dash, 1, 2, str.tostring(upperBlend, "#.##"), text_color=color.white, bgcolor=color.new(color.black, 60))
+    table.cell(dash, 2, 2, str.tostring(lowerBlend, "#.##"), text_color=color.white, bgcolor=color.new(color.black, 60))
+    table.cell(dash, 3, 2, str.tostring(trixNormDB, "#.##"), text_color=color.white, bgcolor=color.new(color.black, 60))
+    table.cell(dash, 4, 2, str.tostring(absorption, "#.##"), text_color=color.white, bgcolor=color.new(color.black, 60))
+    table.cell(dash, 5, 2, wideSpread ? "WIDE" : "OK", text_color=color.orange, bgcolor=color.new(color.black, 60))
+    table.cell(dash, 6, 2, "Net " + str.tostring(netFlow, "#.##"), text_color=color.white, bgcolor=color.new(color.black, 60))
+
+    // Regime row
+    table.cell(dash, 0, 3, "Regime", text_color=color.white, bgcolor=color.new(color.black, 80))
+    table.cell(dash, 1, 3, regimeTxt, text_color=color.black, bgcolor=regCol)
+    table.cell(dash, 2, 3, mrBuySignal ? "MR↑" : boBuySignal ? "BO↑" : "", text_color=color.aqua, bgcolor=color.new(color.black, 60))
+    table.cell(dash, 3, 3, mrSellSignal ? "MR↓" : boSellSignal ? "BO↓" : "", text_color=#ff0066, bgcolor=color.new(color.black, 60))
+    table.cell(dash, 4, 3, compressionCond ? "CMP" : "", text_color=color.silver, bgcolor=color.new(color.black, 60))
+    table.cell(dash, 5, 3, str.tostring(array.size(supBoxes)), text_color=color.new(cBuy, 0), bgcolor=color.new(color.black, 60))
+    table.cell(dash, 6, 3, str.tostring(array.size(resBoxes)), text_color=color.new(cSell, 0), bgcolor=color.new(color.black, 60))
+
+    // Auto row
+    table.cell(dash, 0, 4, "Auto", text_color=color.white, bgcolor=color.new(color.black, 80))
+    table.cell(dash, 1, 4, assetLabel, text_color=color.white, bgcolor=color.new(color.black, 60))
+    table.cell(dash, 2, 4, "ATR " + str.tostring(effAtrLen), text_color=color.white, bgcolor=color.new(color.black, 60))
+    table.cell(dash, 3, 4, "VP " + str.tostring(effVpLookBack) + "/" + str.tostring(effVpBins), text_color=color.white, bgcolor=color.new(color.black, 60))
+    table.cell(dash, 4, 4, "TRX " + str.tostring(effTrixLen) + "/" + str.tostring(effTrixSigLen), text_color=color.white, bgcolor=color.new(color.black, 60))
+    table.cell(dash, 5, 4, autoMode, text_color=color.white, bgcolor=color.new(color.black, 60))
+    table.cell(dash, 6, 4, "sum " + str.tostring(sumBias), text_color=color.white, bgcolor=color.new(color.black, 60))
+
+    // Signature row (visually merged)
+// Unisce tutte le celle della riga 5
+table.merge_cells(dash, 0, 5, 6, 5)
+
+// Scrive la firma nella cella unificata
+table.cell(
+     dash,
+     0, 5,
+     "👁 Adaptive Bollinger Bands [by Oberlunar] ✦",
+     text_color = color.aqua,
+     bgcolor = color.new(color.black, 0),
+     text_halign = text.align_center
+)

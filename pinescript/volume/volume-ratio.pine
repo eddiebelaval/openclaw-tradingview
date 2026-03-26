@@ -1,0 +1,89 @@
+//@version=6
+indicator(title = "Volume Ratio（量比）", shorttitle = "VR 量比", format = format.volume, precision = 2)
+
+// ─── 参数设置 ───────────────────────────────────────────────────────────────
+int   avgLen      = input.int(5,   title = "均量周期（日）", minval = 1)
+bool  showAvgVol  = input.bool(false, title = "显示均量柱")
+int   totalMinInput = input.int(240, title = "全天交易分钟数（A股=240，港股=330，美股=390）", minval = 1, tooltip = "A股: 240 | 港股: 330 | 美股/美股期权: 390 | 其他市场请自行填写")
+
+// ─── 量比计算 ────────────────────────────────────────────────────────────────
+// 同花顺量比公式：
+//   盘中：当日累计成交量 ÷ (过去N日平均每分钟成交量 × 当日已交易分钟数)
+//   收盘/日线：当日成交量 ÷ 过去N日平均成交量
+//
+// 在日线 timeframe 下，volume 即当日总量，直接用 N 日均量做分母。
+// 在分钟级别 timeframe 下，需要将分钟量换算成"当日累计量 vs 标准全天量"。
+
+// 判断当前 timeframe 是否为日线或更高周期
+bool isDailyOrHigher = timeframe.isdaily or timeframe.isweekly or timeframe.ismonthly
+
+// 过去 N 日（不含当日）的平均成交量
+float avgVol = ta.sma(volume, avgLen)
+
+float volRatio = na
+
+if isDailyOrHigher
+    // 日线及以上：量比 = 当日量 / N日均量（均量取前N根，即 avgVol 已是当根收盘前的滚动均值）
+    // 用 avgVol[1] 取前一根均值，避免当日数据污染均值
+    float baseVol = ta.sma(volume[1], avgLen)
+    volRatio := baseVol != 0 ? volume / baseVol : na
+else
+    // 分钟线：
+    //   1. 用 request.security 取日线均量作为"标准全天量"基准
+    //   2. 当日累计量 / (标准全天量 / 全天总分钟数 × 当日已过分钟数)
+    //      化简 = 当日累计量 × 全天分钟数 / (标准全天量 × 当日已过分钟数)
+
+    // 取日线上过去 N 日的平均成交量（不含当日，lookahead=barmerge.lookahead_off）
+    float dailyAvgVol = request.security(syminfo.tickerid, "D",
+         ta.sma(volume[1], avgLen),
+         lookahead = barmerge.lookahead_off)
+
+    // 当日已累计成交量（通过 session 重置累加）
+    bool  isNewDay    = ta.change(time("D")) != 0
+    float cumVol      = 0.0
+    cumVol := isNewDay ? volume : nz(cumVol[1]) + volume
+
+    // 当日已过交易分钟数（每根 bar 代表 timeframe.multiplier 分钟）
+    int   barMinutes  = timeframe.multiplier  // 1 for 1m, 5 for 5m, etc.
+    int   barsToday   = 0
+    barsToday := isNewDay ? 1 : nz(barsToday[1]) + 1
+    float elapsedMin  = barsToday * barMinutes
+
+    float totalMin    = totalMinInput
+
+    float avgVolPerMin = dailyAvgVol / totalMin
+    volRatio := (avgVolPerMin * elapsedMin) != 0 ?
+         cumVol / (avgVolPerMin * elapsedMin) : na
+
+// ─── 颜色映射 ────────────────────────────────────────────────────────────────
+// 量比 < 0.5  极度萎缩  灰色
+// 0.5 ~ 1.0  温和缩量  浅蓝
+// 1.0 ~ 1.5  正常放量  绿色
+// 1.5 ~ 2.5  明显放量  橙色
+// > 2.5      异常放量  红色
+color ratioColor =
+     volRatio < 0.5  ? color.gray   :
+     volRatio < 1.0  ? color.new(color.blue,  30) :
+     volRatio < 1.5  ? color.new(color.green, 20) :
+     volRatio < 2.5  ? color.orange :
+     color.red
+
+// ─── 绘图 ────────────────────────────────────────────────────────────────────
+plot(volRatio, title = "量比", color = ratioColor, style = plot.style_columns, linewidth = 1)
+
+// 参考线
+hline(1.0, title = "基准线 1.0", color = color.new(color.white, 50), linestyle = hline.style_dashed, linewidth = 1)
+hline(2.5, title = "异常放量 2.5", color = color.new(color.red,   60), linestyle = hline.style_dotted,  linewidth = 1)
+hline(0.5, title = "极度萎缩 0.5", color = color.new(color.gray,  40), linestyle = hline.style_dotted,  linewidth = 1)
+
+// 可选：显示均量柱（辅助参考）
+plot(showAvgVol ? avgVol : na, title = "N日均量", color = color.new(color.yellow, 60), style = plot.style_line, linewidth = 1)
+
+// ─── 数值标签（最新 bar）────────────────────────────────────────────────────
+if barstate.islast
+    label.new(bar_index, volRatio,
+         text  = "量比: " + str.tostring(volRatio, "#.##"),
+         style = label.style_label_left,
+         color = ratioColor,
+         textcolor = color.white,
+         size  = size.small)
