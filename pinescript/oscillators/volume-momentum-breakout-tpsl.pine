@@ -1,0 +1,387 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © Uncle_the_shooter
+
+//@version=6
+indicator('Volume Momentum Breakout + TP/SL', 
+     overlay = false, 
+     max_lines_count = 500, 
+     max_labels_count = 500, 
+     max_boxes_count = 500, 
+     max_bars_back = 1000)
+
+// MAIN SETTINGS 
+operationMode = input.string("Signals after pivot breakout", "Operation Mode", 
+     options = ["Signals after pivot breakout", "OB/OS continuation signals"])
+
+avgVolWindow     = input.int(20, 'Average Volume Window', minval = 1)
+posOBLevel       = input.float(15, 'Positive OB Level')
+negOSLevel       = input.float(-15, 'Negative OS Level')
+pivotLeftLen     = input.int(2, 'Pivot Left Length', minval = 1)
+pivotRightLen    = input.int(2, 'Pivot Right Length', minval = 1)
+usePriceFilter   = input.bool(false, 'Price Level Filter')
+maxPivotLineLength = input.int(200, 'Max. Pivot Line Length [bars] (0 = no limit)', minval = 0)
+
+// TP/SL SETTINGS 
+showTargets   = input.bool(true,   "Show TP/SL",               group = "TP/SL")
+useAtrForSl   = input.bool(true,   "SL = ATR × instead of %",  group = "TP/SL")
+atrPeriod     = input.int(14,      "ATR Period",      minval=1,  group = "TP/SL")
+slAtrMult     = input.float(1.5,   "SL ATR Multiplier", step=0.1,  group = "TP/SL")
+slPercent     = input.float(1.0,   "SL % from Entry",   step=0.1, group = "TP/SL")
+
+rrTp1         = input.float(1.0,   "TP1 RR", step=0.1, group = "TP/SL")
+rrTp2         = input.float(2.0,   "TP2 RR", step=0.1, group = "TP/SL")
+rrTp3         = input.float(3.0,   "TP3 RR", step=0.1, group = "TP/SL")
+
+showSlLevel   = input.bool(true,   "SL",   group = "TP/SL Display")
+showTp1Level  = input.bool(true,   "TP1",  group = "TP/SL Display")
+showTp2Level  = input.bool(true,   "TP2",  group = "TP/SL Display")
+showTp3Level  = input.bool(true,   "TP3",  group = "TP/SL Display")
+
+// COLORS 
+oscColor      = input.color(color.rgb(131, 131, 131), "Oscillator Color",               group = "Colors")
+bandZeroColor = input.color(color.gray,  "Zero Line Color",                              group = "Colors")
+bandPosColor  = input.color(color.gray, "Upper Band Color",                             group = "Colors")
+bandNegColor  = input.color(color.gray,   "Lower Band Color",                             group = "Colors")
+gradientColor = input.color(color.new(color.gray, 85), "Gradient Color between OB/OS Lines", group = "Colors")
+
+bullColor = input.color(#26a69a, "Bull Color (lines + boxes + background + triangles)", inline = "bullbear")
+bearColor = input.color(#ef5350,   "Bear Color (lines + boxes + background + triangles)", inline = "bullbear")
+
+buyLabelColor  = bullColor
+sellLabelColor = bearColor
+buyColorLight  = color.new(buyLabelColor,  40)
+sellColorLight = color.new(sellLabelColor, 40)
+buyFill        = color.new(buyLabelColor,  85)
+sellFill       = color.new(sellLabelColor, 85)
+
+//  OSCILLATOR + ATR 
+volAvg  = ta.sma(volume, avgVolWindow)
+volStd  = ta.stdev(volume, avgVolWindow)
+volNorm = math.max((volume - volAvg) / volStd, 0)
+
+priceChange = close - close[1]
+vwo         = priceChange * volNorm
+
+vwoAvg = ta.sma(vwo, avgVolWindow)
+vwoStd = ta.stdev(vwo, avgVolWindow)
+vwoNorm = (vwo - vwoAvg) / vwoStd * 10
+
+plot(vwoNorm, color = oscColor, linewidth = 2)
+hline(0, color = bandZeroColor)
+hline(posOBLevel, color = bandPosColor, linestyle = hline.style_dashed)
+hline(negOSLevel, color = bandNegColor, linestyle = hline.style_dashed)
+
+pPos = plot(posOBLevel, color = na)
+pNeg = plot(negOSLevel, color = na)
+fill(pPos, pNeg, color = gradientColor)
+
+atr_val = ta.atr(atrPeriod)
+
+// VARIABLES 
+bool isPivotMode = operationMode == "Signals after pivot breakout"
+
+float ph = na
+float pl = na
+
+var float lastHiLvl   = na
+var float lastHiClose = na
+var float lastLoLvl   = na
+var float lastLoClose = na
+
+var array<line>  hiLines    = array.new<line>()
+var array<float> hiLvl      = array.new<float>()
+var array<bool>  hiLive     = array.new<bool>()
+
+var array<line>  loLines    = array.new<line>()
+var array<float> loLvl      = array.new<float>()
+var array<bool>  loLive     = array.new<bool>()
+
+var array<box>   activeBoxes = array.new<box>()
+var array<float> boxTops     = array.new<float>()
+var array<float> boxBottoms  = array.new<float>()
+
+var int   trade_dir     = 0
+var int   entry_bar     = na
+var float sl_level      = na
+var float extreme_level = na
+
+var line     entry_line   = na
+var label    entry_label  = na
+var line     sl_line      = na
+var label    sl_label     = na
+var line     tp1_line     = na
+var label    tp1_label    = na
+var line     tp2_line     = na
+var label    tp2_label    = na
+var line     tp3_line     = na
+var label    tp3_label    = na
+var line     extreme_line = na
+var linefill risk_fill    = na
+var linefill reward_fill  = na
+
+// CREATING PIVOT LINES 
+if isPivotMode
+    pivotSrc = vwoNorm
+    ph := ta.pivothigh(pivotSrc, pivotLeftLen, pivotRightLen)
+    pl := ta.pivotlow(pivotSrc, pivotLeftLen, pivotRightLen)
+
+    if not na(ph) and ph > posOBLevel
+        int   thisBar   = bar_index - pivotRightLen
+        float thisClose = close[pivotRightLen]
+        bool createNew = na(lastHiLvl) or (ph > lastHiLvl and (not usePriceFilter or thisClose > lastHiClose))
+        if createNew
+            line newLine = line.new(thisBar, ph, thisBar + 1, ph, extend = extend.right, color = bullColor, width = 2)
+            array.push(hiLines, newLine)
+            array.push(hiLvl,   ph)
+            array.push(hiLive,  true)
+        lastHiLvl   := ph
+        lastHiClose := thisClose
+
+    if not na(pl) and pl < negOSLevel
+        int   thisBar   = bar_index - pivotRightLen
+        float thisClose = close[pivotRightLen]
+        bool createNew = na(lastLoLvl) or (pl < lastLoLvl and (not usePriceFilter or thisClose < lastLoClose))
+        if createNew
+            line newLine = line.new(thisBar, pl, thisBar + 1, pl, extend = extend.right, color = bearColor, width = 2)
+            array.push(loLines, newLine)
+            array.push(loLvl,   pl)
+            array.push(loLive,  true)
+        lastLoLvl   := pl
+        lastLoClose := thisClose
+
+// SIGNAL LOGIC + BOXES 
+bool signalBull = false
+bool signalBear = false
+bool bullBoxCreated = false
+bool bearBoxCreated = false
+
+if isPivotMode
+    // HIGH BREAK
+    int hc = array.size(hiLines)
+    if hc > 0
+        for j = 0 to hc - 1
+            int i = hc - 1 - j
+            if array.get(hiLive, i)
+                float lvl = array.get(hiLvl, i)
+                line  ln  = array.get(hiLines, i)
+                int   x1  = line.get_x1(ln)
+                bool crossed = vwoNorm > lvl
+                bool tooOld  = maxPivotLineLength > 0 and (bar_index - x1 >= maxPivotLineLength)
+                if crossed or tooOld
+                    int stopBar = crossed ? bar_index : x1 + maxPivotLineLength
+                    line.set_x2(ln, stopBar)
+                    line.set_extend(ln, extend.none)
+                    array.set(hiLive, i, false)
+                    if crossed
+                        signalBull := true
+                        if not bullBoxCreated
+                            box newBox = box.new(bar_index, high, bar_index, low, border_color = bullColor, bgcolor = color.new(bullColor, 85), force_overlay = true)
+                            array.push(activeBoxes, newBox)
+                            array.push(boxTops, high)
+                            array.push(boxBottoms, low)
+                            bullBoxCreated := true
+
+    // LOW BREAK
+    int lc = array.size(loLines)
+    if lc > 0
+        for j = 0 to lc - 1
+            int i = lc - 1 - j
+            if array.get(loLive, i)
+                float lvl = array.get(loLvl, i)
+                line  ln  = array.get(loLines, i)
+                int   x1  = line.get_x1(ln)
+                bool crossed = vwoNorm < lvl
+                bool tooOld  = maxPivotLineLength > 0 and (bar_index - x1 >= maxPivotLineLength)
+                if crossed or tooOld
+                    int stopBar = crossed ? bar_index : x1 + maxPivotLineLength
+                    line.set_x2(ln, stopBar)
+                    line.set_extend(ln, extend.none)
+                    array.set(loLive, i, false)
+                    if crossed
+                        signalBear := true
+                        if not bearBoxCreated
+                            box newBox = box.new(bar_index, high, bar_index, low, border_color = bearColor, bgcolor = color.new(bearColor, 85), force_overlay = true)
+                            array.push(activeBoxes, newBox)
+                            array.push(boxTops, high)
+                            array.push(boxBottoms, low)
+                            bearBoxCreated := true
+
+else
+    bool bullCross = ta.crossover(vwoNorm, posOBLevel)
+    bool bearCross = ta.crossunder(vwoNorm, negOSLevel)
+    
+    if bullCross
+        signalBull := true
+        if not bullBoxCreated
+            box newBox = box.new(bar_index, high, bar_index, low, border_color = bullColor, bgcolor = color.new(bullColor, 85), force_overlay = true)
+            array.push(activeBoxes, newBox)
+            array.push(boxTops, high)
+            array.push(boxBottoms, low)
+            bullBoxCreated := true
+    
+    if bearCross
+        signalBear := true
+        if not bearBoxCreated
+            box newBox = box.new(bar_index, high, bar_index, low, border_color = bearColor, bgcolor = color.new(bearColor, 85), force_overlay = true)
+            array.push(activeBoxes, newBox)
+            array.push(boxTops, high)
+            array.push(boxBottoms, low)
+            bearBoxCreated := true
+
+// BOX EXTENSION + BREAKOUT DETECTION 
+bool boxBreakBull = false
+bool boxBreakBear = false
+
+int numBoxes = array.size(activeBoxes)
+if numBoxes > 0
+    for j = 0 to numBoxes - 1
+        int i = numBoxes - 1 - j
+        box b   = array.get(activeBoxes, i)
+        float top = array.get(boxTops, i)
+        float bot = array.get(boxBottoms, i)
+        
+        box.set_right(b, bar_index)
+        
+        bool pierced = close > top or close < bot
+        if pierced
+            if close > top
+                boxBreakBull := true
+            else
+                boxBreakBear := true
+            array.remove(activeBoxes, i)
+            array.remove(boxTops, i)
+            array.remove(boxBottoms, i)
+
+// TP/SL DRAWN FROM THE CANDLE THAT BROKE THE BOX 
+if (boxBreakBull or boxBreakBear) and showTargets
+    line.delete(entry_line)
+    label.delete(entry_label)
+    line.delete(sl_line)
+    label.delete(sl_label)
+    line.delete(tp1_line)
+    label.delete(tp1_label)
+    line.delete(tp2_line)
+    label.delete(tp2_label)
+    line.delete(tp3_line)
+    label.delete(tp3_label)
+    line.delete(extreme_line)
+    linefill.delete(risk_fill)
+    linefill.delete(reward_fill)
+
+    int dir = boxBreakBull ? 1 : -1
+    trade_dir := dir
+    entry_bar := bar_index
+    float entry_price = close
+    float risk_dist = useAtrForSl ? atr_val * slAtrMult : entry_price * (slPercent / 100)
+
+    float sl_level_local = dir == 1 ? entry_price - risk_dist : entry_price + risk_dist
+    float tp1_p = dir == 1 ? entry_price + risk_dist * rrTp1 : entry_price - risk_dist * rrTp1
+    float tp2_p = dir == 1 ? entry_price + risk_dist * rrTp2 : entry_price - risk_dist * rrTp2
+    float tp3_p = dir == 1 ? entry_price + risk_dist * rrTp3 : entry_price - risk_dist * rrTp3
+
+    float extreme_level_local = na
+    if showTp3Level
+        extreme_level_local := tp3_p
+    if showTp2Level
+        extreme_level_local := na(extreme_level_local) ? tp2_p : dir == 1 ? math.max(extreme_level_local, tp2_p) : math.min(extreme_level_local, tp2_p)
+    if showTp1Level
+        extreme_level_local := na(extreme_level_local) ? tp1_p : dir == 1 ? math.max(extreme_level_local, tp1_p) : math.min(extreme_level_local, tp1_p)
+
+    entry_line   := line.new(bar_index, entry_price, bar_index + 1, entry_price, color = dir == 1 ? buyLabelColor : sellLabelColor, width = 2, extend = extend.right, force_overlay = true)
+    entry_label  := label.new(bar_index, entry_price, (dir == 1 ? "BUY " : "SELL ") + str.tostring(entry_price, format.mintick), style = label.style_label_left, color = dir == 1 ? buyLabelColor : sellLabelColor, textcolor = color.white, size = size.small, force_overlay = true)
+
+    if showSlLevel
+        sl_line  := line.new(bar_index, sl_level_local, bar_index + 1, sl_level_local, color = sellColorLight, width = 1, style = line.style_dashed, extend = extend.right, force_overlay = true)
+        sl_label := label.new(bar_index, sl_level_local, "SL " + str.tostring(sl_level_local, format.mintick), style = label.style_label_left, color = sellColorLight, textcolor = color.white, size = size.small, force_overlay = true)
+
+    if showTp1Level
+        tp1_line  := line.new(bar_index, tp1_p, bar_index + 1, tp1_p, color = buyColorLight, width = 1, extend = extend.right, force_overlay = true)
+        tp1_label := label.new(bar_index, tp1_p, "TP1 " + str.tostring(tp1_p, format.mintick), style = label.style_label_left, color = buyColorLight, textcolor = color.white, size = size.small, force_overlay = true)
+
+    if showTp2Level
+        tp2_line  := line.new(bar_index, tp2_p, bar_index + 1, tp2_p, color = buyColorLight, width = 1, extend = extend.right, force_overlay = true)
+        tp2_label := label.new(bar_index, tp2_p, "TP2 " + str.tostring(tp2_p, format.mintick), style = label.style_label_left, color = buyColorLight, textcolor = color.white, size = size.small, force_overlay = true)
+
+    if showTp3Level
+        tp3_line  := line.new(bar_index, tp3_p, bar_index + 1, tp3_p, color = buyColorLight, width = 1, style = line.style_dotted, extend = extend.right, force_overlay = true)
+        tp3_label := label.new(bar_index, tp3_p, "TP3 " + str.tostring(tp3_p, format.mintick), style = label.style_label_left, color = buyColorLight, textcolor = color.white, size = size.small, force_overlay = true)
+
+    if showSlLevel
+        risk_fill := linefill.new(entry_line, sl_line, sellFill)
+
+    float extreme_for_fill = entry_price
+    if showTp1Level
+        extreme_for_fill := dir == 1 ? math.max(extreme_for_fill, tp1_p) : math.min(extreme_for_fill, tp1_p)
+    if showTp2Level
+        extreme_for_fill := dir == 1 ? math.max(extreme_for_fill, tp2_p) : math.min(extreme_for_fill, tp2_p)
+    if showTp3Level
+        extreme_for_fill := dir == 1 ? math.max(extreme_for_fill, tp3_p) : math.min(extreme_for_fill, tp3_p)
+
+    if (dir == 1 and extreme_for_fill > entry_price) or (dir == -1 and extreme_for_fill < entry_price)
+        extreme_line := line.new(bar_index, extreme_for_fill, bar_index + 1, extreme_for_fill, color = na, extend = extend.right, force_overlay = true)
+        reward_fill  := linefill.new(entry_line, extreme_line, buyFill)
+
+    sl_level      := sl_level_local
+    extreme_level := extreme_level_local
+
+// HIGHLIGHTING + TRIANGLES 
+bgcolor(signalBull ? color.new(bullColor, 70) : na)
+bgcolor(signalBear ? color.new(bearColor, 70) : na)
+
+plotshape(boxBreakBull, title = 'Bull Box Breakout ↑', location = location.belowbar, color = bullColor, style = shape.triangleup, size = size.small, force_overlay = true)
+plotshape(boxBreakBear, title = 'Bear Box Breakout ↓', location = location.abovebar, color = bearColor, style = shape.triangledown, size = size.small, force_overlay = true)
+
+// MOVING LABELS AND CLOSING ON SL/TP 
+if trade_dir != 0
+    label.set_x(entry_label, bar_index)
+    if not na(sl_label)
+        label.set_x(sl_label, bar_index)
+    if not na(tp1_label)
+        label.set_x(tp1_label, bar_index)
+    if not na(tp2_label)
+        label.set_x(tp2_label, bar_index)
+    if not na(tp3_label)
+        label.set_x(tp3_label, bar_index)
+
+    bool sl_hit = trade_dir == 1 ? low <= sl_level : high >= sl_level
+    bool tp_hit = not na(extreme_level) and (trade_dir == 1 ? high >= extreme_level : low <= extreme_level)
+
+    if bar_index > entry_bar and (sl_hit or tp_hit)
+        line.set_extend(entry_line, extend.none)
+        line.set_x2(entry_line, bar_index)
+        if not na(sl_line)
+            line.set_extend(sl_line, extend.none)
+            line.set_x2(sl_line, bar_index)
+        if not na(tp1_line)
+            line.set_extend(tp1_line, extend.none)
+            line.set_x2(tp1_line, bar_index)
+        if not na(tp2_line)
+            line.set_extend(tp2_line, extend.none)
+            line.set_x2(tp2_line, bar_index)
+        if not na(tp3_line)
+            line.set_extend(tp3_line, extend.none)
+            line.set_x2(tp3_line, bar_index)
+        if not na(extreme_line)
+            line.set_extend(extreme_line, extend.none)
+            line.set_x2(extreme_line, bar_index)
+        trade_dir := 0
+
+// CLEANUP 
+while array.size(hiLines) > 250
+    line.delete(array.shift(hiLines))
+    array.shift(hiLvl)
+    array.shift(hiLive)
+
+while array.size(loLines) > 250
+    line.delete(array.shift(loLines))
+    array.shift(loLvl)
+    array.shift(loLive)
+
+while array.size(activeBoxes) > 100
+    box.delete(array.shift(activeBoxes))
+    array.shift(boxTops)
+    array.shift(boxBottoms)
+
+// ── ALERT CONDITIONS FOR BOX BREAKOUT SIGNALS ────────────────
+alertcondition(boxBreakBull, title = "Bull Breakout", message = "Volume Momentum Box Breakout - Long Entry Signal")
+alertcondition(boxBreakBear, title = "Bear Breakout", message = "Volume Momentum Box Breakout - Short Entry Signal")

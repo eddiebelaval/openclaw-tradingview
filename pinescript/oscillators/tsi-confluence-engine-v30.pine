@@ -1,0 +1,1111 @@
+// This Pine Script™ code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © s47marsac
+// TSI Confluence Engine v3.0 — Full Adaptive Engine
+// ──────────────────────────────────────────────────────────────────────────────
+// CHANGELOG v3.0 (from v2.4):
+//   1. SELF-ADAPTIVE TSI PARAMETERS: Long/Short/Signal periods adjust
+//      dynamically via ATR volatility ratio, not just the OB/OS thresholds.
+//      High volatility → reduced smoothing (reactivity). Low vol → increased smoothing.
+//   2. MARKET STRUCTURE MODULE (BOS/CHoCH): Automatic detection of
+//      Break of Structure and Change of Character based on swing highs/lows.
+//      Integrated into the confluence score as an independent filter.
+//   3. SESSION FILTER: London, New York, Asia with London/NY overlap.
+//      Score weighting based on active session (expected volatility).
+//   4. REWEIGHTED CONFLUENCE SCORE: Weighted point system (max 10)
+//      with independence verification between components.
+//   5. PRESERVATION: The entire 6 TF × 4 Asset matrix from v2.4 is preserved
+//      as the base; adaptive parameters modulate around those values.
+// ──────────────────────────────────────────────────────────────────────────────
+
+//@version=6
+indicator("TSI Confluence Engine v3.0", shorttitle="TSI-CE 3.0", overlay=false, precision=2, max_labels_count=500, max_lines_count=200)
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ▌ AUTOMATIC INSTRUMENT TYPE DETECTION
+// ══════════════════════════════════════════════════════════════════════════════
+
+getAssetType() =>
+    sym = syminfo.ticker
+    base = syminfo.basecurrency
+    quote = syminfo.currency
+
+    isGold = str.contains(sym, "XAU") or str.contains(sym, "GOLD") or str.contains(sym, "GC1") or str.contains(sym, "GC2")
+    isSilver = str.contains(sym, "XAG") or str.contains(sym, "SILVER") or str.contains(sym, "SI1")
+    isMetal = isGold or isSilver
+
+    isNAS = str.contains(sym, "NAS") or str.contains(sym, "NDX") or str.contains(sym, "QQQ") or str.contains(sym, "NQ1") or str.contains(sym, "USTEC") or str.contains(sym, "US100")
+    isSP = str.contains(sym, "SPX") or str.contains(sym, "SPY") or str.contains(sym, "ES1") or str.contains(sym, "US500") or str.contains(sym, "SP500")
+    isDAX = str.contains(sym, "DAX") or str.contains(sym, "DE40") or str.contains(sym, "GER40") or str.contains(sym, "DE30")
+    isDJI = str.contains(sym, "DJI") or str.contains(sym, "YM1") or str.contains(sym, "US30") or str.contains(sym, "DOW")
+    isCAC = str.contains(sym, "CAC") or str.contains(sym, "FRA40") or str.contains(sym, "FR40")
+    isNIK = str.contains(sym, "NKD") or str.contains(sym, "NIK") or str.contains(sym, "JP225") or str.contains(sym, "JPN225")
+    isFTSE = str.contains(sym, "FTSE") or str.contains(sym, "UK100") or str.contains(sym, "UKX")
+    isIndex = isNAS or isSP or isDAX or isDJI or isCAC or isNIK or isFTSE
+
+    isVolatileFX = str.contains(sym, "GBPJPY") or str.contains(sym, "EURJPY") or str.contains(sym, "AUDJPY") or str.contains(sym, "CADJPY") or str.contains(sym, "NZDJPY") or str.contains(sym, "GBPAUD") or str.contains(sym, "GBPNZD")
+
+    isFX = (syminfo.type == "forex" or str.length(base) == 3 and str.length(quote) == 3) and not isMetal
+
+    isMetal ? 1 : isIndex ? 2 : isVolatileFX ? 3 : isFX ? 4 : 2
+
+assetType = getAssetType()
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ▌ AUTOMATIC TIMEFRAME DETECTION
+// ══════════════════════════════════════════════════════════════════════════════
+
+getTFMinutes() =>
+    float tfMin = 0.0
+    if timeframe.isseconds
+        tfMin := timeframe.multiplier / 60.0
+    else if timeframe.isminutes
+        tfMin := timeframe.multiplier * 1.0
+    else if timeframe.isdwm
+        tfMin := timeframe.multiplier * 1440.0
+    else
+        tfMin := timeframe.multiplier * 60.0
+    tfMin
+
+float currentTFMin = getTFMinutes()
+
+getTFClass() =>
+    int cls = 3
+    if currentTFMin <= 1.0
+        cls := 1
+    else if currentTFMin <= 5.0
+        cls := 2
+    else if currentTFMin <= 15.0
+        cls := 3
+    else if currentTFMin <= 60.0
+        cls := 4
+    else if currentTFMin <= 240.0
+        cls := 5
+    else
+        cls := 6
+    cls
+
+int tfClass = getTFClass()
+
+string tfClassLabel = switch tfClass
+    1 => "M1 SCALP"
+    2 => "M5 SCALP+"
+    3 => "M15 INTRADAY"
+    4 => "H1 INTRADAY+"
+    5 => "H4 SWING"
+    6 => "D1 SWING+"
+    => "M15 INTRADAY"
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ▌ INPUTS — Instrument & TF Detection
+// ══════════════════════════════════════════════════════════════════════════════
+
+string assetLabel = switch assetType
+    1 => "GOLD/METAL"
+    2 => "INDEX"
+    3 => "VOLATILE FX"
+    4 => "STANDARD FX"
+    => "UNKNOWN"
+
+string modeInput = input.string("Auto", "Instrument detection mode", options=["Auto", "Gold/Metal", "Index", "Volatile FX", "Standard FX"], group="⚙️ Instrument Detection")
+
+int activeType = switch modeInput
+    "Gold/Metal"    => 1
+    "Index"         => 2
+    "Volatile FX"   => 3
+    "Standard FX"   => 4
+    => assetType
+
+string tfModeInput = input.string("Auto", "Timeframe detection mode", options=["Auto", "M1 Scalp", "M5 Scalp+", "M15 Intraday", "H1 Intraday+", "H4 Swing", "D1 Swing+"], group="⚙️ Instrument Detection")
+
+int activeTF = switch tfModeInput
+    "M1 Scalp"       => 1
+    "M5 Scalp+"      => 2
+    "M15 Intraday"   => 3
+    "H1 Intraday+"   => 4
+    "H4 Swing"       => 5
+    "D1 Swing+"      => 6
+    => tfClass
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ▌ BASE PARAMETER MATRIX — TSI Long / Short / Signal (v2.4 preserved)
+// ══════════════════════════════════════════════════════════════════════════════
+
+int matrixKey = activeTF * 10 + activeType
+
+// ── TSI Long Period (base) ──
+int baseLong = switch matrixKey
+    11 => 13
+    12 => 13
+    13 => 13
+    14 => 17
+    21 => 18
+    22 => 18
+    23 => 18
+    24 => 21
+    31 => 21
+    32 => 21
+    33 => 21
+    34 => 25
+    41 => 25
+    42 => 25
+    43 => 25
+    44 => 30
+    51 => 30
+    52 => 30
+    53 => 30
+    54 => 34
+    61 => 34
+    62 => 34
+    63 => 34
+    64 => 40
+    => 13
+
+// ── TSI Short Period (base) ──
+int baseShort = switch matrixKey
+    11 => 7
+    12 => 7
+    13 => 7
+    14 => 9
+    21 => 9
+    22 => 9
+    23 => 9
+    24 => 11
+    31 => 11
+    32 => 11
+    33 => 11
+    34 => 13
+    41 => 13
+    42 => 13
+    43 => 13
+    44 => 15
+    51 => 15
+    52 => 15
+    53 => 15
+    54 => 17
+    61 => 17
+    62 => 17
+    63 => 17
+    64 => 20
+    => 7
+
+// ── TSI Signal Period (base) ──
+int baseSignal = switch matrixKey
+    11 => 5
+    12 => 7
+    13 => 5
+    14 => 9
+    21 => 7
+    22 => 9
+    23 => 7
+    24 => 11
+    31 => 9
+    32 => 11
+    33 => 9
+    34 => 13
+    41 => 11
+    42 => 13
+    43 => 11
+    44 => 14
+    51 => 13
+    52 => 14
+    53 => 13
+    54 => 16
+    61 => 14
+    62 => 16
+    63 => 14
+    64 => 18
+    => 7
+
+// ── Base OB/OS Thresholds ──
+float baseOB = switch matrixKey
+    11 => 25.0
+    12 => 30.0
+    13 => 25.0
+    14 => 20.0
+    21 => 28.0
+    22 => 32.0
+    23 => 28.0
+    24 => 22.0
+    31 => 30.0
+    32 => 35.0
+    33 => 30.0
+    34 => 25.0
+    41 => 32.0
+    42 => 37.0
+    43 => 32.0
+    44 => 27.0
+    51 => 35.0
+    52 => 40.0
+    53 => 35.0
+    54 => 30.0
+    61 => 38.0
+    62 => 42.0
+    63 => 38.0
+    64 => 32.0
+    => 25.0
+
+// ── Trend EMA (base) ──
+int baseEMA = switch activeTF
+    1 => 21
+    2 => 34
+    3 => 50
+    4 => 50
+    5 => 55
+    6 => 60
+    => 21
+
+// ── ADX Threshold ──
+float baseADXThresh = switch activeTF
+    1 => 20.0
+    2 => 22.0
+    3 => 23.0
+    4 => 22.0
+    5 => 21.0
+    6 => 20.0
+    => 20.0
+
+// ── Cooldown in seconds ──
+int baseCooldownSec = switch activeTF
+    1 => 300
+    2 => 1200
+    3 => 2700
+    4 => 10800
+    5 => 43200
+    6 => 172800
+    => 300
+
+// ── MTF Timeframe ──
+string adaptMTFTF = switch activeTF
+    1 => "5"
+    2 => "15"
+    3 => "60"
+    4 => "240"
+    5 => "D"
+    6 => "W"
+    => "5"
+
+// ── Minimum crossover slope (base) ──
+float baseSlopeMin = switch activeTF
+    1 => 0.3
+    2 => 0.5
+    3 => 0.8
+    4 => 1.0
+    5 => 1.2
+    6 => 1.5
+    => 0.3
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ▌ 🆕 MODULE 1: ADAPTIVE TSI REACTIVITY (POST-SMOOTHING VOLATILITY)
+// ══════════════════════════════════════════════════════════════════════════════
+// Pine Script requires a "simple int" for ta.ema() → TSI periods cannot
+// vary dynamically. Solution: compute TSI with base periods, then apply
+// an adaptive post-smoothing whose alpha varies with volatility.
+//
+// High volatility → high alpha (less smoothing) → more reactive TSI
+// Low volatility  → low alpha (more smoothing)  → more filtered TSI
+//
+// Net effect identical to a period change: in high vol, the TSI reacts
+// faster to momentum changes, reducing structural lag.
+// ──────────────────────────────────────────────────────────────────────────────
+
+bool  useAdaptTSI   = input.bool(true, "Adaptive TSI reactivity", group="🧠 Dynamic Adaptation v3.0",
+      tooltip="Applies adaptive post-smoothing on the TSI. High vol = increased reactivity, low vol = increased smoothing.")
+int   atrAdaptFast  = input.int(10, "Fast ATR (adaptation)", minval=3, maxval=30, group="🧠 Dynamic Adaptation v3.0")
+int   atrAdaptSlow  = input.int(40, "Slow ATR (adaptation)", minval=15, maxval=100, group="🧠 Dynamic Adaptation v3.0")
+float adaptMinAlpha = input.float(0.15, "Min. alpha (low vol. → smoothed)", minval=0.05, maxval=0.5, step=0.05, group="🧠 Dynamic Adaptation v3.0",
+      tooltip="The lower this value, the more the TSI is smoothed in low volatility (0.15 ≈ EMA 12).")
+float adaptMaxAlpha = input.float(0.85, "Max. alpha (high vol. → reactive)", minval=0.5, maxval=1.0, step=0.05, group="🧠 Dynamic Adaptation v3.0",
+      tooltip="The higher this value, the more reactive the TSI is in high volatility (0.85 ≈ nearly raw).")
+
+// Volatility ratio calculation
+float atrFastVal    = ta.atr(atrAdaptFast)
+float atrSlowVal    = ta.atr(atrAdaptSlow)
+float volRatioRaw   = nz(atrFastVal / atrSlowVal, 1.0)
+
+// Linear mapping: volRatio [0.6..1.6] → alpha [adaptMinAlpha..adaptMaxAlpha]
+float adaptAlpha = math.max(adaptMinAlpha, math.min(adaptMaxAlpha, adaptMinAlpha + (volRatioRaw - 0.6) * (adaptMaxAlpha - adaptMinAlpha) / 1.0))
+
+// Display factor for the table (1.0 = normal, >1 = reactive, <1 = smoothed)
+float volScaleFactor = adaptAlpha / 0.5  // 0.5 as neutral point
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ▌ DYNAMIC ATR VOLATILITY — OB/OS Thresholds (preserved from v2.4)
+// ══════════════════════════════════════════════════════════════════════════════
+
+bool  useDynVol    = input.bool(true, "Dynamic OB/OS thresholds (ATR)", group="🌊 Dynamic Volatility")
+int   atrFast      = input.int(14, "Fast ATR (thresholds)", minval=5, maxval=50, group="🌊 Dynamic Volatility")
+int   atrSlow      = input.int(50, "Slow ATR (thresholds)", minval=20, maxval=200, group="🌊 Dynamic Volatility")
+float volFloor     = input.float(0.6, "Vol. ratio floor", minval=0.3, maxval=1.0, step=0.05, group="🌊 Dynamic Volatility")
+float volCeiling   = input.float(1.6, "Vol. ratio ceiling", minval=1.0, maxval=3.0, step=0.1, group="🌊 Dynamic Volatility")
+
+float atrRatio   = ta.atr(atrFast) / ta.atr(atrSlow)
+float clampedVol = math.max(volFloor, math.min(volCeiling, nz(atrRatio, 1.0)))
+
+float dynOB = useDynVol ? baseOB * clampedVol : baseOB
+float dynOS = useDynVol ? -baseOB * clampedVol : -baseOB
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ▌ MANUAL PARAMETER OVERRIDE
+// ══════════════════════════════════════════════════════════════════════════════
+
+bool useManual    = input.bool(false, "Use manual parameters", group="🔧 Manual TSI Parameters")
+int  manLong      = input.int(13, "Long Period", minval=5, maxval=50, group="🔧 Manual TSI Parameters")
+int  manShort     = input.int(7, "Short Period", minval=2, maxval=25, group="🔧 Manual TSI Parameters")
+int  manSignal    = input.int(7, "Signal Period", minval=2, maxval=20, group="🔧 Manual TSI Parameters")
+float manOB       = input.float(25.0, "Overbought", minval=10.0, maxval=50.0, group="🔧 Manual TSI Parameters")
+float manOS       = input.float(-25.0, "Oversold", minval=-50.0, maxval=-10.0, group="🔧 Manual TSI Parameters")
+int  manEMA       = input.int(21, "Trend EMA", minval=5, maxval=200, group="🔧 Manual TSI Parameters")
+float manADXThr   = input.float(20.0, "ADX Threshold", minval=10.0, maxval=40.0, group="🔧 Manual TSI Parameters")
+int  manCooldownS = input.int(300, "Cooldown (seconds)", minval=0, maxval=259200, step=60, group="🔧 Manual TSI Parameters")
+float manSlopeMin = input.float(0.3, "Min. crossover slope", minval=0.0, maxval=5.0, step=0.1, group="🔧 Manual TSI Parameters")
+
+int   fLong       = useManual ? manLong      : baseLong
+int   fShort      = useManual ? manShort     : baseShort
+int   fSignal     = useManual ? manSignal    : baseSignal
+float lvlOB       = useManual ? manOB        : dynOB
+float lvlOS       = useManual ? manOS        : dynOS
+int   emaLenFinal = useManual ? manEMA       : baseEMA
+float adxThFinal  = useManual ? manADXThr    : baseADXThresh
+int   cdSecFinal  = useManual ? manCooldownS : baseCooldownSec
+float slopeMin    = useManual ? manSlopeMin  : baseSlopeMin
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ▌ TSI CALCULATION (current timeframe) — with adaptive post-smoothing
+// ══════════════════════════════════════════════════════════════════════════════
+
+float mom       = ta.change(close)
+float smoothMom = ta.ema(ta.ema(mom, fLong), fShort)
+float smoothAbs = ta.ema(ta.ema(math.abs(mom), fLong), fShort)
+float tsiRaw    = smoothAbs != 0 ? 100.0 * smoothMom / smoothAbs : 0.0
+
+// Adaptive post-smoothing: manual EMA with variable alpha
+// alpha = 1.0 → no smoothing (raw TSI), alpha → 0 → heavy smoothing
+var float tsiAdapt = 0.0
+float activeAlpha  = useAdaptTSI and not useManual ? adaptAlpha : 1.0
+tsiAdapt := activeAlpha * tsiRaw + (1.0 - activeAlpha) * nz(tsiAdapt[1], tsiRaw)
+
+float tsi       = useAdaptTSI and not useManual ? tsiAdapt : tsiRaw
+float sig       = ta.ema(tsiRaw, fSignal)  // Signal on raw TSI to preserve crossover reactivity
+float hist      = tsi - sig
+
+// RSI
+int   rsiLen    = input.int(14, "RSI Period", minval=2, maxval=50, group="📋 Dashboard")
+float rsiVal    = ta.rsi(close, rsiLen)
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ▌ 🆕 MODULE 2: MARKET STRUCTURE (BOS / CHoCH)
+// ══════════════════════════════════════════════════════════════════════════════
+// Swing high/low detection then identification of:
+//   - BOS (Break of Structure): break in the direction of the trend
+//   - CHoCH (Change of Character): break against the trend = reversal
+// The structural bias (bullish/bearish) is independent of the TSI and EMA.
+// ──────────────────────────────────────────────────────────────────────────────
+
+bool  useStructure   = input.bool(true, "Enable Market Structure", group="🏗️ Market Structure v3.0")
+int   swingLookback  = input.int(5, "Swing H/L Lookback", minval=2, maxval=20, group="🏗️ Market Structure v3.0",
+      tooltip="Number of bars on each side to confirm a swing high/low.")
+bool  showStructure  = input.bool(true, "Show BOS/CHoCH labels", group="🏗️ Market Structure v3.0")
+bool  showSwingLines = input.bool(false, "Show swing H/L lines", group="🏗️ Market Structure v3.0")
+
+// Pivot detection
+float swHigh = ta.pivothigh(high, swingLookback, swingLookback)
+float swLow  = ta.pivotlow(low, swingLookback, swingLookback)
+
+// Structural tracking variables
+var float lastSwingHigh    = na
+var float lastSwingLow     = na
+var int   lastSwingHighBar = na
+var int   lastSwingLowBar  = na
+var float prevSwingHigh    = na
+var float prevSwingLow     = na
+var int   structureBias    = 0  // 1=bullish, -1=bearish, 0=neutral
+
+// Current structural event type
+var int   structEvent      = 0  // 0=none, 1=BOS bull, 2=BOS bear, 3=CHoCH bull, 4=CHoCH bear
+structEvent := 0
+
+// Update swing highs
+if not na(swHigh)
+    prevSwingHigh    := lastSwingHigh
+    lastSwingHigh    := swHigh
+    lastSwingHighBar := bar_index - swingLookback
+
+// Update swing lows
+if not na(swLow)
+    prevSwingLow    := lastSwingLow
+    lastSwingLow    := swLow
+    lastSwingLowBar := bar_index - swingLookback
+
+// Real-time BOS / CHoCH detection on breakout
+// BOS Bullish: price breaks above last swing high in an uptrend
+// CHoCH Bullish: price breaks above last swing high in a downtrend (reversal)
+// BOS Bearish: price breaks below last swing low in a downtrend
+// CHoCH Bearish: price breaks below last swing low in an uptrend (reversal)
+
+bool breakAboveSH = not na(lastSwingHigh) and close > lastSwingHigh and close[1] <= lastSwingHigh
+bool breakBelowSL = not na(lastSwingLow) and close < lastSwingLow and close[1] >= lastSwingLow
+
+if useStructure
+    if breakAboveSH
+        if structureBias >= 0
+            structEvent := 1  // BOS bullish
+        else
+            structEvent := 3  // CHoCH bullish (reversal)
+        structureBias := 1
+
+    if breakBelowSL
+        if structureBias <= 0
+            structEvent := 2  // BOS bearish
+        else
+            structEvent := 4  // CHoCH bearish (reversal)
+        structureBias := -1
+
+// Structural bias for scoring
+bool structBullish = structureBias > 0
+bool structBearish = structureBias < 0
+
+// Visual labels
+color colBOS_Bull  = #00897B
+color colBOS_Bear  = #E53935
+color colCHoCH_Bull = #00BFA5
+color colCHoCH_Bear = #FF1744
+
+if showStructure and useStructure
+    if structEvent == 1
+        label.new(bar_index, tsi + 5, "BOS↑", color=color.new(colBOS_Bull, 20), textcolor=#FFFFFF, style=label.style_label_down, size=size.tiny)
+    if structEvent == 2
+        label.new(bar_index, tsi - 5, "BOS↓", color=color.new(colBOS_Bear, 20), textcolor=#FFFFFF, style=label.style_label_up, size=size.tiny)
+    if structEvent == 3
+        label.new(bar_index, tsi + 5, "CHoCH↑", color=color.new(colCHoCH_Bull, 10), textcolor=#FFFFFF, style=label.style_label_down, size=size.small)
+    if structEvent == 4
+        label.new(bar_index, tsi - 5, "CHoCH↓", color=color.new(colCHoCH_Bear, 10), textcolor=#FFFFFF, style=label.style_label_up, size=size.small)
+
+// Optional swing lines
+var line swHighLine = na
+var line swLowLine  = na
+
+if showSwingLines and useStructure
+    if not na(swHigh)
+        if not na(swHighLine)
+            line.delete(swHighLine)
+        swHighLine := line.new(bar_index - swingLookback, swHigh, bar_index, swHigh, color=color.new(colBOS_Bear, 60), style=line.style_dashed, extend=extend.right)
+    if not na(swLow)
+        if not na(swLowLine)
+            line.delete(swLowLine)
+        swLowLine := line.new(bar_index - swingLookback, swLow, bar_index, swLow, color=color.new(colBOS_Bull, 60), style=line.style_dashed, extend=extend.right)
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ▌ 🆕 MODULE 3: SESSION FILTER (London / NY / Asia / Overlap)
+// ══════════════════════════════════════════════════════════════════════════════
+// Sessions have distinct volatility profiles. The filter:
+//   - Assigns a quality multiplier to the score based on the active session
+//   - Can block signals outside active sessions
+//   - Detects London/NY overlap (best liquidity)
+// ──────────────────────────────────────────────────────────────────────────────
+
+bool   useSessionFilter = input.bool(true, "Enable Session filter", group="🕐 Sessions v3.0",
+       tooltip="Adjusts signal quality based on the active trading session.")
+bool   blockOffSession  = input.bool(false, "Block signals outside sessions", group="🕐 Sessions v3.0",
+       tooltip="If enabled, no signal is emitted during low-liquidity hours (outside the 3 major sessions).")
+bool   showSessionBG    = input.bool(true, "Session background color", group="🕐 Sessions v3.0")
+
+// Sessions in UTC (standard hours — adjust for DST if needed)
+// Asia    : 00:00 - 09:00 UTC
+// London  : 07:00 - 16:00 UTC
+// New York: 12:00 - 21:00 UTC
+// Overlap : 12:00 - 16:00 UTC (London ∩ NY)
+
+int utcHour = hour(time, "UTC")
+
+bool isAsia    = utcHour >= 0 and utcHour < 9
+bool isLondon  = utcHour >= 7 and utcHour < 16
+bool isNY      = utcHour >= 12 and utcHour < 21
+bool isOverlap = utcHour >= 12 and utcHour < 16  // London + NY simultaneously
+bool isActive  = isAsia or isLondon or isNY
+
+// Quality multiplier per session
+// Overlap is the highest liquidity/volatility period
+float sessionMultiplier = 1.0
+if useSessionFilter
+    if isOverlap
+        sessionMultiplier := 1.25
+    else if isLondon or isNY
+        sessionMultiplier := 1.10
+    else if isAsia
+        // Asia less volatile for Gold (except Tokyo open), neutral for JPY FX
+        sessionMultiplier := activeType == 1 ? 0.85 : activeType == 3 ? 1.05 : 0.90
+    else
+        sessionMultiplier := 0.70  // Off-session
+
+bool sessionAllowSignal = useSessionFilter ? (blockOffSession ? isActive : true) : true
+
+// Session background color
+color sessionBGCol = na
+if showSessionBG and useSessionFilter and not timeframe.isdwm
+    if isOverlap
+        sessionBGCol := color.new(#FFD600, 95)
+    else if isLondon
+        sessionBGCol := color.new(#1565C0, 96)
+    else if isNY
+        sessionBGCol := color.new(#E65100, 96)
+    else if isAsia
+        sessionBGCol := color.new(#7B1FA2, 96)
+
+bgcolor(sessionBGCol, title="Session BG")
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ▌ CROSSOVER SLOPE FILTER
+// ══════════════════════════════════════════════════════════════════════════════
+
+bool  useSlopeFilter = input.bool(true, "Filter weak crossovers (slope)", group="📊 Signals v3.0")
+float crossSlope     = math.abs(hist - hist[2]) / 2.0
+bool  slopeOK        = useSlopeFilter ? crossSlope >= slopeMin : true
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ▌ MOMENTUM HISTOGRAM
+// ══════════════════════════════════════════════════════════════════════════════
+
+bool  showHistMom  = input.bool(false, "Show Momentum Histogram (derivative)", group="📊 Signals v3.0")
+float histMom      = hist - hist[1]
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ▌ TREND FILTER — EMA + ADX
+// ══════════════════════════════════════════════════════════════════════════════
+
+bool  useTrendFilter = input.bool(true, "Enable trend filter", group="📈 Trend Filter")
+bool  useADXFilter   = input.bool(true, "Enable ADX filter", group="📈 Trend Filter")
+int   adxLen         = input.int(14, "ADX Period", minval=5, maxval=50, group="📈 Trend Filter")
+bool  useADXSmooth   = input.bool(true, "Double ADX smoothing (anti-noise)", group="📈 Trend Filter")
+int   adxSmoothLen   = input.int(5, "ADX smoothing period", minval=2, maxval=14, group="📈 Trend Filter")
+
+float emaVal   = ta.ema(close, emaLenFinal)
+bool  trendUp  = close > emaVal
+bool  trendDn  = close < emaVal
+
+float trueRange = ta.tr(true)
+float upMove    = high - high[1]
+float dnMove    = low[1] - low
+float plusDM    = upMove > dnMove and upMove > 0 ? upMove : 0.0
+float minusDM   = dnMove > upMove and dnMove > 0 ? dnMove : 0.0
+
+float smoothTR      = ta.rma(trueRange, adxLen)
+float smoothPlusDM  = ta.rma(plusDM, adxLen)
+float smoothMinusDM = ta.rma(minusDM, adxLen)
+
+float diPlus   = smoothTR != 0 ? 100.0 * smoothPlusDM / smoothTR : 0.0
+float diMinus  = smoothTR != 0 ? 100.0 * smoothMinusDM / smoothTR : 0.0
+float dxVal    = (diPlus + diMinus) != 0 ? 100.0 * math.abs(diPlus - diMinus) / (diPlus + diMinus) : 0.0
+float adxRaw   = ta.rma(dxVal, adxLen)
+
+float adxVal   = useADXSmooth ? ta.ema(adxRaw, adxSmoothLen) : adxRaw
+bool  isTrending = adxVal > adxThFinal
+
+bool trendBullOK = useTrendFilter ? trendUp : true
+bool trendBearOK = useTrendFilter ? trendDn : true
+bool adxOK       = useADXFilter ? isTrending : true
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ▌ MTF CONFIRMATION
+// ══════════════════════════════════════════════════════════════════════════════
+
+bool   useMTF      = input.bool(true, "Enable MTF confirmation", group="🔄 Multi-Timeframe")
+string mtfMode     = input.string("Same direction", "MTF Mode", options=["Same direction", "Not in opposing zone"], group="🔄 Multi-Timeframe")
+string mtfManualTF = input.timeframe("", "MTF TF Override (empty=auto)", group="🔄 Multi-Timeframe")
+
+string mtfTF = str.length(mtfManualTF) > 0 ? mtfManualTF : adaptMTFTF
+
+calcTSI(float src, int longPer, int shortPer) =>
+    float m  = ta.change(src)
+    float sm = ta.ema(ta.ema(m, longPer), shortPer)
+    float sa = ta.ema(ta.ema(math.abs(m), longPer), shortPer)
+    sa != 0 ? 100.0 * sm / sa : 0.0
+
+float tsiHTF = request.security(syminfo.tickerid, mtfTF, calcTSI(close, baseLong, baseShort), lookahead=barmerge.lookahead_off, gaps=barmerge.gaps_off)
+
+bool mtfBullOK = true
+bool mtfBearOK = true
+
+if useMTF
+    if mtfMode == "Same direction"
+        mtfBullOK := tsiHTF > 0
+        mtfBearOK := tsiHTF < 0
+    else
+        mtfBullOK := tsiHTF > dynOS * 0.8
+        mtfBearOK := tsiHTF < dynOB * 0.8
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ▌ SIGNAL DETECTION
+// ══════════════════════════════════════════════════════════════════════════════
+
+bool showCross     = input.bool(true, "TSI/Signal crossovers", group="📊 Signals v3.0")
+bool showOBOS      = input.bool(true, "Overbought/Oversold signals", group="📊 Signals v3.0")
+bool showDiverg    = input.bool(true, "Divergences", group="📊 Signals v3.0")
+bool showZeroCross = input.bool(false, "Zero line crossover", group="📊 Signals v3.0")
+int  divLookback   = input.int(14, "Divergence Lookback", minval=5, maxval=50, group="📊 Signals v3.0")
+bool showHist      = input.bool(true, "Show Histogram", group="📊 Signals v3.0")
+
+bool bullCross = ta.crossover(tsi, sig)
+bool bearCross = ta.crossunder(tsi, sig)
+
+bool inOSZone = tsi < dynOS or sig < dynOS
+bool inOBZone = tsi > dynOB or sig > dynOB
+
+bool bullCrossOBOS = showOBOS ? (bullCross and inOSZone) : bullCross
+bool bearCrossOBOS = showOBOS ? (bearCross and inOBZone) : bearCross
+
+// Relaxation in extreme zones
+bool bullTrendOK = inOSZone ? true : trendBullOK
+bool bearTrendOK = inOBZone ? true : trendBearOK
+bool bullMTFOK   = inOSZone ? (useMTF ? tsiHTF > dynOS * 1.5 : true) : mtfBullOK
+bool bearMTFOK   = inOBZone ? (useMTF ? tsiHTF < dynOB * 1.5 : true) : mtfBearOK
+
+// Apply filters + session
+bool bullSignalRaw = bullCrossOBOS and bullTrendOK and adxOK and bullMTFOK and slopeOK and sessionAllowSignal
+bool bearSignalRaw = bearCrossOBOS and bearTrendOK and adxOK and bearMTFOK and slopeOK and sessionAllowSignal
+
+// Temporal cooldown
+var int lastBullTime = 0
+var int lastBearTime = 0
+var int lastBullBar  = 0
+var int lastBearBar  = 0
+
+int currentTimeMs = time
+int cdMillis      = cdSecFinal * 1000
+
+bool bullSignal = bullSignalRaw and (currentTimeMs - lastBullTime) >= cdMillis
+bool bearSignal = bearSignalRaw and (currentTimeMs - lastBearTime) >= cdMillis
+
+if bullSignal
+    lastBullTime := currentTimeMs
+    lastBullBar  := bar_index
+if bearSignal
+    lastBearTime := currentTimeMs
+    lastBearBar  := bar_index
+
+// Zero line crossover
+bool zeroBullCross = ta.crossover(tsi, 0)
+bool zeroBearCross = ta.crossunder(tsi, 0)
+
+// Signal freshness
+int barsSinceBull = bar_index - lastBullBar
+int barsSinceBear = bar_index - lastBearBar
+int barsSinceLast = math.min(barsSinceBull, barsSinceBear)
+string lastSignalDir = barsSinceBull < barsSinceBear ? "BUY" : barsSinceBear < barsSinceBull ? "SELL" : "—"
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ▌ DIVERGENCES (preserved from v2.4)
+// ══════════════════════════════════════════════════════════════════════════════
+
+float divMinDepth  = input.float(5.0, "Min. divergence depth (TSI pts)", minval=1.0, maxval=30.0, group="🔀 Divergences v3.0")
+bool  divUseVol    = input.bool(false, "Confirm with Volume", group="🔀 Divergences v3.0")
+bool  divEarlyWarn = input.bool(false, "Early-warning divergences", group="🔀 Divergences v3.0")
+
+int   basePivotLB  = math.round(divLookback / 2)
+int   pivotLB      = divEarlyWarn ? math.max(2, math.round(basePivotLB * 0.7)) : basePivotLB
+
+float pLow_dv  = ta.pivotlow(tsi, pivotLB, pivotLB)
+float pHigh_dv = ta.pivothigh(tsi, pivotLB, pivotLB)
+
+var float prevPivotLow     = na
+var float prevPriceLow     = na
+var int   prevPivotLowBar  = na
+var float prevVolLow       = na
+var float prevPivotHigh    = na
+var float prevPriceHigh    = na
+var int   prevPivotHighBar = na
+var float prevVolHigh      = na
+
+bool bullDiv = false
+bool bearDiv = false
+
+volAtPivot(int offset) =>
+    float v = 0.0
+    for i = -2 to 2
+        v += nz(volume[offset + i])
+    v / 5.0
+
+if not na(pLow_dv)
+    float currentPriceLow = low[pivotLB]
+    float currentVolLow   = volAtPivot(pivotLB)
+    if not na(prevPivotLow) and (bar_index - prevPivotLowBar) < divLookback * 3
+        bool priceCondition = currentPriceLow < prevPriceLow
+        bool tsiCondition   = pLow_dv > prevPivotLow
+        bool depthOK        = math.abs(pLow_dv - prevPivotLow) >= divMinDepth
+        bool volOK          = divUseVol ? (currentVolLow < prevVolLow) : true
+        if priceCondition and tsiCondition and depthOK and volOK
+            bullDiv := true
+    prevPivotLow    := pLow_dv
+    prevPriceLow    := currentPriceLow
+    prevPivotLowBar := bar_index
+    prevVolLow      := volAtPivot(pivotLB)
+
+if not na(pHigh_dv)
+    float currentPriceHigh = high[pivotLB]
+    float currentVolHigh   = volAtPivot(pivotLB)
+    if not na(prevPivotHigh) and (bar_index - prevPivotHighBar) < divLookback * 3
+        bool priceCondition = currentPriceHigh > prevPriceHigh
+        bool tsiCondition   = pHigh_dv < prevPivotHigh
+        bool depthOK        = math.abs(pHigh_dv - prevPivotHigh) >= divMinDepth
+        bool volOK          = divUseVol ? (currentVolHigh < prevVolHigh) : true
+        if priceCondition and tsiCondition and depthOK and volOK
+            bearDiv := true
+    prevPivotHigh    := pHigh_dv
+    prevPriceHigh    := currentPriceHigh
+    prevPivotHighBar := bar_index
+    prevVolHigh      := volAtPivot(pivotLB)
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ▌ 🆕 MODULE 4: REWEIGHTED CONFLUENCE SCORE (max 10 pts)
+// ══════════════════════════════════════════════════════════════════════════════
+// Weighted point system with independence verification:
+//   - TSI/Signal crossover       : 1 pt  (base, required condition)
+//   - OB/OS zone                 : 1.5 pt (timing — independent of trend)
+//   - BOS/CHoCH structure        : 2 pt  (🆕 independent of TSI and EMA)
+//   - ADX trending               : 1 pt  (strength — no direction)
+//   - MTF confirmation           : 1.5 pt (higher TF — partially correlated with EMA)
+//   - Divergence                 : 2 pt  (independent pattern, high value)
+//   - Strong crossover slope     : 1 pt  (crossover quality)
+//   Total max = 10 pts
+//
+// Note: EMA trend removed from score as correlated with MTF and Structure.
+// It remains active as a filter (gate) but no longer contributes points.
+// ──────────────────────────────────────────────────────────────────────────────
+
+float slopeStrong = slopeMin * 2.5
+
+float scoreBull = 0.0
+if bullCross
+    scoreBull += 1.0                                          // TSI crossover
+if bullCross and inOSZone
+    scoreBull += 1.5                                          // Extreme zone
+if useStructure and structBullish
+    scoreBull += 2.0                                          // Bullish structure
+if bullCross and adxOK
+    scoreBull += 1.0                                          // ADX trending
+if bullCross and mtfBullOK
+    scoreBull += 1.5                                          // MTF
+if bullDiv
+    scoreBull += 2.0                                          // Divergence
+if bullCross and crossSlope >= slopeStrong
+    scoreBull += 1.0                                          // Strong slope
+
+float scoreBear = 0.0
+if bearCross
+    scoreBear += 1.0
+if bearCross and inOBZone
+    scoreBear += 1.5
+if useStructure and structBearish
+    scoreBear += 2.0
+if bearCross and adxOK
+    scoreBear += 1.0
+if bearCross and mtfBearOK
+    scoreBear += 1.5
+if bearDiv
+    scoreBear += 2.0
+if bearCross and crossSlope >= slopeStrong
+    scoreBear += 1.0
+
+// Apply session multiplier
+float adjScoreBull = scoreBull * sessionMultiplier
+float adjScoreBear = scoreBear * sessionMultiplier
+
+float activeScore = adjScoreBull > adjScoreBear ? adjScoreBull : adjScoreBear
+string scoreDir = adjScoreBull > adjScoreBear ? "BUY" : adjScoreBear > adjScoreBull ? "SELL" : "—"
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ▌ ALERTS v3.0 — Based on weighted score
+// ══════════════════════════════════════════════════════════════════════════════
+
+float alertScoreMin = input.float(4.0, "Minimum score for alert", minval=2.0, maxval=10.0, step=0.5, group="🔔 Score Alerts v3.0",
+     tooltip="Minimum weighted score threshold (out of 10) to trigger an alert.")
+bool  alertModerate = input.bool(true, "Moderate alert (4-5.5)", group="🔔 Score Alerts v3.0")
+bool  alertStrong   = input.bool(true, "Strong alert (6-7.5)", group="🔔 Score Alerts v3.0")
+bool  alertVStrong  = input.bool(true, "Very strong alert (8-9.5)", group="🔔 Score Alerts v3.0")
+bool  alertMax      = input.bool(true, "Exceptional alert (10+)", group="🔔 Score Alerts v3.0")
+
+bool bullModerate = bullSignal and adjScoreBull >= 4.0 and adjScoreBull < 6.0
+bool bullStrong   = bullSignal and adjScoreBull >= 6.0 and adjScoreBull < 8.0
+bool bullVStrong  = bullSignal and adjScoreBull >= 8.0 and adjScoreBull < 10.0
+bool bullMax      = bullSignal and adjScoreBull >= 10.0
+bool bullAlertMin = bullSignal and adjScoreBull >= alertScoreMin
+
+bool bearModerate = bearSignal and adjScoreBear >= 4.0 and adjScoreBear < 6.0
+bool bearStrong   = bearSignal and adjScoreBear >= 6.0 and adjScoreBear < 8.0
+bool bearVStrong  = bearSignal and adjScoreBear >= 8.0 and adjScoreBear < 10.0
+bool bearMax      = bearSignal and adjScoreBear >= 10.0
+bool bearAlertMin = bearSignal and adjScoreBear >= alertScoreMin
+
+// Signal alerts
+alertcondition(bullSignal and showCross, "TSI Buy (Filtered v3.0)", "TSI-CE 3.0: Filtered BUY signal — Price: {{close}}")
+alertcondition(bearSignal and showCross, "TSI Sell (Filtered v3.0)", "TSI-CE 3.0: Filtered SELL signal — Price: {{close}}")
+alertcondition(bullDiv and showDiverg, "Bullish TSI Divergence", "TSI-CE 3.0: BULLISH DIVERGENCE detected")
+alertcondition(bearDiv and showDiverg, "Bearish TSI Divergence", "TSI-CE 3.0: BEARISH DIVERGENCE detected")
+alertcondition(zeroBullCross and showZeroCross, "TSI Crosses Zero ↑", "TSI-CE 3.0: TSI crosses zero upward")
+alertcondition(zeroBearCross and showZeroCross, "TSI Crosses Zero ↓", "TSI-CE 3.0: TSI crosses zero downward")
+
+// Level-based alerts — BUY
+alertcondition(bullModerate and alertModerate, "⚡ BUY Moderate (4-5.5)", "TSI-CE 3.0: BUY Moderate Score — Price: {{close}}")
+alertcondition(bullStrong and alertStrong, "🔥 BUY Strong (6-7.5)", "TSI-CE 3.0: BUY STRONG Score — Price: {{close}}")
+alertcondition(bullVStrong and alertVStrong, "💎 BUY Very Strong (8-9.5)", "TSI-CE 3.0: BUY VERY STRONG Score — Price: {{close}}")
+alertcondition(bullMax and alertMax, "🏆 BUY Exceptional (10+)", "TSI-CE 3.0: BUY MAXIMUM Score — Price: {{close}}")
+
+// Level-based alerts — SELL
+alertcondition(bearModerate and alertModerate, "⚡ SELL Moderate (4-5.5)", "TSI-CE 3.0: SELL Moderate Score — Price: {{close}}")
+alertcondition(bearStrong and alertStrong, "🔥 SELL Strong (6-7.5)", "TSI-CE 3.0: SELL STRONG Score — Price: {{close}}")
+alertcondition(bearVStrong and alertVStrong, "💎 SELL Very Strong (8-9.5)", "TSI-CE 3.0: SELL VERY STRONG Score — Price: {{close}}")
+alertcondition(bearMax and alertMax, "🏆 SELL Exceptional (10+)", "TSI-CE 3.0: SELL MAXIMUM Score — Price: {{close}}")
+
+// Combined alerts
+alertcondition(bullAlertMin, "🎯 BUY Score ≥ Threshold", "TSI-CE 3.0: BUY — Score ≥ threshold — Price: {{close}}")
+alertcondition(bearAlertMin, "🎯 SELL Score ≥ Threshold", "TSI-CE 3.0: SELL — Score ≥ threshold — Price: {{close}}")
+alertcondition(bullAlertMin or bearAlertMin, "🎯 SIGNAL Score ≥ Threshold", "TSI-CE 3.0: SIGNAL — Score ≥ threshold — Price: {{close}}")
+
+// Structural alerts
+alertcondition(useStructure and structEvent == 3, "CHoCH Bullish ↑", "TSI-CE 3.0: BULLISH CHoCH — Potential reversal — Price: {{close}}")
+alertcondition(useStructure and structEvent == 4, "CHoCH Bearish ↓", "TSI-CE 3.0: BEARISH CHoCH — Potential reversal — Price: {{close}}")
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ▌ DISPLAY
+// ══════════════════════════════════════════════════════════════════════════════
+
+color colBull      = input.color(#089981, "Bullish Color", group="🎨 Colors")
+color colBear      = input.color(#F23645, "Bearish Color", group="🎨 Colors")
+color colSignal    = input.color(#E65100, "Signal Color", group="🎨 Colors")
+color colNeutral   = input.color(#546E7A, "Neutral Color", group="🎨 Colors")
+color colHTF       = input.color(#1565C0, "HTF TSI Color", group="🎨 Colors")
+
+color tsiColor = tsi > sig ? colBull : colBear
+
+plot(tsi, "TSI", tsiColor, linewidth=2)
+plot(sig, "Signal", colSignal, linewidth=1, style=plot.style_line)
+
+bool showHTF = input.bool(true, "Show HTF TSI", group="🔄 Multi-Timeframe")
+plot(showHTF and useMTF ? tsiHTF : na, "HTF TSI", color.new(colHTF, 60), linewidth=1, style=plot.style_stepline)
+
+hline(0, "Zero", color.new(colNeutral, 60), linestyle=hline.style_solid)
+
+plot(dynOB, "Overbought Dyn.", color.new(colBear, 70), linewidth=1, style=plot.style_stepline)
+plot(dynOS, "Oversold Dyn.", color.new(colBull, 70), linewidth=1, style=plot.style_stepline)
+
+bool showBG = input.bool(true, "Colored background extreme zones", group="🎨 Colors")
+bgcolor(showBG and tsi > dynOB ? color.new(colBear, 92) : na, title="OB Background")
+bgcolor(showBG and tsi < dynOS ? color.new(colBull, 92) : na, title="OS Background")
+
+color histCol = hist > 0 ? (hist > hist[1] ? colBull : color.new(colBull, 60)) : (hist < hist[1] ? colBear : color.new(colBear, 60))
+plot(showHist ? hist : na, "Histogram", histCol, style=plot.style_columns)
+
+color histMomCol = histMom > 0 ? color.new(#00838F, 30) : color.new(#AB47BC, 30)
+plot(showHistMom ? histMom * 3 : na, "Momentum Hist.", histMomCol, style=plot.style_columns)
+
+plotshape(showCross and bullSignal ? tsi : na, "Filtered Buy", shape.triangleup, location.absolute, colBull, size=size.small)
+plotshape(showCross and bearSignal ? tsi : na, "Filtered Sell", shape.triangledown, location.absolute, colBear, size=size.small)
+
+plotshape(showDiverg and bullDiv ? tsi[pivotLB] : na, "Bullish Div.", shape.diamond, location.absolute, #00838F, size=size.tiny, offset=-pivotLB)
+plotshape(showDiverg and bearDiv ? tsi[pivotLB] : na, "Bearish Div.", shape.diamond, location.absolute, #AB47BC, size=size.tiny, offset=-pivotLB)
+
+plotshape(showZeroCross and zeroBullCross ? 0 : na, "Zero ↑", shape.circle, location.absolute, color.new(colBull, 40), size=size.tiny)
+plotshape(showZeroCross and zeroBearCross ? 0 : na, "Zero ↓", shape.circle, location.absolute, color.new(colBear, 40), size=size.tiny)
+
+bool showPriceLabels = input.bool(true, "Price labels on strong signals", group="📊 Signals v3.0")
+float labelMinScore  = input.float(4.0, "Min. score for label", minval=1.0, maxval=10.0, step=0.5, group="📊 Signals v3.0")
+
+if showPriceLabels and bullSignal and adjScoreBull >= labelMinScore
+    string lbl = str.tostring(close, format.mintick) + "\n★" + str.tostring(adjScoreBull, "#.#") + "/10"
+    label.new(bar_index, tsi, lbl, color=color.new(colBull, 20), textcolor=#FFFFFF, style=label.style_label_up, size=size.small)
+
+if showPriceLabels and bearSignal and adjScoreBear >= labelMinScore
+    string lbl = str.tostring(close, format.mintick) + "\n★" + str.tostring(adjScoreBear, "#.#") + "/10"
+    label.new(bar_index, tsi, lbl, color=color.new(colBear, 20), textcolor=#FFFFFF, style=label.style_label_down, size=size.small)
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ▌ INFORMATION DASHBOARD v3.0
+// ══════════════════════════════════════════════════════════════════════════════
+
+bool showTable = input.bool(true, "Show Info Dashboard", group="📋 Dashboard")
+string tblPos  = input.string("top_right", "Dashboard Position", options=["top_right", "top_left", "bottom_right", "bottom_left"], group="📋 Dashboard")
+string tblSize = input.string("small", "Text size", options=["tiny", "small", "normal"], group="📋 Dashboard")
+
+var table infoTbl = na
+
+if showTable and barstate.islast
+    tblPosition = switch tblPos
+        "top_right"    => position.top_right
+        "top_left"     => position.top_left
+        "bottom_right" => position.bottom_right
+        "bottom_left"  => position.bottom_left
+        => position.top_right
+
+    infoTbl := table.new(tblPosition, 2, 23, bgcolor=color.new(#F5F5F5, 5), border_color=color.new(#B0BEC5, 30), border_width=1, force_overlay=true)
+
+    txtSize = switch tblSize
+        "tiny"   => size.tiny
+        "small"  => size.small
+        "normal" => size.normal
+        => size.small
+
+    int row = 0
+
+    // Header
+    table.cell(infoTbl, 0, row, "TSI Confluence Engine v3.0", text_color=#FFFFFF, text_size=txtSize, bgcolor=color.new(#1565C0, 10))
+    table.merge_cells(infoTbl, 0, row, 1, row)
+    row += 1
+
+    // TF Profile
+    table.cell(infoTbl, 0, row, "TF Profile", text_color=#546E7A, text_size=txtSize)
+    string tfLabel = useManual ? "MANUAL" : (tfModeInput != "Auto" ? tfModeInput : tfClassLabel)
+    color tfLabelCol = switch activeTF
+        1 => #E65100
+        2 => #2E7D32
+        3 => #6A1B9A
+        4 => #1565C0
+        5 => #00838F
+        6 => #4E342E
+        => #546E7A
+    table.cell(infoTbl, 1, row, tfLabel, text_color=tfLabelCol, text_size=txtSize)
+    row += 1
+
+    // Asset type
+    table.cell(infoTbl, 0, row, "Instrument", text_color=#546E7A, text_size=txtSize)
+    string modeLabel = useManual ? "MANUAL" : (modeInput != "Auto" ? modeInput : assetLabel)
+    table.cell(infoTbl, 1, row, modeLabel, text_color=#212121, text_size=txtSize)
+    row += 1
+
+    // Adaptive parameters
+    table.cell(infoTbl, 0, row, "Long / Short", text_color=#546E7A, text_size=txtSize)
+    string adaptLabel = str.tostring(fLong) + " / " + str.tostring(fShort)
+    if useAdaptTSI and not useManual
+        adaptLabel += " ⚡"
+    table.cell(infoTbl, 1, row, adaptLabel, text_color=#212121, text_size=txtSize)
+    row += 1
+
+    table.cell(infoTbl, 0, row, "Signal", text_color=#546E7A, text_size=txtSize)
+    table.cell(infoTbl, 1, row, str.tostring(fSignal), text_color=#212121, text_size=txtSize)
+    row += 1
+
+    // Adaptation factor (post-smoothing alpha)
+    if useAdaptTSI and not useManual
+        table.cell(infoTbl, 0, row, "Adapt. Alpha", text_color=#546E7A, text_size=txtSize)
+        color adaptCol = adaptAlpha > 0.65 ? #E65100 : adaptAlpha < 0.35 ? #1565C0 : #546E7A
+        string adaptStr = str.tostring(adaptAlpha, "#.##")
+        adaptStr += adaptAlpha > 0.65 ? " REACTIVE" : adaptAlpha < 0.35 ? " SMOOTHED" : " NORMAL"
+        table.cell(infoTbl, 1, row, adaptStr, text_color=adaptCol, text_size=txtSize)
+        row += 1
+
+    // Dynamic thresholds
+    table.cell(infoTbl, 0, row, "OB / OS dyn.", text_color=#546E7A, text_size=txtSize)
+    table.cell(infoTbl, 1, row, str.tostring(dynOB, "#.#") + " / " + str.tostring(dynOS, "#.#"), text_color=#212121, text_size=txtSize)
+    row += 1
+
+    // Vol. Ratio
+    table.cell(infoTbl, 0, row, "Vol. Ratio", text_color=#546E7A, text_size=txtSize)
+    color volCol = clampedVol > 1.2 ? colBear : clampedVol < 0.8 ? colBull : #546E7A
+    table.cell(infoTbl, 1, row, str.tostring(clampedVol, "#.##"), text_color=volCol, text_size=txtSize)
+    row += 1
+
+    // TSI
+    table.cell(infoTbl, 0, row, "TSI", text_color=#546E7A, text_size=txtSize)
+    table.cell(infoTbl, 1, row, str.tostring(tsi, "#.##"), text_color=tsiColor, text_size=txtSize)
+    row += 1
+
+    // HTF TSI
+    table.cell(infoTbl, 0, row, "HTF TSI (" + mtfTF + ")", text_color=#546E7A, text_size=txtSize)
+    color htfCol = tsiHTF > 0 ? colBull : colBear
+    table.cell(infoTbl, 1, row, str.tostring(tsiHTF, "#.##"), text_color=htfCol, text_size=txtSize)
+    row += 1
+
+    // 🆕 Market Structure
+    table.cell(infoTbl, 0, row, "Structure", text_color=#546E7A, text_size=txtSize)
+    string structStr = "—"
+    color structCol = #546E7A
+    if useStructure
+        structStr := structBullish ? "↑ BULLISH" : structBearish ? "↓ BEARISH" : "— NEUTRAL"
+        structCol := structBullish ? colBull : structBearish ? colBear : #546E7A
+    table.cell(infoTbl, 1, row, structStr, text_color=structCol, text_size=txtSize)
+    row += 1
+
+    // EMA
+    table.cell(infoTbl, 0, row, "EMA (" + str.tostring(emaLenFinal) + ")", text_color=#546E7A, text_size=txtSize)
+    string trendStr = trendUp ? "↑ BULLISH" : "↓ BEARISH"
+    color  trendCol = trendUp ? colBull : colBear
+    table.cell(infoTbl, 1, row, trendStr, text_color=trendCol, text_size=txtSize)
+    row += 1
+
+    // ADX
+    table.cell(infoTbl, 0, row, "ADX (thr. " + str.tostring(adxThFinal, "#.#") + ")", text_color=#546E7A, text_size=txtSize)
+    color adxCol = isTrending ? colBull : color.new(#546E7A, 30)
+    string adxStr = str.tostring(adxVal, "#.#") + (isTrending ? " ✓" : " ✗") + (useADXSmooth ? " [S]" : "")
+    table.cell(infoTbl, 1, row, adxStr, text_color=adxCol, text_size=txtSize)
+    row += 1
+
+    // 🆕 Active session
+    table.cell(infoTbl, 0, row, "Session", text_color=#546E7A, text_size=txtSize)
+    string sessStr = "OFF"
+    color sessCol = #B0BEC5
+    if useSessionFilter
+        if isOverlap
+            sessStr := "OVERLAP ×" + str.tostring(sessionMultiplier, "#.##")
+            sessCol := #FFD600
+        else if isLondon
+            sessStr := "LONDON ×" + str.tostring(sessionMultiplier, "#.##")
+            sessCol := #1565C0
+        else if isNY
+            sessStr := "NEW YORK ×" + str.tostring(sessionMultiplier, "#.##")
+            sessCol := #E65100
+        else if isAsia
+            sessStr := "ASIA ×" + str.tostring(sessionMultiplier, "#.##")
+            sessCol := #7B1FA2
+        else
+            sessStr := "OFF-SESSION ×" + str.tostring(sessionMultiplier, "#.##")
+            sessCol := #B0BEC5
+    else
+        sessStr := "DISABLED"
+    table.cell(infoTbl, 1, row, sessStr, text_color=sessCol, text_size=txtSize)
+    row += 1
+
+    // Cooldown
+    table.cell(infoTbl, 0, row, "Cooldown", text_color=#546E7A, text_size=txtSize)
+    string cdLabel = cdSecFinal >= 3600 ? str.tostring(math.round(cdSecFinal / 3600.0, 1)) + " h" : str.tostring(math.round(cdSecFinal / 60)) + " min"
+    table.cell(infoTbl, 1, row, cdLabel, text_color=#212121, text_size=txtSize)
+    row += 1
+
+    // Cross Slope
+    table.cell(infoTbl, 0, row, "Cross Slope", text_color=#546E7A, text_size=txtSize)
+    color slopeCol = crossSlope >= slopeStrong ? #00897B : crossSlope >= slopeMin ? #E65100 : #B0BEC5
+    string slopeQual = crossSlope >= slopeStrong ? " ★★" : crossSlope >= slopeMin ? " ★" : " ✗"
+    table.cell(infoTbl, 1, row, str.tostring(crossSlope, "#.##") + slopeQual, text_color=slopeCol, text_size=txtSize)
+    row += 1
+
+    // RSI
+    table.cell(infoTbl, 0, row, "RSI (" + str.tostring(rsiLen) + ")", text_color=#546E7A, text_size=txtSize)
+    color rsiCol = rsiVal > 70 ? colBear : rsiVal < 30 ? colBull : #212121
+    table.cell(infoTbl, 1, row, str.tostring(rsiVal, "#.#"), text_color=rsiCol, text_size=txtSize)
+    row += 1
+
+    // 🆕 Weighted score /10
+    table.cell(infoTbl, 0, row, "Score /10", text_color=#546E7A, text_size=txtSize)
+    color scoreCol = activeScore >= 8.0 ? #00695C : activeScore >= 6.0 ? #00897B : activeScore >= 4.0 ? #E65100 : activeScore >= 1.0 ? #212121 : #546E7A
+    string scoreStr = activeScore > 0 ? str.tostring(activeScore, "#.#") + "/10 " + scoreDir : "—"
+    table.cell(infoTbl, 1, row, scoreStr, text_color=scoreCol, text_size=txtSize)
+    row += 1
+
+    // Alert threshold
+    table.cell(infoTbl, 0, row, "Alert Score ≥", text_color=#546E7A, text_size=txtSize)
+    table.cell(infoTbl, 1, row, str.tostring(alertScoreMin, "#.#"), text_color=#1565C0, text_size=txtSize)
+    row += 1
+
+    // Signal freshness
+    table.cell(infoTbl, 0, row, "Last Signal", text_color=#546E7A, text_size=txtSize)
+    color freshCol = barsSinceLast <= 3 ? #00897B : barsSinceLast <= 10 ? #E65100 : #B0BEC5
+    string freshStr = lastSignalDir != "—" ? lastSignalDir + " " + str.tostring(barsSinceLast) + " bars ago" : "—"
+    table.cell(infoTbl, 1, row, freshStr, text_color=freshCol, text_size=txtSize)
+    row += 1
+
+    // State
+    string state = tsi > dynOB ? "⚠ OVERBOUGHT" : tsi < dynOS ? "⚠ OVERSOLD" : tsi > 0 ? "↑ BULLISH" : "↓ BEARISH"
+    color stateCol = tsi > dynOB ? colBear : tsi < dynOS ? colBull : tsi > 0 ? colBull : colBear
+    table.cell(infoTbl, 0, row, "State", text_color=#546E7A, text_size=txtSize)
+    table.cell(infoTbl, 1, row, state, text_color=stateCol, text_size=txtSize)
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ▌ END — TSI Confluence Engine v3.0 © s47marsac
+// ══════════════════════════════════════════════════════════════════════════════

@@ -1,0 +1,191 @@
+//@version=5
+indicator("Double RSI [Yellow_Yoshi]", overlay=true)
+
+// ==========================================
+// --- SECTION 1: TREND & MOMENTUM ---
+// ==========================================
+grp_trend   = "Trend & Momentum Settings"
+maType      = input.string("EMA", "MA Type", options=["SMA", "EMA", "WMA", "HMA", "DEMA", "TEMA"], group=grp_trend)
+maLength    = input.int(50, "MA Length", group=grp_trend)
+
+shortLen    = input.int(5, "Short RSI Period", group=grp_trend)
+longLen     = input.int(13, "Long RSI Period", group=grp_trend)
+shortSmooth = input.int(2, "Short Smoothing", group=grp_trend)
+longSmooth  = input.int(3, "Long Smoothing", group=grp_trend)
+threshold   = input.float(1.0, "RSI Neutral Zone", group=grp_trend)
+
+// --- MA SWITCH FUNCTION ---
+calc_ma(_type, _src, _len) =>
+    switch _type
+        "SMA"  => ta.sma(_src, _len)
+        "EMA"  => ta.ema(_src, _len)
+        "WMA"  => ta.wma(_src, _len)
+        "HMA"  => ta.hma(_src, _len)
+        "DEMA" => 2 * ta.ema(_src, _len) - ta.ema(ta.ema(_src, _len), _len)
+        "TEMA" => 3 * (ta.ema(_src, _len) - ta.ema(ta.ema(_src, _len), _len)) + ta.ema(ta.ema(ta.ema(_src, _len), _len), _len)
+        => ta.ema(_src, _len)
+
+maVal = calc_ma(maType, close, maLength)
+
+// ==========================================
+// --- SECTION 2: TIME & DAY FILTERS ---
+// ==========================================
+grp_time    = "Time & Day Filters"
+paintOnlyInSession = input.bool(true, "Only Paint Background in Session?", group=grp_time)
+sessionTime = input.session("0930-1600", "Trading Hours", group=grp_time)
+tradeMon    = input.bool(true, "Mon", group=grp_time, inline="d")
+tradeTue    = input.bool(true, "Tue", group=grp_time, inline="d")
+tradeWed    = input.bool(true, "Wed", group=grp_time, inline="d")
+tradeThu    = input.bool(true, "Thu", group=grp_time, inline="d")
+tradeFri    = input.bool(true, "Fri", group=grp_time, inline="d")
+
+inSession  = not na(time(timeframe.period, sessionTime, "America/New_York"))
+dayAllowed = (dayofweek == dayofweek.monday and tradeMon) or
+             (dayofweek == dayofweek.tuesday and tradeTue) or
+             (dayofweek == dayofweek.wednesday and tradeWed) or
+             (dayofweek == dayofweek.thursday and tradeThu) or
+             (dayofweek == dayofweek.friday and tradeFri)
+visualsAllowed = not paintOnlyInSession or (inSession and dayAllowed)
+
+// ==========================================
+// --- SECTION 3: NY SESSION & ATR ---
+// ==========================================
+grp_ny      = "NY ATR & Dashboard Settings"
+showDash    = input.bool(true, "Show ATR Dashboard?", group=grp_ny) // NEW TOGGLE
+atr_length  = input.int(7, "7-Day ATR Benchmark Length", group=grp_ny)
+hudPos      = input.string("Top Right", "Dashboard Position", options=["Top Right", "Bottom Right", "Top Left", "Bottom Left"], group=grp_ny)
+
+daily_atr = request.security(syminfo.tickerid, "D", ta.atr(atr_length))
+is_ny     = not na(time(timeframe.period, "0800-1700:23456", "America/New_York"))
+
+var float ny_high = 0.0
+var float ny_low  = 0.0
+
+if is_ny
+    if not is_ny[1]
+        ny_high := high
+        ny_low  := low
+    else
+        ny_high := math.max(high, ny_high)
+        ny_low  := math.min(low, ny_low)
+
+ny_range = ny_high - ny_low
+vol_perc = (ny_range / daily_atr) * 100
+
+string status = "QUIET"
+color status_color = color.gray
+if vol_perc >= 110
+    status := "EXTREME", status_color := color.red
+else if vol_perc >= 90
+    status := "EXTENDED", status_color := color.orange
+else if vol_perc >= 40
+    status := "NORMAL", status_color := color.green
+
+// ==========================================
+// --- SECTION 4: RSI & STOCH & VOLUME ---
+// ==========================================
+rsiS = ta.ema(ta.rsi(close, shortLen), shortSmooth)
+rsiL = ta.ema(ta.rsi(close, longLen), longSmooth)
+diff = rsiS - rsiL
+
+grp_stoch  = "Double Stochastic Settings"
+stochLen   = input.int(10, "Stoch Period", group=grp_stoch)
+stochSmth  = input.int(3, "Stoch Smoothing", group=grp_stoch)
+raw_stoch = ta.stoch(close, high, low, stochLen)
+db_stoch  = ta.ema(ta.ema(raw_stoch, stochSmth), stochSmth)
+
+// 1. STATE LOGIC (For Confluence)
+stoch_in_ob = db_stoch >= 60
+stoch_in_os = db_stoch <= 35
+
+// 2. EVENT LOGIC (For Visual Painting - Single Candle)
+stoch_trigger_ob = ta.crossover(db_stoch, 60)
+stoch_trigger_os = ta.crossunder(db_stoch, 35)
+
+hasVolume = not na(volume) and volume > 0
+vol_ma     = ta.sma(hasVolume ? volume : 1, 20)
+vol_filter = hasVolume ? (volume / vol_ma > 1.1) : true 
+
+// ==========================================
+// --- SECTION 5: SIGNALS & VISUALS ---
+// ==========================================
+isBull = diff > threshold and close > maVal
+isBear = diff < -threshold and close < maVal
+
+// Confluence uses the STATE (stoch_in_os) so it remembers we are in the zone
+high_conv_long  = isBull and vol_filter and stoch_in_os and visualsAllowed
+high_conv_short = isBear and vol_filter and stoch_in_ob and visualsAllowed
+
+// 1. Background Momentum Ribbon
+bg_color = visualsAllowed ? (diff > threshold ? color.new(#00ffbb, 85) : diff < -threshold ? color.new(#ff0055, 85) : color.new(color.gray, 90)) : na
+bgcolor(bg_color, title="RSI Momentum Ribbon")
+
+// 2. Trend Line
+plot(maVal, "Trend Line", color=close > maVal ? color.green : color.red, linewidth=2)
+
+// 3. Candle Coloring (Uses the EVENT for Stoch, so it only paints once)
+candle_col = high_conv_long   ? #00ff00 : 
+             high_conv_short  ? #ff0000 : 
+             stoch_trigger_ob ? #ff9800 : // Paints Orange only on the cross up
+             stoch_trigger_os ? #2196f3 : // Paints Blue only on the cross down
+             color.gray
+barcolor(visualsAllowed ? candle_col : na)
+
+// 4. Signal Labels
+plotshape(high_conv_long and not high_conv_long[1], "Long Strike", style=shape.triangleup, location=location.belowbar, color=color.green, size=size.small)
+plotshape(high_conv_short and not high_conv_short[1], "Short Strike", style=shape.triangledown, location=location.abovebar, color=color.red, size=size.small)
+
+// ==========================================
+// --- SECTION 6: DASHBOARD TABLE (CLEANED) ---
+// ==========================================
+t_pos = switch hudPos
+    "Top Right"    => position.top_right
+    "Bottom Right" => position.bottom_right
+    "Top Left"     => position.top_left
+    "Bottom Left"  => position.bottom_left
+    => position.top_right
+
+var table_id = table.new(t_pos, 3, 2, border_width = 1, frame_color = color.white)
+
+if barstate.islast
+    table.cell(table_id, 0, 0, "7D ATR Benchmark", bgcolor=color.new(color.gray, 20), text_color=color.white)
+    table.cell(table_id, 1, 0, "Current NY Range", bgcolor=color.new(color.gray, 20), text_color=color.white)
+    table.cell(table_id, 2, 0, "Current Status", bgcolor=color.new(color.gray, 20), text_color=color.white)
+    table.cell(table_id, 0, 1, str.tostring(daily_atr, "#.####"), bgcolor=color.black, text_color=color.white)
+    table.cell(table_id, 1, 1, str.tostring(ny_range, "#.####") + " (" + str.tostring(vol_perc, "0") + "%)", bgcolor=color.black, text_color=color.white)
+    table.cell(table_id, 2, 1, status, bgcolor=status_color, text_color=color.white)
+
+
+// ==========================================
+// --- SECTION 7: CONFLUENCE ALERTS ---
+// ==========================================
+// Define the Exit Events (Crossing back OUT of the zones)
+stoch_exit_os = ta.crossover(db_stoch, 35)  // Bullish: Crossing UP through 35
+stoch_exit_ob = ta.crossunder(db_stoch, 60) // Bearish: Crossing DOWN through 60
+
+// Create the Alert Trigger: Exit Event + RSI Alignment
+// No need for 'not [1]' here because ta.crossover is already a single-bar event
+bull_alert_trigger = stoch_exit_os and (diff > threshold)
+bear_alert_trigger = stoch_exit_ob and (diff < -threshold)
+
+// TradingView Alert Conditions
+alertcondition(bull_alert_trigger, title="Bullish Reversal: RSI + Stoch", message="Bullish Confirmation: Stoch crossed OUT of Oversold, and RSI Ribbon is Green.")
+alertcondition(bear_alert_trigger, title="Bearish Reversal: RSI + Stoch", message="Bearish Confirmation: Stoch crossed OUT of Overbought, and RSI Ribbon is Red.")
+
+// Optional: The "Neon Strike" alerts for full execution confluence
+strike_long_alert  = high_conv_long and not high_conv_long[1]
+strike_short_alert = high_conv_short and not high_conv_short[1]
+
+alertcondition(strike_long_alert, title="Neon Strike: LONG", message="FULL CONFLUENCE LONG: Trend, Volume, RSI, and Stoch are aligned!")
+alertcondition(strike_short_alert, title="Neon Strike: SHORT", message="FULL CONFLUENCE SHORT: Trend, Volume, RSI, and Stoch are aligned!")
+
+
+// ================================================
+// --- used for alert structuring
+// ================================================
+// Plotting Previous Bar Data for the Alert System
+plot(open[1],  title="PrevOpen",  display=display.none) // This will be {{plot_0}}
+plot(high[1],  title="PrevHigh",  display=display.none) // This will be {{plot_1}}
+plot(low[1],   title="PrevLow",   display=display.none) // This will be {{plot_2}}
+plot(close[1], title="PrevClose", display=display.none) // This will be {{plot_3}}
+plot(volume[1], title="PrevVol",   display=display.none) // This will be {{plot_4}}

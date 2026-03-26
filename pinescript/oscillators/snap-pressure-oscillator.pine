@@ -1,0 +1,374 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © TheRealDrip2Rip
+
+//@version=5
+indicator("Snap Pressure Oscillator", shorttitle="SPO", overlay=false, precision=1)
+
+
+// USER INPUTS (MINIMAL VERSION)
+groupCore   = "Core"
+groupStyle  = "Style"
+groupAlerts = "Alerts"
+
+signalMode = input.string("Aggressive","Signal Mode",options=["Aggressive", "Balanced", "Conservative"],group=groupCore,tooltip="Controls how easily the oscillator triggers. Aggressive gives earlier, more frequent signals. Conservative requires stronger pressure and more confirmation.")
+pivotLen = input.int(9,"Pivot Length",minval=2,maxval=20,group=groupCore, tooltip="Sets how many bars are used to confirm pivot highs and lows. Lower values react faster. Higher values create more stable support and resistance levels.")
+lookback = input.int(12,"Pressure Lookback", minval=5,maxval=100,group=groupCore, tooltip="Defines how far back the oscillator measures repeated tests, wick probes, and reaction quality. Smaller values are faster. Larger values smooth pressure development over time.")
+showNet = input.bool(true,"Show Net Pressure",group=groupStyle,tooltip="Displays the net balance between bullish and bearish pressure. Positive values favor bullish conditions. Negative values favor bearish conditions.")
+showPulseDots = input.bool(true,"Show Pulse Dots", group=groupStyle, tooltip="Shows small pulse markers when bullish or bearish pressure first crosses into the snap-ready zone.")
+showComponents = input.bool(true,"Show Stacked Components", group=groupStyle,tooltip="When using Stacked Histogram mode, this shows the internal pressure layers stacked on top of each other instead of a simpler single-column display.")
+visualMode = input.string("Stacked Histogram","Visual Mode",options=["Lines", "Histogram", "Stacked Histogram"],group=groupStyle,tooltip="Lines = smooth pressure curves. Histogram = single bullish and bearish columns. Stacked Histogram = layered pressure components for more visual detail.")
+theme = input.string("Normal","Theme",options=["Normal", "Blacked Out", "Neon Flux", "Infrared"],group=groupStyle,tooltip="Changes the indicator color style. Normal uses classic green/red. Blacked Out is muted. Neon Flux is vivid and high-contrast. Infrared uses a thermal-style palette.")
+requireBarClose = input.bool(true,"Alerts Only On Confirmed Bar Close",group=groupAlerts,tooltip="When enabled, signals and alerts only trigger after the bar closes. This reduces intrabar noise and helps avoid premature triggers.")
+
+// INTERNAL DEFAULTS / MODE PRESETS
+atrLen          = 14
+zoneAtrMult     = 0.20
+smoothLen       = 5
+
+wTouches        = 22.0
+wWicks          = 18.0
+wWeakReaction   = 18.0
+wCloseLocation  = 14.0
+wCompression    = 12.0
+wVolume         = 16.0
+
+useTrendFilter  = true
+useAgeWeighting = true
+useDivFilter    = true
+trendEmaLen     = 50
+agePivotHalflife= 60
+divRsiLen       = 14
+divLookback     = 5
+divRsiThresh    = 3.0
+
+snapWatch = signalMode == "Aggressive" ? 55.0 : signalMode == "Conservative" ? 65.0 : 60.0
+snapReady = signalMode == "Aggressive" ? 75.0 : signalMode == "Conservative" ? 85.0 : 80.0
+trendFilterStrength = signalMode == "Aggressive" ? 0.35 : signalMode == "Conservative" ? 0.80 : 0.60
+
+
+// HELPERS
+f_clamp(_x, _lo, _hi) =>
+    math.max(_lo, math.min(_hi, _x))
+
+f_safe_div(_a, _b) =>
+    _b == 0.0 ? 0.0 : _a / _b
+
+// BASE SERIES
+atr     = ta.atr(atrLen)
+atrSafe = math.max(atr, syminfo.mintick * 10.0)
+zoneW   = atrSafe * zoneAtrMult
+
+volSma20 = ta.sma(volume, 20)
+volRatio = volSma20 > 0 ? volume / volSma20 : 1.0
+
+atrShort = ta.atr(math.max(3, int(math.floor(atrLen * 0.5))))
+atrLong  = ta.atr(math.max(atrLen * 2, atrLen + 5))
+
+ph = ta.pivothigh(high, pivotLen, pivotLen)
+pl = ta.pivotlow(low, pivotLen, pivotLen)
+
+res = ta.valuewhen(not na(ph), ph, 0)
+sup = ta.valuewhen(not na(pl), pl, 0)
+
+hasRes = not na(res)
+hasSup = not na(sup)
+
+// TREND FILTER
+trendEma       = ta.ema(close, trendEmaLen)
+aboveTrend     = close >= trendEma
+bullTrendMult  = useTrendFilter ? (aboveTrend ? 1.0 : 1.0 - trendFilterStrength) : 1.0
+bearTrendMult  = useTrendFilter ? (aboveTrend ? 1.0 - trendFilterStrength : 1.0)  : 1.0
+
+// LEVEL AGE WEIGHTING
+resBarIdx   = ta.valuewhen(not na(ph), bar_index, 0)
+supBarIdx   = ta.valuewhen(not na(pl), bar_index, 0)
+resAge      = hasRes ? bar_index - resBarIdx : 0
+supAge      = hasSup ? bar_index - supBarIdx : 0
+ageDecayRes = useAgeWeighting and hasRes ? math.exp(-0.693 * resAge / agePivotHalflife) : 1.0
+ageDecaySup = useAgeWeighting and hasSup ? math.exp(-0.693 * supAge / agePivotHalflife) : 1.0
+
+// RESISTANCE-SIDE LOGIC → BULLISH SNAP PRESSURE
+touchRes = hasRes and high >= (res - zoneW) and low <= (res + zoneW)
+wickRes  = hasRes and high > (res + zoneW) and close <= (res + zoneW)
+rejRes   = touchRes ? f_clamp((res - close) / atrSafe, 0.0, 3.0) : 0.0
+
+touchesResN = math.sum(touchRes ? 1.0 : 0.0, lookback)
+wicksResN   = math.sum(wickRes ? 1.0 : 0.0, lookback)
+
+touchCompRes = f_clamp(touchesResN / 4.0, 0.0, 1.0)
+wickCompRes  = f_clamp(wicksResN / 3.0, 0.0, 1.0)
+
+halfLookback = math.max(2, int(math.floor(lookback * 0.5)))
+recentRejRes = ta.sma(rejRes, halfLookback)
+priorRejRes  = ta.sma(rejRes[halfLookback], halfLookback)
+weakRejRes   = priorRejRes > 0 ? f_clamp((priorRejRes - recentRejRes) / priorRejRes, 0.0, 1.0) : 0.0
+
+rangeLen = math.max(5, int(math.floor(lookback * 0.5)))
+hh = ta.highest(high, rangeLen)
+ll = ta.lowest(low, rangeLen)
+closePos = f_clamp(f_safe_div(close - ll, math.max(hh - ll, syminfo.mintick)), 0.0, 1.0)
+
+distToRes = hasRes ? math.max(res - close, 0.0) : na
+nearRes   = hasRes ? f_clamp(1.0 - f_safe_div(distToRes, atrSafe * 2.0), 0.0, 1.0) : 0.0
+closeCompRes = hasRes ? f_clamp(closePos * 0.55 + nearRes * 0.45, 0.0, 1.0) : 0.0
+
+compressionRaw = atrLong > 0 ? f_clamp(1.0 - (atrShort / atrLong), 0.0, 1.0) : 0.0
+
+avgTestVolRes = touchesResN > 0 ? math.sum(touchRes ? volRatio : 0.0, lookback) / touchesResN : 0.0
+volCompRes    = f_clamp((avgTestVolRes - 1.0) / 1.5, 0.0, 1.0)
+
+bullRaw =
+     (touchCompRes   * wTouches      * ageDecayRes) +
+     (wickCompRes    * wWicks        * ageDecayRes) +
+     weakRejRes     * wWeakReaction +
+     closeCompRes   * wCloseLocation +
+     compressionRaw * wCompression +
+     volCompRes     * wVolume
+
+bullScore = hasRes ? f_clamp(bullRaw * bullTrendMult, 0.0, 100.0) : 0.0
+bull = ta.ema(bullScore, smoothLen)
+
+// SUPPORT-SIDE LOGIC → BEARISH SNAP PRESSURE
+touchSup = hasSup and high >= (sup - zoneW) and low <= (sup + zoneW)
+wickSup  = hasSup and low < (sup - zoneW) and close >= (sup - zoneW)
+rejSup   = touchSup ? f_clamp((close - sup) / atrSafe, 0.0, 3.0) : 0.0
+
+touchesSupN = math.sum(touchSup ? 1.0 : 0.0, lookback)
+wicksSupN   = math.sum(wickSup ? 1.0 : 0.0, lookback)
+
+touchCompSup = f_clamp(touchesSupN / 4.0, 0.0, 1.0)
+wickCompSup  = f_clamp(wicksSupN / 3.0, 0.0, 1.0)
+
+recentRejSup = ta.sma(rejSup, halfLookback)
+priorRejSup  = ta.sma(rejSup[halfLookback], halfLookback)
+weakRejSup   = priorRejSup > 0 ? f_clamp((priorRejSup - recentRejSup) / priorRejSup, 0.0, 1.0) : 0.0
+
+closePosLow = 1.0 - closePos
+distToSup   = hasSup ? math.max(close - sup, 0.0) : na
+nearSup     = hasSup ? f_clamp(1.0 - f_safe_div(distToSup, atrSafe * 2.0), 0.0, 1.0) : 0.0
+closeCompSup = hasSup ? f_clamp(closePosLow * 0.55 + nearSup * 0.45, 0.0, 1.0) : 0.0
+
+avgTestVolSup = touchesSupN > 0 ? math.sum(touchSup ? volRatio : 0.0, lookback) / touchesSupN : 0.0
+volCompSup    = f_clamp((avgTestVolSup - 1.0) / 1.5, 0.0, 1.0)
+
+bearRaw =
+     (touchCompSup   * wTouches      * ageDecaySup) +
+     (wickCompSup    * wWicks        * ageDecaySup) +
+     weakRejSup     * wWeakReaction +
+     closeCompSup   * wCloseLocation +
+     compressionRaw * wCompression +
+     volCompSup     * wVolume
+
+bearScore = hasSup ? f_clamp(bearRaw * bearTrendMult, 0.0, 100.0) : 0.0
+bear = ta.ema(bearScore, smoothLen)
+
+// COMPONENT VALUES FOR STACKED HISTOGRAMS
+bullSeg1 = ta.ema((touchCompRes * wTouches) + (wickCompRes * wWicks), smoothLen)
+bullSeg2 = ta.ema(weakRejRes * wWeakReaction, smoothLen)
+bullSeg3 = ta.ema(closeCompRes * wCloseLocation, smoothLen)
+bullSeg4 = ta.ema((compressionRaw * wCompression) + (volCompRes * wVolume), smoothLen)
+
+bearSeg1 = ta.ema((touchCompSup * wTouches) + (wickCompSup * wWicks), smoothLen)
+bearSeg2 = ta.ema(weakRejSup * wWeakReaction, smoothLen)
+bearSeg3 = ta.ema(closeCompSup * wCloseLocation, smoothLen)
+bearSeg4 = ta.ema((compressionRaw * wCompression) + (volCompSup * wVolume), smoothLen)
+
+bullCum1 = bullSeg1
+bullCum2 = bullCum1 + bullSeg2
+bullCum3 = bullCum2 + bullSeg3
+bullCum4 = bullCum3 + bullSeg4
+
+bearCum1 = -bearSeg1
+bearCum2 = -(bearSeg1 + bearSeg2)
+bearCum3 = -(bearSeg1 + bearSeg2 + bearSeg3)
+bearCum4 = -(bearSeg1 + bearSeg2 + bearSeg3 + bearSeg4)
+
+// NET PRESSURE
+net = bull - bear
+
+// MOMENTUM DIVERGENCE
+rsiVal          = ta.rsi(close, divRsiLen)
+rsiSlope        = rsiVal - rsiVal[divLookback]
+bullPressSlope  = bull - bull[divLookback]
+bearPressSlope  = bear - bear[divLookback]
+
+bullDivWarn = useDivFilter and bull > snapWatch and bullPressSlope > 1.5 and rsiSlope < -divRsiThresh
+bearDivWarn = useDivFilter and bear > snapWatch and bearPressSlope > 1.5 and rsiSlope >  divRsiThresh
+
+bullDispScore = bullDivWarn ? bull * 0.65 : bull
+bearDispScore = bearDivWarn ? bear * 0.65 : bear
+
+// SNAP CONDITIONS
+confirmedOK = requireBarClose ? barstate.isconfirmed : true
+
+bullWatch = confirmedOK and bull > snapWatch and bull > bear
+bearWatch = confirmedOK and bear > snapWatch and bear > bull
+
+bullReady = confirmedOK and bull > snapReady and bull > bear
+bearReady = confirmedOK and bear > snapReady and bear > bull
+
+bullPulse = confirmedOK and ta.crossover(bull, snapReady) and bull > bear
+bearPulse = confirmedOK and ta.crossover(bear, snapReady) and bear > bull
+
+bullBreak = confirmedOK and hasRes and bull > snapReady and close > (res + zoneW)
+bearBreak = confirmedOK and hasSup and bear > snapReady and close < (sup - zoneW)
+
+// THEME DEFINITIONS
+var color n_bull  = #2ED573
+var color n_bear  = #FF4757
+var color n_net   = #A8A8A8
+var int   n_base  = 88
+var int   n_step  = 9
+var int   n_min   = 14
+var int   n_boost = 40
+var int   n_pool  = 92
+var int   n_bg    = 96
+
+var color b_bull  = #C8C8C8
+var color b_bear  = #565656
+var color b_net   = #787878
+var int   b_base  = 95
+var int   b_step  = 4
+var int   b_min   = 78
+var int   b_boost = 10
+var int   b_pool  = 99
+var int   b_bg    = 99
+
+var color nf_bull = #00E5FF
+var color nf_bear = #FF2D78
+var color nf_net  = #B8B8FF
+var int   nf_base = 82
+var int   nf_step = 9
+var int   nf_min  = 5
+var int   nf_boost= 50
+var int   nf_pool = 88
+var int   nf_bg   = 94
+
+var color ir_bull = #7B2FFF
+var color ir_bear = #FF6B00
+var color ir_net  = #FFD060
+var int   ir_base = 85
+var int   ir_step = 9
+var int   ir_min  = 8
+var int   ir_boost= 46
+var int   ir_pool = 90
+var int   ir_bg   = 95
+
+// RESOLVE ACTIVE THEME
+//──────────────────────────────────────────────────────────────────────────────
+themeBull  = theme == "Blacked Out" ? b_bull  : theme == "Neon Flux" ? nf_bull  : theme == "Infrared" ? ir_bull  : n_bull
+themeBear  = theme == "Blacked Out" ? b_bear  : theme == "Neon Flux" ? nf_bear  : theme == "Infrared" ? ir_bear  : n_bear
+themeNet   = theme == "Blacked Out" ? b_net   : theme == "Neon Flux" ? nf_net   : theme == "Infrared" ? ir_net   : n_net
+themeBase  = theme == "Blacked Out" ? b_base  : theme == "Neon Flux" ? nf_base  : theme == "Infrared" ? ir_base  : n_base
+themeStep  = theme == "Blacked Out" ? b_step  : theme == "Neon Flux" ? nf_step  : theme == "Infrared" ? ir_step  : n_step
+themeMin   = theme == "Blacked Out" ? b_min   : theme == "Neon Flux" ? nf_min   : theme == "Infrared" ? ir_min   : n_min
+themeBoost = theme == "Blacked Out" ? b_boost : theme == "Neon Flux" ? nf_boost : theme == "Infrared" ? ir_boost : n_boost
+themePool  = theme == "Blacked Out" ? b_pool  : theme == "Neon Flux" ? nf_pool  : theme == "Infrared" ? ir_pool  : n_pool
+themeBg    = theme == "Blacked Out" ? b_bg    : theme == "Neon Flux" ? nf_bg    : theme == "Infrared" ? ir_bg    : n_bg
+
+// ALPHA HELPERS
+f_layerAlpha(layer, score) =>
+    layerBase = themeBase - (4 - layer) * themeStep
+    boost     = int(math.round(score / 100.0 * float(themeBoost)))
+    math.max(layerBase - boost, themeMin)
+
+f_pressureAlpha(baseAlpha, score) =>
+    boost = int(math.round(score / 100.0 * float(themeBoost)))
+    math.max(baseAlpha - boost, themeMin)
+
+// BUCKET COLORS
+bullStackCol1 = color.new(themeBull, f_layerAlpha(1, bullDispScore))
+bullStackCol2 = color.new(themeBull, f_layerAlpha(2, bullDispScore))
+bullStackCol3 = color.new(themeBull, f_layerAlpha(3, bullDispScore))
+bullStackCol4 = color.new(themeBull, f_layerAlpha(4, bullDispScore))
+
+bearStackCol1 = color.new(themeBear, f_layerAlpha(1, bearDispScore))
+bearStackCol2 = color.new(themeBear, f_layerAlpha(2, bearDispScore))
+bearStackCol3 = color.new(themeBear, f_layerAlpha(3, bearDispScore))
+bearStackCol4 = color.new(themeBear, f_layerAlpha(4, bearDispScore))
+
+bullHistCol = color.new(themeBull, f_pressureAlpha(themeBase - 2 * themeStep, bull))
+bearHistCol = color.new(themeBear, f_pressureAlpha(themeBase - 2 * themeStep, bear))
+
+bullLineCol = color.new(themeBull, f_pressureAlpha(themeBase - themeStep, bull))
+bearLineCol = color.new(themeBear, f_pressureAlpha(themeBase - themeStep, bear))
+
+netAbsScore = math.abs(net)
+netSide     = net >= 0 ? themeBull : themeBear
+netColor    = color.new(netSide, f_pressureAlpha(themeBase - themeStep, netAbsScore))
+
+bullPoolColor = bull > 5 ? color.new(themeBull, f_pressureAlpha(themePool, bullDispScore)) : color.new(themeBull, 100)
+bearPoolColor = bear > 5 ? color.new(themeBear, f_pressureAlpha(themePool, bearDispScore)) : color.new(themeBear, 100)
+
+bullBgColor = bull > bear and bull > 8 ? color.new(themeBull, math.max(themeBg - int(bull / 100.0 * 10.0), themeBg - 12)) : na
+bearBgColor = bear > bull and bear > 8 ? color.new(themeBear, math.max(themeBg - int(bear / 100.0 * 10.0), themeBg - 12)) : na
+
+markerBull = color.new(themeBull, themeMin + 5)
+markerBear = color.new(themeBear, themeMin + 5)
+markerDiv  = #FFD166
+
+// PLOTS
+h_zero = hline(0,           "Zero",         color=color.new(color.gray, 78))
+h_wp   = hline(snapWatch,   "Watch +",      color=color.new(color.lime, 50), linestyle=hline.style_dashed)
+h_rp   = hline(snapReady,   "Snap Ready +", color=color.new(color.lime, 20), linestyle=hline.style_dotted)
+h_wn   = hline(-snapWatch,  "Watch -",      color=color.new(color.red,  50), linestyle=hline.style_dashed)
+h_rn   = hline(-snapReady,  "Snap Ready -", color=color.new(color.red,  20), linestyle=hline.style_dotted)
+
+fill(h_zero, h_wp, color=color.new(themeBull, 97))
+fill(h_wp,   h_rp, color=color.new(themeBull, 94))
+fill(h_zero, h_wn, color=color.new(themeBear, 97))
+fill(h_wn,   h_rn, color=color.new(themeBear, 94))
+
+bgcolor(bullBgColor, title="Bull Pressure Wash")
+bgcolor(bearBgColor, title="Bear Pressure Wash")
+
+plot(visualMode == "Histogram" ? bull  : na, "Bull Histogram", style=plot.style_columns, color=bullHistCol, linewidth=2)
+plot(visualMode == "Histogram" ? -bear : na, "Bear Histogram", style=plot.style_columns, color=bearHistCol, linewidth=2)
+
+p_bullCum4 = plot(visualMode == "Stacked Histogram" and showComponents ? bullCum4 : na, "Bull Stack 4", style=plot.style_columns, color=bullStackCol4, linewidth=2)
+plot(visualMode == "Stacked Histogram" and showComponents ? bullCum3 : na, "Bull Stack 3", style=plot.style_columns, color=bullStackCol3, linewidth=2)
+plot(visualMode == "Stacked Histogram" and showComponents ? bullCum2 : na, "Bull Stack 2", style=plot.style_columns, color=bullStackCol2, linewidth=2)
+plot(visualMode == "Stacked Histogram" and showComponents ? bullCum1 : na, "Bull Stack 1", style=plot.style_columns, color=bullStackCol1, linewidth=2)
+
+p_bearCum4 = plot(visualMode == "Stacked Histogram" and showComponents ? bearCum4 : na, "Bear Stack 4", style=plot.style_columns, color=bearStackCol4, linewidth=2)
+plot(visualMode == "Stacked Histogram" and showComponents ? bearCum3 : na, "Bear Stack 3", style=plot.style_columns, color=bearStackCol3, linewidth=2)
+plot(visualMode == "Stacked Histogram" and showComponents ? bearCum2 : na, "Bear Stack 2", style=plot.style_columns, color=bearStackCol2, linewidth=2)
+plot(visualMode == "Stacked Histogram" and showComponents ? bearCum1 : na, "Bear Stack 1", style=plot.style_columns, color=bearStackCol1, linewidth=2)
+
+p_zero = plot(0, "Zero Base", color=color.new(color.black, 100), display=display.none)
+
+fill(p_bullCum4, p_zero, color=bullPoolColor)
+fill(p_bearCum4, p_zero, color=bearPoolColor)
+
+plot(visualMode == "Lines" ? bull  : na, "Bullish Snap Pressure", color=bullLineCol, linewidth=2)
+plot(visualMode == "Lines" ? -bear : na, "Bearish Snap Pressure", color=bearLineCol, linewidth=2)
+
+plot(showNet ? net : na, "Net Pressure", color=netColor, linewidth=3)
+
+plotshape(showPulseDots and bullPulse ? (visualMode == "Stacked Histogram" ? bullCum4 : bull)  : na, title="Bull Pulse", style=shape.circle, location=location.absolute, size=size.tiny, color=markerBull)
+plotshape(showPulseDots and bearPulse ? (visualMode == "Stacked Histogram" ? bearCum4 : -bear) : na, title="Bear Pulse", style=shape.circle, location=location.absolute, size=size.tiny, color=markerBear)
+
+plotshape(bullBreak ? (visualMode == "Stacked Histogram" ? bullCum4 : bull)  : na, title="Bull Break Confirmed", style=shape.triangleup, location=location.absolute, size=size.small, color=markerBull)
+plotshape(bearBreak ? (visualMode == "Stacked Histogram" ? bearCum4 : -bear) : na, title="Bear Break Confirmed", style=shape.triangledown, location=location.absolute, size=size.small, color=markerBear)
+
+plot(hasRes ? res : na, "Active Resistance", display=display.data_window)
+plot(hasSup ? sup : na, "Active Support", display=display.data_window)
+
+plotshape(bullDivWarn ? (visualMode == "Stacked Histogram" ? bullCum4 : bull) : na,
+     title="Bull Divergence Warning", style=shape.diamond, location=location.absolute,
+     size=size.tiny, color=markerDiv)
+plotshape(bearDivWarn ? (visualMode == "Stacked Histogram" ? bearCum4 : -bear) : na,
+     title="Bear Divergence Warning", style=shape.diamond, location=location.absolute,
+     size=size.tiny, color=markerDiv)
+
+// ALERTS
+alertcondition(bullWatch, "SPO Bull Watch", "Snap Pressure Oscillator: bullish pressure is above watch threshold.")
+alertcondition(bearWatch, "SPO Bear Watch", "Snap Pressure Oscillator: bearish pressure is above watch threshold.")
+alertcondition(bullReady, "SPO Bull Ready", "Snap Pressure Oscillator: bullish pressure is snap-ready.")
+alertcondition(bearReady, "SPO Bear Ready", "Snap Pressure Oscillator: bearish pressure is snap-ready.")
+alertcondition(bullPulse, "SPO Bull Pulse", "Snap Pressure Oscillator: bullish pressure just crossed into snap-ready.")
+alertcondition(bearPulse, "SPO Bear Pulse", "Snap Pressure Oscillator: bearish pressure just crossed into snap-ready.")
+alertcondition(bullBreak, "SPO Bull Break", "Snap Pressure Oscillator: resistance break confirmed with high bullish snap pressure.")
+alertcondition(bearBreak, "SPO Bear Break", "Snap Pressure Oscillator: support break confirmed with high bearish snap pressure.")
+alertcondition(bullDivWarn, "SPO Bull Divergence", "Snap Pressure Oscillator: bullish pressure elevated but RSI diverging — potential false breakout.")
+alertcondition(bearDivWarn, "SPO Bear Divergence", "Snap Pressure Oscillator: bearish pressure elevated but RSI diverging — potential false breakdown.")

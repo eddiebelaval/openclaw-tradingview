@@ -1,0 +1,229 @@
+//@version=6
+indicator("Market Effort vs Result Engine Pro [MERE]", shorttitle="MERE Pro", overlay=false, max_labels_count=50)
+
+//==================================================================================================
+// Market Effort vs Result Engine Pro [MERE]
+// A pure price-efficiency oscillator.
+// Effort = total travel over a window
+// Result = net directional progress over the same window
+// No external indicators, no volume, no higher timeframe data.
+//==================================================================================================
+
+//----------------------------------------
+// Inputs
+//----------------------------------------
+groupCore = "Core Engine"
+calcLen        = input.int(18, "Calculation length", minval=5, maxval=100, group=groupCore)
+baselineLen    = input.int(50, "Baseline effort length", minval=10, maxval=300, group=groupCore)
+smoothLen      = input.int(5, "Smoothing length", minval=1, maxval=50, group=groupCore)
+effHighThresh  = input.float(55.0, "High efficiency threshold", minval=10.0, maxval=95.0, step=1.0, group=groupCore)
+effLowThresh   = input.float(22.0, "Low efficiency threshold", minval=5.0, maxval=60.0, step=1.0, group=groupCore)
+effortHotLevel = input.float(115.0, "Hot effort threshold", minval=50.0, maxval=300.0, step=1.0, group=groupCore)
+
+groupDisplay = "Display"
+showHistogram     = input.bool(true, "Show efficiency histogram", group=groupDisplay)
+showSignalLine    = input.bool(true, "Show smoothed line", group=groupDisplay)
+showChurnLine     = input.bool(true, "Show churn pressure line", group=groupDisplay)
+showStateRibbon   = input.bool(true, "Show state ribbon", group=groupDisplay)
+showStateMarkers  = input.bool(true, "Show state markers", group=groupDisplay)
+
+groupDashboard = "Dashboard"
+showDashboard = input.bool(true, "Show dashboard", group=groupDashboard)
+dashboardPosition = input.string("Top Right", "Dashboard position", options=[
+     "Top Left", "Top Center", "Top Right",
+     "Middle Left", "Middle Center", "Middle Right",
+     "Bottom Left", "Bottom Center", "Bottom Right"
+], group=groupDashboard)
+dashboardTextSize = input.string("Small", "Dashboard text size", options=["Tiny", "Small", "Normal", "Large"], group=groupDashboard)
+
+//----------------------------------------
+// Helpers
+//----------------------------------------
+f_clamp(val, minv, maxv) =>
+    math.max(minv, math.min(maxv, val))
+
+f_sign(v) =>
+    v > 0 ? 1.0 : v < 0 ? -1.0 : 0.0
+
+f_tablePos(pos) =>
+    pos == "Top Left" ? position.top_left :
+     pos == "Top Center" ? position.top_center :
+     pos == "Top Right" ? position.top_right :
+     pos == "Middle Left" ? position.middle_left :
+     pos == "Middle Center" ? position.middle_center :
+     pos == "Middle Right" ? position.middle_right :
+     pos == "Bottom Left" ? position.bottom_left :
+     pos == "Bottom Center" ? position.bottom_center :
+     position.bottom_right
+
+f_txtSize(sz) =>
+    sz == "Tiny" ? size.tiny :
+     sz == "Small" ? size.small :
+     sz == "Large" ? size.large :
+     size.normal
+
+//----------------------------------------
+// Core calculations
+//----------------------------------------
+enoughBars = bar_index > math.max(calcLen, baselineLen)
+
+// Total effort over calc window = sum of bar ranges
+float totalEffort = na
+if enoughBars
+    totalEffort := 0.0
+    for i = 0 to calcLen - 1
+        totalEffort += (high[i] - low[i])
+
+// Baseline average bar effort
+float baselineAvgEffort = na
+if enoughBars
+    baselineAvgEffort := 0.0
+    for i = 0 to baselineLen - 1
+        baselineAvgEffort += (high[i] - low[i])
+    baselineAvgEffort := baselineAvgEffort / baselineLen
+
+netMove = enoughBars ? close - close[calcLen] : na
+dirSign = enoughBars ? f_sign(netMove) : na
+
+// Efficiency = net directional progress / total travel
+efficiencyRaw = enoughBars ? math.abs(netMove) / math.max(totalEffort, syminfo.mintick) : na
+efficiencyPct = enoughBars ? efficiencyRaw * 100.0 : na
+signedEfficiency = enoughBars ? efficiencyPct * dirSign : na
+
+// Effort pressure = current average effort vs baseline effort
+avgEffortNow = enoughBars ? totalEffort / calcLen : na
+effortPressure = enoughBars ? (avgEffortNow / math.max(baselineAvgEffort, syminfo.mintick)) * 100.0 : na
+
+// Churn pressure = high effort with poor result
+churnPressure = enoughBars ? f_clamp((100.0 - efficiencyPct) * (effortPressure / 100.0), 0.0, 200.0) : na
+
+// Always call EMA every bar for consistency
+signedEffSmRaw = ta.ema(nz(signedEfficiency, 0.0), smoothLen)
+efficiencySmRaw = ta.ema(nz(efficiencyPct, 0.0), smoothLen)
+churnSmRaw = ta.ema(nz(churnPressure, 0.0), smoothLen)
+
+signedEffSm = enoughBars ? signedEffSmRaw : na
+efficiencySm = enoughBars ? efficiencySmRaw : na
+churnSm = enoughBars ? churnSmRaw : na
+
+//----------------------------------------
+// State logic
+//----------------------------------------
+isEfficientUp   = enoughBars and signedEffSm >= effHighThresh
+isEfficientDown = enoughBars and signedEffSm <= -effHighThresh
+isAbsorption    = enoughBars and efficiencySm <= effLowThresh and effortPressure >= effortHotLevel
+isFatigueUp     = enoughBars and signedEffSm > 0 and signedEffSm < signedEffSm[1] and effortPressure >= effortHotLevel and efficiencySm < effHighThresh
+isFatigueDown   = enoughBars and signedEffSm < 0 and signedEffSm > signedEffSm[1] and effortPressure >= effortHotLevel and efficiencySm < effHighThresh
+isNeutral       = enoughBars and not isEfficientUp and not isEfficientDown and not isAbsorption and not isFatigueUp and not isFatigueDown
+
+stateText =
+     isEfficientUp ? "Efficient Uptrend" :
+     isEfficientDown ? "Efficient Downtrend" :
+     isAbsorption ? "Absorption / Churn" :
+     isFatigueUp ? "Uptrend Fatigue" :
+     isFatigueDown ? "Downtrend Fatigue" :
+     isNeutral ? "Neutral Rotation" : "Insufficient Data"
+
+stateColor =
+     isEfficientUp ? color.rgb(0, 210, 120) :
+     isEfficientDown ? color.rgb(235, 70, 70) :
+     isAbsorption ? color.rgb(255, 170, 0) :
+     isFatigueUp ? color.rgb(140, 220, 120) :
+     isFatigueDown ? color.rgb(255, 120, 120) :
+     color.rgb(90, 125, 255)
+
+//----------------------------------------
+// Visuals
+//----------------------------------------
+hline(0, "Zero Line", color=color.new(color.gray, 70))
+hline(effHighThresh, "Positive Efficient Zone", color=color.new(color.green, 80))
+hline(-effHighThresh, "Negative Efficient Zone", color=color.new(color.red, 80))
+hline(effLowThresh, "Low Efficiency Ref", color=color.new(color.orange, 85), linestyle=hline.style_dotted)
+hline(-effLowThresh, "Low Efficiency Ref Mirror", color=color.new(color.orange, 85), linestyle=hline.style_dotted)
+
+histColor =
+     signedEfficiency >= effHighThresh ? color.rgb(0, 210, 120) :
+     signedEfficiency <= -effHighThresh ? color.rgb(235, 70, 70) :
+     math.abs(signedEfficiency) <= effLowThresh ? color.rgb(255, 170, 0) :
+     signedEfficiency > 0 ? color.rgb(90, 180, 255) :
+     color.rgb(180, 120, 255)
+
+plot(showHistogram ? signedEfficiency : na, "Signed Efficiency", style=plot.style_columns, color=histColor, linewidth=2)
+plot(showSignalLine ? signedEffSm : na, "Smoothed Efficiency", color=color.white, linewidth=2)
+plot(showChurnLine ? churnSm - 100.0 : na, "Churn Pressure (Centered)", color=color.rgb(255, 170, 0), linewidth=2)
+
+// State ribbon
+ribbonValue = showStateRibbon ? 95 : na
+plot(ribbonValue, "State Ribbon", style=plot.style_area, color=color.new(stateColor, 84), linewidth=1)
+
+// State markers
+plotshape(showStateMarkers and isEfficientUp, title="Efficient Uptrend", style=shape.circle, location=location.bottom, color=color.rgb(0, 210, 120), size=size.tiny)
+plotshape(showStateMarkers and isEfficientDown, title="Efficient Downtrend", style=shape.circle, location=location.top, color=color.rgb(235, 70, 70), size=size.tiny)
+plotshape(showStateMarkers and isAbsorption, title="Absorption / Churn", style=shape.square, location=location.bottom, color=color.rgb(255, 170, 0), size=size.tiny)
+plotshape(showStateMarkers and isFatigueUp, title="Uptrend Fatigue", style=shape.triangleup, location=location.bottom, color=color.rgb(140, 220, 120), size=size.tiny)
+plotshape(showStateMarkers and isFatigueDown, title="Downtrend Fatigue", style=shape.triangledown, location=location.top, color=color.rgb(255, 120, 120), size=size.tiny)
+
+// Background tint
+bgcolor(showStateRibbon ? color.new(stateColor, 94) : na)
+
+//----------------------------------------
+// Dashboard
+//----------------------------------------
+var string lastDashboardPosition = dashboardPosition
+var table dash = table.new(f_tablePos(dashboardPosition), 2, 7, border_width=1)
+
+if dashboardPosition != lastDashboardPosition
+    table.delete(dash)
+    dash := table.new(f_tablePos(dashboardPosition), 2, 7, border_width=1)
+    lastDashboardPosition := dashboardPosition
+
+if showDashboard and barstate.islast
+    txtSz = f_txtSize(dashboardTextSize)
+
+    headerBg = color.rgb(10, 12, 18)
+    leftBg   = color.rgb(22, 26, 34)
+    rightBg  = color.rgb(14, 17, 24)
+
+    frameTxt = color.rgb(255, 255, 255)
+    softTxt  = color.rgb(255, 255, 255)
+
+    effTxt    = na(efficiencySm) ? "-" : str.tostring(math.round(efficiencySm * 10.0) / 10.0)
+    signedTxt = na(signedEffSm) ? "-" : str.tostring(math.round(signedEffSm * 10.0) / 10.0)
+    effortTxt = na(effortPressure) ? "-" : str.tostring(math.round(effortPressure * 10.0) / 10.0)
+    churnTxt  = na(churnSm) ? "-" : str.tostring(math.round(churnSm * 10.0) / 10.0)
+    biasTxt   = na(signedEffSm) ? "-" : signedEffSm > 0 ? "Upward" : signedEffSm < 0 ? "Downward" : "Flat"
+
+    biasBg =
+         biasTxt == "Upward" ? color.new(color.rgb(0, 210, 120), 18) :
+         biasTxt == "Downward" ? color.new(color.rgb(235, 70, 70), 18) :
+         color.new(color.rgb(90, 125, 255), 18)
+
+    table.cell(dash, 0, 0, "MERE", text_color=color.white, text_size=txtSz, bgcolor=headerBg)
+    table.cell(dash, 1, 0, "PRO",  text_color=color.white, text_size=txtSz, bgcolor=headerBg)
+
+    table.cell(dash, 0, 1, "State", text_color=frameTxt, text_size=txtSz, bgcolor=leftBg)
+    table.cell(dash, 1, 1, stateText, text_color=color.white, text_size=txtSz, bgcolor=color.new(stateColor, 20))
+
+    table.cell(dash, 0, 2, "Bias", text_color=frameTxt, text_size=txtSz, bgcolor=leftBg)
+    table.cell(dash, 1, 2, biasTxt, text_color=color.black, text_size=txtSz, bgcolor=biasBg)
+
+    table.cell(dash, 0, 3, "Efficiency", text_color=frameTxt, text_size=txtSz, bgcolor=leftBg)
+    table.cell(dash, 1, 3, effTxt, text_color=color.white, text_size=txtSz, bgcolor=rightBg)
+
+    table.cell(dash, 0, 4, "Signed Score", text_color=frameTxt, text_size=txtSz, bgcolor=leftBg)
+    table.cell(dash, 1, 4, signedTxt, text_color=color.white, text_size=txtSz, bgcolor=rightBg)
+
+    table.cell(dash, 0, 5, "Effort Pressure", text_color=frameTxt, text_size=txtSz, bgcolor=leftBg)
+    table.cell(dash, 1, 5, effortTxt, text_color=color.white, text_size=txtSz, bgcolor=rightBg)
+
+    table.cell(dash, 0, 6, "Churn Pressure", text_color=frameTxt, text_size=txtSz, bgcolor=leftBg)
+    table.cell(dash, 1, 6, churnTxt, text_color=color.white, text_size=txtSz, bgcolor=rightBg)
+
+//----------------------------------------
+// Alerts
+//----------------------------------------
+alertcondition(isEfficientUp, title="MERE Efficient Uptrend", message="MERE Pro: Efficient upward movement detected.")
+alertcondition(isEfficientDown, title="MERE Efficient Downtrend", message="MERE Pro: Efficient downward movement detected.")
+alertcondition(isAbsorption, title="MERE Absorption / Churn", message="MERE Pro: High effort with poor result detected.")
+alertcondition(isFatigueUp, title="MERE Uptrend Fatigue", message="MERE Pro: Uptrend fatigue detected.")
+alertcondition(isFatigueDown, title="MERE Downtrend Fatigue", message="MERE Pro: Downtrend fatigue detected.")

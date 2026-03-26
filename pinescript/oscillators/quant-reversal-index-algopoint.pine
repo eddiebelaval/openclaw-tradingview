@@ -1,0 +1,144 @@
+// -----------------------------------------------------------------------------
+// | © AlgoPoint                                                               |
+// | Indicator: Quant Reversal Index [AlgoPoint]                               |
+// | Developer: Harmony Algo & AlgoPoint Collaboration                         |
+// -----------------------------------------------------------------------------
+//@version=5
+// max_bars_back eklendi: Dinamik uzunlukların hafıza sınırına takılmasını engeller.
+indicator("AlgoPoint Quant Reversal Index", shorttitle="Quant Index", overlay=false, max_bars_back=1000)
+
+// =============================================================================
+// 1. INPUTS & SETTINGS (UI/UX)
+// =============================================================================
+grp_calc = "1. Quantitative Core Settings"
+src = input.source(close, "Source", group=grp_calc, inline="c1")
+quant_len = input.int(100, "Lookback Window", minval=20, maxval=500, group=grp_calc, inline="c1", tooltip="Window length for Hurst and Half-Life calculations.")
+ou_mult = input.float(2.0, "OU Band Multiplier", step=0.1, group=grp_calc, inline="c2", tooltip="Standard deviation multiplier for Ornstein-Uhlenbeck bands.")
+hurst_threshold = input.float(0.5, "Hurst Threshold", step=0.05, group=grp_calc, inline="c2", tooltip="Values below this indicate Mean Reversion. Default is 0.5.")
+
+grp_ui = "2. UI & Dashboard Settings"
+show_dashboard = input.bool(true, "Show Quant Dashboard?", group=grp_ui)
+dash_pos = input.string("Bottom Right", "Position", options=["Top Right", "Bottom Right", "Bottom Left"], group=grp_ui)
+
+// AlgoPoint Brand Colors
+color_bull = color.new(#2ee319, 0)
+color_bear = color.new(#f31623, 0)
+color_neut = color.new(#7f49de, 0)
+
+// =============================================================================
+// 2. MATHEMATICAL CORE: HURST EXPONENT (Variance Ratio Approximation)
+// =============================================================================
+tau1 = 2
+tau2 = 8
+var1 = ta.variance(src - src[tau1], quant_len)
+var2 = ta.variance(src - src[tau2], quant_len)
+
+float hurst_value = na
+if var1 > 0 and var2 > 0
+    hurst_value := (math.log(var2) - math.log(var1)) / (2 * (math.log(tau2) - math.log(tau1)))
+
+bool is_mean_reverting = hurst_value < hurst_threshold
+
+// =============================================================================
+// 3. MATHEMATICAL CORE: HALF-LIFE (AR(1) Model & Custom Covariance)
+// =============================================================================
+delta_p = src - src[1]
+p_prev = src[1]
+
+// Building Custom Covariance: Cov(X,Y) = SMA((X - SMA(X)) * (Y - SMA(Y)))
+mean_delta_p = ta.sma(delta_p, quant_len)
+mean_p_prev = ta.sma(p_prev, quant_len)
+cov_p = ta.sma((delta_p - mean_delta_p) * (p_prev - mean_p_prev), quant_len)
+
+var_p = ta.variance(p_prev, quant_len)
+
+float lambda = var_p > 0 ? cov_p / var_p : na
+float half_life = (lambda < 0) ? (-math.log(2) / lambda) : na
+
+// Constrain Half-Life to avoid extreme values in dynamic lengths
+int hl_len = 20
+if not na(half_life) and half_life > 2 and half_life <= 100
+    hl_len := int(math.round(half_life))
+
+// =============================================================================
+// 4. ORNSTEIN-UHLENBECK (OU) TO 0-100 INDEX CONVERSION
+// =============================================================================
+float mu = ta.sma(src, hl_len)
+float sigma = ta.stdev(src, hl_len)
+
+float upper_ou = mu + (ou_mult * sigma)
+float lower_ou = mu - (ou_mult * sigma)
+
+float quant_index = na
+if (upper_ou - lower_ou) != 0
+    // Normalize price position between Lower (0) and Upper (100) Bands
+    quant_index := ((src - lower_ou) / (upper_ou - lower_ou)) * 100
+
+// =============================================================================
+// 5. VISUALS (UI/UX)
+// =============================================================================
+// Regime Background
+bgcolor(is_mean_reverting ? color.new(color_neut, 90) : na, title="Mean Reverting Regime Background")
+
+// Reference Lines
+hline(100, "Overbought (Upper OU)", color=color.new(color_bear, 50), linestyle=hline.style_dashed)
+hline(50, "Mean (\u03BC)", color=color.new(color_neut, 50), linestyle=hline.style_dotted)
+hline(0, "Oversold (Lower OU)", color=color.new(color_bull, 50), linestyle=hline.style_dashed)
+
+// Gradient Line for the Index
+idx_color = color.from_gradient(quant_index, 0, 100, color_bull, color_bear)
+plot(quant_index, title="Quant Index", color=idx_color, linewidth=2, style=plot.style_line)
+
+// Extreme Area Fills
+p_index = plot(quant_index, color=na, editable=false)
+p_100 = plot(100, color=na, editable=false)
+p_0 = plot(0, color=na, editable=false)
+
+fill(p_index, p_100, quant_index > 100 ? color.new(color_bear, 70) : na, title="Overbought Extreme Fill")
+fill(p_index, p_0, quant_index < 0 ? color.new(color_bull, 70) : na, title="Oversold Extreme Fill")
+
+// =============================================================================
+// 6. SIGNAL GENERATION (Strictly No Repaint)
+// =============================================================================
+// Signal Logic: Index crosses back inside the 0-100 range + Mean Reverting + Confirmed
+buy_cond = ta.crossover(quant_index, 0) and is_mean_reverting and barstate.isconfirmed
+sell_cond = ta.crossunder(quant_index, 100) and is_mean_reverting and barstate.isconfirmed
+
+// Labels adjusted for Oscillator Pane (0 and 100 scale instead of Price/ATR)
+if (buy_cond)
+    label.new(bar_index, -15, "Buy", color=#018208, style=label.style_label_up, textcolor=color.white, size=size.small)
+
+if (sell_cond)
+    label.new(bar_index, 115, "Sell", color=#d12208, style=label.style_label_down, textcolor=color.white, size=size.small)
+
+// =============================================================================
+// 7. ALERTS (Webhook & JSON Ready)
+// =============================================================================
+alertcondition(buy_cond, title="Quant Index: BUY", message="AlgoPoint Quant Index crossed above 0 in a Mean Reverting regime.")
+alertcondition(sell_cond, title="Quant Index: SELL", message="AlgoPoint Quant Index crossed below 100 in a Mean Reverting regime.")
+
+if buy_cond
+    alert('{"action": "buy", "asset": "' + syminfo.ticker + '", "index_value": ' + str.tostring(quant_index, "#.##") + ', "hurst": ' + str.tostring(hurst_value, "#.##") + ', "half_life": ' + str.tostring(half_life, "#.#") + '}', alert.freq_once_per_bar_close)
+
+if sell_cond
+    alert('{"action": "sell", "asset": "' + syminfo.ticker + '", "index_value": ' + str.tostring(quant_index, "#.##") + ', "hurst": ' + str.tostring(hurst_value, "#.##") + ', "half_life": ' + str.tostring(half_life, "#.#") + '}', alert.freq_once_per_bar_close)
+
+// =============================================================================
+// 8. QUANT DASHBOARD
+// =============================================================================
+var table dash = table.new(dash_pos == "Top Right" ? position.top_right : dash_pos == "Bottom Left" ? position.bottom_left : position.bottom_right, 2, 4, border_width=1, border_color=color.gray, frame_color=color.black, frame_width=2)
+
+if barstate.islast and show_dashboard
+    table.cell(dash, 0, 0, "AlgoPoint Quant Core", text_color=color.white, bgcolor=color_neut, text_size=size.small, width=15)
+    table.cell(dash, 1, 0, "Metrics", text_color=color.white, bgcolor=color_neut, text_size=size.small, width=10)
+    
+    regime_txt = is_mean_reverting ? "Ranging (Reversion)" : "Trending (No Signals)"
+    regime_col = is_mean_reverting ? color_bull : color_bear
+    table.cell(dash, 0, 1, "Market Regime", text_color=color.white, bgcolor=color.new(color.gray, 80), text_size=size.small)
+    table.cell(dash, 1, 1, regime_txt, text_color=color.white, bgcolor=color.new(regime_col, 50), text_size=size.small)
+    
+    table.cell(dash, 0, 2, "Hurst Exponent (H)", text_color=color.white, bgcolor=color.new(color.gray, 80), text_size=size.small)
+    table.cell(dash, 1, 2, str.tostring(hurst_value, "#.###"), text_color=color.white, bgcolor=color.new(color.gray, 80), text_size=size.small)
+    
+    table.cell(dash, 0, 3, "Est. Half-Life (Bars)", text_color=color.white, bgcolor=color.new(color.gray, 80), text_size=size.small)
+    table.cell(dash, 1, 3, str.tostring(math.round(half_life)), text_color=color.white, bgcolor=color.new(color.gray, 80), text_size=size.small)

@@ -1,0 +1,672 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © AlphaX
+
+//@version=6
+indicator("AlphaX Reversal Engine – RSI Divergence & WPR Timing Signals", shorttitle="AlphaX Reversal", overlay=true,
+  max_labels_count=500, max_lines_count=500, max_bars_back=500)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ═══════════════════════════ INPUTS ═══════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// ── RSI Divergence Engine ──────────────────────────────────────────────────────
+rsiLen         = input.int(9,     "RSI Period",              minval=5,   maxval=21,  group="RSI Divergence")
+rsiPivotLen    = input.int(2,     "RSI Pivot Lookback",      minval=2,   maxval=8,   group="RSI Divergence")
+divMaxBars     = input.int(60,    "Max Divergence Width",    minval=15,  maxval=80,  group="RSI Divergence")
+divMinBars     = input.int(3,     "Min Divergence Width",    minval=3,   maxval=15,  group="RSI Divergence")
+showDivLines   = input.bool(true, "Show Divergence Lines",                           group="RSI Divergence")
+
+// ── WPR Timing ─────────────────────────────────────────────────────────────────
+wprFastLen     = input.int(8,     "WPR Fast Period",         minval=3,   maxval=15,  group="WPR Timing")
+wprMedLen      = input.int(21,    "WPR Medium Period",       minval=14,  maxval=34,  group="WPR Timing")
+wprSlowLen     = input.int(55,    "WPR Slow Period",         minval=34,  maxval=100, group="WPR Timing")
+wprOversold    = input.float(-82, "WPR Oversold Level",      minval=-95, maxval=-70, step=1, group="WPR Timing")
+wprOverbought  = input.float(-18, "WPR Overbought Level",    minval=-30, maxval=-5,  step=1, group="WPR Timing")
+
+// ── Signal Filters ─────────────────────────────────────────────────────────────
+minConfidence  = input.int(25,    "Min Confidence %",        minval=10,  maxval=80,  group="Signal Filters")
+cooldownBars   = input.int(3,     "Signal Cooldown (bars)",  minval=1,   maxval=20,  group="Signal Filters")
+useVolFilter   = input.bool(false,"Require Volume Confirm",                          group="Signal Filters")
+volMinRatio    = input.float(0.7, "Min Volume Ratio",        minval=0.3, maxval=2.0, step=0.1, group="Signal Filters")
+
+// ── Exit Settings ──────────────────────────────────────────────────────────────
+exitOnOpposite = input.bool(true, "Exit on Opposite Signal",                        group="Exits")
+exitOnWPRCross = input.bool(true, "Exit on WPR Exhaustion",                         group="Exits")
+wprExitBull    = input.float(-15, "WPR Exit Bull (above)",   minval=-25, maxval=-5,  step=1, group="Exits")
+wprExitBear    = input.float(-85, "WPR Exit Bear (below)",   minval=-95, maxval=-75, step=1, group="Exits")
+
+// ── Appearance ─────────────────────────────────────────────────────────────────
+labelSizeInput = input.string("Small", "Label Size",
+  options=["Tiny","Small","Normal"],                                                  group="Appearance")
+dashSizeInput  = input.string("Small", "Dashboard Text",
+  options=["Tiny","Small","Normal"],                                                  group="Appearance")
+
+// ── Dashboard ──────────────────────────────────────────────────────────────────
+showDash       = input.bool(true,  "Show Dashboard",                                 group="Dashboard")
+dashPos        = input.string("Top Right", "Position",
+  options=["Top Left","Top Right","Bottom Left","Bottom Right"],                       group="Dashboard")
+
+// ── Colors ─────────────────────────────────────────────────────────────────────
+colBullPrimary  = input.color(#c8e624, "Bull Primary",          group="Colors")
+colBullBright   = input.color(#d4f03a, "Bull Bright",           group="Colors")
+colBullDim      = input.color(#9ab81c, "Bull Dim",              group="Colors")
+colBearPrimary  = input.color(#ff1744, "Bear Primary",          group="Colors")
+colBearBright   = input.color(#ff5252, "Bear Bright",           group="Colors")
+colBearDim      = input.color(#d50032, "Bear Dim",              group="Colors")
+colNeutral      = input.color(#555555, "Neutral",               group="Colors")
+colNeutralLight = input.color(#888888, "Neutral Light",         group="Colors")
+colTextLight    = input.color(#cccccc, "Text Light",            group="Colors")
+colDashBg       = input.color(#1a1a1a, "Dashboard Background",  group="Colors")
+colDivLine      = input.color(#c8e624, "Divergence Line Bull",  group="Colors")
+colDivLineBear  = input.color(#ff1744, "Divergence Line Bear",  group="Colors")
+colEntryBull    = input.color(#c8e624, "Entry Label Bull",      group="Colors")
+colEntryBear    = input.color(#ff1744, "Entry Label Bear",      group="Colors")
+colExitBull     = input.color(#888888, "Exit Label Bull",       group="Colors")
+colExitBear     = input.color(#888888, "Exit Label Bear",       group="Colors")
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ═══════════════════════════ HELPERS ═══════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════════════════
+
+getLabelSize(sz) =>
+    switch sz
+        "Tiny"   => size.tiny
+        "Small"  => size.small
+        "Normal" => size.normal
+
+getDashPos(p) =>
+    switch p
+        "Top Left"     => position.top_left
+        "Top Right"    => position.top_right
+        "Bottom Left"  => position.bottom_left
+        "Bottom Right" => position.bottom_right
+
+labelSize    = getLabelSize(labelSizeInput)
+dashTextSize = getLabelSize(dashSizeInput)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ═══════════════════════════ RSI CALCULATION ══════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════════════════
+
+rsiVal     = ta.rsi(close, rsiLen)
+rsiPivotHi = ta.pivothigh(rsiVal, rsiPivotLen, rsiPivotLen)
+rsiPivotLo = ta.pivotlow(rsiVal, rsiPivotLen, rsiPivotLen)
+
+pricePivotHi = ta.pivothigh(high, rsiPivotLen, rsiPivotLen)
+pricePivotLo = ta.pivotlow(low, rsiPivotLen, rsiPivotLen)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ═══════════════════════════ DIVERGENCE DETECTION ═════════════════════════════
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// Store previous pivots
+var float prevRsiLow      = na
+var float prevPriceLow    = na
+var int   prevPriceLowBar = na
+var float prevRsiHigh     = na
+var float prevPriceHigh   = na
+var int   prevPriceHighBar = na
+
+var float currRsiLow      = na
+var float currPriceLow    = na
+var int   currPriceLowBar = na
+var float currRsiHigh     = na
+var float currPriceHigh   = na
+var int   currPriceHighBar = na
+
+if not na(rsiPivotLo)
+    prevRsiLow      := currRsiLow
+    prevPriceLow    := currPriceLow
+    prevPriceLowBar := currPriceLowBar
+    currRsiLow      := rsiPivotLo
+    currPriceLow    := pricePivotLo
+    currPriceLowBar := bar_index - rsiPivotLen
+
+if not na(rsiPivotHi)
+    prevRsiHigh      := currRsiHigh
+    prevPriceHigh    := currPriceHigh
+    prevPriceHighBar := currPriceHighBar
+    currRsiHigh      := rsiPivotHi
+    currPriceHigh    := pricePivotHi
+    currPriceHighBar := bar_index - rsiPivotLen
+
+// Regular Bullish Divergence: price makes lower low, RSI makes higher low
+bullDivRaw = not na(prevPriceLow) and not na(currPriceLow) and
+  not na(prevRsiLow) and not na(currRsiLow) and
+  currPriceLow < prevPriceLow and
+  currRsiLow > prevRsiLow and
+  not na(currPriceLowBar) and not na(prevPriceLowBar) and
+  bar_index - currPriceLowBar <= rsiPivotLen + 1 and
+  currPriceLowBar - prevPriceLowBar >= divMinBars and
+  currPriceLowBar - prevPriceLowBar <= divMaxBars
+
+// Regular Bearish Divergence: price makes higher high, RSI makes lower high
+bearDivRaw = not na(prevPriceHigh) and not na(currPriceHigh) and
+  not na(prevRsiHigh) and not na(currRsiHigh) and
+  currPriceHigh > prevPriceHigh and
+  currRsiHigh < prevRsiHigh and
+  not na(currPriceHighBar) and not na(prevPriceHighBar) and
+  bar_index - currPriceHighBar <= rsiPivotLen + 1 and
+  currPriceHighBar - prevPriceHighBar >= divMinBars and
+  currPriceHighBar - prevPriceHighBar <= divMaxBars
+
+// Hidden Bullish Divergence: price makes higher low, RSI makes lower low
+hiddenBullDiv = not na(prevPriceLow) and not na(currPriceLow) and
+  not na(prevRsiLow) and not na(currRsiLow) and
+  currPriceLow > prevPriceLow and
+  currRsiLow < prevRsiLow and
+  not na(currPriceLowBar) and not na(prevPriceLowBar) and
+  bar_index - currPriceLowBar <= rsiPivotLen + 1 and
+  currPriceLowBar - prevPriceLowBar >= divMinBars and
+  currPriceLowBar - prevPriceLowBar <= divMaxBars
+
+// Hidden Bearish Divergence: price makes lower high, RSI makes higher high
+hiddenBearDiv = not na(prevPriceHigh) and not na(currPriceHigh) and
+  not na(prevRsiHigh) and not na(currRsiHigh) and
+  currPriceHigh < prevPriceHigh and
+  currRsiHigh > prevRsiHigh and
+  not na(currPriceHighBar) and not na(prevPriceHighBar) and
+  bar_index - currPriceHighBar <= rsiPivotLen + 1 and
+  currPriceHighBar - prevPriceHighBar >= divMinBars and
+  currPriceHighBar - prevPriceHighBar <= divMaxBars
+
+anyBullDiv = bullDivRaw or hiddenBullDiv
+anyBearDiv = bearDivRaw or hiddenBearDiv
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ═══════════════════════════ WPR CALCULATIONS ═════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════════════════
+
+wprFast = ta.wpr(wprFastLen)
+wprMed  = ta.wpr(wprMedLen)
+wprSlow = ta.wpr(wprSlowLen)
+
+// WPR states
+wprFastOS = wprFast < wprOversold
+wprFastOB = wprFast > wprOverbought
+wprMedOS  = wprMed < wprOversold
+wprMedOB  = wprMed > wprOverbought
+
+// WPR crosses from extreme zones
+wprFastCrossUp = wprFast > wprOversold and wprFast[1] <= wprOversold
+wprFastCrossDown = wprFast < wprOverbought and wprFast[1] >= wprOverbought
+
+// WPR velocity
+wprFastVel   = wprFast - wprFast[1]
+wprFastAccel = wprFastVel - wprFastVel[1]
+
+// WPR alignment for trend context
+wprBullAlign = wprSlow > -65 and wprMed > -60
+wprBearAlign = wprSlow < -35 and wprMed < -40
+wprBullRecovery = wprFast > wprFast[1] and wprFast > wprFast[2]
+wprBearRecovery = wprFast < wprFast[1] and wprFast < wprFast[2]
+
+// Multi-WPR convergence
+wprTripleOS = wprFast < wprOversold and wprMed < -70 and wprSlow < -60
+wprTripleOB = wprFast > wprOverbought and wprMed > -30 and wprSlow > -40
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ═══════════════════════════ CONFLUENCE SCORING ═══════════════════════════════
+// ═══════════════════════════════════════════════════════════════════════════════
+
+volSMA   = ta.sma(volume, 20)
+volRatio = volSMA > 0 ? volume / volSMA : 1.0
+volOK    = not useVolFilter or volRatio >= volMinRatio
+
+atrVal      = ta.atr(14)
+candleBody  = math.abs(close - open)
+candleRange = high - low
+bodyRatio   = candleRange > 0 ? candleBody / candleRange : 0
+
+calcBullConfidence() =>
+    float c = 0.0
+
+    // Divergence type (max 30)
+    c += bullDivRaw ? 30.0 : hiddenBullDiv ? 22.0 : 0.0
+
+    // WPR depth (max 20)
+    c += wprFast < -95 ? 20.0 :
+      wprFast < -90 ? 16.0 :
+      wprFast < -85 ? 12.0 :
+      wprFast < -80 ? 7.0 : 0.0
+
+    // WPR cross timing (max 15)
+    c += wprFastCrossUp ? 15.0 :
+      wprFastVel > 3 ? 10.0 :
+      wprBullRecovery ? 6.0 : 0.0
+
+    // WPR multi-timeframe (max 10)
+    c += wprTripleOS ? 10.0 :
+      wprMedOS ? 7.0 : 0.0
+
+    // WPR slow alignment (max 8)
+    c += wprBullAlign ? 8.0 :
+      wprSlow > -55 ? 4.0 : 0.0
+
+    // Candle confirmation (max 7)
+    c += close > open and bodyRatio > 0.5 ? 7.0 :
+      close > open ? 4.0 : 0.0
+
+    // Volume (max 5)
+    c += volRatio > 1.5 ? 5.0 :
+      volRatio > 1.0 ? 3.0 : 0.0
+
+    // RSI depth bonus (max 5)
+    c += rsiVal < 25 ? 5.0 :
+      rsiVal < 30 ? 3.0 :
+      rsiVal < 35 ? 1.0 : 0.0
+
+    // Penalties
+    c -= rsiVal > 65 ? 10.0 : rsiVal > 55 ? 5.0 : 0.0
+    c -= wprSlow > -30 ? 8.0 : 0.0
+    c -= math.abs(wprFastVel) > 30 ? 5.0 : 0.0
+
+    math.max(0.0, math.min(100.0, c))
+
+calcBearConfidence() =>
+    float c = 0.0
+
+    c += bearDivRaw ? 30.0 : hiddenBearDiv ? 22.0 : 0.0
+
+    c += wprFast > -5 ? 20.0 :
+      wprFast > -10 ? 16.0 :
+      wprFast > -15 ? 12.0 :
+      wprFast > -20 ? 7.0 : 0.0
+
+    c += wprFastCrossDown ? 15.0 :
+      wprFastVel < -3 ? 10.0 :
+      wprBearRecovery ? 6.0 : 0.0
+
+    c += wprTripleOB ? 10.0 :
+      wprMedOB ? 7.0 : 0.0
+
+    c += wprBearAlign ? 8.0 :
+      wprSlow < -45 ? 4.0 : 0.0
+
+    c += close < open and bodyRatio > 0.5 ? 7.0 :
+      close < open ? 4.0 : 0.0
+
+    c += volRatio > 1.5 ? 5.0 :
+      volRatio > 1.0 ? 3.0 : 0.0
+
+    c += rsiVal > 75 ? 5.0 :
+      rsiVal > 70 ? 3.0 :
+      rsiVal > 65 ? 1.0 : 0.0
+
+    c -= rsiVal < 35 ? 10.0 : rsiVal < 45 ? 5.0 : 0.0
+    c -= wprSlow < -70 ? 8.0 : 0.0
+    c -= math.abs(wprFastVel) > 30 ? 5.0 : 0.0
+
+    math.max(0.0, math.min(100.0, c))
+
+bullConfidence = calcBullConfidence()
+bearConfidence = calcBearConfidence()
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ═══════════════════════════ SIGNAL GENERATION ═══════════════════════════════
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// Entry triggers: divergence + WPR timing
+bullEntry = anyBullDiv and
+  (wprFastCrossUp or wprFastVel > 2 or wprBullRecovery) and
+  bullConfidence >= minConfidence and volOK
+
+bearEntry = anyBearDiv and
+  (wprFastCrossDown or wprFastVel < -2 or wprBearRecovery) and
+  bearConfidence >= minConfidence and volOK
+
+// Cooldown
+var int lastBullBar = -999
+var int lastBearBar = -999
+
+bullCoolOK = bar_index - lastBullBar >= cooldownBars
+bearCoolOK = bar_index - lastBearBar >= cooldownBars
+
+bullSignal = bullEntry and bullCoolOK
+bearSignal = bearEntry and bearCoolOK
+
+if bullSignal
+    lastBullBar := bar_index
+if bearSignal
+    lastBearBar := bar_index
+
+// Signal tier
+bullTier = bullConfidence >= 70 ? "S" :
+  bullConfidence >= 55 ? "A" : "B"
+bearTier = bearConfidence >= 70 ? "S" :
+  bearConfidence >= 55 ? "A" : "B"
+
+// Divergence type label
+bullDivType = bullDivRaw ? "REG" : "HID"
+bearDivType = bearDivRaw ? "REG" : "HID"
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ═══════════════════════════ TRADE STATE & EXITS ═════════════════════════════
+// ═══════════════════════════════════════════════════════════════════════════════
+
+var int   activeDir   = 0
+var float activeEntry = na
+var int   activeBar   = na
+
+// Entry
+if bullSignal
+    activeDir   := 1
+    activeEntry := close
+    activeBar   := bar_index
+
+if bearSignal
+    activeDir   := -1
+    activeEntry := close
+    activeBar   := bar_index
+
+// Exit conditions
+exitBullOnOpposite = activeDir == 1 and bearSignal and exitOnOpposite
+exitBearOnOpposite = activeDir == -1 and bullSignal and exitOnOpposite
+
+exitBullOnWPR = activeDir == 1 and wprFast > wprExitBull and
+  wprFast[1] <= wprExitBull and exitOnWPRCross and
+  bar_index > activeBar + 2
+exitBearOnWPR = activeDir == -1 and wprFast < wprExitBear and
+  wprFast[1] >= wprExitBear and exitOnWPRCross and
+  bar_index > activeBar + 2
+
+bullExit = exitBullOnOpposite or exitBullOnWPR
+bearExit = exitBearOnOpposite or exitBearOnWPR
+
+if bullExit and activeDir == 1
+    activeDir := 0
+if bearExit and activeDir == -1
+    activeDir := 0
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ═══════════════════════════ PLOTTING ═════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// ── Divergence Lines ──────────────────────────────────────────────────────────
+if showDivLines and bullSignal and not na(prevPriceLowBar) and not na(currPriceLowBar)
+    line.new(prevPriceLowBar, prevPriceLow, currPriceLowBar, currPriceLow,
+      color=color.new(colDivLine, 30),
+      style=line.style_solid, width=2)
+
+if showDivLines and bearSignal and not na(prevPriceHighBar) and not na(currPriceHighBar)
+    line.new(prevPriceHighBar, prevPriceHigh, currPriceHighBar, currPriceHigh,
+      color=color.new(colDivLineBear, 30),
+      style=line.style_solid, width=2)
+
+// ── Entry Labels ──────────────────────────────────────────────────────────────
+if bullSignal
+    confText  = str.tostring(bullConfidence, "#")
+    entryText = "▲ " + bullTier + " " + bullDivType + " (" + confText + ")"
+    bgClr = bullConfidence >= 70 ? color.new(colBullBright, 5) :
+      bullConfidence >= 55 ? color.new(colBullPrimary, 10) :
+      color.new(colBullDim, 15)
+
+    label.new(bar_index, low,
+      text=entryText,
+      yloc=yloc.belowbar,
+      color=bgClr,
+      textcolor=colDashBg,
+      size=labelSize,
+      style=label.style_label_up)
+
+if bearSignal
+    confText  = str.tostring(bearConfidence, "#")
+    entryText = "▼ " + bearTier + " " + bearDivType + " (" + confText + ")"
+    bgClr = bearConfidence >= 70 ? color.new(colBearBright, 5) :
+      bearConfidence >= 55 ? color.new(colBearPrimary, 10) :
+      color.new(colBearDim, 15)
+
+    label.new(bar_index, high,
+      text=entryText,
+      yloc=yloc.abovebar,
+      color=bgClr,
+      textcolor=#ffffff,
+      size=labelSize,
+      style=label.style_label_down)
+
+// ── Exit Labels ───────────────────────────────────────────────────────────────
+if bullExit
+    label.new(bar_index, high,
+      text="●",
+      yloc=yloc.abovebar,
+      color=color.new(#ff1744, 0),
+      textcolor=#ff1744,
+      size=size.tiny,
+      style=label.style_none)
+
+if bearExit
+    label.new(bar_index, low,
+      text="●",
+      yloc=yloc.belowbar,
+      color=color.new(#ff1744, 0),
+      textcolor=#ff1744,
+      size=size.tiny,
+      style=label.style_none)
+      
+// ═══════════════════════════════════════════════════════════════════════════════
+// ═══════════════════════════ DASHBOARD ════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════════════════
+
+var table dash = na
+if showDash
+    dash := table.new(getDashPos(dashPos), 2, 12,
+      bgcolor=color.new(colDashBg, 0),
+      border_width=1,
+      border_color=color.new(colNeutral, 70),
+      frame_width=2,
+      frame_color=color.new(colNeutral, 35))
+
+if showDash and barstate.islast
+    // Row 0 — Title
+    table.cell(dash, 0, 0, "A L P H A X   R E V E R S A L",
+      text_color=colBullPrimary, text_size=dashTextSize,
+      bgcolor=color.new(colDashBg, 0))
+    table.cell(dash, 1, 0, "", bgcolor=color.new(colDashBg, 0))
+    table.merge_cells(dash, 0, 0, 1, 0)
+
+    // Row 1 — RSI
+    rsiClr = rsiVal > 70 ? colBearPrimary :
+      rsiVal > 60 ? colBearDim :
+      rsiVal < 30 ? colBullPrimary :
+      rsiVal < 40 ? colBullDim : colNeutralLight
+    table.cell(dash, 0, 1, "RSI (" + str.tostring(rsiLen) + ")",
+      text_color=colTextLight, text_size=dashTextSize,
+      bgcolor=color.new(colDashBg, 0))
+    table.cell(dash, 1, 1, str.tostring(rsiVal, "#.#"),
+      text_color=rsiClr, text_size=dashTextSize,
+      bgcolor=color.new(colDashBg, 0))
+
+    // Row 2 — WPR Fast
+    wprFClr = wprFast > wprOverbought ? colBearPrimary :
+      wprFast < wprOversold ? colBullPrimary : colNeutralLight
+    table.cell(dash, 0, 2, "WPR FAST",
+      text_color=colTextLight, text_size=dashTextSize,
+      bgcolor=color.new(colDashBg, 0))
+    table.cell(dash, 1, 2, str.tostring(wprFast, "#.#"),
+      text_color=wprFClr, text_size=dashTextSize,
+      bgcolor=color.new(colDashBg, 0))
+
+    // Row 3 — WPR Med
+    wprMClr = wprMed > wprOverbought ? colBearPrimary :
+      wprMed < wprOversold ? colBullPrimary : colNeutralLight
+    table.cell(dash, 0, 3, "WPR MED",
+      text_color=colTextLight, text_size=dashTextSize,
+      bgcolor=color.new(colDashBg, 0))
+    table.cell(dash, 1, 3, str.tostring(wprMed, "#.#"),
+      text_color=wprMClr, text_size=dashTextSize,
+      bgcolor=color.new(colDashBg, 0))
+
+    // Row 4 — WPR Slow
+    wprSClr = wprSlow > -35 ? colBullBright :
+      wprSlow > -45 ? colBullDim :
+      wprSlow < -65 ? colBearBright :
+      wprSlow < -55 ? colBearDim : colNeutralLight
+    table.cell(dash, 0, 4, "WPR SLOW",
+      text_color=colTextLight, text_size=dashTextSize,
+      bgcolor=color.new(colDashBg, 0))
+    table.cell(dash, 1, 4, str.tostring(wprSlow, "#.#"),
+      text_color=wprSClr, text_size=dashTextSize,
+      bgcolor=color.new(colDashBg, 0))
+
+    // Row 5 — WPR Velocity
+    velText = wprFastVel > 8 ? "▲▲ FAST" :
+      wprFastVel > 3 ? "▲ RISING" :
+      wprFastVel < -8 ? "▼▼ FAST" :
+      wprFastVel < -3 ? "▼ FALLING" : "— FLAT"
+    velClr = wprFastVel > 8 ? colBullBright :
+      wprFastVel > 3 ? colBullPrimary :
+      wprFastVel < -8 ? colBearBright :
+      wprFastVel < -3 ? colBearPrimary : colNeutralLight
+    table.cell(dash, 0, 5, "WPR VELOCITY",
+      text_color=colTextLight, text_size=dashTextSize,
+      bgcolor=color.new(colDashBg, 0))
+    table.cell(dash, 1, 5, velText,
+      text_color=velClr, text_size=dashTextSize,
+      bgcolor=color.new(colDashBg, 0))
+
+    // Row 6 — Divergence Status
+    divText = bullDivRaw ? "▲ REGULAR BULL" :
+      hiddenBullDiv ? "▲ HIDDEN BULL" :
+      bearDivRaw ? "▼ REGULAR BEAR" :
+      hiddenBearDiv ? "▼ HIDDEN BEAR" : "— NONE"
+    divClr = bullDivRaw or hiddenBullDiv ? colBullPrimary :
+      bearDivRaw or hiddenBearDiv ? colBearPrimary : colNeutral
+    table.cell(dash, 0, 6, "DIVERGENCE",
+      text_color=colTextLight, text_size=dashTextSize,
+      bgcolor=color.new(colDashBg, 0))
+    table.cell(dash, 1, 6, divText,
+      text_color=divClr, text_size=dashTextSize,
+      bgcolor=color.new(colDashBg, 0))
+
+    // Row 7 — Bull Confidence
+    bClr = bullConfidence >= 70 ? colBullBright :
+      bullConfidence >= 55 ? colBullPrimary :
+      bullConfidence >= 35 ? colBullDim : colNeutral
+    table.cell(dash, 0, 7, "BULL CONF",
+      text_color=colTextLight, text_size=dashTextSize,
+      bgcolor=color.new(colDashBg, 0))
+    table.cell(dash, 1, 7, str.tostring(bullConfidence, "#") + "%",
+      text_color=bClr, text_size=dashTextSize,
+      bgcolor=color.new(colDashBg, 0))
+
+    // Row 8 — Bear Confidence
+    sClr = bearConfidence >= 70 ? colBearBright :
+      bearConfidence >= 55 ? colBearPrimary :
+      bearConfidence >= 35 ? colBearDim : colNeutral
+    table.cell(dash, 0, 8, "BEAR CONF",
+      text_color=colTextLight, text_size=dashTextSize,
+      bgcolor=color.new(colDashBg, 0))
+    table.cell(dash, 1, 8, str.tostring(bearConfidence, "#") + "%",
+      text_color=sClr, text_size=dashTextSize,
+      bgcolor=color.new(colDashBg, 0))
+
+    // Row 9 — Active Position
+    posText = activeDir == 1 ? "▲ LONG" :
+      activeDir == -1 ? "▼ SHORT" : "— FLAT"
+    posClr = activeDir == 1 ? colBullPrimary :
+      activeDir == -1 ? colBearPrimary : colNeutral
+    table.cell(dash, 0, 9, "POSITION",
+      text_color=colTextLight, text_size=dashTextSize,
+      bgcolor=color.new(colDashBg, 0))
+    table.cell(dash, 1, 9, posText,
+      text_color=posClr, text_size=dashTextSize,
+      bgcolor=color.new(colDashBg, 0))
+
+    // Row 10 — P&L if in position
+    plText = "—"
+    plClr  = colNeutral
+    if activeDir != 0 and not na(activeEntry)
+        pl = activeDir == 1 ? close - activeEntry : activeEntry - close
+        plPct = pl / activeEntry * 100
+        plText := (pl >= 0 ? "+" : "") + str.tostring(pl, format.mintick) +
+          "  (" + (pl >= 0 ? "+" : "") + str.tostring(plPct, "#.##") + "%)"
+        plClr := pl >= 0 ? colBullPrimary : colBearPrimary
+    table.cell(dash, 0, 10, "OPEN P&L",
+      text_color=colTextLight, text_size=dashTextSize,
+      bgcolor=color.new(colDashBg, 0))
+    table.cell(dash, 1, 10, plText,
+      text_color=plClr, text_size=dashTextSize,
+      bgcolor=color.new(colDashBg, 0))
+
+    // Row 11 — Volume
+    volText = volRatio > 2.0 ? "SPIKE" :
+      volRatio > 1.3 ? "HIGH" :
+      volRatio > 0.7 ? "NORMAL" : "DRY"
+    volClr = volRatio > 2.0 ? colBullBright :
+      volRatio > 1.3 ? colBullPrimary :
+      volRatio > 0.7 ? colNeutralLight : colNeutral
+    table.cell(dash, 0, 11, "VOLUME",
+      text_color=colTextLight, text_size=dashTextSize,
+      bgcolor=color.new(colDashBg, 0))
+    table.cell(dash, 1, 11, volText + "  ×" + str.tostring(volRatio, "#.#"),
+      text_color=volClr, text_size=dashTextSize,
+      bgcolor=color.new(colDashBg, 0))
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ═══════════════════════════ ALERTS ════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// Entry alerts by tier
+alertcondition(bullSignal and bullConfidence >= 70,
+  title="S-Tier Bull Reversal",
+  message="[AlphaX Reversal] S-TIER BULL reversal — {{ticker}} {{interval}} @ {{close}}")
+alertcondition(bullSignal and bullConfidence >= 55 and bullConfidence < 70,
+  title="A-Tier Bull Reversal",
+  message="[AlphaX Reversal] A-TIER BULL reversal — {{ticker}} {{interval}} @ {{close}}")
+alertcondition(bullSignal and bullConfidence >= 35 and bullConfidence < 55,
+  title="B-Tier Bull Reversal",
+  message="[AlphaX Reversal] B-TIER BULL reversal — {{ticker}} {{interval}} @ {{close}}")
+
+alertcondition(bearSignal and bearConfidence >= 70,
+  title="S-Tier Bear Reversal",
+  message="[AlphaX Reversal] S-TIER BEAR reversal — {{ticker}} {{interval}} @ {{close}}")
+alertcondition(bearSignal and bearConfidence >= 55 and bearConfidence < 70,
+  title="A-Tier Bear Reversal",
+  message="[AlphaX Reversal] A-TIER BEAR reversal — {{ticker}} {{interval}} @ {{close}}")
+alertcondition(bearSignal and bearConfidence >= 35 and bearConfidence < 55,
+  title="B-Tier Bear Reversal",
+  message="[AlphaX Reversal] B-TIER BEAR reversal — {{ticker}} {{interval}} @ {{close}}")
+
+// Combined entry alerts
+alertcondition(bullSignal,
+  title="Any Bull Reversal",
+  message="[AlphaX Reversal] BULL reversal — {{ticker}} {{interval}} @ {{close}}")
+alertcondition(bearSignal,
+  title="Any Bear Reversal",
+  message="[AlphaX Reversal] BEAR reversal — {{ticker}} {{interval}} @ {{close}}")
+alertcondition(bullSignal or bearSignal,
+  title="Any Reversal Signal",
+  message="[AlphaX Reversal] Reversal signal — {{ticker}} {{interval}} @ {{close}}")
+
+// Exit alerts
+alertcondition(bullExit,
+  title="Bull Exit",
+  message="[AlphaX Reversal] EXIT bull position — {{ticker}} {{interval}} @ {{close}}")
+alertcondition(bearExit,
+  title="Bear Exit",
+  message="[AlphaX Reversal] EXIT bear position — {{ticker}} {{interval}} @ {{close}}")
+alertcondition(bullExit or bearExit,
+  title="Any Exit",
+  message="[AlphaX Reversal] EXIT signal — {{ticker}} {{interval}} @ {{close}}")
+
+// Divergence detection alerts
+alertcondition(bullDivRaw,
+  title="Regular Bull Divergence Detected",
+  message="[AlphaX Reversal] Regular bullish divergence — {{ticker}} {{interval}}")
+alertcondition(bearDivRaw,
+  title="Regular Bear Divergence Detected",
+  message="[AlphaX Reversal] Regular bearish divergence — {{ticker}} {{interval}}")
+alertcondition(hiddenBullDiv,
+  title="Hidden Bull Divergence Detected",
+  message="[AlphaX Reversal] Hidden bullish divergence — {{ticker}} {{interval}}")
+alertcondition(hiddenBearDiv,
+  title="Hidden Bear Divergence Detected",
+  message="[AlphaX Reversal] Hidden bearish divergence — {{ticker}} {{interval}}")
+
+// WPR extreme alerts
+alertcondition(wprTripleOS,
+  title="Triple WPR Oversold",
+  message="[AlphaX Reversal] All 3 WPR oversold — {{ticker}} {{interval}}")
+alertcondition(wprTripleOB,
+  title="Triple WPR Overbought",
+  message="[AlphaX Reversal] All 3 WPR overbought — {{ticker}} {{interval}}")

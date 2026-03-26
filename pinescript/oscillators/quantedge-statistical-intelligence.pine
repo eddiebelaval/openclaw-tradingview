@@ -1,0 +1,517 @@
+// This Pine Script™ code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © alphachart_tv
+// QuantEdge Statistical Intelligence (QSI) v1.0 [FREE]
+// Statistical & quantitative market intelligence — simplified edition.
+
+// ╔══════════════════════════════════════════════════════════════════╗
+// ║  HOW IT WORKS                                                    ║
+// ║                                                                  ║
+// ║  QSI measures the statistical "quality" of market conditions     ║
+// ║  using three core modules:                                       ║
+// ║                                                                  ║
+// ║  1. HURST REGIME ENGINE                                          ║
+// ║     Calculates the Hurst Exponent via Rescaled Range (R/S)       ║
+// ║     analysis. H > 0.5 = trending, H = 0.5 = random walk,        ║
+// ║     H < 0.5 = mean-reverting. Tells you whether the market      ║
+// ║     has memory (trend) or anti-memory (fade).                    ║
+// ║                                                                  ║
+// ║  2. ENTROPY FLOW                                                 ║
+// ║     Shannon Entropy on log-returns distribution. High entropy    ║
+// ║     = chaotic/random market (reduce size). Low entropy =         ║
+// ║     ordered/predictable market (increase conviction).            ║
+// ║                                                                  ║
+// ║  3. PRICE EFFICIENCY RATIO                                       ║
+// ║     Net move vs. gross move ratio. High efficiency = clean       ║
+// ║     directional moves (good for trend-following). Low            ║
+// ║     efficiency = choppy, noisy price action.                     ║
+// ║                                                                  ║
+// ║  These three modules combine into the QSI COMPOSITE SCORE       ║
+// ║  (0-100) which rates overall market conditions:                  ║
+// ║  > 70 = PRIME | > 55 = FAVORABLE | > 40 = NEUTRAL               ║
+// ║  > 25 = CAUTION | < 25 = AVOID                                  ║
+// ║                                                                  ║
+// ║  PRO version adds: Markov Transition Probabilities,              ║
+// ║  Correlation Intelligence, Fractal Dimension, Absorption         ║
+// ║  Detection, Trading Style Presets & Asset Auto-Optimization.     ║
+// ║                                                                  ║
+// ║  DISCLAIMER: This indicator is for educational purposes only.    ║
+// ║  It does not constitute financial advice. Always do your own     ║
+// ║  research and use proper risk management.                        ║
+// ╚══════════════════════════════════════════════════════════════════╝
+
+//@version=6
+indicator("AlphaChart — QuantEdge Statistical Intelligence [QSI]", shorttitle="QSI", overlay=false,
+         max_lines_count=50, max_labels_count=50, max_boxes_count=20,
+         max_bars_back=500, precision=4)
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// 🎨 COLOR CONSTANTS
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+var color C_BULL     = color.new(#00e5ff, 0)
+var color C_BULL2    = color.new(#00bfa5, 0)
+var color C_BEAR     = color.new(#ff1744, 0)
+var color C_BEAR2    = color.new(#e040fb, 0)
+var color C_WARN     = color.new(#ffd740, 0)
+var color C_INFO     = color.new(#42A5F5, 0)
+var color C_PURPLE   = color.new(#CE93D8, 0)
+var color C_GRAY     = color.new(#9E9E9E, 0)
+var color C_BG_DARK  = color.new(#0d1117, 0)
+var color C_BG_MID   = color.new(#161b22, 0)
+var color C_WHITE    = color.new(#FFFFFF, 0)
+var color C_DIMWHITE = color.new(#BDBDBD, 0)
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// 🛠 UTILITY FUNCTIONS
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+safeDivide(float num, float denom) =>
+    denom == 0.0 ? 0.0 : num / denom
+
+clamp(float val, float lo, float hi) =>
+    math.max(lo, math.min(hi, val))
+
+rescale(float val, float inLo, float inHi) =>
+    clamp(safeDivide(val - inLo, inHi - inLo) * 100.0, 0.0, 100.0)
+
+zScore(series float src, int len) =>
+    float m = ta.sma(src, len)
+    float s = ta.stdev(src, len)
+    safeDivide(src - m, s)
+
+// --- Timeframe Detection ---
+f_tfInMinutes() =>
+    mult = timeframe.multiplier
+    switch
+        timeframe.isseconds => mult / 60.0
+        timeframe.isminutes => mult * 1.0
+        timeframe.isdaily   => mult * 1440.0
+        timeframe.isweekly  => mult * 10080.0
+        timeframe.ismonthly => mult * 43200.0
+        => mult * 60.0
+
+// --- Dashboard Position Helper ---
+f_dashPosition(_s) =>
+    switch _s
+        "Top Right"    => position.top_right
+        "Top Left"     => position.top_left
+        "Bottom Right"  => position.bottom_right
+        "Bottom Left"   => position.bottom_left
+        => position.top_right
+
+// --- Dashboard Size Helper ---
+f_dashSize(_s) =>
+    switch _s
+        "Tiny"   => size.tiny
+        "Small"  => size.small
+        "Normal" => size.normal
+        => size.small
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// 📊 INPUTS — Hurst Regime Engine
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+group_hurst = "📊 Hurst Regime Engine"
+i_hurstLen    = input.int(100, "Hurst Lookback", minval=50, maxval=500, step=10, group=group_hurst,
+     tooltip="Number of bars for R/S calculation. Higher = smoother but slower.")
+i_hurstSubdiv = input.int(8, "Hurst Subdivisions", minval=4, maxval=20, step=1, group=group_hurst,
+     tooltip="Number of subdivisions for R/S method.")
+i_hurstSmooth = input.int(10, "Hurst Smoothing", minval=1, maxval=50, step=1, group=group_hurst,
+     tooltip="EMA smoothing of the Hurst exponent.")
+i_hurstShow   = input.bool(true, "Show Hurst", group=group_hurst)
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// 🌐 INPUTS — Entropy Flow
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+group_entropy = "🌐 Entropy Flow"
+i_entropyLen    = input.int(50, "Entropy Lookback", minval=20, maxval=200, step=5, group=group_entropy,
+     tooltip="Window size for Shannon Entropy calculation.")
+i_entropyBins   = input.int(10, "Entropy Bins", minval=5, maxval=20, step=1, group=group_entropy,
+     tooltip="Number of bins for distribution histogram.")
+i_entropySmooth = input.int(5, "Entropy Smoothing", minval=1, maxval=20, step=1, group=group_entropy,
+     tooltip="EMA smoothing of entropy values.")
+i_entropyShow   = input.bool(true, "Show Entropy", group=group_entropy)
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// 🔀 INPUTS — Price Efficiency
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+group_eff = "🔀 Price Efficiency"
+i_effLen = input.int(20, "Efficiency Lookback", minval=5, maxval=100, step=5, group=group_eff,
+     tooltip="Window for Price Efficiency Ratio (net/gross move).")
+i_effShow = input.bool(true, "Show Efficiency", group=group_eff)
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// 📋 INPUTS — Dashboard
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+group_dash = "📋 Dashboard"
+i_dashShow = input.bool(true, "Show Dashboard", group=group_dash)
+i_dashPos  = input.string("Top Left", "Dashboard Position",
+     options=["Top Right", "Top Left", "Bottom Right", "Bottom Left"], group=group_dash)
+i_dashSize = input.string("Small", "Dashboard Size",
+     options=["Tiny", "Small", "Normal"], group=group_dash)
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// 🎨 INPUTS — Visuals & Alerts
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+group_visual = "🎨 Visuals & Alerts"
+i_bgZones   = input.bool(true, "Background Zones", group=group_visual,
+     tooltip="Color background based on QSI regime.")
+i_sigLabels = input.bool(true, "Signal Labels", group=group_visual,
+     tooltip="Show signal labels on chart.")
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// 📊 MODULE 1: HURST REGIME ENGINE
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// H > 0.5 = Trend-persistent | H = 0.5 = Random Walk | H < 0.5 = Mean-Reverting
+
+calcHurst(series float src, int totalLen, int subdivisions) =>
+    float hurstVal = 0.5
+    if bar_index >= totalLen
+        float sumLogRS = 0.0
+        float sumLogN  = 0.0
+        float sumLogRS_LogN = 0.0
+        float sumLogN2 = 0.0
+        int validCount = 0
+
+        for div = 2 to subdivisions
+            int subLen = math.floor(totalLen / div)
+            if subLen >= 10
+                float totalRS = 0.0
+                int rsCount = 0
+
+                for seg = 0 to div - 1
+                    int startIdx = seg * subLen
+                    if startIdx + subLen <= totalLen
+                        float segMean = 0.0
+                        for k = 0 to subLen - 1
+                            segMean += nz(src[startIdx + k])
+                        segMean := segMean / float(subLen)
+
+                        float cumDev = 0.0
+                        float maxDev = -1e10
+                        float minDev = 1e10
+                        float sumSq  = 0.0
+
+                        for k = 0 to subLen - 1
+                            float diff = nz(src[startIdx + k]) - segMean
+                            cumDev += diff
+                            sumSq  += diff * diff
+                            maxDev := math.max(maxDev, cumDev)
+                            minDev := math.min(minDev, cumDev)
+
+                        float rangeRS = maxDev - minDev
+                        float stdDev  = math.sqrt(sumSq / float(subLen))
+
+                        if stdDev > 0
+                            totalRS += rangeRS / stdDev
+                            rsCount += 1
+
+                if rsCount > 0
+                    float avgRS = totalRS / float(rsCount)
+                    if avgRS > 0
+                        float logN  = math.log(float(subLen))
+                        float logRS = math.log(avgRS)
+                        sumLogRS       += logRS
+                        sumLogN        += logN
+                        sumLogRS_LogN  += logRS * logN
+                        sumLogN2       += logN * logN
+                        validCount     += 1
+
+        if validCount >= 3
+            float n = float(validCount)
+            float slope = safeDivide(n * sumLogRS_LogN - sumLogRS * sumLogN,
+                                     n * sumLogN2 - sumLogN * sumLogN)
+            hurstVal := clamp(slope, 0.0, 1.0)
+
+    hurstVal
+
+logReturns = math.log(close / nz(close[1], close))
+
+rawHurst = calcHurst(logReturns, math.max(50, i_hurstLen), i_hurstSubdiv)
+smoothHurst = ta.ema(rawHurst, math.max(1, i_hurstSmooth))
+
+// Hurst Regime Classification
+int hurstRegime = 0
+if smoothHurst > 0.60
+    hurstRegime := 2
+else if smoothHurst > 0.55
+    hurstRegime := 1
+else if smoothHurst < 0.40
+    hurstRegime := -2
+else if smoothHurst < 0.45
+    hurstRegime := -1
+
+hurstRegimeStr = switch hurstRegime
+    2  => "STRONG TREND"
+    1  => "TRENDING"
+    0  => "RANDOM WALK"
+    -1 => "MEAN-REV"
+    -2 => "STRONG M-REV"
+    => "UNKNOWN"
+
+hurstColor = switch hurstRegime
+    2  => C_BULL
+    1  => color.new(C_BULL, 40)
+    0  => C_GRAY
+    -1 => color.new(C_PURPLE, 40)
+    -2 => C_PURPLE
+    => C_GRAY
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// 🌐 MODULE 2: ENTROPY FLOW
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+calcShannonEntropy(series float src, int len, int bins) =>
+    float entropy = 0.0
+    if bar_index >= len
+        float minVal = src
+        float maxVal = src
+        for i = 1 to len - 1
+            float v = nz(src[i])
+            minVal := math.min(minVal, v)
+            maxVal := math.max(maxVal, v)
+
+        float rangeVal = maxVal - minVal
+        if rangeVal > 0
+            float binWidth = rangeVal / float(bins)
+            for b = 0 to bins - 1
+                float binLo = minVal + float(b) * binWidth
+                float binHi = binLo + binWidth
+                int count = 0
+                for i = 0 to len - 1
+                    float v = nz(src[i])
+                    if b == bins - 1
+                        if v >= binLo and v <= binHi
+                            count += 1
+                    else
+                        if v >= binLo and v < binHi
+                            count += 1
+                float prob = float(count) / float(len)
+                if prob > 0
+                    entropy -= prob * math.log(prob) / math.log(2.0)
+    entropy
+
+rawEntropy = calcShannonEntropy(logReturns, math.max(20, i_entropyLen), i_entropyBins)
+maxEntropy = math.log(float(i_entropyBins)) / math.log(2.0)
+normEntropy = safeDivide(rawEntropy, maxEntropy)
+smoothEntropy = ta.ema(normEntropy, math.max(1, i_entropySmooth))
+
+entropyScore = rescale(smoothEntropy, 0.3, 0.95)
+
+// Entropy Regime Classification
+int entropyRegime = 0
+if entropyScore > 75.0
+    entropyRegime := 2
+else if entropyScore > 65.0
+    entropyRegime := 1
+else if entropyScore < 25.0
+    entropyRegime := -2
+else if entropyScore < 35.0
+    entropyRegime := -1
+
+entropyRegimeStr = switch entropyRegime
+    2  => "HIGH CHAOS"
+    1  => "UNSETTLED"
+    0  => "NEUTRAL"
+    -1 => "ORDERED"
+    -2 => "VERY ORDERED"
+    => "UNKNOWN"
+
+entropyColor = switch entropyRegime
+    2  => C_BEAR
+    1  => color.new(C_WARN, 30)
+    0  => C_GRAY
+    -1 => color.new(C_INFO, 30)
+    -2 => C_INFO
+    => C_GRAY
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// 🔀 MODULE 3: PRICE EFFICIENCY RATIO
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+calcEfficiency(int len) =>
+    float netMove = math.abs(close - nz(close[len], close))
+    float grossMove = 0.0
+    for i = 0 to len - 2
+        grossMove += math.abs(nz(close[i]) - nz(close[i + 1]))
+    safeDivide(netMove, grossMove)
+
+priceEfficiency = calcEfficiency(math.max(5, i_effLen))
+smoothEfficiency = ta.ema(priceEfficiency, 5)
+
+efficiencyScore = rescale(smoothEfficiency, 0.05, 0.6)
+
+int effRegime = 0
+if smoothEfficiency > 0.5
+    effRegime := 2
+else if smoothEfficiency > 0.3
+    effRegime := 1
+else if smoothEfficiency < 0.1
+    effRegime := -2
+else if smoothEfficiency < 0.2
+    effRegime := -1
+
+effRegimeStr = switch effRegime
+    2  => "HIGH EFF"
+    1  => "MODERATE"
+    0  => "NEUTRAL"
+    -1 => "LOW EFF"
+    -2 => "VERY LOW"
+    => "UNKNOWN"
+
+effColor = switch effRegime
+    2  => C_BULL
+    1  => color.new(C_BULL, 40)
+    0  => C_GRAY
+    -1 => color.new(C_WARN, 40)
+    -2 => C_WARN
+    => C_GRAY
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// 📈 QSI COMPOSITE SCORE
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// Fixed weights: Hurst 40%, Entropy 35%, Efficiency 25%
+
+hurstEdge = math.abs(smoothHurst - 0.5) * 2.0
+hurstComponent = rescale(hurstEdge, 0.0, 0.8)
+
+entropyComponent = 100.0 - entropyScore
+
+efficiencyComponent = efficiencyScore
+
+compositeQSI = hurstComponent * 0.40 +
+               entropyComponent * 0.35 +
+               efficiencyComponent * 0.25
+
+compositeRegime = compositeQSI > 70 ? "PRIME" : compositeQSI > 55 ? "FAVORABLE" : compositeQSI > 40 ? "NEUTRAL" : compositeQSI > 25 ? "CAUTION" : "AVOID"
+compositeColor = compositeQSI > 70 ? C_BULL : compositeQSI > 55 ? color.new(C_BULL, 40) : compositeQSI > 40 ? C_GRAY : compositeQSI > 25 ? C_WARN : C_BEAR
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// 🔔 SIGNAL GENERATION
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+hurstCrossBull  = ta.crossover(smoothHurst, 0.55)
+hurstCrossBear  = ta.crossunder(smoothHurst, 0.45)
+entropyCrossLow  = ta.crossunder(entropyScore, 30.0)
+entropyCrossHigh = ta.crossover(entropyScore, 70.0)
+
+compositePrime   = compositeQSI > 70 and compositeQSI[1] <= 70
+compositeAvoid   = compositeQSI < 25 and compositeQSI[1] >= 25
+compositeFavorUp = ta.crossover(compositeQSI, 55.0)
+compositeFavorDn = ta.crossunder(compositeQSI, 40.0)
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// 📈 PLOTS
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+hline(75, "Prime Zone",   color=color.new(C_BULL, 80), linestyle=hline.style_dotted)
+hline(50, "Neutral",      color=color.new(C_GRAY, 80), linestyle=hline.style_dotted)
+hline(25, "Caution Zone", color=color.new(C_BEAR, 80), linestyle=hline.style_dotted)
+
+plot(compositeQSI, "QSI Composite", color=compositeColor, linewidth=3)
+
+plot(hurstComponent,      "Hurst Edge",  color=hurstColor,   linewidth=1, display=i_hurstShow ? display.all : display.none)
+plot(entropyComponent,    "Entropy Inv", color=entropyColor,  linewidth=1, display=i_entropyShow ? display.all : display.none)
+plot(efficiencyComponent, "Efficiency",  color=effColor,      linewidth=1, display=i_effShow ? display.all : display.none)
+
+// Signal Labels
+plotshape(hurstCrossBull and i_sigLabels, "Hurst->Trend",   shape.triangleup,   location.bottom, C_BULL,   size=size.tiny, text="H")
+plotshape(hurstCrossBear and i_sigLabels, "Hurst->MeanRev", shape.triangledown, location.top,    C_PURPLE, size=size.tiny, text="H")
+
+plotshape(entropyCrossLow and i_sigLabels,  "Entropy->Order", shape.circle, location.bottom, C_INFO, size=size.tiny, text="E")
+plotshape(entropyCrossHigh and i_sigLabels, "Entropy->Chaos", shape.circle, location.top,    C_BEAR, size=size.tiny, text="E")
+
+plotshape(compositePrime and i_sigLabels, "QSI PRIME", shape.flag, location.bottom, C_BULL, size=size.small, text="PRIME")
+plotshape(compositeAvoid and i_sigLabels, "QSI AVOID", shape.flag, location.top,    C_BEAR, size=size.small, text="AVOID")
+
+bgcolor(i_bgZones ? color.new(compositeColor, 92) : na, title="QSI Background")
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// 📋 DASHBOARD
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+var table dash = table.new(f_dashPosition(i_dashPos), 3, 8, border_width=1,
+     border_color=color.new(#ffffff, 85), frame_width=2,
+     frame_color=color.new(C_INFO, 70))
+
+if i_dashShow and barstate.islast
+    _dSize = f_dashSize(i_dashSize)
+    color hdr_bg  = C_BG_DARK
+    color row_bg  = C_BG_MID
+    color row_alt = color.new(C_BG_DARK, 20)
+
+    // Row 0: Header
+    table.cell(dash, 0, 0, "  QSI  ", text_color=C_INFO, bgcolor=hdr_bg, text_size=_dSize, text_halign=text.align_left)
+    table.cell(dash, 1, 0, "v1.0 FREE", text_color=color.new(C_DIMWHITE, 40), bgcolor=hdr_bg, text_size=size.tiny, text_halign=text.align_center)
+    table.cell(dash, 2, 0, timeframe.period, text_color=color.new(C_DIMWHITE, 40), bgcolor=hdr_bg, text_size=size.tiny, text_halign=text.align_right)
+
+    // Row 1: QSI Composite
+    table.cell(dash, 0, 1, "QSI INDEX", text_color=C_WHITE, bgcolor=row_bg, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(dash, 1, 1, str.tostring(compositeQSI, "#.0"), text_color=compositeColor, bgcolor=row_bg, text_size=_dSize, text_halign=text.align_center)
+    table.cell(dash, 2, 1, compositeRegime, text_color=compositeColor, bgcolor=row_bg, text_size=size.tiny, text_halign=text.align_right)
+
+    // Row 2: Separator
+    table.cell(dash, 0, 2, "", bgcolor=color.new(#444444, 70), text_size=size.tiny)
+    table.cell(dash, 1, 2, "", bgcolor=color.new(#444444, 70), text_size=size.tiny)
+    table.cell(dash, 2, 2, "", bgcolor=color.new(#444444, 70), text_size=size.tiny)
+
+    // Row 3: Hurst
+    table.cell(dash, 0, 3, "HURST", text_color=C_DIMWHITE, bgcolor=row_alt, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(dash, 1, 3, str.tostring(smoothHurst, "#.000"), text_color=hurstColor, bgcolor=row_alt, text_size=_dSize, text_halign=text.align_center)
+    table.cell(dash, 2, 3, hurstRegimeStr, text_color=hurstColor, bgcolor=row_alt, text_size=size.tiny, text_halign=text.align_right)
+
+    // Row 4: Entropy
+    table.cell(dash, 0, 4, "ENTROPY", text_color=C_DIMWHITE, bgcolor=row_bg, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(dash, 1, 4, str.tostring(entropyScore, "#.0"), text_color=entropyColor, bgcolor=row_bg, text_size=_dSize, text_halign=text.align_center)
+    table.cell(dash, 2, 4, entropyRegimeStr, text_color=entropyColor, bgcolor=row_bg, text_size=size.tiny, text_halign=text.align_right)
+
+    // Row 5: Efficiency
+    table.cell(dash, 0, 5, "EFFICIENCY", text_color=C_DIMWHITE, bgcolor=row_alt, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(dash, 1, 5, str.tostring(smoothEfficiency * 100, "#.0") + "%", text_color=effColor, bgcolor=row_alt, text_size=_dSize, text_halign=text.align_center)
+    table.cell(dash, 2, 5, effRegimeStr, text_color=effColor, bgcolor=row_alt, text_size=size.tiny, text_halign=text.align_right)
+
+    // Row 6: Weights Info
+    table.cell(dash, 0, 6, "WEIGHTS", text_color=color.new(C_DIMWHITE, 40), bgcolor=hdr_bg, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(dash, 1, 6, "H:40 E:35 F:25", text_color=color.new(C_DIMWHITE, 40), bgcolor=hdr_bg, text_size=size.tiny, text_halign=text.align_center)
+    table.cell(dash, 2, 6, "", text_color=color.new(C_DIMWHITE, 40), bgcolor=hdr_bg, text_size=size.tiny, text_halign=text.align_right)
+
+    // Row 7: PRO Hint
+    table.cell(dash, 0, 7, "", bgcolor=color.new(C_INFO, 90), text_size=size.tiny)
+    table.cell(dash, 1, 7, "PRO: +Markov +Corr +Fractal", text_color=color.new(C_INFO, 40), bgcolor=color.new(C_INFO, 90), text_size=size.tiny, text_halign=text.align_center)
+    table.cell(dash, 2, 7, "", bgcolor=color.new(C_INFO, 90), text_size=size.tiny)
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// 🔔 ALERTS
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+alertcondition(compositePrime, title="QSI: PRIME Conditions",
+     message="QSI PRIME: Statistical conditions are optimal. Composite: {{plot(\"QSI Composite\")}}.")
+
+alertcondition(compositeAvoid, title="QSI: AVOID Conditions",
+     message="QSI AVOID: Conditions unfavorable. Composite: {{plot(\"QSI Composite\")}}. Avoid new trades.")
+
+alertcondition(compositeFavorUp, title="QSI: Conditions Improving",
+     message="QSI IMPROVING: Composite crossed above 55. QSI: {{plot(\"QSI Composite\")}}.")
+
+alertcondition(compositeFavorDn, title="QSI: Conditions Deteriorating",
+     message="QSI DETERIORATING: Composite dropped below 40. QSI: {{plot(\"QSI Composite\")}}.")
+
+alertcondition(hurstCrossBull, title="QSI: Hurst -> Trending",
+     message="HURST TRENDING: Market shows trend persistence. Breakout strategies preferred.")
+
+alertcondition(hurstCrossBear, title="QSI: Hurst -> Mean-Reversion",
+     message="HURST MEAN-REV: Market shows mean-reversion. Fade strategies preferred.")
+
+alertcondition(entropyCrossHigh, title="QSI: Entropy -> Chaos",
+     message="ENTROPY CHAOS: High disorder — consider reducing position size.")
+
+alertcondition(entropyCrossLow, title="QSI: Entropy -> Order",
+     message="ENTROPY ORDER: Ordered market — good trading conditions.")
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// END OF SCRIPT
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━

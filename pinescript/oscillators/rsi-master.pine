@@ -1,0 +1,415 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © matthewjnrb
+
+//@version=6
+indicator("RSI Master (MNQ) — 1H Structure + 30M Liquidity + FVG + Breakout Entry",
+     overlay=true, max_labels_count=400, max_lines_count=150, max_boxes_count=50)
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// Inputs
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+tfStructure          = input.timeframe("60", "Structure TF (S/R pivots)")
+tfSignal             = input.timeframe("30", "Signal TF (Entry + Liquidity + FVG)")
+confirmEntryOnClose  = input.bool(true, "Confirm signals on Signal TF close (recommended)")
+showRSIValue         = input.bool(true, "Show RSI value on entries")
+
+rsiLength            = input.int(14, "RSI Period", minval=1)
+rsiSource            = input.source(ohlc4, "RSI Source")
+
+overboughtLevel      = input.int(70, "Overbought (Entry TF)", minval=50, maxval=100)
+oversoldLevel        = input.int(30, "Oversold (Entry TF)", minval=0, maxval=50)
+
+pivotLeftBars        = input.int(5, "Structure Pivot Left Bars", minval=1)
+pivotRightBars       = input.int(5, "Structure Pivot Right Bars", minval=1)
+
+liqLeftBars          = input.int(3, "Liquidity Pivot Left Bars (Signal TF)", minval=1)
+liqRightBars         = input.int(3, "Liquidity Pivot Right Bars (Signal TF)", minval=1)
+
+lineWidth            = input.int(2, "Line Width", minval=1, maxval=4)
+showPriceLabels      = input.bool(true, "Show Price Labels (S/R)")
+extendBars           = input.int(200, "Extend Lines (bars)", minval=20, maxval=2000)
+
+tolPct               = input.float(0.5, "Near-Level Tolerance (%)", minval=0.05, step=0.05)
+
+// Filters / Modes
+useLiquidityFilter   = input.bool(true, "Entries require Liquidity Grab (sweep)")
+useFVGFilter         = input.bool(true, "Entries require recent FVG on Signal TF")
+fvgLookbackBars      = input.int(6, "FVG lookback (Signal bars)", minval=1, maxval=50)
+showFVGBoxes         = input.bool(true, "Show most recent Bull/Bear FVG boxes")
+
+useBiasFilter        = input.bool(true, "Use 1H Bias Filter")
+biasMode             = input.string("EMA200", "Bias Mode", options=["EMA200","RSI50","None"])
+emaLen               = input.int(200, "Bias EMA Length (Structure TF)", minval=1)
+
+useBreakoutEntries   = input.bool(true, "Enable Breakout Entries (from Structure levels)")
+breakoutNeedsRetest  = input.bool(false, "Breakout requires retest")
+breakoutUseFVG        = input.bool(false, "Breakout also requires recent FVG")
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// STRUCTURE TF (1H) — pivots + bias
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+pivotHighHTF = request.security(
+     syminfo.tickerid, tfStructure,
+     ta.pivothigh(high, pivotLeftBars, pivotRightBars),
+     gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off
+)
+
+pivotLowHTF = request.security(
+     syminfo.tickerid, tfStructure,
+     ta.pivotlow(low, pivotLeftBars, pivotRightBars),
+     gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off
+)
+
+emaHTF = request.security(
+     syminfo.tickerid, tfStructure,
+     ta.ema(close, emaLen),
+     gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off
+)
+
+rsiHTF = request.security(
+     syminfo.tickerid, tfStructure,
+     ta.rsi(rsiSource, rsiLength),
+     gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off
+)
+
+// Bias booleans
+trendUp = biasMode == "None" ? true : biasMode == "EMA200" ? close > emaHTF : rsiHTF >= 50
+trendDn = biasMode == "None" ? true : biasMode == "EMA200" ? close < emaHTF : rsiHTF <= 50
+applyBias = useBiasFilter and biasMode != "None"
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// SIGNAL TF (30m) — RSI Entry Triggers (confirmed)
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+buyRSI = request.security(
+     syminfo.tickerid, tfSignal,
+     (not confirmEntryOnClose or barstate.isconfirmed) and ta.crossover(ta.rsi(rsiSource, rsiLength), oversoldLevel),
+     gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off
+)
+
+sellRSI = request.security(
+     syminfo.tickerid, tfSignal,
+     (not confirmEntryOnClose or barstate.isconfirmed) and ta.crossunder(ta.rsi(rsiSource, rsiLength), overboughtLevel),
+     gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off
+)
+
+rsiSignal = request.security(
+     syminfo.tickerid, tfSignal,
+     ta.rsi(rsiSource, rsiLength),
+     gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off
+)
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// SIGNAL TF Liquidity (pivot sweep + reclaim)
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+plSig = request.security(
+     syminfo.tickerid, tfSignal,
+     ta.pivotlow(low, liqLeftBars, liqRightBars),
+     gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off
+)
+
+phSig = request.security(
+     syminfo.tickerid, tfSignal,
+     ta.pivothigh(high, liqLeftBars, liqRightBars),
+     gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off
+)
+
+var float lastPL = na
+var float lastPH = na
+if not na(plSig)
+    lastPL := plSig
+if not na(phSig)
+    lastPH := phSig
+
+sweepDown = not na(lastPL) and low < lastPL and close > lastPL
+sweepUp   = not na(lastPH) and high > lastPH and close < lastPH
+
+liqBuyOk  = not useLiquidityFilter or sweepDown
+liqSellOk = not useLiquidityFilter or sweepUp
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// SIGNAL TF FVG detection (classic 3-candle imbalance)
+// Bullish FVG: low > high[2]  → gap between high[2] (lower) and low (upper)
+// Bearish FVG: high < low[2]  → gap between high (lower) and low[2] (upper)
+// We track “recent FVG occurred within lookback” + last FVG bounds for box display.
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+bullFvgOcc = request.security(
+     syminfo.tickerid, tfSignal,
+     (not confirmEntryOnClose or barstate.isconfirmed) and (low > high[2]),
+     gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off
+)
+
+bearFvgOcc = request.security(
+     syminfo.tickerid, tfSignal,
+     (not confirmEntryOnClose or barstate.isconfirmed) and (high < low[2]),
+     gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off
+)
+
+// Return bounds when FVG occurs (else na)
+bullFvgLo = request.security(
+     syminfo.tickerid, tfSignal,
+     (low > high[2]) ? high[2] : na,
+     gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off
+)
+bullFvgHi = request.security(
+     syminfo.tickerid, tfSignal,
+     (low > high[2]) ? low : na,
+     gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off
+)
+
+bearFvgLo = request.security(
+     syminfo.tickerid, tfSignal,
+     (high < low[2]) ? high : na,
+     gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off
+)
+bearFvgHi = request.security(
+     syminfo.tickerid, tfSignal,
+     (high < low[2]) ? low[2] : na,
+     gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off
+)
+
+// “Recent FVG within lookback” using bar count since last occurrence
+barsSinceBullFVG = ta.barssince(bullFvgOcc)
+barsSinceBearFVG = ta.barssince(bearFvgOcc)
+
+bullFvgRecent = (barsSinceBullFVG >= 0) and (barsSinceBullFVG <= fvgLookbackBars)
+bearFvgRecent = (barsSinceBearFVG >= 0) and (barsSinceBearFVG <= fvgLookbackBars)
+
+// Store last FVG bounds for box display
+var float lastBullLo = na
+var float lastBullHi = na
+var int   lastBullBar = na
+
+var float lastBearLo = na
+var float lastBearHi = na
+var int   lastBearBar = na
+
+if not na(bullFvgLo) and not na(bullFvgHi)
+    lastBullLo := bullFvgLo
+    lastBullHi := bullFvgHi
+    lastBullBar := bar_index
+
+if not na(bearFvgLo) and not na(bearFvgHi)
+    lastBearLo := bearFvgLo
+    lastBearHi := bearFvgHi
+    lastBearBar := bar_index
+
+// Draw most recent Bull/Bear FVG boxes (1 each)
+var box bullBox = na
+var box bearBox = na
+
+if showFVGBoxes
+    if not na(lastBullLo) and not na(lastBullHi)
+        if na(bullBox)
+            bullBox := box.new(left=lastBullBar, top=lastBullHi, right=bar_index + extendBars, bottom=lastBullLo,
+                               bgcolor=color.new(color.green, 90), border_color=color.new(color.green, 40))
+        else
+            box.set_left(bullBox, lastBullBar)
+            box.set_right(bullBox, bar_index + extendBars)
+            box.set_top(bullBox, lastBullHi)
+            box.set_bottom(bullBox, lastBullLo)
+            box.set_bgcolor(bullBox, color.new(color.green, 90))
+            box.set_border_color(bullBox, color.new(color.green, 40))
+    if not na(lastBearLo) and not na(lastBearHi)
+        if na(bearBox)
+            bearBox := box.new(left=lastBearBar, top=lastBearHi, right=bar_index + extendBars, bottom=lastBearLo,
+                               bgcolor=color.new(color.red, 90), border_color=color.new(color.red, 40))
+        else
+            box.set_left(bearBox, lastBearBar)
+            box.set_right(bearBox, bar_index + extendBars)
+            box.set_top(bearBox, lastBearHi)
+            box.set_bottom(bearBox, lastBearLo)
+            box.set_bgcolor(bearBox, color.new(color.red, 90))
+            box.set_border_color(bearBox, color.new(color.red, 40))
+else
+    if not na(bullBox)
+        box.delete(bullBox), bullBox := na
+    if not na(bearBox)
+        box.delete(bearBox), bearBox := na
+
+// Entry FVG filter (mean reversion entries)
+fvgBuyOk  = not useFVGFilter or bullFvgRecent
+fvgSellOk = not useFVGFilter or bearFvgRecent
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// Mean Reversion Entry Signals (30m)
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+buyEntryMR  = buyRSI  and liqBuyOk  and fvgBuyOk  and (not applyBias or trendUp)
+sellEntryMR = sellRSI and liqSellOk and fvgSellOk and (not applyBias or trendDn)
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// STRUCTURE S/R storage + drawing (top 2 each)
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+var float r1 = na
+var float r2 = na
+var float s1 = na
+var float s2 = na
+
+var int r1Bar = na
+var int r2Bar = na
+var int s1Bar = na
+var int s2Bar = na
+
+var line r1Line = na
+var line r2Line = na
+var line s1Line = na
+var line s2Line = na
+
+var label r1Lab = na
+var label r2Lab = na
+var label s1Lab = na
+var label s2Lab = na
+
+// breakout flags (to prevent repeated breakout labels per level)
+var bool r1Broken = false
+var bool s1Broken = false
+
+// Helpers
+f_setLine(_ln, _x1, _y, _col, _w, _style) =>
+    if na(_ln)
+        line.new(_x1, _y, bar_index + extendBars, _y, extend=extend.none, color=_col, width=_w, style=_style)
+    else
+        line.set_xy1(_ln, _x1, _y)
+        line.set_xy2(_ln, bar_index + extendBars, _y)
+        line.set_color(_ln, _col)
+        line.set_width(_ln, _w)
+        line.set_style(_ln, _style)
+        _ln
+
+f_setLabel(_lb, _x, _y, _txt, _bg, _tc, _style, _size) =>
+    if not showPriceLabels
+        if not na(_lb)
+            label.delete(_lb)
+        na
+    else
+        if na(_lb)
+            label.new(_x, _y, text=_txt, color=_bg, textcolor=_tc, style=_style, size=_size)
+        else
+            label.set_x(_lb, _x)
+            label.set_y(_lb, _y)
+            label.set_text(_lb, _txt)
+            label.set_color(_lb, _bg)
+            label.set_textcolor(_lb, _tc)
+            label.set_style(_lb, _style)
+            label.set_size(_lb, _size)
+            _lb
+
+// Update structure pivot levels (anchor at current bar when confirmed pivot arrives)
+if not na(pivotHighHTF)
+    r2 := r1
+    r2Bar := r1Bar
+    r1 := pivotHighHTF
+    r1Bar := bar_index
+    r1Broken := false
+
+if not na(pivotLowHTF)
+    s2 := s1
+    s2Bar := s1Bar
+    s1 := pivotLowHTF
+    s1Bar := bar_index
+    s1Broken := false
+
+// Draw/update structure lines
+if not na(r1)
+    r1Col = color.new(color.red, 0)
+    r1Line := f_setLine(r1Line, r1Bar, r1, r1Col, lineWidth, line.style_solid)
+    r1Lab  := f_setLabel(r1Lab, r1Bar, r1, "R1: " + str.tostring(r1, format.mintick), color.new(color.red, 85), r1Col, label.style_label_left, size.normal)
+
+if not na(r2)
+    r2Col = color.new(color.red, 40)
+    r2Line := f_setLine(r2Line, r2Bar, r2, r2Col, lineWidth, line.style_solid)
+    r2Lab  := f_setLabel(r2Lab, r2Bar, r2, "R2: " + str.tostring(r2, format.mintick), color.new(color.red, 88), r2Col, label.style_label_left, size.small)
+
+if not na(s1)
+    s1Col = color.new(color.green, 0)
+    s1Line := f_setLine(s1Line, s1Bar, s1, s1Col, lineWidth, line.style_solid)
+    s1Lab  := f_setLabel(s1Lab, s1Bar, s1, "S1: " + str.tostring(s1, format.mintick), color.new(color.green, 85), s1Col, label.style_label_left, size.normal)
+
+if not na(s2)
+    s2Col = color.new(color.green, 40)
+    s2Line := f_setLine(s2Line, s2Bar, s2, s2Col, lineWidth, line.style_solid)
+    s2Lab  := f_setLabel(s2Lab, s2Bar, s2, "S2: " + str.tostring(s2, format.mintick), color.new(color.green, 88), s2Col, label.style_label_left, size.small)
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// Breakout Entries (from structure levels)
+// - Breakout BUY: cross above R1
+// - Breakout SELL: cross below S1
+// Optional retest + optional FVG confluence
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+tol = tolPct / 100.0
+
+breakBuyRaw  = useBreakoutEntries and not na(r1) and ta.crossover(close, r1) and (not applyBias or trendUp)
+breakSellRaw = useBreakoutEntries and not na(s1) and ta.crossunder(close, s1) and (not applyBias or trendDn)
+
+retestBuyOk  = not breakoutNeedsRetest or (not na(r1) and close > r1 and low <= r1 * (1 + tol))
+retestSellOk = not breakoutNeedsRetest or (not na(s1) and close < s1 and high >= s1 * (1 - tol))
+
+breakFvgBuyOk  = not breakoutUseFVG or bullFvgRecent
+breakFvgSellOk = not breakoutUseFVG or bearFvgRecent
+
+buyEntryBO  = breakBuyRaw  and retestBuyOk  and breakFvgBuyOk
+sellEntryBO = breakSellRaw and retestSellOk and breakFvgSellOk
+
+// One-shot “level broke” styling (visual only)
+if useBreakoutEntries and not na(r1Line) and not r1Broken and close > r1
+    r1Broken := true
+    line.set_color(r1Line, color.new(color.blue, 0))
+    line.set_style(r1Line, line.style_dashed)
+    line.set_width(r1Line, lineWidth + 1)
+
+if useBreakoutEntries and not na(s1Line) and not s1Broken and close < s1
+    s1Broken := true
+    line.set_color(s1Line, color.new(color.orange, 0))
+    line.set_style(s1Line, line.style_dashed)
+    line.set_width(s1Line, lineWidth + 1)
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// Plot Signals
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+plotshape(buyEntryMR,  title="BUY MR (30m Liquidity+RSI+FVG)",  style=shape.triangleup,   location=location.belowbar, color=color.new(color.lime, 0),   size=size.normal, text="BUY MR")
+plotshape(sellEntryMR, title="SELL MR (30m Liquidity+RSI+FVG)", style=shape.triangledown, location=location.abovebar, color=color.new(color.red, 0),    size=size.normal, text="SELL MR")
+
+plotshape(buyEntryBO,  title="BUY BO (Breakout)",  style=shape.arrowup,   location=location.belowbar, color=color.new(color.blue, 0),   size=size.normal, text="BUY BO")
+plotshape(sellEntryBO, title="SELL BO (Breakdown)", style=shape.arrowdown, location=location.abovebar, color=color.new(color.orange, 0), size=size.normal, text="SELL BO")
+
+if showRSIValue and buyEntryMR
+    label.new(bar_index, low,
+      "MR BUY\n30m RSI: " + str.tostring(rsiSignal, "#.##") +
+      "\nSweep: " + (sweepDown ? "Yes" : "No") +
+      "\nBull FVG recent: " + (bullFvgRecent ? "Yes" : "No"),
+      color=color.new(color.lime, 0), textcolor=color.white, style=label.style_label_up, size=size.tiny)
+
+if showRSIValue and sellEntryMR
+    label.new(bar_index, high,
+      "MR SELL\n30m RSI: " + str.tostring(rsiSignal, "#.##") +
+      "\nSweep: " + (sweepUp ? "Yes" : "No") +
+      "\nBear FVG recent: " + (bearFvgRecent ? "Yes" : "No"),
+      color=color.new(color.red, 0), textcolor=color.white, style=label.style_label_down, size=size.tiny)
+
+if showRSIValue and buyEntryBO
+    label.new(bar_index, low,
+      "BO BUY\nR1 Break\nBull FVG recent: " + (bullFvgRecent ? "Yes" : "No"),
+      color=color.new(color.blue, 0), textcolor=color.white, style=label.style_label_up, size=size.tiny)
+
+if showRSIValue and sellEntryBO
+    label.new(bar_index, high,
+      "BO SELL\nS1 Break\nBear FVG recent: " + (bearFvgRecent ? "Yes" : "No"),
+      color=color.new(color.orange, 0), textcolor=color.white, style=label.style_label_down, size=size.tiny)
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// Alerts
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+alertcondition(buyEntryMR,  title="BUY MR (30m Liquidity+RSI+FVG)",  message="BUY MR: 30m RSI cross + liquidity sweep + recent Bull FVG (optional bias)")
+alertcondition(sellEntryMR, title="SELL MR (30m Liquidity+RSI+FVG)", message="SELL MR: 30m RSI cross + liquidity sweep + recent Bear FVG (optional bias)")
+
+alertcondition(buyEntryBO,  title="BUY BO (R1 Breakout Entry)",  message="BUY BO: price broke above R1 (optional retest + FVG + bias)")
+alertcondition(sellEntryBO, title="SELL BO (S1 Breakdown Entry)", message="SELL BO: price broke below S1 (optional retest + FVG + bias)")
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// Background highlighting (single bgcolor call)
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+inRange = not na(s1) and not na(r1) and close > s1 and close < r1
+nearS1  = not na(s1) and close >= s1 * (1 - tol) and close <= s1 * (1 + tol)
+nearR1  = not na(r1) and close >= r1 * (1 - tol) and close <= r1 * (1 + tol)
+
+bgCol = nearS1 ? color.new(color.green, 95) : nearR1 ? color.new(color.red, 95) : inRange ? color.new(color.gray, 97) : na
+bgcolor(bgCol, title="Range / Near Levels Highlight")

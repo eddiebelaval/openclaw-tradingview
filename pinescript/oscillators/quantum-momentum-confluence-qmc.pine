@@ -1,0 +1,204 @@
+// This source code is subject to the terms of the Mozilla Public License 2.0
+// © QuantumMomentumConfluence
+
+//@version=6
+indicator(title="Quantum Momentum Confluence [QMC]", shorttitle="QMC", overlay=false, max_lines_count=500, max_labels_count=500)
+
+// ═══════════════════════════════════════════════════════════════
+// DESCRIPTION:
+// Quantum Momentum Confluence (QMC) is an original multi-component
+// oscillator that combines four modern momentum indicators into a
+// single normalized confluence score (-100 to +100).
+//
+// Components:
+//   1. Normalized RSI Momentum        (weight: 30%)
+//   2. Kaufman Efficiency Ratio (ER)  (weight: 25%)
+//   3. Vortex Indicator Strength      (weight: 20%)
+//   4. Chande Momentum Oscillator     (weight: 25%)
+//   5. Composite Confluence Score
+//   6. Dynamic Bollinger Band Squeeze Detection
+// ═══════════════════════════════════════════════════════════════
+
+
+// ──────────────────────────────────────────────
+// INPUTS
+// ──────────────────────────────────────────────
+
+grp1 = "⚙️ Core Settings"
+int   rsi_len    = input.int  (14,   "RSI Period",              minval=2, maxval=50,           group=grp1)
+int   cmo_len    = input.int  (14,   "CMO Period",              minval=2, maxval=50,           group=grp1)
+int   er_len     = input.int  (10,   "Efficiency Ratio Period", minval=2, maxval=50,           group=grp1)
+int   vortex_len = input.int  (14,   "Vortex Period",           minval=2, maxval=50,           group=grp1)
+int   smooth_len = input.int  (3,    "Smoothing (EMA)",         minval=1, maxval=10,           group=grp1)
+
+grp2 = "🎨 Visual Settings"
+bool  show_hist  = input.bool (true,  "Show Histogram",         group=grp2)
+bool  show_sig   = input.bool (true,  "Show Signal Line",       group=grp2)
+float ob_level   = input.float(65.0,  "Overbought Level",       minval=50.0, maxval=95.0,     group=grp2)
+float os_level   = input.float(-65.0, "Oversold Level",         minval=-95.0, maxval=-50.0,   group=grp2)
+
+grp3 = "🔔 Signal Settings"
+bool  show_cross = input.bool (true,  "Crossover Signals",      group=grp3)
+bool  show_sq    = input.bool (true,  "BB Squeeze Dots",        group=grp3)
+int   sq_len     = input.int  (20,    "BB Squeeze Period",      minval=5, maxval=50,           group=grp3)
+float bb_mult    = input.float(2.0,   "BB Multiplier",          minval=0.5, maxval=4.0, step=0.1, group=grp3)
+
+
+// ──────────────────────────────────────────────
+// CALCULATIONS
+// ──────────────────────────────────────────────
+
+// ── 1. Normalized RSI Momentum ─────────────────────────────────
+// Shifts RSI from 0–100 to a -100/+100 scale centered at zero
+float rsi_raw  = ta.rsi(close, rsi_len)
+float rsi_norm = (rsi_raw - 50.0) * 2.0
+
+
+// ── 2. Kaufman Efficiency Ratio (ER) ───────────────────────────
+// Measures how efficiently price moves — high ER = strong, clean trend
+float price_change = math.abs(close - close[er_len])
+
+float path_length = 0.0
+for i = 0 to er_len - 1
+    path_length += math.abs(close[i] - close[i + 1])
+
+float er      = path_length != 0.0 ? price_change / path_length : 0.5
+float er_dir  = close > close[er_len] ? 1.0 : -1.0   // FIX: declared as float, not int (avoids implicit int→float cast)
+float er_norm = er * er_dir * 100.0
+
+
+// ── 3. Vortex Indicator Strength ───────────────────────────────
+// Directional strength score from the difference between VI+ and VI-
+float vm_plus  = 0.0
+float vm_minus = 0.0
+float tr_sum   = 0.0
+for i = 0 to vortex_len - 1
+    vm_plus  += math.abs(high[i] - low[i + 1])
+    vm_minus += math.abs(low[i]  - high[i + 1])
+    tr_sum   += ta.tr(true)[i]
+
+float vi_plus     = tr_sum != 0.0 ? vm_plus  / tr_sum : 1.0
+float vi_minus    = tr_sum != 0.0 ? vm_minus / tr_sum : 1.0
+float vortex_diff = (vi_plus - vi_minus) * 100.0
+
+
+// ── 4. Chande Momentum Oscillator (CMO) ────────────────────────
+// Net difference between up-close and down-close sums — pure momentum
+float up_sum   = 0.0
+float down_sum = 0.0
+for i = 0 to cmo_len - 1
+    diff = close[i] - close[i + 1]   // FIX: no type keyword inside loop body in v6
+    up_sum   += diff > 0.0 ? diff : 0.0
+    down_sum += diff < 0.0 ? math.abs(diff) : 0.0
+
+float cmo = (up_sum + down_sum) != 0.0 ? ((up_sum - down_sum) / (up_sum + down_sum)) * 100.0 : 0.0
+
+
+// ── 5. Composite Confluence Score ──────────────────────────────
+// Weighted average of all four components
+float w1 = 0.30  // RSI weight
+float w2 = 0.25  // ER weight
+float w3 = 0.20  // Vortex weight
+float w4 = 0.25  // CMO weight
+
+float qmc_raw  = (rsi_norm * w1) + (er_norm * w2) + (vortex_diff * w3) + (cmo * w4)
+float qmc      = ta.ema(qmc_raw, smooth_len)
+float qmc_sig  = ta.ema(qmc, smooth_len + 2)
+float qmc_hist = qmc - qmc_sig
+
+
+// ── 6. Bollinger Band Squeeze Detection ────────────────────────
+// Flags low-volatility compression before potential breakouts
+float bb_basis    = ta.sma(close, sq_len)
+float bb_dev      = ta.stdev(close, sq_len)
+float bb_upper    = bb_basis + bb_mult * bb_dev
+float bb_lower    = bb_basis - bb_mult * bb_dev
+float bb_width    = (bb_upper - bb_lower) / bb_basis * 100.0
+float bb_width_ma = ta.sma(bb_width, sq_len)
+bool  bb_squeeze  = bb_width < bb_width_ma * 0.75
+
+
+// ── Signal Conditions ──────────────────────────────────────────
+bool is_bull_cross = ta.crossover (qmc, qmc_sig)
+bool is_bear_cross = ta.crossunder(qmc, qmc_sig)
+bool is_ob         = qmc > ob_level
+bool is_os         = qmc < os_level
+
+
+// ──────────────────────────────────────────────
+// VISUALS
+// ──────────────────────────────────────────────
+
+// Zero baseline
+hline(0, "Zero Line", color=color.new(color.gray, 50), linestyle=hline.style_solid, linewidth=1)
+
+// Extreme zone levels
+// FIX: "plot p_ob = plot(...)" syntax is invalid — use plain assignment without type prefix
+p_ob  = plot(ob_level,  "Overbought Level", color=color.new(color.red,   55), linewidth=1, style=plot.style_line)
+p_os  = plot(os_level,  "Oversold Level",   color=color.new(color.green, 55), linewidth=1, style=plot.style_line)
+p_top = plot(100.0,  "", color=color.new(color.red,   100), linewidth=1, display=display.none)
+p_bot = plot(-100.0, "", color=color.new(color.green, 100), linewidth=1, display=display.none)
+
+// Zone fills
+fill(p_ob, p_top, color=color.new(color.red,   90))
+fill(p_os, p_bot, color=color.new(color.green, 90))
+
+// ── Histogram ─────────────────────────────────────────────────
+// Bright bar = accelerating momentum | Faded bar = decelerating
+color hist_col = qmc_hist >= 0.0 ? (qmc_hist > qmc_hist[1] ? color.new(#00e5ff, 10) : color.new(#00e5ff, 55)) : (qmc_hist < qmc_hist[1] ? color.new(#ff4081, 10) : color.new(#ff4081, 55))
+
+// plot() cannot be placed inside conditional blocks — hide via full transparency
+color hist_final = show_hist ? hist_col : color.new(color.white, 100)
+plot(qmc_hist, "QMC Histogram", style=plot.style_histogram, color=hist_final, linewidth=2)
+
+// ── Main QMC Line ──────────────────────────────────────────────
+color qmc_col = qmc > 0.0 ? color.new(#00e5ff, 0) : color.new(#ff4081, 0)
+plot(qmc, "QMC", color=qmc_col, linewidth=2)
+
+// ── Signal Line ────────────────────────────────────────────────
+// FIX: na must be cast to float explicitly in v6 to match the series type
+float sig_val = show_sig ? qmc_sig : float(na)
+plot(sig_val, "Signal", color=color.new(color.orange, 20), linewidth=1, style=plot.style_line)
+
+// ── BB Squeeze Dots ────────────────────────────────────────────
+// FIX: ternary with na must use float(na) — plain na causes type ambiguity in v6
+plotshape(show_sq and bb_squeeze ? -95.0 : float(na), "BB Squeeze", shape.square, location.absolute, color=color.new(color.yellow, 0), size=size.tiny)
+
+// ── Crossover Signals ──────────────────────────────────────────
+// FIX: same float(na) fix applied to both crossover plotshape calls
+plotshape(show_cross and is_bull_cross ? qmc : float(na), "Bull Cross", shape.triangleup, location.absolute, color=color.new(color.lime, 0), size=size.small)
+
+plotshape(show_cross and is_bear_cross ? qmc : float(na), "Bear Cross", shape.triangledown, location.absolute, color=color.new(color.red, 0), size=size.small)
+
+
+// ──────────────────────────────────────────────
+// DASHBOARD TABLE
+// ──────────────────────────────────────────────
+var table dashboard = table.new(position.top_right, 2, 6, bgcolor=color.new(color.black, 80), border_color=color.new(color.gray, 50), border_width=1, frame_color=color.new(color.gray, 30), frame_width=1)
+
+string mkt_state = qmc > ob_level ? "⚡ OVERBOUGHT" : qmc < os_level ? "🧊 OVERSOLD" : qmc > 0.0 ? "📈 BULLISH" : "📉 BEARISH"
+
+color state_col = qmc > 0.0 ? color.new(#00e5ff, 0) : color.new(#ff4081, 0)
+
+table.cell(dashboard, 0, 0, "QMC Indicator",                               text_color=color.silver, text_size=size.small, bgcolor=color.new(color.navy, 60))
+table.cell(dashboard, 1, 0, "Value",                                       text_color=color.silver, text_size=size.small, bgcolor=color.new(color.navy, 60))
+table.cell(dashboard, 0, 1, "QMC Score",                                   text_color=color.gray,   text_size=size.small)
+table.cell(dashboard, 1, 1, str.tostring(math.round(qmc,       2)),        text_color=state_col,    text_size=size.small)
+table.cell(dashboard, 0, 2, "RSI Mom.",                                    text_color=color.gray,   text_size=size.small)
+table.cell(dashboard, 1, 2, str.tostring(math.round(rsi_norm,  1)),        text_color=color.white,  text_size=size.small)
+table.cell(dashboard, 0, 3, "Eff. Ratio",                                  text_color=color.gray,   text_size=size.small)
+table.cell(dashboard, 1, 3, str.tostring(math.round(er * 100.0, 1)) + "%", text_color=color.white,  text_size=size.small)
+table.cell(dashboard, 0, 4, "Market State",                                text_color=color.gray,   text_size=size.small)
+table.cell(dashboard, 1, 4, mkt_state,                                     text_color=state_col,    text_size=size.small)
+table.cell(dashboard, 0, 5, "BB Squeeze",                                  text_color=color.gray,   text_size=size.small)
+table.cell(dashboard, 1, 5, bb_squeeze ? "🟡 ACTIVE" : "⬜ NONE", text_color=bb_squeeze ? color.yellow : color.gray, text_size=size.small)
+
+
+// ──────────────────────────────────────────────
+// ALERTS
+// ──────────────────────────────────────────────
+alertcondition(is_bull_cross,                    "QMC Bull Cross",     "QMC: Crossed above signal line — Bullish signal!")
+alertcondition(is_bear_cross,                    "QMC Bear Cross",     "QMC: Crossed below signal line — Bearish signal!")
+alertcondition(bb_squeeze and not bb_squeeze[1], "BB Squeeze Started", "QMC: Bollinger Band squeeze detected — breakout may follow!")
+alertcondition(is_ob  and not is_ob[1],          "Overbought Entry",   "QMC: Entered overbought zone!")
+alertcondition(is_os  and not is_os[1],          "Oversold Entry",     "QMC: Entered oversold zone!")

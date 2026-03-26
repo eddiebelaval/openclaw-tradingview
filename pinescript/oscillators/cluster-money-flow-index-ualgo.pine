@@ -1,0 +1,329 @@
+// This work is licensed under Creative Commons Attribution-NonCommercial-ShareAlike 4.0 International  
+// https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © UAlgo
+//@version=6
+indicator("Cluster Money Flow Index [UAlgo]",
+     overlay=false, max_boxes_count=500, max_labels_count=500, max_lines_count=500)
+
+grp_mfi = "MFI Settings"
+mfiLen      = input.int(14,    "MFI Length",          minval=2,  maxval=100, group=grp_mfi)
+mfiSmooth   = input.int(3,     "MFI Smoothing",       minval=1,  maxval=20,  group=grp_mfi,
+                 tooltip="EMA smoothing for the MFI line")
+
+grp_cluster = "Cluster Detection"
+pivotLeft   = input.int(8,     "Pivot Left Bars",     minval=2,  maxval=30,  group=grp_cluster,
+                 tooltip="Left bars to confirm an MFI pivot point")
+pivotRight  = input.int(8,     "Pivot Right Bars",    minval=2,  maxval=30,  group=grp_cluster,
+                 tooltip="Right bars to confirm an MFI pivot point")
+proxMult    = input.float(1.0, "Proximity Multiplier", minval=0.2, maxval=5.0, step=0.1, group=grp_cluster,
+                 tooltip="Controls how close two MFI pivots must be to form a cluster. Higher = wider zones")
+minTouches  = input.int(2,     "Minimum Touches",     minval=1,  maxval=15,  group=grp_cluster,
+                 tooltip="Minimum pivot touches before a zone is displayed")
+maxZones    = input.int(15,    "Max Active Zones",    minval=3,  maxval=40,  group=grp_cluster)
+expandZone  = input.bool(true, "Expand Zone on Retest", group=grp_cluster)
+
+grp_style = "Style"
+obColor     = input.color(color.rgb(255, 82, 82),    "Overbought Zone",  group=grp_style)
+osColor     = input.color(color.rgb(0, 230, 118),    "Oversold Zone",    group=grp_style)
+midColor    = input.color(color.rgb(100, 149, 237),  "Mid Zone",         group=grp_style)
+baseOpacity = input.int(15,    "Base Zone Opacity",   minval=5,  maxval=50, group=grp_style,
+                 tooltip="Opacity for weakest zones. Stronger zones become slightly more visible")
+showCenter  = input.bool(true, "Show Center Line",    group=grp_style)
+showLabels  = input.bool(true, "Show Info Labels",    group=grp_style)
+lblSize     = input.string("tiny", "Label Size", options=["tiny", "small", "normal"], group=grp_style)
+
+grp_dash = "Dashboard"
+showDash    = input.bool(true, "Show Dashboard",      group=grp_dash)
+dashPos     = input.string("Top Right", "Position",   group=grp_dash,
+                 options=["Top Right", "Top Left", "Bottom Right", "Bottom Left"])
+
+type MFICluster
+    float       top
+    float       bottom
+    float       center
+    bool        isOB
+    int         touches
+    int         firstBarTime
+    int         lastTouchTime
+    int         firstBarIdx
+    bool        isValid
+    bool        isDisplayed
+    box         zoneBox
+    line        centerLine
+    label       infoLabel
+
+f_labelSize(string s) =>
+    switch s
+        "tiny"   => size.tiny
+        "small"  => size.small
+        "normal" => size.normal
+        => size.tiny
+
+f_calcOpacity(int touches, int baseOp) =>
+    float strength = math.min((touches - 1) / 8.0, 1.0)
+    int result = int(baseOp + (strength * 15))
+    math.min(result, 40)
+
+f_zoneColor(float center) =>
+    center >= 70 ? obColor : center <= 30 ? osColor : midColor
+
+method checkProximity(MFICluster this, float pivotVal, bool isOB, float threshold) =>
+    bool result = false
+    if this.isOB == isOB and this.isValid
+        if math.abs(pivotVal - this.center) <= threshold
+            result := true
+    result
+
+method addTouch(MFICluster this, float pivotVal, int pTime, bool shouldExpand) =>
+    this.touches += 1
+    this.lastTouchTime := pTime
+    if shouldExpand
+        if pivotVal > this.top
+            this.top := pivotVal
+        if pivotVal < this.bottom
+            this.bottom := pivotVal
+        this.center := (this.top + this.bottom) / 2.0
+    int(na)
+
+method deleteVisuals(MFICluster this) =>
+    if not na(this.zoneBox)
+        box.delete(this.zoneBox)
+    if not na(this.centerLine)
+        line.delete(this.centerLine)
+    if not na(this.infoLabel)
+        label.delete(this.infoLabel)
+    int(na)
+
+method invalidate(MFICluster this, float mfiVal) =>
+    bool broken = false
+    if this.isOB
+        if mfiVal > this.top + 2
+            broken := true
+    else
+        if mfiVal < this.bottom - 2
+            broken := true
+    
+    if broken
+        this.isValid := false
+    broken
+
+method drawZone(MFICluster this, int minT, int bOpacity, bool drawCenter, bool drawLabel, string lSize) =>
+    if this.touches >= minT
+        int zoneOpacity = f_calcOpacity(this.touches, bOpacity)
+        color baseCol   = f_zoneColor(this.center)
+        color fillCol   = color.new(baseCol, zoneOpacity)
+        color borderCol = color.new(baseCol, math.max(zoneOpacity - 30, 0))
+        color textCol   = color.new(baseCol, math.max(zoneOpacity - 50, 0))
+
+        int bWidth = this.touches >= 4 ? 2 : 1
+
+        string typeStr = this.isOB ? "OB" : "OS"
+        string lblText = typeStr + " · " + str.tostring(math.round(this.center, 1)) + " | ×" + str.tostring(this.touches)
+
+        if not this.isDisplayed
+            this.zoneBox := box.new(
+                 left=this.firstBarTime, top=this.top, right=time, bottom=this.bottom,
+                 border_color=borderCol, border_width=bWidth, bgcolor=fillCol,
+                 xloc=xloc.bar_time)
+
+            if drawCenter
+                this.centerLine := line.new(
+                     x1=this.firstBarTime, y1=this.center, x2=time, y2=this.center,
+                     color=color.new(baseCol, zoneOpacity - 5), style=line.style_dotted,
+                     width=1, xloc=xloc.bar_time)
+
+            if drawLabel
+                this.infoLabel := label.new(
+                     x=time, y=this.isOB ? this.top : this.bottom,
+                     text=lblText, textcolor=textCol,
+                     style=label.style_none, size=f_labelSize(lSize),
+                     xloc=xloc.bar_time, textalign=text.align_right)
+
+            this.isDisplayed := true
+        else if this.isValid
+            box.set_right(this.zoneBox, time)
+            box.set_bgcolor(this.zoneBox, fillCol)
+            box.set_border_color(this.zoneBox, borderCol)
+            box.set_border_width(this.zoneBox, bWidth)
+            box.set_top(this.zoneBox, this.top)
+            box.set_bottom(this.zoneBox, this.bottom)
+
+            if drawCenter and not na(this.centerLine)
+                line.set_x2(this.centerLine, time)
+                line.set_y1(this.centerLine, this.center)
+                line.set_y2(this.centerLine, this.center)
+                line.set_color(this.centerLine, color.new(baseCol, zoneOpacity - 5))
+
+            if drawLabel and not na(this.infoLabel)
+                label.set_text(this.infoLabel, lblText)
+                label.set_textcolor(this.infoLabel, textCol)
+                label.set_x(this.infoLabel, time)
+                label.set_y(this.infoLabel, this.isOB ? this.top : this.bottom)
+        else
+            box.set_bgcolor(this.zoneBox, color.new(baseCol, math.max(zoneOpacity + 20, 95)))
+            box.set_border_color(this.zoneBox, color.new(baseCol, math.max(zoneOpacity + 20, 95)))
+            if not na(this.centerLine)
+                line.set_style(this.centerLine, line.style_dashed)
+                line.set_color(this.centerLine, color.new(baseCol, 80))
+
+    int(na)
+
+float rawMFI      = ta.mfi(hlc3, mfiLen)
+float smoothedMFI = ta.ema(rawMFI, mfiSmooth)
+
+var array<MFICluster> clusters = array.new<MFICluster>()
+
+float mfiStd       = ta.stdev(rawMFI, 50)
+float proximity    = math.max(2.0, mfiStd * proxMult)
+
+float mfiPH = ta.pivothigh(rawMFI, pivotLeft, pivotRight)
+float mfiPL = ta.pivotlow(rawMFI, pivotLeft, pivotRight)
+
+if not na(mfiPH) or not na(mfiPL)
+    bool  isOB     = not na(mfiPH)
+    float pVal     = isOB ? mfiPH : mfiPL
+    int   pTime    = time[pivotRight]
+    int   pBarIdx  = bar_index[pivotRight]
+
+    bool wasClustered = false
+
+    if array.size(clusters) > 0
+        for i = 0 to array.size(clusters) - 1
+            MFICluster cl = array.get(clusters, i)
+            if cl.isValid and cl.firstBarTime != pTime
+                if cl.checkProximity(pVal, isOB, proximity)
+                    cl.addTouch(pVal, pTime, expandZone)
+                    wasClustered := true
+                    break
+
+    if not wasClustered
+        float zoneHalf = math.max(proximity * 0.15, 0.8)
+        float zTop = pVal + zoneHalf
+        float zBot = pVal - zoneHalf
+
+        MFICluster newCl = MFICluster.new(
+             top          = zTop,
+             bottom       = zBot,
+             center       = pVal,
+             isOB         = isOB,
+             touches      = 1,
+             firstBarTime = pTime,
+             lastTouchTime= pTime,
+             firstBarIdx  = pBarIdx,
+             isValid      = true,
+             isDisplayed  = false)
+
+        clusters.push(newCl)
+
+        if array.size(clusters) > maxZones
+            MFICluster oldest = array.shift(clusters)
+            oldest.deleteVisuals()
+
+if array.size(clusters) > 0
+    for i = array.size(clusters) - 1 to 0
+        MFICluster cl = array.get(clusters, i)
+        if cl.isValid
+            cl.invalidate(rawMFI)
+            
+        cl.drawZone(minTouches, baseOpacity, showCenter, showLabels, lblSize)
+
+hline(80, "Overbought",  color.new(obColor, 70), linestyle=hline.style_dashed)
+hline(50, "Midline",      color.new(color.gray, 60), linestyle=hline.style_dotted)
+hline(20, "Oversold",     color.new(osColor, 70), linestyle=hline.style_dashed)
+
+color mfiLineColor = rawMFI >= 70 ? color.new(obColor, 10) :
+     rawMFI <= 30 ? color.new(osColor, 10) :
+     color.new(midColor, 20)
+
+plot(rawMFI, "MFI", color=mfiLineColor, linewidth=2)
+plot(smoothedMFI, "Smoothed MFI", color=color.new(color.white, 50), linewidth=1)
+
+p_mfi = plot(rawMFI, display=display.none)
+p_ob  = plot(80, display=display.none)
+p_os  = plot(20, display=display.none)
+var bool inOBZone = false
+var bool inOSZone = false
+inOBZone := false
+inOSZone := false
+
+if array.size(clusters) > 0
+    for i = 0 to array.size(clusters) - 1
+        MFICluster cl = array.get(clusters, i)
+        if cl.isValid and cl.touches >= minTouches
+            if cl.isOB and rawMFI >= cl.bottom and rawMFI <= cl.top + 5
+                inOBZone := true
+            if not cl.isOB and rawMFI <= cl.top and rawMFI >= cl.bottom - 5
+                inOSZone := true
+
+var _tblPos = switch dashPos
+    "Top Left"     => position.top_left
+    "Bottom Right" => position.bottom_right
+    "Bottom Left"  => position.bottom_left
+    => position.top_right
+
+var table dashTable = table.new(_tblPos, 2, 7,
+     bgcolor      = color.new(#0a0a0f, 15),
+     border_width = 0,
+     frame_width  = 1,
+     frame_color  = color.new(#2a2a3a, 40))
+
+if barstate.islast and showDash
+    color hdrBg  = color.new(#12121f, 10)
+    color hdrTxt = color.new(#8888aa, 0)
+    color valTxt = color.new(#ccccdd, 0)
+
+    int obZoneCount = 0
+    int osZoneCount = 0
+    int strongMax   = 0
+    float nearOB    = na
+    float nearOS    = na
+
+    if array.size(clusters) > 0
+        for i = 0 to array.size(clusters) - 1
+            MFICluster cl = array.get(clusters, i)
+            
+            if cl.touches > strongMax
+                strongMax := cl.touches
+                
+            if cl.touches >= minTouches
+                if cl.center >= 70
+                    obZoneCount += 1
+                    float dist = math.abs(rawMFI - cl.center)
+                    if na(nearOB) or dist < nearOB
+                        nearOB := cl.center
+                else if cl.center <= 30
+                    osZoneCount += 1
+                    float dist = math.abs(rawMFI - cl.center)
+                    if na(nearOS) or dist < nearOS
+                        nearOS := cl.center
+
+    string mfiState = rawMFI >= 80 ? "OVERBOUGHT" : rawMFI <= 20 ? "OVERSOLD" : rawMFI >= 50 ? "BULLISH" : "BEARISH"
+    color  stateClr = rawMFI >= 80 ? obColor : rawMFI <= 20 ? osColor : rawMFI >= 50 ? color.rgb(0, 200, 100) : color.rgb(200, 100, 0)
+
+    table.cell(dashTable, 0, 0, "CLUSTER MONEY FLOW INDEX", text_color=color.new(#e0e0ff, 0), bgcolor=hdrBg, text_size=size.small)
+    table.cell(dashTable, 1, 0, str.tostring(math.round(rawMFI, 1)), text_color=stateClr, bgcolor=color.new(stateClr, 88), text_size=size.small)
+
+    table.cell(dashTable, 0, 1, "State", text_color=hdrTxt, bgcolor=hdrBg, text_size=size.tiny)
+    table.cell(dashTable, 1, 1, mfiState, text_color=stateClr, bgcolor=color.new(stateClr, 90), text_size=size.tiny)
+
+    table.cell(dashTable, 0, 2, "OB Zones", text_color=hdrTxt, bgcolor=hdrBg, text_size=size.tiny)
+    table.cell(dashTable, 1, 2, str.tostring(obZoneCount), text_color=obColor, bgcolor=color.new(obColor, 92), text_size=size.tiny)
+
+    table.cell(dashTable, 0, 3, "OS Zones", text_color=hdrTxt, bgcolor=hdrBg, text_size=size.tiny)
+    table.cell(dashTable, 1, 3, str.tostring(osZoneCount), text_color=osColor, bgcolor=color.new(osColor, 92), text_size=size.tiny)
+
+    table.cell(dashTable, 0, 4, "Strongest", text_color=hdrTxt, bgcolor=hdrBg, text_size=size.tiny)
+    table.cell(dashTable, 1, 4, "×" + str.tostring(strongMax), text_color=valTxt, bgcolor=hdrBg, text_size=size.tiny)
+
+    table.cell(dashTable, 0, 5, "Near OB", text_color=hdrTxt, bgcolor=hdrBg, text_size=size.tiny)
+    table.cell(dashTable, 1, 5, na(nearOB) ? "—" : str.tostring(math.round(nearOB, 1)),
+         text_color=obColor, bgcolor=color.new(obColor, 92), text_size=size.tiny)
+
+    table.cell(dashTable, 0, 6, "Near OS", text_color=hdrTxt, bgcolor=hdrBg, text_size=size.tiny)
+    table.cell(dashTable, 1, 6, na(nearOS) ? "—" : str.tostring(math.round(nearOS, 1)),
+         text_color=osColor, bgcolor=color.new(osColor, 92), text_size=size.tiny)
+
+alertcondition(inOBZone, title="MFI Entered OB Cluster Zone", message="Cluster MFI: Price entered an overbought cluster zone — watch for reversal")
+alertcondition(inOSZone, title="MFI Entered OS Cluster Zone", message="Cluster MFI: Price entered an oversold cluster zone — watch for reversal")
+alertcondition(ta.crossover(rawMFI, 80),  title="MFI Crossed Above 80", message="Cluster MFI: MFI crossed above 80 — overbought territory")
+alertcondition(ta.crossunder(rawMFI, 20), title="MFI Crossed Below 20", message="Cluster MFI: MFI crossed below 20 — oversold territory")

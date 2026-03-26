@@ -1,0 +1,373 @@
+//@version=6
+indicator("Tick Asymmetry Index [DAFE]", shorttitle="📏TAI", overlay=false, max_lines_count=500, max_labels_count=500, max_boxes_count=500, max_bars_back=5000)
+// ═══════════════════════════════════════════════════════════════════════════════════════════════════════
+// ⚙️ INPUTS
+// ═══════════════════════════════════════════════════════════════════════════════════════════════════════
+grpCore = "⚙️ TAI Engine"
+i_taiLength      = input.int(14, "Calculation Length", minval=5, maxval=100, group=grpCore, tooltip=
+ "Determines the primary lookback period for the Tick Asymmetry Index calculation. This is the number of recent bars the indicator will analyze to determine the balance between buying and selling pressure.\n\n" +
+ "• Shorter Length (e.g., 5-10): More responsive to recent price action, resulting in a faster, more volatile TAI line. Good for scalping or very active markets.\n" +
+ "• Longer Length (e.g., 20-50): Smoother and less sensitive to noise, reflecting a more stable, longer-term order flow trend. Better for swing trading or identifying major shifts.")
+i_taiSmoothing   = input.int(3, "Smoothing", minval=1, maxval=10, group=grpCore, tooltip=
+ "Applies a Simple Moving Average to the raw TAI line to filter out noise and make it easier to interpret. A value of 1 means no smoothing.\n\n" +
+ "• Higher values create a smoother, lagging line, which helps in identifying the underlying trend but may delay signals.\n" +
+ "• Lower values keep the line more responsive to immediate changes.")
+i_tickEstimation = input.string("Footprint (Real)", "Tick Estimation", options=["Footprint (Real)", "Multi-Factor", "Close Position", "Wick Analysis", "OHLC Sequence"], group=grpCore, tooltip=
+ "Selects the method for estimating the ratio of buying vs. selling ticks within each bar. This is the core of the TAI calculation.\n\n" +
+ "1. Footprint (Real): HIGHEST ACCURACY. Uses real bid/ask volume data from footprint charts. This provides a true measure of order flow. If footprint data is unavailable for the symbol/timeframe, it automatically falls back to the 'Close Position' method.\n\n" +
+ "2. Multi-Factor: A sophisticated heuristic model that combines Close Position, bar-over-bar direction, and body/wick analysis for a robust estimation when real footprint data is unavailable.\n\n" +
+ "3. Close Position: A classic method (similar to RSI) that assumes buying pressure is proportional to where the price closes within the high-low range of the bar.\n\n" +
+ "4. Wick Analysis: Infers pressure by analyzing candle wicks. Long lower wicks suggest buying pressure (rejection of lows), and long upper wicks suggest selling pressure (rejection of highs).\n\n" +
+ "5. OHLC Sequence: A basic heuristic based on the sequence of Open, High, Low, and Close prices.")
+i_volumeWeight   = input.bool(true, "Volume-Weight", group=grpCore, tooltip=
+ "If enabled, each bar's contribution to the TAI calculation is weighted by its volume. High-volume bars will have a greater impact on the index than low-volume bars. This helps to emphasize periods of high activity and institutional participation.")
+i_momentumLength = input.int(5, "Momentum Lookback", minval=2, maxval=20, group=grpCore, tooltip=
+ "The lookback period used to calculate the TAI's momentum (its rate of change). This measures how quickly the order flow balance is shifting.\n\n" +
+ "• A shorter lookback is more sensitive to immediate bursts in momentum.\n" +
+ "• A longer lookback provides a smoother, more stable measure of the momentum trend.")
+i_accelLength    = input.int(3, "Acceleration Lookback", minval=2, maxval=10, group=grpCore, tooltip=
+ "The lookback period for calculating the TAI's acceleration (the rate of change of its momentum). This helps identify when a trend is speeding up or slowing down, which is crucial for spotting exhaustion and potential reversals.")
+i_momentumSmooth = input.int(2, "Momentum Smoothing", minval=1, maxval=10, group=grpCore, tooltip=
+ "Applies a Simple Moving Average to the raw Momentum line before it's used for other calculations (like Acceleration). This helps to prevent false signals by filtering out insignificant jitters in momentum.")
+grpFP = "👣 Footprint Order Flow"
+i_useFP   = input.bool(true, "Fetch Real Footprint Data", group=grpFP, tooltip=
+ "Master switch to enable or disable the fetching of real-time footprint data. This must be enabled for the 'Footprint (Real)' estimation mode to work and for the dashboard to display true Delta, Buy, and Sell volumes. \n\nNOTE: Requires a broker/data feed that provides footprint data (e.g., TradingView Premium with compatible brokers).")
+i_fpTicks = input.int(100, "Ticks per row", minval=1, group=grpFP, tooltip=
+ "Defines the price granularity for the footprint data request. This is the number of ticks that are aggregated into a single row in the footprint profile. Adjust based on the asset's volatility and price range.")
+i_fpVA    = input.int(70, "Value Area %", minval=1, group=grpFP, tooltip=
+ "The percentage of total volume to be included in the Value Area of the footprint profile. A standard value is 70%, representing the price range where the majority of trading occurred.")
+grpThresholds = "📍 Thresholds & Zones"
+i_overboughtLevel = input.float(70, "Overbought Threshold", minval=50, maxval=95, group=grpThresholds, tooltip=
+ "The level above which buying pressure is considered dominant or excessive. When the TAI line crosses above this threshold, it indicates a strong bullish order flow. It is also a key level for identifying potential seller exhaustion and bearish reversal signals.")
+i_oversoldLevel   = input.float(30, "Oversold Threshold", minval=5, maxval=50, group=grpThresholds, tooltip=
+ "The level below which selling pressure is considered dominant or excessive. When the TAI line crosses below this threshold, it indicates a strong bearish order flow. It is also a key level for identifying potential buyer exhaustion and bullish reversal signals.")
+i_extremeLevel    = input.float(85, "Extreme Threshold", minval=70, maxval=99, group=grpThresholds, tooltip=
+ "A secondary, more extreme threshold used to identify potential climax or exhaustion events. When the TAI exceeds this level (or drops below its inverse, e.g., 15), it signals a very high probability of an impending reversal, especially when combined with divergence.")
+grpSigTune = "🎛️ Signal Tuning & Filters"
+i_sigStrictness   = input.string("Standard (Requires TAI < 50)", "Signal Strictness", options=["Loose (Any Condition)", "Standard (Requires TAI < 50)", "Strict (Requires TAI < Oversold)"], group=grpSigTune, tooltip=
+ "Adjusts the filtering criteria for generating Buy/Sell signals to match your risk tolerance.\n\n" +
+ "1. Loose: Fires a signal as soon as a valid condition (e.g., Divergence, Absorption) is met, regardless of the TAI level. Provides the most signals.\n\n" +
+ "2. Standard: Acts as a mean-reversion filter. A Buy signal can only appear when TAI is below 50 (in the 'bearish' half), and a Sell signal only when TAI is above 50 (in the 'bullish' half). This looks for flow to 'return to the mean'.\n\n" +
+ "3. Strict: The highest conviction filter. A Buy signal MUST occur when TAI is below the Oversold threshold, and a Sell signal MUST occur when TAI is above the Overbought threshold. This focuses exclusively on extreme reversal setups.")
+i_reqAccel        = input.bool(true, "Require Acceleration Alignment", group=grpSigTune, tooltip=
+ "If enabled, signals require confirmation from TAI Acceleration. A Buy signal will only fire if momentum is accelerating upwards, and a Sell signal will only fire if momentum is accelerating downwards. This adds a powerful layer of confirmation, filtering out signals where momentum is weakening.")
+grpSignals = "🎯 Chart Signals & Dashboard"
+i_showMainSignals = input.bool(true, "Show Signals on Main Chart", group=grpSignals, tooltip=
+ "Toggles the visibility of all signal shapes (Buy/Sell triangles, HFT diamonds, Secret Signal keys) directly on the main price chart.")
+i_showDashboard   = input.bool(true, "Show Dashboard", group=grpSignals, tooltip=
+ "Toggles the visibility of the comprehensive analysis dashboard, which displays real-time data on Flow, Momentum, Footprint Delta, and key detected events.")
+i_dashLocation    = input.string("Main Chart Overlay", "Dashboard Location", options=["Main Chart Overlay", "Indicator Panel"], group=grpSignals, tooltip=
+ "Choose where the dashboard is displayed.\n\n" +
+ "• Main Chart Overlay: The dashboard floats on top of your price chart (position set below).\n" +
+ "• Indicator Panel: The dashboard is fixed inside the TAI indicator's pane.")
+i_dashboardPos    = input.string("Top Right", "Dashboard Position", options=["Top Right", "Top Left", "Bottom Right", "Bottom Left"], group=grpSignals, tooltip=
+ "Sets the corner position for the dashboard on the chart or within the indicator panel.")
+// ═══════════════════════════════════════════════════════════════════════════════════════════════════════
+// 🎨 THEMES
+// ═══════════════════════════════════════════════════════════════════════════════════════════════════════
+grpTheme = "🎨 Visual Engine & Theme"
+colorTheme = input.string("Neon Tokyo", "Select Theme", options=["Neon Tokyo", "Ocean Depths", "Arctic Aurora", "Classic Terminal"], group=grpTheme, tooltip=
+ "Select a pre-designed color palette for the entire indicator, including lines, fills, signals, and the dashboard. This allows you to quickly match the indicator to your chart's aesthetic.")
+i_visualMode = input.string("Footprint Battle", "Lower Pane Visualization Mode", options=["Footprint Battle", "Quantum Vortex", "Neon Pulse", "Aura Ribbon"], group=grpTheme, tooltip=
+ "Controls the primary background visualization in the indicator pane, each designed to highlight a different aspect of order flow.\n\n" +
+ "1. Footprint Battle: Displays a histogram of real Buy vs. Sell volume from footprint data, showing the tug-of-war between buyers and sellers around the 50-level.\n\n" +
+ "2. Quantum Vortex: A dynamic, multi-layered band whose width is driven by TAI volatility and acceleration. It expands during volatile, accelerating moves and contracts in quiet periods.\n\n" +
+ "3. Neon Pulse: A zero-centered histogram that directly visualizes the TAI Momentum. Helps to clearly see the strength and rhythm of momentum shifts.\n\n" +
+ "4. Aura Ribbon: A smooth, filled ribbon whose width expands and contracts with momentum strength. Provides a clean, continuous view of the dominant flow.")
+bullColor = switch colorTheme
+    "Neon Tokyo" => #00FFAA
+    "Ocean Depths" => #00CED1
+    "Arctic Aurora" => #00FF7F
+    "Classic Terminal" => #00FF00
+    => #00FFAA
+bearColor = switch colorTheme
+    "Neon Tokyo" => #FF0055
+    "Ocean Depths" => #FF6B6B
+    "Arctic Aurora" => #FF4500
+    "Classic Terminal" => #FF0000
+    => #FF0055
+bgColor = switch colorTheme
+    "Neon Tokyo" => #0A0A14
+    "Ocean Depths" => #0C1929
+    "Arctic Aurora" => #0D1B2A
+    "Classic Terminal" => #000000
+    => #0A0A14
+frameColor = switch colorTheme
+    "Neon Tokyo" => #00DDFF
+    "Ocean Depths" => #1E90FF
+    "Arctic Aurora" => #7FFFD4
+    "Classic Terminal" => #333333
+    => #00DDFF
+neutralColor = #8899AA
+hftColor     = #B026FF 
+accentColor1 = #00DDFF
+accentColor2 = #FFD700
+// ═══════════════════════════════════════════════════════════════════════════════════════════════════════
+// 👣 FOOTPRINT DATA 
+// ═══════════════════════════════════════════════════════════════════════════════════════════════════════
+footprint reqFootprint = i_useFP ? request.footprint(i_fpTicks, i_fpVA) : na
+float fpBuy = not na(reqFootprint) ? reqFootprint.buy_volume() : na
+float fpSell = not na(reqFootprint) ? reqFootprint.sell_volume() : na
+float fpDelta = not na(reqFootprint) ? reqFootprint.delta() : na
+float fpTotal = nz(fpBuy) + nz(fpSell)
+// ═══════════════════════════════════════════════════════════════════════════════════════════════════════
+// 🛠️ UTILITIES & GLOBAL
+// ═══════════════════════════════════════════════════════════════════════════════════════════════════════
+f_str(v) => str.tostring(v, "#.##")
+atr = ta.atr(14)
+avgVolume = ta.sma(volume, 50)
+volumeRatio = avgVolume > 0 ? volume / avgVolume : 1.0
+priceChange = close - nz(close[1], close)
+getTickRatio(int i) =>
+    float ratio = 0.5
+    float c = nz(close[i]), float o = nz(open[i]), float h = nz(high[i]), float l = nz(low[i])
+    float rng = h - l
+    bool useFP = i_tickEstimation == "Footprint (Real)" and not na(fpBuy[i]) and not na(fpSell[i])
+    if useFP
+        float tot = fpBuy[i] + fpSell[i]
+        ratio := tot > 0 ? fpBuy[i] / tot : 0.5
+    else if i_tickEstimation == "Close Position" or (i_tickEstimation == "Footprint (Real)" and not useFP)
+        ratio := rng > 0 ? (c - l) / rng : 0.5
+    else if i_tickEstimation == "Wick Analysis"
+        float uw = h - math.max(o, c)
+        float lw = math.min(o, c) - l
+        float bd = math.abs(c - o)
+        ratio := (uw + lw + bd) > 0 ? (lw + (c > o ? bd * 0.7 : bd * 0.3)) / (uw + lw + bd) : 0.5
+    else if i_tickEstimation == "Multi-Factor"
+        float cpf = rng > 0 ? (c - l) / rng : 0.5
+        float ocf = c >= o ? 0.6 : 0.4
+        float tf = c > nz(close[i+1], c) ? 0.6 : c < nz(close[i+1], c) ? 0.4 : 0.5
+        ratio := cpf * 0.4 + ocf * 0.3 + tf * 0.3
+    else
+        ratio := rng > 0 ? (c - l) / rng : 0.5
+        ratio := c > o ? 0.5 + (ratio * 0.3) : 0.5 - ((1-ratio) * 0.3)
+    ratio
+// ═══════════════════════════════════════════════════════════════════════════════════════════════════════
+// 📊 CORE CALCULATIONS & MATH ENGINE
+// ═══════════════════════════════════════════════════════════════════════════════════════════════════════
+calcVolumeWeightedTAI() =>
+    float sumWeighted = 0.0
+    float sumVol = 0.0
+    for i = 0 to i_taiLength - 1
+        float ratio = 0.5
+        float c = nz(close[i]), float o = nz(open[i]), float h = nz(high[i]), float l = nz(low[i])
+        float rng = h - l
+        bool useFP = i_tickEstimation == "Footprint (Real)" and not na(fpBuy[i]) and not na(fpSell[i])
+        if useFP
+            float tot = fpBuy[i] + fpSell[i]
+            ratio := tot > 0 ? fpBuy[i] / tot : 0.5
+        else if i_tickEstimation == "Close Position" or (i_tickEstimation == "Footprint (Real)" and not useFP)
+            ratio := rng > 0 ? (c - l) / rng : 0.5
+        else if i_tickEstimation == "Wick Analysis"
+            float uw = h - math.max(o, c)
+            float lw = math.min(o, c) - l
+            float bd = math.abs(c - o)
+            ratio := (uw + lw + bd) > 0 ? (lw + (c > o ? bd * 0.7 : bd * 0.3)) / (uw + lw + bd) : 0.5
+        else if i_tickEstimation == "Multi-Factor"
+            float cpf = rng > 0 ? (c - l) / rng : 0.5
+            float ocf = c >= o ? 0.6 : 0.4
+            float tf = c > nz(close[i+1], c) ? 0.6 : c < nz(close[i+1], c) ? 0.4 : 0.5
+            ratio := cpf * 0.4 + ocf * 0.3 + tf * 0.3
+        else
+            ratio := rng > 0 ? (c - l) / rng : 0.5
+            ratio := c > o ? 0.5 + (ratio * 0.3) : 0.5 - ((1-ratio) * 0.3)
+        float w = i_volumeWeight ? nz(volume[i], 1.0) : 1.0
+        sumWeighted += ratio * w
+        sumVol += w
+    (sumVol > 0 ? sumWeighted / sumVol : 0.5) * 100
+taiRaw = calcVolumeWeightedTAI()
+taiSmooth = ta.sma(taiRaw, i_taiSmoothing)
+taiMomentum = taiSmooth - nz(taiSmooth[i_momentumLength], taiSmooth)
+taiMomentumSmooth = ta.sma(taiMomentum, i_momentumSmooth)
+taiMomStdev = ta.stdev(taiMomentum, 50)
+taiMomZ = taiMomStdev > 0 ? taiMomentum / taiMomStdev : 0.0
+taiAccel = taiMomentumSmooth - nz(taiMomentumSmooth[i_accelLength], taiMomentumSmooth)
+taiAccelStdev = ta.stdev(taiAccel, 50)
+taiAccelZ = taiAccelStdev > 0 ? taiAccel / taiAccelStdev : 0.0
+int dirChanges = 0
+for i = 1 to 10
+    if (taiSmooth[i] - nz(taiSmooth[i+1], taiSmooth[i])) * (nz(taiSmooth[i-1], taiSmooth[i]) - taiSmooth[i]) < 0
+        dirChanges += 1
+float taiOsc = dirChanges / 10.0 * 100
+float volSpike = volumeRatio > 2.0 ? volumeRatio : 0.0
+float priceImpact = atr > 0 ? math.abs(priceChange) / atr : 0.0
+float hftScore = (taiOsc * 0.3) + (volSpike * (1 - priceImpact) * 5)
+float hftScoreStdev = ta.stdev(hftScore, 30)
+float hftScoreSma = ta.sma(hftScore, 30)
+float hftZ = hftScoreStdev > 0 ? (hftScore - hftScoreSma) / hftScoreStdev : 0.0
+bool isHFTActive = hftZ > 1.5
+float priceMom = ta.sma(close, 5) - ta.sma(close, 20)
+float taiMomLine = ta.sma(taiSmooth, 5) - ta.sma(taiSmooth, 20)
+float divScore = (priceMom > 0 and taiMomLine < 0) ? -math.abs(priceMom - taiMomLine) : (priceMom < 0 and taiMomLine > 0) ? math.abs(priceMom - taiMomLine) : 0.0
+float divSmooth = ta.sma(divScore, 3)
+bool bullDiv = divSmooth > 0.3
+bool bearDiv = divSmooth < -0.3
+float avgRange20 = ta.sma(high - low, 20)
+bool buyerExh = taiSmooth < i_oversoldLevel and taiMomZ < -2.0
+bool sellerExh = taiSmooth > i_overboughtLevel and taiMomZ > 2.0
+float fpDeltaStdev = ta.stdev(fpDelta, 50)
+bool buyAbs = false
+bool sellAbs = false
+if not na(fpDelta)
+    buyAbs := fpDelta > (fpDeltaStdev * 1.5) and priceChange <= 0
+    sellAbs := fpDelta < -(fpDeltaStdev * 1.5) and priceChange >= 0
+else
+    buyAbs := volumeRatio > 1.5 and (high - low) < avgRange20 and taiMomentumSmooth > 5 and priceChange <= 0
+    sellAbs := volumeRatio > 1.5 and (high - low) < avgRange20 and taiMomentumSmooth < -5 and priceChange >= 0
+float revProb = 50.0
+if taiSmooth > i_extremeLevel and bearDiv
+    revProb += 25
+if taiSmooth < (100 - i_extremeLevel) and bullDiv
+    revProb += 25
+if math.abs(taiMomZ) > 2 and taiAccelZ * taiMomZ < 0
+    revProb += 15
+if buyAbs or buyerExh
+    revProb += 15
+if sellAbs or sellerExh
+    revProb += 15
+revProb := math.max(0, math.min(100, revProb))
+string revDir = taiMomZ > 0 ? "Bearish" : "Bullish"
+bool secretSignal = (bearDiv and taiSmooth > 65) or (bullDiv and taiSmooth < 35)
+// ═══════════════════════════════════════════════════════════════════════════════════════════════════════
+// 🎯 SIGNAL FILTERING ENGINE
+// ═══════════════════════════════════════════════════════════════════════════════════════════════════════
+bool isBuyZone = i_sigStrictness == "Strict (Requires TAI < Oversold)" ? (taiSmooth < i_oversoldLevel) : 
+                 i_sigStrictness == "Standard (Requires TAI < 50)" ? (taiSmooth < 50) : true         
+bool isSellZone = i_sigStrictness == "Strict (Requires TAI < Oversold)" ? (taiSmooth > i_overboughtLevel) : 
+                  i_sigStrictness == "Standard (Requires TAI < 50)" ? (taiSmooth > 50) : true
+bool accelUp = i_reqAccel ? (taiAccelZ > 0) : true
+bool accelDn = i_reqAccel ? (taiAccelZ < 0) : true
+bool fireLong = (bullDiv or buyerExh or buyAbs or (revProb > 70 and revDir == "Bullish")) and taiMomZ > nz(taiMomZ[1]) and isBuyZone and accelUp
+bool fireShort = (bearDiv or sellerExh or sellAbs or (revProb > 70 and revDir == "Bearish")) and taiMomZ < nz(taiMomZ[1]) and isSellZone and accelDn
+bool trigBuy = fireLong and not fireLong[1]
+bool trigSell = fireShort and not fireShort[1]
+// ═══════════════════════════════════════════════════════════════════════════════════════════════════════
+// 🌌 MAIN CHART OVERLAYS 
+// ═══════════════════════════════════════════════════════════════════════════════════════════════════════
+plotshape(i_showMainSignals and trigBuy, "BUY", shape.triangleup, location.belowbar, bullColor, size=size.tiny, force_overlay=true)
+plotshape(i_showMainSignals and trigSell, "SELL", shape.triangledown, location.abovebar, bearColor, size=size.tiny, force_overlay=true)
+plotshape(i_showMainSignals and isHFTActive and not isHFTActive[1] ? hl2 : na, "HFT Diamond", shape.diamond, location.absolute, hftColor, size=size.tiny, force_overlay=true)
+plotshape(i_showMainSignals and secretSignal and not secretSignal[1] and bullDiv, "Secret Bull", shape.labelup, location.belowbar, bullColor, size=size.tiny, text="🔑", textcolor=color.white, force_overlay=true)
+plotshape(i_showMainSignals and secretSignal and not secretSignal[1] and bearDiv, "Secret Bear", shape.labeldown, location.abovebar, bearColor, size=size.tiny, text="🔑", textcolor=color.white, force_overlay=true)
+// ═══════════════════════════════════════════════════════════════════════════════════════════════════════
+// 🎆 LOWER PANE VISUAL ENGINE
+// ═══════════════════════════════════════════════════════════════════════════════════════════════════════
+bool mBattle = i_visualMode == "Footprint Battle"
+bool mVortex = i_visualMode == "Quantum Vortex"
+bool mPulse  = i_visualMode == "Neon Pulse"
+bool mAura   = i_visualMode == "Aura Ribbon"
+plot(50, "Neutral", color.new(neutralColor, 50), 1)
+plot(i_overboughtLevel, "OB", color.new(bearColor, 70), 1)
+plot(i_oversoldLevel, "OS", color.new(bullColor, 70), 1)
+color dynCol = taiSmooth > 50 ? color.from_gradient(taiSmooth, 50, 85, color.new(bullColor, 60), bullColor) : color.from_gradient(taiSmooth, 15, 50, bearColor, color.new(bearColor, 60))
+float maxFp = ta.highest(fpTotal, 50)
+float normFpBuy = mBattle and maxFp > 0 ? (fpBuy / maxFp) * 40 : na
+float normFpSell = mBattle and maxFp > 0 ? (fpSell / maxFp) * 40 : na
+plot(mBattle ? 50 + normFpBuy : na, "FP Buy", color.new(bullColor, 40), 4, plot.style_columns, histbase=50)
+plot(mBattle ? 50 - normFpSell : na, "FP Sell", color.new(bearColor, 40), 4, plot.style_columns, histbase=50)
+float basis = ta.ema(taiSmooth, 21)
+float taiVol = ta.stdev(taiSmooth, 20)
+float curvInf = 1.0 + (math.abs(taiAccelZ) / 4.0)
+float bandW = taiVol * 1.5 * curvInf
+bool trendUp = taiSmooth > basis
+color fillCol = trendUp ? bullColor : bearColor
+p1 = plot(mVortex ? basis + bandW * 2.0 : na, "B1", color.new(fillCol, 80), 1)
+p2 = plot(mVortex ? basis + bandW * 1.2 : na, "B2", color.new(fillCol, 60), 1)
+p3 = plot(mVortex ? basis + bandW * 0.5 : na, "B3", color.new(fillCol, 40), 2)
+p4 = plot(mVortex ? basis - bandW * 0.5 : na, "B4", color.new(fillCol, 40), 2)
+p5 = plot(mVortex ? basis - bandW * 1.2 : na, "B5", color.new(fillCol, 60), 1)
+p6 = plot(mVortex ? basis - bandW * 2.0 : na, "B6", color.new(fillCol, 80), 1)
+fill(p1, p2, color.new(trendUp ? bullColor : bearColor, 85))
+fill(p2, p3, color.new(trendUp ? bullColor : bearColor, 75))
+fill(p3, p4, color.new(trendUp ? bullColor : bearColor, 90))
+fill(p4, p5, color.new(trendUp ? bullColor : bearColor, 75))
+fill(p5, p6, color.new(trendUp ? bullColor : bearColor, 85))
+plot(mPulse ? taiSmooth - 50 : na, "Pulse Hist", taiMomZ > 0 ? color.new(bullColor, 50) : color.new(bearColor, 50), 4, plot.style_columns, histbase=0)
+rUp = plot(mAura ? taiSmooth + math.abs(taiMomZ)*3 : na, "Ribbon Up", color.new(dynCol, 80), 1)
+rDn = plot(mAura ? taiSmooth - math.abs(taiMomZ)*3 : na, "Ribbon Dn", color.new(dynCol, 80), 1)
+fill(rUp, rDn, color.new(dynCol, 85))
+plot(taiSmooth, "TAI Core", dynCol, 2)
+plot(taiSmooth, "TAI Glow", color.new(dynCol, 75), 6)
+plot(trigBuy ? taiSmooth : na, "Buy Dot", bullColor, 4, plot.style_circles)
+plot(trigSell ? taiSmooth : na, "Sell Dot", bearColor, 4, plot.style_circles)
+plot(bullDiv ? taiSmooth : na, "Div Bull", accentColor1, 3, plot.style_cross)
+plot(bearDiv ? taiSmooth : na, "Div Bear", accentColor2, 3, plot.style_cross)
+// ═══════════════════════════════════════════════════════════════════════════════════════════════════════
+// DASHBOARD
+// ═══════════════════════════════════════════════════════════════════════════════════════════════════════
+tPos = switch i_dashboardPos
+    "Top Right" => position.top_right
+    "Top Left" => position.top_left
+    "Bottom Right" => position.bottom_right
+    "Bottom Left" => position.bottom_left
+    => position.top_right
+sz = size.small
+szS = size.tiny
+var table dashOverlay = table.new(position = tPos, columns = 3, rows = 12, bgcolor = color.new(#0A0A14, 10), border_width = 0, frame_width = 1, frame_color = color.new(accentColor1, 50), force_overlay = true)
+var table dashPanel   = table.new(position = tPos, columns = 3, rows = 12, bgcolor = color.new(#0A0A14, 10), border_width = 0, frame_width = 1, frame_color = color.new(accentColor1, 50), force_overlay = false)
+table dash = i_dashLocation == "Main Chart Overlay" ? dashOverlay : dashPanel
+if i_showDashboard and barstate.islast
+    if i_dashLocation == "Main Chart Overlay"
+        table.clear(dashPanel, 0, 0, 2, 11)
+    else
+        table.clear(dashOverlay, 0, 0, 2, 11)
+    table.cell(dash, 0, 0, "⬡", text_color=accentColor1, text_size=szS, bgcolor=color.new(#1A1A24, 0))
+    table.cell(dash, 1, 0, "Tick Asymmetry Index", text_color=color.white, text_size=szS, text_halign=text.align_left, bgcolor=color.new(#1A1A24, 0))
+    table.cell(dash, 2, 0, "[DAFE]", text_color=neutralColor, text_size=szS, text_halign=text.align_right, bgcolor=color.new(#1A1A24, 0))
+    table.cell(dash, 0, 1, "───", text_color=color.new(neutralColor, 60), text_size=szS)
+    table.cell(dash, 1, 1, "FLOW", text_color=color.new(neutralColor, 30), text_size=szS)
+    table.cell(dash, 2, 1, "───", text_color=color.new(neutralColor, 60), text_size=szS)
+    table.cell(dash, 0, 2, "TAI", text_color=neutralColor, text_size=sz, text_halign=text.align_left)
+    table.cell(dash, 1, 2, f_str(taiSmooth), text_color=dynCol, text_size=szS)
+    flowTxt = taiSmooth > 60 ? "STRONG BUY" : taiSmooth < 40 ? "STRONG SELL" : "NEUTRAL"
+    table.cell(dash, 2, 2, flowTxt, text_color=dynCol, text_size=sz, text_halign=text.align_right)
+    table.cell(dash, 0, 3, "MOM", text_color=neutralColor, text_size=sz, text_halign=text.align_left)
+    color momCol = taiMomZ > 0 ? bullColor : bearColor
+    table.cell(dash, 1, 3, f_str(taiMomZ)+"σ", text_color=momCol, text_size=sz)
+    table.cell(dash, 2, 3, taiMomZ > 0 ? "▲ ACCEL" : "▼ DECEL", text_color=momCol, text_size=sz, text_halign=text.align_right)
+    table.cell(dash, 0, 4, "───", text_color=color.new(neutralColor, 60), text_size=szS)
+    table.cell(dash, 1, 4, "FOOTPRINT", text_color=color.new(neutralColor, 30), text_size=szS)
+    table.cell(dash, 2, 4, "───", text_color=color.new(neutralColor, 60), text_size=szS)
+    if not na(fpDelta)
+        table.cell(dash, 0, 5, "REAL DELTA", text_color=neutralColor, text_size=sz, text_halign=text.align_left)
+        table.cell(dash, 1, 5, f_str(fpDelta), text_color=fpDelta > 0 ? bullColor : bearColor, text_size=sz)
+        table.cell(dash, 2, 5, "B:" + f_str(fpBuy) + " S:" + f_str(fpSell), text_color=neutralColor, text_size=szS, text_halign=text.align_right)
+    else
+        table.cell(dash, 0, 5, "REAL DELTA", text_color=neutralColor, text_size=sz, text_halign=text.align_left)
+        table.cell(dash, 1, 5, "UNAVAILABLE", text_color=bearColor, text_size=szS)
+        table.cell(dash, 2, 5, "Check Data Feed", text_color=neutralColor, text_size=szS, text_halign=text.align_right)
+    table.cell(dash, 0, 6, "───", text_color=color.new(neutralColor, 60), text_size=szS)
+    table.cell(dash, 1, 6, "EVENTS", text_color=color.new(neutralColor, 30), text_size=szS)
+    table.cell(dash, 2, 6, "───", text_color=color.new(neutralColor, 60), text_size=szS)
+    table.cell(dash, 0, 7, "HFT", text_color=neutralColor, text_size=sz, text_halign=text.align_left)
+    table.cell(dash, 1, 7, isHFTActive ? "◆ ACTIVE" : "━", text_color=isHFTActive ? hftColor : neutralColor, text_size=sz)
+    table.cell(dash, 2, 7, f_str(hftZ)+"σ", text_color=isHFTActive ? hftColor : neutralColor, text_size=sz, text_halign=text.align_right)
+    table.cell(dash, 0, 8, "DIV", text_color=neutralColor, text_size=sz, text_halign=text.align_left)
+    table.cell(dash, 1, 8, bullDiv ? "🟢 BULL" : bearDiv ? "🔴 BEAR" : "━", text_color=bullDiv ? bullColor : bearDiv ? bearColor : neutralColor, text_size=sz)
+    table.cell(dash, 2, 8, f_str(divSmooth), text_color=neutralColor, text_size=sz, text_halign=text.align_right)
+    table.cell(dash, 0, 9, "───", text_color=color.new(neutralColor, 60), text_size=szS)
+    table.cell(dash, 1, 9, "INTEL", text_color=color.new(neutralColor, 30), text_size=szS)
+    table.cell(dash, 2, 9, "───", text_color=color.new(neutralColor, 60), text_size=szS)
+    secTxt = secretSignal ? (bullDiv ? "🔑 BUY LOADING" : "🔑 SELL LOADING") : "○ WATCHING"
+    secCol = secretSignal ? (bullDiv ? bullColor : bearColor) : neutralColor
+    table.cell(dash, 0, 10, "SEC", text_color=neutralColor, text_size=sz, text_halign=text.align_left)
+    table.cell(dash, 1, 10, secTxt, text_color=secCol, text_size=sz)
+    table.merge_cells(dash, 1, 10, 2, 10)
+    sigTxt = trigBuy ? "● BUY EXECUTE" : trigSell ? "● SELL EXECUTE" : "○ AWAITING"
+    sigCol = trigBuy ? bullColor : trigSell ? bearColor : neutralColor
+    table.cell(dash, 0, 11, "SIG", text_color=neutralColor, text_size=sz, text_halign=text.align_left)
+    table.cell(dash, 1, 11, sigTxt, text_color=sigCol, text_size=szS)
+    table.merge_cells(dash, 1, 11, 2, 11)
+// ═══════════════════════════════════════════════════════════════════════════════════════════════════════
+// 🔔 ALERTS 
+// ═══════════════════════════════════════════════════════════════════════════════════════════════════════
+alertcondition(buyerExh and not buyerExh[1], "Buyer Exhaustion", "Passive buyers exhausted - bounce likely")
+alertcondition(sellerExh and not sellerExh[1], "Seller Exhaustion", "Passive sellers exhausted - drop likely")
+alertcondition(isHFTActive and not isHFTActive[1], "HFT Activity Detected", "Unusual HFT footprint detected")
+alertcondition(bullDiv and not bullDiv[1], "Bullish Divergence", "TAI bullish divergence - reversal up likely")
+alertcondition(bearDiv and not bearDiv[1], "Bearish Divergence", "TAI bearish divergence - reversal down likely")
+alertcondition(secretSignal and not secretSignal[1], "🔑 THE SECRET", "HIGH CONVICTION REVERSAL: TAI diverging from price at extreme level")
+alertcondition(buyAbs and not buyAbs[1], "Buy Absorption", "Large buying being absorbed - accumulation")
+alertcondition(sellAbs and not sellAbs[1], "Sell Absorption", "Large selling being absorbed - distribution")
+alertcondition(fireLong, "TAI BUY", "TAI: BUY signal")
+alertcondition(fireShort, "TAI SELL", "TAI: SELL signal")

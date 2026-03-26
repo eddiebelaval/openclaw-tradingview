@@ -1,0 +1,470 @@
+//@version=6
+indicator('Gravity Reactor [by Oberlunar]', overlay = false, dynamic_requests = true, max_labels_count = 200, max_lines_count = 50, max_boxes_count = 20)
+
+//---------------------------------------------------------
+// INPUTS
+//---------------------------------------------------------
+groupCore = 'Core Engine'
+groupVol = 'Volume Engine'
+groupMTF = 'MTF Engine'
+groupViz = 'Visualization'
+
+src = input.source(ohlc4, 'Source', group = groupCore)
+maMode = input.string('Hull', 'MA Mode', options = ['EMA', 'SMA', 'Hull'], group = groupCore)
+lenFast = 21
+lenMid = 55
+lenSlow = 200
+atrLen = 14
+distWindow = input.int(150, 'Distance Stats Lookback', minval = 20, group = groupCore)
+stabilityLen = input.int(10, 'Path Stability Length', minval = 2, group = groupCore)
+cooldownBars = input.int(8, 'Signal Cooldown Bars', minval = 0, group = groupCore)
+signalThr = input.float(32.0, 'Engine Trigger', step = 1.0, group = groupCore)
+compressionMin = input.float(0.62, 'Compression Threshold', minval = 0.0, maxval = 1.0, step = 0.01, group = groupCore)
+stretchSoft = input.float(1.15, 'Soft Stretch (ATR)', minval = 0.2, step = 0.05, group = groupCore)
+stretchExtreme = input.float(2.10, 'Extreme Stretch (ATR)', minval = 0.5, step = 0.05, group = groupCore)
+
+volLen = input.int(34, 'Relative Volume Length', minval = 2, group = groupVol)
+absorbRV = input.float(1.50, 'Absorption RV Threshold', minval = 0.5, step = 0.05, group = groupVol)
+absorbLook = input.int(7, 'Absorption Swing Lookback', minval = 2, group = groupVol)
+
+useMTF = input.bool(true, 'Use Higher-Timeframe Vote', group = groupMTF)
+strictMTF = input.bool(true, 'Require Broad MTF Agreement', group = groupMTF)
+tf1 = input.timeframe('1', 'TF 1', group = groupMTF)
+tf2 = input.timeframe('2', 'TF 2', group = groupMTF)
+tf3 = input.timeframe('3', 'TF 3', group = groupMTF)
+tf4 = input.timeframe('5', 'TF 4', group = groupMTF)
+tf5 = input.timeframe('10', 'TF 5', group = groupMTF)
+
+showMAs = input.bool(false, 'Show MA Stack', group = groupViz)
+showBands = input.bool(true, 'Show Gravity Bands', group = groupViz)
+bandATR = input.float(1.25, 'Band Width (ATR)', minval = 0.1, step = 0.05, group = groupViz)
+showBarBias = input.bool(true, 'Color Bars by Engine Bias', group = groupViz)
+showSignals = input.bool(false, 'Show Signal Markers', group = groupViz)
+detailLabels = input.bool(false, 'Show Detailed Labels', group = groupViz)
+showAbsorp = input.bool(false, 'Show Absorption Markers', group = groupViz)
+showTable = input.bool(true, 'Show MTF Table', group = groupViz)
+
+//---------------------------------------------------------
+// UTILITIES
+//---------------------------------------------------------
+f_ma(_src, _len, _mode) =>
+    _mode == 'EMA' ? ta.ema(_src, _len) : _mode == 'SMA' ? ta.sma(_src, _len) : ta.hma(_src, _len)
+
+f_safe_div(_num, _den) =>
+    na(_num) or na(_den) or _den == 0 ? 0.0 : _num / _den
+
+f_clamp(_x, _lo, _hi) =>
+    math.max(_lo, math.min(_hi, _x))
+
+f_range01(_x, _len) =>
+    _hh = ta.highest(_x, _len)
+    _ll = ta.lowest(_x, _len)
+    _hh == _ll ? 0.5 : (_x - _ll) / (_hh - _ll)
+
+f_state(_a, _b, _c) =>
+    _a > _b and _b > _c ? 1 : _a < _b and _b < _c ? -1 : 0
+
+f_state_txt(_v) =>
+    _v > 0 ? 'BULL' : _v < 0 ? 'BEAR' : 'MIX'
+
+f_fmt(_v) =>
+    na(_v) ? 'n/a' : str.tostring(_v, '#.##')
+
+f_num_or_one(_s) =>
+    _n = str.tonumber(_s)
+    na(_n) ? 1.0 : _n
+
+f_tf_minutes(_tf) =>
+    _s = str.upper(str.replace_all(_tf, ' ', ''))
+    str.contains(_s, 'S') ? f_num_or_one(str.replace_all(_s, 'S', '')) / 60.0 :
+     str.contains(_s, 'H') ? f_num_or_one(str.replace_all(_s, 'H', '')) * 60.0 :
+     str.contains(_s, 'D') ? f_num_or_one(str.replace_all(_s, 'D', '')) * 1440.0 :
+     str.contains(_s, 'W') ? f_num_or_one(str.replace_all(_s, 'W', '')) * 10080.0 :
+     str.contains(_s, 'M') ? f_num_or_one(str.replace_all(_s, 'M', '')) * 43200.0 :
+     f_num_or_one(_s)
+
+f_heat(_v) =>
+    _a = 100 - int(math.min(math.abs(_v) * 90.0, 85.0))
+    _v > 0 ? color.new(color.aqua, _a) : _v < 0 ? color.new(color.rgb(255, 82, 157), _a) : color.new(color.white, 85)
+
+f_lane_pos(_laneBot, _v, _scale) =>
+    _laneBot + 0.5 + f_clamp(f_safe_div(_v, _scale), -1.0, 1.0) * 0.42
+
+f_lane_col(_v, _scale) =>
+    f_heat(f_clamp(f_safe_div(_v, _scale), -1.0, 1.0))
+
+f_tag(_id, _y, _txt, _bg) =>
+    if na(_id)
+        _id = label.new(bar_index + 1, _y, _txt, xloc = xloc.bar_index, yloc = yloc.price, style = label.style_label_left, color = _bg, textcolor = color.white, size = size.tiny)
+    else
+        label.set_xy(_id, bar_index + 1, _y)
+        label.set_text(_id, _txt)
+        label.set_color(_id, _bg)
+        label.set_textcolor(_id, color.white)
+    _id
+
+// Confirmed HTF pack
+f_tf_pack(_tf) =>
+    request.security(
+         syminfo.tickerid,
+         _tf,
+         [
+            close[1],
+            f_ma(close, lenFast, maMode)[1],
+            f_ma(close, lenMid, maMode)[1],
+            f_ma(close, lenSlow, maMode)[1],
+            ta.atr(atrLen)[1],
+            f_safe_div(volume[1], nz(ta.sma(volume, volLen)[1], volume[1])),
+            f_safe_div((close[1] - low[1]) - (high[1] - close[1]), math.max(high[1] - low[1], syminfo.mintick))
+         ],
+         lookahead = barmerge.lookahead_on
+     )
+
+f_tf_score(_c, _f, _m, _s, _atr, _rv, _clv) =>
+    _state = f_state(_f, _m, _s)
+    _pf = f_safe_div(_c - _f, _atr)
+    _fm = f_safe_div(_f - _m, _atr)
+    _ms = f_safe_div(_m - _s, _atr)
+    _dist = f_clamp((_pf * 0.40 + _fm * 0.35 + _ms * 0.25) / 2.0, -1.0, 1.0)
+    _vol = f_clamp(_clv * _rv / 2.0, -1.0, 1.0)
+    _state * 0.45 + _dist * 0.35 + _vol * 0.20
+
+//---------------------------------------------------------
+// LOCAL ENGINE
+//---------------------------------------------------------
+fast = f_ma(src, lenFast, maMode)
+mid = f_ma(src, lenMid, maMode)
+slow = f_ma(src, lenSlow, maMode)
+atr = ta.atr(atrLen)
+tr = math.max(high - low, syminfo.mintick)
+
+priceFast = f_safe_div(close - fast, atr)
+fastMid = f_safe_div(fast - mid, atr)
+midSlow = f_safe_div(mid - slow, atr)
+gravity = (fast * 2.0 + mid + slow) / 4.0
+gravityGap = f_safe_div(close - gravity, atr)
+
+stackState = f_state(fast, mid, slow)
+stackBias = f_clamp((priceFast * 0.45 + fastMid * 0.35 + midSlow * 0.20) / 2.0, -1.0, 1.0)
+stackBreadth = (math.abs(priceFast) + math.abs(fastMid) + math.abs(midSlow)) / 3.0
+
+compression = 1.0 - f_range01(stackBreadth, distWindow)
+stretchRank = f_range01(math.abs(gravityGap), distWindow)
+
+distanceVelocity = ta.ema(priceFast - priceFast[1], 3)
+distanceAccel = distanceVelocity - distanceVelocity[1]
+distancePhase = f_clamp(nz(distanceVelocity) * 2.2 + nz(distanceAccel) * 1.4, -1.0, 1.0)
+
+slopeBias = f_clamp(((fast - fast[1]) * 0.55 + (mid - mid[1]) * 0.30 + (slow - slow[1]) * 0.15) / atr * 4.0, -1.0, 1.0)
+
+pathStability = nz(math.sum(stackState == stackState[1] and stackState != 0 ? 1.0 : 0.0, stabilityLen) / stabilityLen)
+
+rv = f_safe_div(volume, ta.sma(volume, volLen))
+clv = f_safe_div((close - low) - (high - close), tr)
+bodyShare = f_safe_div(math.abs(close - open), tr)
+volPressure = clv * rv * (0.65 + bodyShare * 0.35)
+volBias = f_clamp(volPressure / 2.5, -1.0, 1.0)
+
+rangeResult = f_safe_div(tr, atr)
+efficiency = f_safe_div(rangeResult, math.max(rv, 0.10))
+effBias = stackState != 0 ? f_clamp((efficiency - 1.0) * stackState * 0.10, -0.10, 0.10) : 0.0
+
+absorptionBull = rv > absorbRV and clv > 0.15 and rangeResult < 0.90 and low <= ta.lowest(low, absorbLook)
+absorptionBear = rv > absorbRV and clv < -0.15 and rangeResult < 0.90 and high >= ta.highest(high, absorbLook)
+
+releaseLong = compression[1] > compressionMin and stackBreadth > stackBreadth[1] and stackBias > 0 and volPressure > 0
+releaseShort = compression[1] > compressionMin and stackBreadth > stackBreadth[1] and stackBias < 0 and volPressure < 0
+
+//---------------------------------------------------------
+// MTF ENGINE
+//---------------------------------------------------------
+[c1, f1, m1, s1, a1, rv1, clv1] = f_tf_pack(tf1)
+[c2, f2, m2, s2, a2, rv2, clv2] = f_tf_pack(tf2)
+[c3, f3, m3, s3, a3, rv3, clv3] = f_tf_pack(tf3)
+[c4, f4, m4, s4, a4, rv4, clv4] = f_tf_pack(tf4)
+[c5, f5, m5, s5, a5, rv5, clv5] = f_tf_pack(tf5)
+
+tfState1 = f_state(f1, m1, s1)
+tfState2 = f_state(f2, m2, s2)
+tfState3 = f_state(f3, m3, s3)
+tfState4 = f_state(f4, m4, s4)
+tfState5 = f_state(f5, m5, s5)
+
+tfDist1 = f_clamp((f_safe_div(c1 - f1, a1) * 0.40 + f_safe_div(f1 - m1, a1) * 0.35 + f_safe_div(m1 - s1, a1) * 0.25) / 2.0, -1.0, 1.0)
+tfDist2 = f_clamp((f_safe_div(c2 - f2, a2) * 0.40 + f_safe_div(f2 - m2, a2) * 0.35 + f_safe_div(m2 - s2, a2) * 0.25) / 2.0, -1.0, 1.0)
+tfDist3 = f_clamp((f_safe_div(c3 - f3, a3) * 0.40 + f_safe_div(f3 - m3, a3) * 0.35 + f_safe_div(m3 - s3, a3) * 0.25) / 2.0, -1.0, 1.0)
+tfDist4 = f_clamp((f_safe_div(c4 - f4, a4) * 0.40 + f_safe_div(f4 - m4, a4) * 0.35 + f_safe_div(m4 - s4, a4) * 0.25) / 2.0, -1.0, 1.0)
+tfDist5 = f_clamp((f_safe_div(c5 - f5, a5) * 0.40 + f_safe_div(f5 - m5, a5) * 0.35 + f_safe_div(m5 - s5, a5) * 0.25) / 2.0, -1.0, 1.0)
+
+tfVol1 = f_clamp(clv1 * rv1 / 2.0, -1.0, 1.0)
+tfVol2 = f_clamp(clv2 * rv2 / 2.0, -1.0, 1.0)
+tfVol3 = f_clamp(clv3 * rv3 / 2.0, -1.0, 1.0)
+tfVol4 = f_clamp(clv4 * rv4 / 2.0, -1.0, 1.0)
+tfVol5 = f_clamp(clv5 * rv5 / 2.0, -1.0, 1.0)
+
+tfScore1 = f_tf_score(c1, f1, m1, s1, a1, rv1, clv1)
+tfScore2 = f_tf_score(c2, f2, m2, s2, a2, rv2, clv2)
+tfScore3 = f_tf_score(c3, f3, m3, s3, a3, rv3, clv3)
+tfScore4 = f_tf_score(c4, f4, m4, s4, a4, rv4, clv4)
+tfScore5 = f_tf_score(c5, f5, m5, s5, a5, rv5, clv5)
+
+w1 = math.sqrt(math.max(f_tf_minutes(tf1), 1.0))
+w2 = math.sqrt(math.max(f_tf_minutes(tf2), 1.0))
+w3 = math.sqrt(math.max(f_tf_minutes(tf3), 1.0))
+w4 = math.sqrt(math.max(f_tf_minutes(tf4), 1.0))
+w5 = math.sqrt(math.max(f_tf_minutes(tf5), 1.0))
+
+mtfRaw = f_safe_div(tfScore1 * w1 + tfScore2 * w2 + tfScore3 * w3 + tfScore4 * w4 + tfScore5 * w5, w1 + w2 + w3 + w4 + w5)
+mtfComposite = useMTF ? f_clamp(mtfRaw, -1.0, 1.0) : 0.0
+
+bullVotes = (tfScore1 > 0 ? 1 : 0) + (tfScore2 > 0 ? 1 : 0) + (tfScore3 > 0 ? 1 : 0) + (tfScore4 > 0 ? 1 : 0) + (tfScore5 > 0 ? 1 : 0)
+bearVotes = (tfScore1 < 0 ? 1 : 0) + (tfScore2 < 0 ? 1 : 0) + (tfScore3 < 0 ? 1 : 0) + (tfScore4 < 0 ? 1 : 0) + (tfScore5 < 0 ? 1 : 0)
+
+strictBullOK = not useMTF or not strictMTF or bullVotes >= 4
+strictBearOK = not useMTF or not strictMTF or bearVotes >= 4
+
+//---------------------------------------------------------
+// GRAVITY LANE MATRIX
+//---------------------------------------------------------
+tfGravity1 = f_safe_div(c1 - (f1 * 2.0 + m1 + s1) / 4.0, a1)
+tfGravity2 = f_safe_div(c2 - (f2 * 2.0 + m2 + s2) / 4.0, a2)
+tfGravity3 = f_safe_div(c3 - (f3 * 2.0 + m3 + s3) / 4.0, a3)
+tfGravity4 = f_safe_div(c4 - (f4 * 2.0 + m4 + s4) / 4.0, a4)
+tfGravity5 = f_safe_div(c5 - (f5 * 2.0 + m5 + s5) / 4.0, a5)
+
+chartWeight = math.sqrt(math.max(timeframe.in_seconds() / 60.0, 1.0))
+gravityComposite = useMTF ? f_safe_div(gravityGap * chartWeight + tfGravity1 * w1 + tfGravity2 * w2 + tfGravity3 * w3 + tfGravity4 * w4 + tfGravity5 * w5, chartWeight + w1 + w2 + w3 + w4 + w5) : gravityGap
+laneScale = math.max(stretchExtreme, 1.0)
+
+comboCol = f_lane_col(gravityComposite, laneScale)
+localCol = f_lane_col(gravityGap, laneScale)
+tf1Col = f_lane_col(tfGravity1, laneScale)
+tf2Col = f_lane_col(tfGravity2, laneScale)
+tf3Col = f_lane_col(tfGravity3, laneScale)
+tf4Col = f_lane_col(tfGravity4, laneScale)
+tf5Col = f_lane_col(tfGravity5, laneScale)
+
+// lane separators
+hline(0, '', color = color.new(color.white, 90))
+hline(1, '', color = color.new(color.white, 90))
+hline(2, '', color = color.new(color.white, 90))
+hline(3, '', color = color.new(color.white, 90))
+hline(4, '', color = color.new(color.white, 90))
+hline(5, '', color = color.new(color.white, 90))
+hline(6, '', color = color.new(color.white, 90))
+hline(7, '', color = color.new(color.white, 90))
+
+// lane heatmap bodies - reduced plot budget
+plot(7.0, title = 'Gravity Combo Lane', color = comboCol, style = plot.style_columns, histbase = 6.0)
+plot(6.0, title = 'Gravity Local Lane', color = localCol, style = plot.style_columns, histbase = 5.0)
+plot(5.0, title = 'Gravity TF1 Lane', color = tf1Col, style = plot.style_columns, histbase = 4.0)
+plot(4.0, title = 'Gravity TF2 Lane', color = tf2Col, style = plot.style_columns, histbase = 3.0)
+plot(3.0, title = 'Gravity TF3 Lane', color = tf3Col, style = plot.style_columns, histbase = 2.0)
+plot(2.0, title = 'Gravity TF4 Lane', color = tf4Col, style = plot.style_columns, histbase = 1.0)
+plot(1.0, title = 'Gravity TF5 Lane', color = tf5Col, style = plot.style_columns, histbase = 0.0)
+// lane traces
+plot(f_lane_pos(6.0, gravityComposite, laneScale), 'Combo Trace', color = color.new(color.white, 0), linewidth = 3)
+plot(f_lane_pos(5.0, gravityGap, laneScale), 'Local Trace', color = color.new(color.white, 10), linewidth = 2)
+plot(f_lane_pos(4.0, tfGravity1, laneScale), 'TF1 Trace', color = color.new(color.white, 20), linewidth = 1)
+plot(f_lane_pos(3.0, tfGravity2, laneScale), 'TF2 Trace', color = color.new(color.white, 20), linewidth = 1)
+plot(f_lane_pos(2.0, tfGravity3, laneScale), 'TF3 Trace', color = color.new(color.white, 20), linewidth = 1)
+plot(f_lane_pos(1.0, tfGravity4, laneScale), 'TF4 Trace', color = color.new(color.white, 20), linewidth = 1)
+plot(f_lane_pos(0.0, tfGravity5, laneScale), 'TF5 Trace', color = color.new(color.white, 20), linewidth = 1)
+
+// right-side lane tags
+var label comboTag = na
+var label localTag = na
+var label tf1Tag = na
+var label tf2Tag = na
+var label tf3Tag = na
+var label tf4Tag = na
+var label tf5Tag = na
+
+if barstate.islast
+    comboTag := f_tag(comboTag, 6.5, 'COMBO  ' + f_fmt(gravityComposite), color.new(comboCol, 10))
+    localTag := f_tag(localTag, 5.5, 'LOCAL  ' + f_fmt(gravityGap), color.new(localCol, 10))
+    tf1Tag := f_tag(tf1Tag, 4.5, tf1 + '  ' + f_fmt(tfGravity1), color.new(tf1Col, 10))
+    tf2Tag := f_tag(tf2Tag, 3.5, tf2 + '  ' + f_fmt(tfGravity2), color.new(tf2Col, 10))
+    tf3Tag := f_tag(tf3Tag, 2.5, tf3 + '  ' + f_fmt(tfGravity3), color.new(tf3Col, 10))
+    tf4Tag := f_tag(tf4Tag, 1.5, tf4 + '  ' + f_fmt(tfGravity4), color.new(tf4Col, 10))
+    tf5Tag := f_tag(tf5Tag, 0.5, tf5 + '  ' + f_fmt(tfGravity5), color.new(tf5Col, 10))
+
+//---------------------------------------------------------
+// COMPOSITE PREDICTIVE ENGINE
+//---------------------------------------------------------
+releaseBias = releaseLong ? 0.10 : releaseShort ? -0.10 : 0.0
+snapBias = absorptionBull and gravityGap < -stretchExtreme ? 0.14 : absorptionBear and gravityGap > stretchExtreme ? -0.14 : 0.0
+
+localCore = stackBias * 0.28 + slopeBias * 0.20 + volBias * 0.16 + distancePhase * 0.12 + stackState * pathStability * 0.08 + effBias
+engineRaw = localCore + (useMTF ? mtfComposite * 0.20 : 0.0) + releaseBias + snapBias
+engineDir = engineRaw > 0 ? 1 : engineRaw < 0 ? -1 : 0
+
+stretchPenalty = engineDir > 0 ? f_clamp((gravityGap - stretchSoft) / math.max(stretchExtreme - stretchSoft, 0.10), 0.0, 1.0) : engineDir < 0 ? f_clamp((-gravityGap - stretchSoft) / math.max(stretchExtreme - stretchSoft, 0.10), 0.0, 1.0) : 0.0
+
+engineScore = 100.0 * f_clamp(engineRaw - engineDir * stretchPenalty * 0.22, -1.0, 1.0)
+
+//---------------------------------------------------------
+// SIGNALS
+//---------------------------------------------------------
+longThrust = engineScore > signalThr and releaseLong and stackState > 0 and slopeBias > 0 and (not useMTF or mtfComposite > 0.05) and strictBullOK
+shortThrust = engineScore < -signalThr and releaseShort and stackState < 0 and slopeBias < 0 and (not useMTF or mtfComposite < -0.05) and strictBearOK
+
+snapLong = absorptionBull and gravityGap < -stretchExtreme and engineScore > 5 and (not useMTF or mtfComposite > -0.15)
+snapShort = absorptionBear and gravityGap > stretchExtreme and engineScore < -5 and (not useMTF or mtfComposite < 0.15)
+
+var int lastLongBar = na
+var int lastShortBar = na
+
+longSignalRaw = longThrust or snapLong
+shortSignalRaw = shortThrust or snapShort
+
+longSignal = longSignalRaw and (na(lastLongBar) or bar_index - lastLongBar > cooldownBars)
+shortSignal = shortSignalRaw and (na(lastShortBar) or bar_index - lastShortBar > cooldownBars)
+
+if longSignal
+    lastLongBar := bar_index
+if shortSignal
+    lastShortBar := bar_index
+
+longFade = engineScore[1] > signalThr and engineScore < signalThr * 0.35 and gravityGap > stretchSoft
+shortFade = engineScore[1] < -signalThr and engineScore > -signalThr * 0.35 and gravityGap < -stretchSoft
+
+//---------------------------------------------------------
+// VISUALS ON MAIN CHART
+//---------------------------------------------------------
+upperBand = gravity + atr * bandATR
+lowerBand = gravity - atr * bandATR
+
+pFast = plot(showMAs ? fast : na, 'Fast MA', color = color.new(color.rgb(255, 82, 157), 100), linewidth = 2, force_overlay = true)
+pMid = plot(showMAs ? mid : na, 'Mid MA', color = color.new(color.orange, 100), linewidth = 3, force_overlay = true)
+pSlow = plot(showMAs ? slow : na, 'Slow MA', color = color.new(color.fuchsia, 100), linewidth = 4, force_overlay = true)
+
+pUpper = plot(showBands ? upperBand : na, 'Upper Gravity', color = color.new(color.aqua, 60), force_overlay = true)
+pGrav = plot(showBands ? gravity : na, 'Gravity', color = color.new(color.silver, 15), linewidth = 2, force_overlay = true)
+pLower = plot(showBands ? lowerBand : na, 'Lower Gravity', color = color.new(color.aqua, 60), force_overlay = true)
+
+fill(pUpper, pGrav, color = engineScore >= 0 ? color.new(color.aqua, 60) : color.new(color.white, 80))
+fill(pLower, pGrav, color = engineScore < 0 ? color.new(color.rgb(255, 82, 157), 60) : color.new(color.white, 80))
+
+fill(pFast, pMid, color = stackState > 0 ? color.new(color.aqua, 60) : stackState < 0 ? color.new(color.rgb(255, 82, 157), 60) : color.new(color.white, 60))
+fill(pMid, pSlow, color = stackState > 0 ? color.new(color.teal, 60) : stackState < 0 ? color.new(color.maroon, 60) : color.new(color.white, 60))
+
+barAlpha = 100 - int(math.min(math.abs(engineScore), 85.0))
+barcolor(showBarBias ? engineScore > 0 ? color.new(color.aqua, barAlpha) : engineScore < 0 ? color.new(color.rgb(255, 82, 157), barAlpha) : na : na)
+
+plotshape(showAbsorp and absorptionBull, title = 'Bull Absorption', style = shape.circle, size = size.tiny, color = color.new(color.aqua, 0), location = location.belowbar, text = 'AB', force_overlay = true)
+plotshape(showAbsorp and absorptionBear, title = 'Bear Absorption', style = shape.circle, size = size.tiny, color = color.new(color.rgb(255, 82, 157), 0), location = location.abovebar, text = 'AS', force_overlay = true)
+
+plotshape(showSignals and longThrust, title = 'Long Thrust', style = shape.triangleup, location = location.belowbar, size = size.small, color = color.new(color.aqua, 0), text = 'LT', force_overlay = true)
+plotshape(showSignals and shortThrust, title = 'Short Thrust', style = shape.triangledown, location = location.abovebar, size = size.small, color = color.new(color.rgb(255, 82, 157), 0), text = 'ST', force_overlay = true)
+plotshape(showSignals and snapLong, title = 'Long Snapback', style = shape.arrowup, location = location.belowbar, size = size.small, color = color.new(color.aqua, 0), text = 'LS', force_overlay = true)
+plotshape(showSignals and snapShort, title = 'Short Snapback', style = shape.arrowdown, location = location.abovebar, size = size.small, color = color.new(color.orange, 0), text = 'SS', force_overlay = true)
+plotshape(showSignals and longFade, title = 'Long Fade', style = shape.xcross, location = location.abovebar, size = size.tiny, color = color.new(color.yellow, 0), text = 'FX', force_overlay = true)
+plotshape(showSignals and shortFade, title = 'Short Fade', style = shape.xcross, location = location.belowbar, size = size.tiny, color = color.new(color.yellow, 0), text = 'FX', force_overlay = true)
+
+if detailLabels and longSignal
+    label.new(bar_index, low, (longThrust ? 'LONG THRUST' : 'LONG SNAPBACK') + '\nScore ' + str.tostring(engineScore, '#.0') + ' | G ' + str.tostring(gravityGap, '#.##') + '\nVol ' + str.tostring(volPressure, '#.##') + ' | MTF ' + str.tostring(mtfComposite * 100.0, '#'), yloc = yloc.belowbar, style = label.style_label_up, color = color.new(color.aqua, 78), textcolor = color.black, size = size.normal, force_overlay = true)
+
+if detailLabels and shortSignal
+    label.new(bar_index, high, (shortThrust ? 'SHORT THRUST' : 'SHORT SNAPBACK') + '\nScore ' + str.tostring(engineScore, '#.0') + ' | G ' + str.tostring(gravityGap, '#.##') + '\nVol ' + str.tostring(volPressure, '#.##') + ' | MTF ' + str.tostring(mtfComposite * 100.0, '#'), yloc = yloc.abovebar, style = label.style_label_down, color = color.new(shortThrust ? color.rgb(255, 82, 157) : color.orange, 78), textcolor = color.black, size = size.normal, force_overlay = true)
+
+//---------------------------------------------------------
+// DATA WINDOW
+//---------------------------------------------------------
+plot(engineScore, 'Engine Score', color = color.new(color.white, 100), display = display.data_window)
+plot(gravityGap, 'Gravity Gap ATR', color = color.new(color.white, 100), display = display.data_window)
+plot(gravityComposite, 'Gravity Composite ATR', color = color.new(color.white, 100), display = display.data_window)
+plot(stackBreadth, 'Stack Breadth', color = color.new(color.white, 100), display = display.data_window)
+plot(compression * 100.0, 'Compression %', color = color.new(color.white, 100), display = display.data_window)
+plot(stretchRank * 100.0, 'Stretch Rank %', color = color.new(color.white, 100), display = display.data_window)
+plot(volPressure, 'Volume Pressure', color = color.new(color.white, 100), display = display.data_window)
+plot(mtfComposite * 100.0, 'MTF Composite', color = color.new(color.white, 100), display = display.data_window)
+
+//---------------------------------------------------------
+// TABLE
+//---------------------------------------------------------
+var table dash = table.new(position.middle_right, 6, 9, bgcolor = color.new(color.black, 88), frame_color = color.new(color.white, 80), frame_width = 1)
+
+modelMode = longThrust ? 'THR+' : shortThrust ? 'THR-' : snapLong ? 'SNP+' : snapShort ? 'SNP-' : engineScore > signalThr ? 'BIAS+' : engineScore < -signalThr ? 'BIAS-' : 'NEUT'
+
+if barstate.islast
+    if showTable
+        headerBg = color.new(color.silver, 75)
+        brandBg = color.new(color.black, 55)
+
+        table.cell(dash, 0, 0, 'TF', bgcolor = headerBg, text_color = color.white)
+        table.cell(dash, 1, 0, 'Grav', bgcolor = headerBg, text_color = color.white)
+        table.cell(dash, 2, 0, 'State', bgcolor = headerBg, text_color = color.white)
+        table.cell(dash, 3, 0, 'Vol', bgcolor = headerBg, text_color = color.white)
+        table.cell(dash, 4, 0, 'Score', bgcolor = headerBg, text_color = color.white)
+        table.cell(dash, 5, 0, 'Meta', bgcolor = headerBg, text_color = color.white)
+
+        table.cell(dash, 0, 1, tf1, text_color = color.white)
+        table.cell(dash, 1, 1, f_fmt(tfGravity1), bgcolor = f_lane_col(tfGravity1, laneScale), text_color = color.black)
+        table.cell(dash, 2, 1, f_state_txt(tfState1), bgcolor = f_heat(tfState1), text_color = color.black)
+        table.cell(dash, 3, 1, f_fmt(tfVol1), bgcolor = f_heat(tfVol1), text_color = color.black)
+        table.cell(dash, 4, 1, f_fmt(tfScore1 * 100.0), bgcolor = f_heat(tfScore1), text_color = color.black)
+        table.cell(dash, 5, 1, 'rv ' + f_fmt(rv1), text_color = color.white)
+
+        table.cell(dash, 0, 2, tf2, text_color = color.white)
+        table.cell(dash, 1, 2, f_fmt(tfGravity2), bgcolor = f_lane_col(tfGravity2, laneScale), text_color = color.black)
+        table.cell(dash, 2, 2, f_state_txt(tfState2), bgcolor = f_heat(tfState2), text_color = color.black)
+        table.cell(dash, 3, 2, f_fmt(tfVol2), bgcolor = f_heat(tfVol2), text_color = color.black)
+        table.cell(dash, 4, 2, f_fmt(tfScore2 * 100.0), bgcolor = f_heat(tfScore2), text_color = color.black)
+        table.cell(dash, 5, 2, 'rv ' + f_fmt(rv2), text_color = color.white)
+
+        table.cell(dash, 0, 3, tf3, text_color = color.white)
+        table.cell(dash, 1, 3, f_fmt(tfGravity3), bgcolor = f_lane_col(tfGravity3, laneScale), text_color = color.black)
+        table.cell(dash, 2, 3, f_state_txt(tfState3), bgcolor = f_heat(tfState3), text_color = color.black)
+        table.cell(dash, 3, 3, f_fmt(tfVol3), bgcolor = f_heat(tfVol3), text_color = color.black)
+        table.cell(dash, 4, 3, f_fmt(tfScore3 * 100.0), bgcolor = f_heat(tfScore3), text_color = color.black)
+        table.cell(dash, 5, 3, 'rv ' + f_fmt(rv3), text_color = color.white)
+
+        table.cell(dash, 0, 4, tf4, text_color = color.white)
+        table.cell(dash, 1, 4, f_fmt(tfGravity4), bgcolor = f_lane_col(tfGravity4, laneScale), text_color = color.black)
+        table.cell(dash, 2, 4, f_state_txt(tfState4), bgcolor = f_heat(tfState4), text_color = color.black)
+        table.cell(dash, 3, 4, f_fmt(tfVol4), bgcolor = f_heat(tfVol4), text_color = color.black)
+        table.cell(dash, 4, 4, f_fmt(tfScore4 * 100.0), bgcolor = f_heat(tfScore4), text_color = color.black)
+        table.cell(dash, 5, 4, 'rv ' + f_fmt(rv4), text_color = color.white)
+
+        table.cell(dash, 0, 5, tf5, text_color = color.white)
+        table.cell(dash, 1, 5, f_fmt(tfGravity5), bgcolor = f_lane_col(tfGravity5, laneScale), text_color = color.black)
+        table.cell(dash, 2, 5, f_state_txt(tfState5), bgcolor = f_heat(tfState5), text_color = color.black)
+        table.cell(dash, 3, 5, f_fmt(tfVol5), bgcolor = f_heat(tfVol5), text_color = color.black)
+        table.cell(dash, 4, 5, f_fmt(tfScore5 * 100.0), bgcolor = f_heat(tfScore5), text_color = color.black)
+        table.cell(dash, 5, 5, 'rv ' + f_fmt(rv5), text_color = color.white)
+
+        table.cell(dash, 0, 6, 'LOCAL', text_color = color.white)
+        table.cell(dash, 1, 6, f_fmt(gravityGap), bgcolor = f_lane_col(gravityGap, laneScale), text_color = color.black)
+        table.cell(dash, 2, 6, f_state_txt(stackState), bgcolor = f_heat(stackState), text_color = color.black)
+        table.cell(dash, 3, 6, 'VP ' + f_fmt(volPressure), bgcolor = f_heat(volBias), text_color = color.black)
+        table.cell(dash, 4, 6, f_fmt(engineScore), bgcolor = f_heat(engineScore / 100.0), text_color = color.black)
+        table.cell(dash, 5, 6, 'Eff ' + f_fmt(efficiency), text_color = color.white)
+
+        table.cell(dash, 0, 7, 'COMBO', text_color = color.white)
+        table.cell(dash, 1, 7, f_fmt(gravityComposite), bgcolor = f_lane_col(gravityComposite, laneScale), text_color = color.black)
+        table.cell(dash, 2, 7, 'MTF ' + str.tostring(mtfComposite * 100.0, '#'), bgcolor = f_heat(mtfComposite), text_color = color.black)
+        table.cell(dash, 3, 7, 'Cmp ' + str.tostring(compression * 100.0, '#'), text_color = color.white)
+        table.cell(dash, 4, 7, modelMode, bgcolor = f_heat(engineScore / 100.0), text_color = color.black)
+        table.cell(dash, 5, 7, 'RV ' + f_fmt(rv), text_color = color.white)
+
+        table.cell(dash, 0, 8, 'Gravity', bgcolor = brandBg, text_color = color.white)
+        table.cell(dash, 1, 8, 'Reactor', bgcolor = brandBg, text_color = color.white)
+        table.cell(dash, 2, 8, 'Oberlunar', bgcolor = brandBg, text_color = color.white)
+        table.cell(dash, 3, 8, '◉✦', bgcolor = brandBg, text_color = color.aqua)
+        table.cell(dash, 4, 8, 'Thr ' + str.tostring(signalThr, '#'), bgcolor = brandBg, text_color = color.white)
+        table.cell(dash, 5, 8, 'G ' + f_fmt(gravityGap), bgcolor = brandBg, text_color = color.white)
+    else
+        for c = 0 to 5 by 1
+            for r = 0 to 8 by 1
+                table.cell(dash, c, r, '', bgcolor = color.new(color.black, 100))
+
+//---------------------------------------------------------
+// ALERTS
+//---------------------------------------------------------
+alertcondition(longThrust, 'Gravity Reactor Long Thrust', 'Gravity Reactor: long thrust')
+alertcondition(shortThrust, 'Gravity Reactor Short Thrust', 'Gravity Reactor: short thrust')
+alertcondition(snapLong, 'Gravity Reactor Long Snapback', 'Gravity Reactor: long snapback')
+alertcondition(snapShort, 'Gravity Reactor Short Snapback', 'Gravity Reactor: short snapback')
+alertcondition(longFade, 'Gravity Reactor Long Fade', 'Gravity Reactor: long fade')
+alertcondition(shortFade, 'Gravity Reactor Short Fade', 'Gravity Reactor: short fade')

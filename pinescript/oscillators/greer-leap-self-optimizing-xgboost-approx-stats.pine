@@ -1,0 +1,133 @@
+//@version=6
+//@fenyesk
+strategy("Self-Optimizing XGBoost Approx & Stats", overlay=true)
+
+// === INPUTS ===
+rsiLength       = input.int(14, "RSI Length")
+cciLength       = input.int(20, "CCI Length")
+atrLength       = input.int(14, "ATR Length")
+rocLength       = input.int(12, "ROC Length")
+wtEmaLength     = input.int(10, "WT EMA Length")
+wtChannelLength = input.int(21, "WT Channel Length")
+optWindow       = input.int(5, "Optimization Rolling Window (Auto-Weighting)", minval=2)
+useKalman       = input.bool(false, "Apply Kalman Filter")
+useRegime       = input.bool(true, "Apply Regime Filter")
+regimeEMA_len   = input.int(50, "Regime EMA Length (HTF)")
+regimeTF        = input.timeframe("D", "Regime Filter Timeframe")
+
+// === FEATURE CALCULATIONS ===
+rsiValue = ta.rsi(close, rsiLength)
+typicalPrice = (high + low + close) / 3
+smaTypical = ta.sma(typicalPrice, cciLength)
+meanDev = ta.sma(math.abs(typicalPrice - smaTypical), cciLength)
+cciValue = meanDev == 0 ? 0 : (typicalPrice - smaTypical) / (0.015 * meanDev)
+atrValue = ta.atr(atrLength)
+normAtr = atrValue / close * 100
+rocValue = ta.roc(close, rocLength)
+ap = (high + low + close) / 3
+esa = ta.ema(ap, wtEmaLength)
+d = ta.ema(math.abs(ap - esa), wtEmaLength)
+ci = (ap - esa) / (0.015 * d)
+wt1 = ta.ema(ci, wtChannelLength)
+
+// === FEATURE NORMALIZATION ===
+rsin = (rsiValue - 50) / 50
+ccin = math.max(math.min(cciValue, 200), -200) / 200
+atrn = math.min(normAtr / 5, 1) 
+rocn = math.max(math.min(rocValue, 5), -5) / 5
+wtn  = math.max(math.min(wt1, 60), -60) / 60
+
+// === AUTO-OPTIMIZATION LOGIC ===
+priceChange = close - close[1]
+calc_weight(feat, window) =>
+    corr = ta.correlation(feat, priceChange, window)
+    nz(corr, 0.2) 
+
+w_rsi = calc_weight(rsin, optWindow)
+w_cci = calc_weight(ccin, optWindow)
+w_atr = calc_weight(atrn, optWindow) * -1 
+w_roc = calc_weight(rocn, optWindow)
+w_wt  = calc_weight(wtn, optWindow)
+
+total_w = math.abs(w_rsi) + math.abs(w_cci) + math.abs(w_atr) + math.abs(w_roc) + math.abs(w_wt)
+composite = (w_rsi*rsin + w_cci*ccin + w_atr*atrn + w_roc*rocn + w_wt*wtn) / (total_w == 0 ? 1 : total_w)
+
+// === KALMAN FILTER ===
+var float kf_state = na
+var float kf_p = 1.0
+kalman_gain = 0.2
+kalman_noise = 0.01
+
+if barstate.isfirst
+    kf_state := composite
+else
+    kf_p := kf_p + kalman_noise
+    kalman_k = kf_p / (kf_p + kalman_gain)
+    kf_state := kf_state + kalman_k * (composite - kf_state)
+    kf_p := (1 - kalman_k) * kf_p
+
+kf_output = useKalman ? kf_state : composite
+
+// === REGIME FILTER ===
+regime_price = request.security(syminfo.tickerid, regimeTF, close, gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_on)
+regime_ema = ta.ema(regime_price, regimeEMA_len)
+in_regime = regime_price > regime_ema ? 1 : regime_price < regime_ema ? -1 : 0
+final_output = useRegime ? (in_regime == 1 ? math.max(kf_output, 0) : in_regime == -1 ? math.min(kf_output, 0) : 0) : kf_output
+
+// === STATE-CHANGE SIGNAL LOGIC ===
+var int current_pos = 0 // 1 for Long, -1 for Short
+bool longSignal  = false
+bool shortSignal = false
+
+if ta.crossover(final_output, 0) and current_pos <= 0
+    longSignal  := true
+    current_pos := 1
+else if ta.crossunder(final_output, 0) and current_pos >= 0
+    shortSignal := true
+    current_pos := -1
+
+// === STATISTICS TRACKING ===
+var float entry_price = 0.0
+var float total_profit = 0.0
+var int win_count = 0
+var int total_trades = 0
+
+if longSignal
+    if entry_price != 0 and current_pos[1] == -1
+        pnl = entry_price - close
+        total_profit += pnl
+        if pnl > 0
+            win_count += 1
+    entry_price := close
+    total_trades += 1
+    strategy.entry("Trade", strategy.long)
+
+if shortSignal
+    if entry_price != 0 and current_pos[1] == 1
+        pnl = close - entry_price
+        total_profit += pnl
+        if pnl > 0
+            win_count += 1
+    entry_price := close
+    total_trades += 1
+    strategy.close("Trade")
+
+win_rate = total_trades > 0 ? (win_count / total_trades) * 100 : 0
+
+// === STATISTICS PANE ===
+var table stats_table = table.new(position.bottom_right, 2, 4, bgcolor=color.new(color.black, 70), border_width=1, border_color=color.gray)
+if barstate.islast
+    table.cell(stats_table, 0, 0, "Strategy Stats", text_color=color.white, text_halign=text.align_left)
+    table.cell(stats_table, 0, 1, "Net Profit:", text_color=color.white, text_halign=text.align_left)
+    table.cell(stats_table, 1, 1, str.tostring(total_profit, "#.##"), text_color=total_profit >= 0 ? color.green : color.red)
+    table.cell(stats_table, 0, 2, "Win Rate:", text_color=color.white, text_halign=text.align_left)
+    table.cell(stats_table, 1, 2, str.tostring(win_rate, "#.##") + "%", text_color=win_rate >= 50 ? color.green : color.yellow)
+    table.cell(stats_table, 0, 3, "Total Trades:", text_color=color.white, text_halign=text.align_left)
+    table.cell(stats_table, 1, 3, str.tostring(total_trades), text_color=color.white)
+
+// === VISUALS & ALERTS ===
+plotshape(longSignal, "Long Signal", location=location.belowbar, color=color.green, style=shape.triangleup, size=size.small, text="LONG", textcolor=color.white)
+plotshape(shortSignal, "Short Signal", location=location.abovebar, color=color.red, style=shape.triangledown, size=size.small, text="SHORT", textcolor=color.white)
+
+alertcondition(longSignal, "Trend Flip: LONG", "Direction changed to LONG")
+alertcondition(shortSignal, "Trend Flip: SHORT", "Direction changed to SHORT")

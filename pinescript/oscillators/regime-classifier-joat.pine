@@ -1,0 +1,319 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © officialjackofalltrades
+//@version=6
+indicator("Regime Classifier [JOAT]", shorttitle="RC [JOAT]", overlay=false, max_bars_back=500)
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// REGIME CLASSIFIER
+// Quantitative Trading Systems - Market State Detection Engine
+// Purpose: Classify market into distinct operational regimes for adaptive trading
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+//───────────────────────────────────────────────────────────────────────────────
+// CONFIGURATION
+//───────────────────────────────────────────────────────────────────────────────
+
+g_regime = "═══════════ Regime Detection ═══════════"
+int     i_adx_len       = input.int(14, "Trend Strength Period", minval=5, maxval=50, group=g_regime)
+int     i_atr_len       = input.int(14, "Volatility Period", minval=5, maxval=50, group=g_regime)
+int     i_regime_smooth = input.int(3, "Regime Smoothing", minval=1, maxval=10, group=g_regime)
+float   i_trend_thresh  = input.float(25.0, "Trend Threshold", minval=10.0, maxval=50.0, step=1.0, group=g_regime)
+float   i_vol_exp_mult  = input.float(1.3, "Volatility Expansion Mult", minval=1.1, maxval=2.0, step=0.1, group=g_regime)
+float   i_vol_con_mult  = input.float(0.7, "Volatility Contraction Mult", minval=0.3, maxval=0.9, step=0.1, group=g_regime)
+
+g_session = "═══════════ Session Awareness ═══════════"
+bool    i_use_session   = input.bool(true, "Enable Session Filter", group=g_session)
+string  i_timezone      = input.string("America/New_York", "Timezone", options=["America/New_York", "Europe/London", "Asia/Tokyo", "UTC"], group=g_session)
+
+g_visual = "═══════════ Visual Settings ═══════════"
+color   i_trend_col     = input.color(color.new(#00e676, 0), "Trending Color", group=g_visual)
+color   i_trend_glow    = input.color(color.new(#69f0ae, 0), "Trend Glow", group=g_visual)
+color   i_range_col     = input.color(color.new(#7c4dff, 0), "Ranging Color", group=g_visual)
+color   i_range_glow    = input.color(color.new(#b388ff, 0), "Range Glow", group=g_visual)
+color   i_volatile_col  = input.color(color.new(#ff1744, 0), "Volatile Color", group=g_visual)
+color   i_volatile_glow = input.color(color.new(#ff8a80, 0), "Volatile Glow", group=g_visual)
+color   i_neutral_col   = input.color(color.new(#546e7a, 0), "Neutral Color", group=g_visual)
+bool    i_show_dash     = input.bool(true, "Show Dashboard", group=g_visual)
+bool    i_show_glow     = input.bool(true, "Enable Glow Effects", group=g_visual)
+
+//───────────────────────────────────────────────────────────────────────────────
+// CORE CALCULATIONS
+//───────────────────────────────────────────────────────────────────────────────
+
+// Directional Movement Calculation
+f_dm_calc(int len) =>
+    float tr_val = ta.tr(true)
+    float plus_dm = math.max(high - high[1], 0)
+    float minus_dm = math.max(low[1] - low, 0)
+    
+    if plus_dm > minus_dm
+        minus_dm := 0
+    else
+        plus_dm := 0
+    
+    float smooth_tr = ta.rma(tr_val, len)
+    float smooth_plus = ta.rma(plus_dm, len)
+    float smooth_minus = ta.rma(minus_dm, len)
+    
+    float plus_di = smooth_tr > 0 ? 100 * smooth_plus / smooth_tr : 0
+    float minus_di = smooth_tr > 0 ? 100 * smooth_minus / smooth_tr : 0
+    float di_sum = plus_di + minus_di
+    float dx = di_sum > 0 ? 100 * math.abs(plus_di - minus_di) / di_sum : 0
+    float adx_val = ta.rma(dx, len)
+    
+    [adx_val, plus_di, minus_di]
+
+// Volatility Regime Calculation
+f_vol_regime(int len, float exp_mult, float con_mult) =>
+    float atr_val = ta.atr(len)
+    float atr_ma = ta.sma(atr_val, len * 3)
+    float vol_ratio = atr_ma > 0 ? atr_val / atr_ma : 1.0
+    
+    int vol_state = 0
+    if vol_ratio > exp_mult
+        vol_state := 1   // Expansion
+    else if vol_ratio < con_mult
+        vol_state := -1  // Contraction
+    
+    [vol_ratio, vol_state]
+
+// Trend Direction Calculation
+f_trend_direction(int len) =>
+    float fast_ma = ta.ema(close, len)
+    float slow_ma = ta.ema(close, len * 2)
+    float ma_diff = fast_ma - slow_ma
+    float ma_slope = fast_ma - fast_ma[len]
+    
+    int direction = 0
+    if ma_diff > 0 and ma_slope > 0
+        direction := 1   // Bullish
+    else if ma_diff < 0 and ma_slope < 0
+        direction := -1  // Bearish
+    
+    [direction, ma_slope]
+
+// Session Detection
+f_get_session() =>
+    int hour_now = hour(time, i_timezone)
+    int session_type = 0  // 0=off-hours, 1=asian, 2=london, 3=newyork, 4=overlap
+    
+    if hour_now >= 19 or hour_now < 4
+        session_type := 1  // Asian
+    else if hour_now >= 3 and hour_now < 8
+        session_type := 2  // London early
+    else if hour_now >= 8 and hour_now < 9
+        session_type := 4  // Overlap
+    else if hour_now >= 9 and hour_now < 16
+        session_type := 3  // NY
+    else
+        session_type := 0  // Off hours
+    
+    session_type
+
+// Regime Persistence Score - tracks how long current regime has persisted
+var int regime_persist_count = 0
+f_regime_persistence(int current_regime, int prev_regime, int lookback) =>
+    var int persist = 0
+    if current_regime == prev_regime
+        persist := math.min(persist + 1, lookback)
+    else
+        persist := 0
+    float(persist) / float(lookback) * 100
+
+//───────────────────────────────────────────────────────────────────────────────
+// REGIME CLASSIFICATION ENGINE
+//───────────────────────────────────────────────────────────────────────────────
+
+// Calculate components
+[adx, plus_di, minus_di] = f_dm_calc(i_adx_len)
+[vol_ratio, vol_state] = f_vol_regime(i_atr_len, i_vol_exp_mult, i_vol_con_mult)
+[trend_dir, trend_slope] = f_trend_direction(i_adx_len)
+
+// Regime Classification
+// 0 = Neutral, 1 = Trending, 2 = Ranging, 3 = Volatile
+var int raw_regime = 0
+
+if vol_state == 1 and adx < i_trend_thresh
+    raw_regime := 3  // Volatile (high vol, no trend)
+else if adx >= i_trend_thresh
+    raw_regime := 1  // Trending
+else if vol_state == -1 and adx < i_trend_thresh
+    raw_regime := 2  // Ranging (low vol, no trend)
+else
+    raw_regime := 0  // Neutral
+
+// Smooth regime transitions
+var int regime_counter = 0
+var int confirmed_regime = 0
+
+if raw_regime == raw_regime[1]
+    regime_counter := math.min(regime_counter + 1, i_regime_smooth)
+else
+    regime_counter := 0
+
+if regime_counter >= i_regime_smooth
+    confirmed_regime := raw_regime
+
+// Regime strength (0-100)
+float regime_strength = 0.0
+if confirmed_regime == 1
+    regime_strength := math.min(adx / 50.0 * 100, 100)
+else if confirmed_regime == 2
+    regime_strength := math.min((1 - vol_ratio) * 100, 100)
+else if confirmed_regime == 3
+    regime_strength := math.min(vol_ratio * 50, 100)
+else
+    regime_strength := 50.0
+
+// Session detection
+int current_session = i_use_session ? f_get_session() : 0
+
+// Regime persistence
+float persistence = f_regime_persistence(confirmed_regime, nz(confirmed_regime[1]), 20)
+
+// Regime quality score (combines strength + persistence + session)
+float session_mult = current_session == 4 ? 1.2 : current_session >= 2 ? 1.0 : 0.8
+float regime_quality = math.min((regime_strength * 0.5 + persistence * 0.5) * session_mult, 100)
+
+// Regime transition momentum
+float regime_momentum = ta.change(regime_strength, 5)
+
+//───────────────────────────────────────────────────────────────────────────────
+// OUTPUT SERIES
+//───────────────────────────────────────────────────────────────────────────────
+
+// Normalized outputs for external consumption
+float regime_trend = confirmed_regime == 1 ? regime_strength : 0
+float regime_range = confirmed_regime == 2 ? regime_strength : 0
+float regime_volatile = confirmed_regime == 3 ? regime_strength : 0
+float regime_bias = trend_dir * (adx / 100)
+
+//───────────────────────────────────────────────────────────────────────────────
+// VISUALIZATION
+//───────────────────────────────────────────────────────────────────────────────
+
+// Dynamic color with intensity based on strength
+f_blend_color(color base, color glow, float intensity) =>
+    int transp = math.round(100 - intensity)
+    color.new(base, math.max(transp - 20, 0))
+
+// Regime colors with glow
+color regime_color = switch confirmed_regime
+    1 => i_trend_col
+    2 => i_range_col
+    3 => i_volatile_col
+    => i_neutral_col
+
+color regime_glow = switch confirmed_regime
+    1 => i_trend_glow
+    2 => i_range_glow
+    3 => i_volatile_glow
+    => i_neutral_col
+
+// Intensity-adjusted colors
+color intensity_color = f_blend_color(regime_color, regime_glow, regime_strength)
+color glow_color = i_show_glow ? color.new(regime_glow, math.round(100 - regime_strength * 0.6)) : na
+
+// Main regime plot with glow effect
+plot(confirmed_regime + 0.3, "Regime Glow", color=glow_color, style=plot.style_columns, linewidth=6)
+plot(confirmed_regime, "Regime State", color=intensity_color, style=plot.style_columns, linewidth=4)
+
+// Reference lines
+hline(0, "Zero", color=color.new(#37474f, 50), linestyle=hline.style_dotted)
+hline(1, "Trend Level", color=color.new(i_trend_col, 70), linestyle=hline.style_dotted)
+hline(2, "Range Level", color=color.new(i_range_col, 70), linestyle=hline.style_dotted)
+hline(3, "Volatile Level", color=color.new(i_volatile_col, 70), linestyle=hline.style_dotted)
+
+// ADX with gradient based on strength
+color adx_color = adx >= i_trend_thresh ? color.new(#ffab00, 20) : color.new(#ffab00, 70)
+plot(adx / 25, "ADX Scaled", color=adx_color, style=plot.style_line, linewidth=1)
+
+// Regime quality ribbon
+plot(regime_quality / 33, "Quality Ribbon", color=color.new(#00bcd4, 60), style=plot.style_area)
+
+// Background fill with gradient based on regime strength
+color bg_color = switch confirmed_regime
+    1 => color.new(i_trend_col, math.round(98 - regime_strength * 0.1))
+    2 => color.new(i_range_col, math.round(98 - regime_strength * 0.1))
+    3 => color.new(i_volatile_col, math.round(95 - regime_strength * 0.15))
+    => na
+bgcolor(bg_color)
+
+// Session indicator at bottom
+color session_color = switch current_session
+    1 => color.new(#ffeb3b, 70)  // Asian - yellow
+    2 => color.new(#2196f3, 70)  // London - blue
+    3 => color.new(#4caf50, 70)  // NY - green
+    4 => color.new(#ff9800, 50)  // Overlap - orange
+    => color.new(#616161, 90)    // Off hours
+plotshape(i_use_session, "Session", shape.square, location.bottom, session_color, size=size.tiny)
+
+//───────────────────────────────────────────────────────────────────────────────
+// DASHBOARD
+//───────────────────────────────────────────────────────────────────────────────
+
+if i_show_dash and barstate.islast
+    var table dash = table.new(position.top_right, 2, 8, bgcolor=color.new(#0d1117, 5), border_width=1, border_color=color.new(#30363d, 40))
+    
+    string regime_text = switch confirmed_regime
+        1 => "TRENDING"
+        2 => "RANGING"
+        3 => "VOLATILE"
+        => "NEUTRAL"
+    
+    string bias_text = trend_dir == 1 ? "BULLISH" : trend_dir == -1 ? "BEARISH" : "NEUTRAL"
+    color bias_color = trend_dir == 1 ? i_trend_col : trend_dir == -1 ? i_volatile_col : i_neutral_col
+    
+    table.cell(dash, 0, 0, "REGIME", text_color=color.new(#b2b5be, 0), text_size=size.small)
+    table.cell(dash, 1, 0, regime_text, text_color=regime_color, text_size=size.small)
+    
+    table.cell(dash, 0, 1, "BIAS", text_color=color.new(#b2b5be, 0), text_size=size.small)
+    table.cell(dash, 1, 1, bias_text, text_color=bias_color, text_size=size.small)
+    
+    table.cell(dash, 0, 2, "ADX", text_color=color.new(#b2b5be, 0), text_size=size.small)
+    table.cell(dash, 1, 2, str.tostring(adx, "#.#"), text_color=color.new(#ffa726, 0), text_size=size.small)
+    
+    table.cell(dash, 0, 3, "VOL RATIO", text_color=color.new(#b2b5be, 0), text_size=size.small)
+    table.cell(dash, 1, 3, str.tostring(vol_ratio, "#.##"), text_color=color.new(#42a5f5, 0), text_size=size.small)
+    
+    table.cell(dash, 0, 4, "STRENGTH", text_color=color.new(#b2b5be, 0), text_size=size.small)
+    table.cell(dash, 1, 4, str.tostring(regime_strength, "#") + "%", text_color=regime_color, text_size=size.small)
+    
+    // Additional metrics
+    string session_text = switch current_session
+        1 => "ASIAN"
+        2 => "LONDON"
+        3 => "NEW YORK"
+        4 => "OVERLAP"
+        => "OFF-HOURS"
+    
+    table.cell(dash, 0, 5, "SESSION", text_color=color.new(#b2b5be, 0), text_size=size.small)
+    table.cell(dash, 1, 5, session_text, text_color=session_color, text_size=size.small)
+    
+    table.cell(dash, 0, 6, "QUALITY", text_color=color.new(#b2b5be, 0), text_size=size.small)
+    table.cell(dash, 1, 6, str.tostring(regime_quality, "#") + "%", text_color=color.new(#00bcd4, 0), text_size=size.small)
+    
+    table.cell(dash, 0, 7, "PERSIST", text_color=color.new(#b2b5be, 0), text_size=size.small)
+    table.cell(dash, 1, 7, str.tostring(persistence, "#") + "%", text_color=color.new(#9c27b0, 0), text_size=size.small)
+
+//───────────────────────────────────────────────────────────────────────────────
+// ALERTS
+//───────────────────────────────────────────────────────────────────────────────
+
+alertcondition(ta.change(confirmed_regime) != 0, "Regime Change", "Market regime changed")
+alertcondition(confirmed_regime == 1 and confirmed_regime[1] != 1, "Trend Regime Start", "Market entered trending regime")
+alertcondition(confirmed_regime == 2 and confirmed_regime[1] != 2, "Range Regime Start", "Market entered ranging regime")
+alertcondition(confirmed_regime == 3 and confirmed_regime[1] != 3, "Volatile Regime Start", "Market entered volatile regime")
+
+//───────────────────────────────────────────────────────────────────────────────
+// EXPORT PLOTS (for strategy integration)
+//───────────────────────────────────────────────────────────────────────────────
+
+plot(regime_bias, "Regime Bias Export", display=display.none)
+plot(regime_strength, "Regime Strength Export", display=display.none)
+plot(float(confirmed_regime), "Regime State Export", display=display.none)
+plot(vol_ratio, "Volatility Ratio Export", display=display.none)
+plot(regime_quality, "Regime Quality Export", display=display.none)
+plot(persistence, "Persistence Export", display=display.none)
+plot(float(current_session), "Session Export", display=display.none)
+plot(regime_momentum, "Regime Momentum Export", display=display.none)

@@ -1,0 +1,1158 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © KodiakMarket
+// Indicator uses interplay of RSI, EMAs, MACD, and Stochastic Oscillation to color the trading environment
+// and predict future movement based on recent movements. Allows for interactions with VWAP and Bollinger Bands
+// to evaluate tradinging environments. Allows for display of distance to Bollinger Bands to better time entries
+// internal v0.8.3
+
+//@version=6
+indicator("REMS 'Fugue State' Enhanced Candles", shorttitle = "REMS Fugue State", overlay=true)
+
+//====================================================
+//================== GLOBAL INPUTS ====================
+//====================================================
+
+groupCore = "Evaluation and Color"
+
+// Timeframe
+tfInput = input.timeframe("", "Evaluation Timeframe", group=groupCore)
+
+// Evaluation Point
+evalPoint = input.string(
+    "Close",
+    "Evaluation Point",
+    options=["Live", "Close", "High", "Low", "Extreme"],
+    group=groupCore
+)
+
+// Candle Coloring
+colorMode = input.string(
+    "Absolute",
+    "Color Trigger",
+    options=["Absolute", "Directional"],
+    group=groupCore,
+    tooltip = "Absolute: All candles will fill unless true neutral. Directional: Candles will only fill if aggregate matches candle output."
+)
+
+// Direction Filter (visual only)
+directionFilter = input.string(
+    "None",
+    "Direction Filter",
+    options=["None", "Bullish", "Bearish"],
+    group=groupCore,
+    tooltip = "If selected, will only fill candles favoring selected direction."
+)
+
+// Aggregation Mode
+aggregationMode = input.string(
+    "Strict Consensus",
+    "Aggregation Mode",
+    options=["Strict Consensus", "Directional Tolerance"],
+    group="Aggregate State",
+    tooltip = "Strict: All observed components MUST agree. Directional: Components that are neutral (neither agree nor disagree) will not prevent a state."
+)
+
+// Neutral candle color (hollow)
+neutralColor = color.new(color.gray, 85)
+
+//====================================================
+//================ EVALUATION SOURCE ==================
+//====================================================
+
+// Stable base price for indicator calculation
+basePrice = close  // always compute RSI / EMA on stable price
+
+// Evaluation gate: Live vs confirmed
+evalGate = evalPoint == "Live" ? true : barstate.isconfirmed
+
+//====================================================
+//===================== OBSERVATION & Tooltips  ===========================
+//====================================================
+
+observeTooltip = "*CONFIRM*\n" + "Evaluates current directional requirements.\n\n" + "*IGNORE*\n" + "Indicator is not evaluated.\n\n" + "*INFER*\n" + "Indicator contributes contextual bias and momentum information.\n\n" + "*DEFER*\n" + "Temporarily withholds participation when the indicator is within the deadzone and recent movement lacks sufficient momentum. Defer does not generate signals and does not override others — it only suppresses noise during compression.\n\n"
+momentumTooltip = "*Momentum Threshold*\n" + "Minimum average movement required to validate inferred direction or escape defer suppression.\n\n" + "•Infer: Required to project a directional bias.\n" + "•Defer: Required to prevent neutralization when near the deadzone.\n\n" + "Set to 0 to rely on the deadzone alone."
+lookbackTooltip = "*Lookback Bars*\n" + "Number of past bars used to evaluate recent movement.\n\n" + "•Confirm: Not used — only the current value is assessed.\n" + "•Infer: Determines the average directional change used to project forward.\n" + "•Defer: Measures recent movement strength to determine whether signals should be temporarily neutralized during compression or indecision."
+lookaheadTooltip = "*Lookahead Bars*\n" + "Forward evaluation window used to assess momentum continuation.\n\n" + "•Confirm: Not used.\n" + "•Infer: Projects where the indicator could be in the near future based on recent movement.\n" + "•Defer: Extends recent movement to determine whether momentum is sufficient to escape the deadzone; otherwise suppresses signals.\n\n" + "Less Bars means future move must happen sooner"
+
+groupOBS = "Observation Protocal"
+
+rsiObserve = input.string( "Confirm", "RSI Observation Mode",
+    options=["Confirm", "Infer", "Defer", "Ignore"],
+    tooltip = observeTooltip,
+    group=groupOBS)
+
+emaObserve = input.string(
+    "Confirm",
+    "EMA Observation Mode",
+    options=["Confirm", "Infer", "Defer", "Ignore"],
+    group=groupOBS
+)
+
+macdObserve = input.string(
+    "Confirm",
+    "MACD Observation Mode",
+    options=["Confirm", "Infer", "Defer", "Ignore"],
+    group=groupOBS
+)
+
+stochObsMode = input.string(
+    "Confirm",
+    "Stochastic Observation Mode",
+    options = ["Confirm", "Ignore"],
+    tooltip = "Stochastic does not have an infer state due to phase element nature.",
+    group=groupOBS
+)
+
+//====================================================
+//===================== RSI ===========================
+//====================================================
+
+groupRSI = "RSI INPUTS"
+groupRSIQ = "RSI QUALIFIERS"
+
+rsiMode = input.string(
+    "RSI vs 50",
+    "RSI Reference Mode",
+    options=["RSI vs 50", "RSI vs SMA"],
+    group=groupRSI
+)
+
+rsiLength    = input.int(14, "RSI Length", group=groupRSI)
+rsiSmaLength = input.int(20, "RSI SMA Length", group=groupRSI)
+
+rsiLookback  = input.int(3, "Lookback Bars", minval=1, group=groupRSIQ, tooltip = lookbackTooltip)
+rsiLookahead = input.int(3, "Lookahead Bars", minval=1, group=groupRSIQ, tooltip = lookaheadTooltip)
+rsiDeadzone  = input.float(0.0, "Deadzone", group=groupRSIQ, step=0.1, tooltip = "Proximity between RSI and MA/50-line used to reduce noise or false signals.")
+rsiThreshold = input.float(0.0, "Momentum Threshold", group=groupRSIQ, step=0.1, tooltip = "Magnitude of average change to be considered a valid signal. *Only affects 'Infer' signals.")
+
+var bool rsiBullHit = false
+var bool rsiBearHit = false
+
+// RSI calculation (TV default)
+rsiVal = request.security(syminfo.tickerid, tfInput == "" ? timeframe.period : tfInput,
+     ta.rsi(basePrice, rsiLength))
+
+rsiMA = ta.sma(rsiVal, rsiSmaLength)
+
+// --- compute RSI base normally ---
+rsiStateRaw = rsiMode == "RSI vs SMA" ? (rsiVal - rsiMA) : (rsiVal - 50)
+rsiStateBase = math.abs(rsiStateRaw) < rsiDeadzone ? 0.0 : rsiStateRaw
+
+// --- inference ---
+rsiSlope = (rsiStateBase - rsiStateBase[rsiLookback]) / rsiLookback
+rsiProjected = rsiStateBase + rsiSlope * rsiLookahead
+
+rsiSlopeValid     = math.abs(rsiSlope) >= rsiThreshold
+rsiProjectedValid = math.abs(rsiProjected) >= rsiDeadzone
+
+// ===== RSI Deferrence Block =====
+rsiDeferBlock = rsiObserve == "Defer" and math.abs(rsiStateBase) < rsiDeadzone and (rsiThreshold == 0 ? true : math.abs(rsiSlope * rsiLookahead) < rsiThreshold)
+rsiCloseState = rsiObserve == "Ignore" ? 0 : rsiObserve == "Defer"  ? 0 :  rsiObserve == "Confirm" ? math.sign(rsiStateBase) :  (rsiSlopeValid and rsiProjectedValid) ? math.sign(rsiProjected) : 0
+
+//////////////////////////////////////////
+// --- RSI High/Low/Extreme evaluation ---
+/////////////////////////////////////////
+
+// Compute RSI state at High
+rsiHighRaw = rsiMode == "RSI vs SMA" ? (ta.rsi(high, rsiLength) - rsiMA) : (ta.rsi(high, rsiLength) - 50)
+rsiHighBase = math.abs(rsiHighRaw) < rsiDeadzone ? 0.0 : rsiHighRaw
+rsiHighSlope = (rsiHighBase - rsiHighBase[rsiLookback]) / rsiLookback
+rsiHighProj = rsiHighBase + rsiHighSlope * rsiLookahead
+
+rsiHighSlopeValid     = math.abs(rsiHighSlope) >= rsiThreshold
+rsiHighProjectedValid = math.abs(rsiHighProj) >= rsiDeadzone
+
+rsiHighState = rsiObserve == "Ignore" ? 0 :  rsiObserve == "Defer"  ? 0 :  rsiObserve == "Confirm" ? math.sign(rsiHighBase) :  (rsiHighSlopeValid and rsiHighProjectedValid) ? math.sign(rsiHighProj) : 0
+
+// Compute RSI state at Low
+rsiLowRaw = rsiMode == "RSI vs SMA" ? (ta.rsi(low, rsiLength) - rsiMA) : (ta.rsi(low, rsiLength) - 50)
+rsiLowBase = math.abs(rsiLowRaw) < rsiDeadzone ? 0.0 : rsiLowRaw
+rsiLowSlope = (rsiLowBase - rsiLowBase[rsiLookback]) / rsiLookback
+rsiLowProj = rsiLowBase + rsiLowSlope * rsiLookahead
+
+rsiLowSlopeValid     = math.abs(rsiLowSlope) >= rsiThreshold
+rsiLowProjectedValid = math.abs(rsiLowProj) >= rsiDeadzone
+
+rsiLowState = rsiObserve == "Ignore" ? 0 : rsiObserve == "Defer"  ? 0 : rsiObserve == "Confirm" ? math.sign(rsiLowBase) : (rsiLowSlopeValid and rsiLowProjectedValid) ? math.sign(rsiLowProj) : 0
+
+// Declare first
+var float rsiFinalState = 0.0  
+
+// Then assign based on evalPoint
+if evalPoint == "High"
+    rsiFinalState := rsiHighState
+else if evalPoint == "Low"
+    rsiFinalState := rsiLowState
+else if evalPoint == "Extreme"
+    if rsiHighState > 0 or rsiLowState > 0
+        rsiFinalState := 1
+    else if rsiHighState < 0 or rsiLowState < 0
+        rsiFinalState := -1
+    else
+        rsiFinalState := 0
+else
+    rsiFinalState := rsiCloseState
+
+// --- update hits ---
+if evalGate
+    if rsiFinalState == 1
+        rsiBullHit := true
+    if rsiFinalState == -1
+        rsiBearHit := true
+
+rsiParticipates = rsiObserve != "Ignore" and rsiObserve != "Defer"
+
+//====================================================
+//====================== EMA ==========================
+//====================================================
+
+groupEMA = "EMA INPUTS"
+groupEMAQ = "EMA QUALIFIERS"
+
+emaFastLen = input.int(8,  "EMA Fast Length", group=groupEMA)
+emaSlowLen = input.int(21, "EMA Slow Length", group=groupEMA)
+
+emaLookback  = input.int(3, "Lookback Bars", minval=1, group=groupEMAQ, tooltip = lookbackTooltip)
+emaLookahead = input.int(3, "Lookahead Bars", minval=1, group=groupEMAQ, tooltip = lookaheadTooltip)
+emaDeadzone  = input.float(0.0, "Deadzone", group=groupEMAQ, step=0.1, tooltip = "Proximity between EMAs used to reduce noise or false signals.")
+emaThreshold = input.float(0.0, "Momentum Threshold", group=groupEMAQ, step=0.1, tooltip = momentumTooltip)
+
+var bool emaBullHit = false
+var bool emaBearHit = false
+
+// EMA calculation
+emaFast = request.security(syminfo.tickerid, tfInput == "" ? timeframe.period : tfInput,
+    ta.ema(basePrice, emaFastLen))
+
+emaSlow = request.security(syminfo.tickerid, tfInput == "" ? timeframe.period : tfInput,
+    ta.ema(basePrice, emaSlowLen))
+
+emaDiff = emaFast - emaSlow
+emaStateBase = math.abs(emaDiff) < emaDeadzone ? 0.0 : emaDiff
+emaSlope = (emaStateBase - emaStateBase[emaLookback]) / emaLookback
+emaProjected = emaStateBase + emaSlope * emaLookahead
+
+emaSlopeValid     = math.abs(emaSlope) >= emaThreshold
+emaProjectedValid = math.abs(emaProjected) >= emaDeadzone
+
+// ===== Deferrence Block =====
+emaDeferBlock = emaObserve == "Defer" and math.abs(emaStateBase) < emaDeadzone and (emaThreshold == 0  ? true  : math.abs(emaSlope * emaLookahead) < emaThreshold)
+
+emaCloseState = emaObserve == "Ignore" ? 0 : emaObserve == "Defer"  ? 0 :  emaObserve == "Confirm" ? math.sign(emaStateBase) : (emaSlopeValid and emaProjectedValid) ? math.sign(emaProjected) : 0
+
+//////////////////////////////////////////
+// --- EMA High/Low/Extreme evaluation ---
+/////////////////////////////////////////
+
+emaHighFast = ta.ema(high, emaFastLen)
+emaHighSlow = ta.ema(high, emaSlowLen)
+emaHighDiff = emaHighFast - emaHighSlow
+emaHighBase = math.abs(emaHighDiff) < emaDeadzone ? 0.0 : emaHighDiff
+emaHighSlope = (emaHighBase - emaHighBase[emaLookback]) / emaLookback
+emaHighProj = emaHighBase + emaHighSlope * emaLookahead
+
+emaHighSlopeValid     = math.abs(emaHighSlope) >= emaThreshold
+emaHighProjectedValid = math.abs(emaHighProj) >= emaDeadzone
+
+emaHighState =  emaObserve == "Ignore" ? 0 :  emaObserve == "Confirm" ? math.sign(emaHighBase) :  (emaHighSlopeValid and emaHighProjectedValid) ? math.sign(emaHighProj) : 0
+
+emaLowFast = ta.ema(low, emaFastLen)
+emaLowSlow = ta.ema(low, emaSlowLen)
+emaLowDiff = emaLowFast - emaLowSlow
+emaLowBase = math.abs(emaLowDiff) < emaDeadzone ? 0.0 : emaLowDiff
+emaLowSlope = (emaLowBase - emaLowBase[emaLookback]) / emaLookback
+emaLowProj = emaLowBase + emaLowSlope * emaLookahead
+
+emaLowSlopeValid     = math.abs(emaLowSlope) >= emaThreshold
+emaLowProjectedValid = math.abs(emaLowProj) >= emaDeadzone
+
+emaLowState =  emaObserve == "Ignore" ? 0 :  emaObserve == "Confirm" ? math.sign(emaLowBase) :  (emaLowSlopeValid and emaLowProjectedValid) ? math.sign(emaLowProj) : 0
+
+// Declare first
+var float emaFinalState = 0.0
+
+// Then assign based on evalPoint
+if evalPoint == "High"
+    emaFinalState := emaHighState
+else if evalPoint == "Low"
+    emaFinalState := emaLowState
+else if evalPoint == "Extreme"
+    if emaHighState > 0 or emaLowState > 0
+        emaFinalState := 1
+    else if emaHighState < 0 or emaLowState < 0
+        emaFinalState := -1
+    else
+        emaFinalState := 0
+else
+    emaFinalState := emaCloseState
+
+//=== Updated Hits for Extremes ===
+if evalGate
+    if emaFinalState == 1
+        emaBullHit := true
+    if emaFinalState == -1
+        emaBearHit := true
+
+emaParticipates = emaObserve != "Ignore" and emaObserve != "Defer"
+
+//====================================================
+//====================== MACD ========================
+//====================================================
+
+groupMACD = "MACD INPUTS"
+groupMACDQ = "MACD QUALIFIERS"
+
+// MACD parameters
+macdFastLen  = input.int(12, "MACD Fast Length", group=groupMACD)
+macdSlowLen  = input.int(26, "MACD Slow Length", group=groupMACD)
+macdSignalLen = input.int(9, "MACD Signal Length", group=groupMACD)
+
+macdLookback  = input.int(3, "Lookback Bars", minval=1, group=groupMACDQ, tooltip = lookbackTooltip)
+macdLookahead = input.int(3, "Lookahead Bars", minval=1, group=groupMACDQ, tooltip = lookaheadTooltip)
+macdDeadzone  = input.float(0.0, "Deadzone", group=groupMACDQ, step=0.005, tooltip = "Proximity between MACD and Signal Line used to reduce noise or false signals.")
+macdThreshold = input.float(0.0, "Momentum Threshold", group=groupMACDQ, step=0.005, tooltip = "Threshold for average change across selected number of lookback bars.")
+
+var bool macdBullHit = false
+var bool macdBearHit = false
+
+// MACD calculation (TradingView default)
+[macdLine, signalLine, macdHist] = ta.macd(basePrice, macdFastLen, macdSlowLen, macdSignalLen)
+
+// Histogram as base for evaluation
+macdStateBase = math.abs(macdHist) < macdDeadzone ? 0.0 : macdHist
+
+// Slope and projected state
+macdSlope = (macdStateBase - macdStateBase[macdLookback]) / macdLookback
+macdProjected = macdStateBase + macdSlope * macdLookahead
+
+macdSlopeValid     = math.abs(macdSlope) >= macdThreshold
+macdProjectedValid = math.abs(macdProjected) >= macdDeadzone
+
+macdDeferBlock = macdObserve == "Defer" and math.abs(macdStateBase) < macdDeadzone and (macdThreshold == 0  ? true  : math.abs(macdSlope * macdLookahead) < macdThreshold)
+
+// Close evaluation
+macdCloseState = macdObserve == "Ignore" ? 0 :  macdObserve == "Defer"  ? 0 :  macdObserve == "Confirm" ? math.sign(macdStateBase) :  (macdSlopeValid and macdProjectedValid) ? math.sign(macdProjected) : 0
+
+// High / Low / Extreme evaluation
+
+f_macdHist(src) =>
+    [macdLine, signalLine, histLine] = ta.macd(src, macdFastLen, macdSlowLen, macdSignalLen)
+    histLine
+
+macdHighHist = request.security(syminfo.tickerid, tfInput == "" ? timeframe.period : tfInput, f_macdHist(high))
+macdLowHist  = request.security(syminfo.tickerid, tfInput == "" ? timeframe.period : tfInput, f_macdHist(low))
+
+macdHighBase = math.abs(macdHighHist) < macdDeadzone ? 0.0 : macdHighHist
+macdHighSlope = (macdHighBase - macdHighBase[macdLookback]) / macdLookback
+macdHighProj = macdHighBase + macdHighSlope * macdLookahead
+
+macdHighSlopeValid     = math.abs(macdHighSlope) >= macdThreshold
+macdHighProjectedValid = math.abs(macdHighProj) >= macdDeadzone
+
+macdHighState =  macdObserve == "Ignore" ? 0 :  macdObserve == "Confirm" ? math.sign(macdHighBase) : (macdHighSlopeValid and macdHighProjectedValid) ? math.sign(macdHighProj) : 0
+
+macdLowBase = math.abs(macdLowHist) < macdDeadzone ? 0.0 : macdLowHist
+macdLowSlope = (macdLowBase - macdLowBase[macdLookback]) / macdLookback
+macdLowProj = macdLowBase + macdLowSlope * macdLookahead
+
+macdLowSlopeValid     = math.abs(macdLowSlope) >= macdThreshold
+macdLowProjectedValid = math.abs(macdLowProj) >= macdDeadzone
+
+macdLowState =  macdObserve == "Ignore" ? 0 :  macdObserve == "Confirm" ? math.sign(macdLowBase) :  (macdLowSlopeValid and macdLowProjectedValid) ? math.sign(macdLowProj) : 0
+
+// Declare final state
+var float macdFinalState = 0.0
+
+if evalPoint == "High"
+    macdFinalState := macdHighState
+else if evalPoint == "Low"
+    macdFinalState := macdLowState
+else if evalPoint == "Extreme"
+    if macdHighState > 0 or macdLowState > 0
+        macdFinalState := 1
+    else if macdHighState < 0 or macdLowState < 0
+        macdFinalState := -1
+    else
+        macdFinalState := 0
+else
+    macdFinalState := macdCloseState
+
+// Update hits
+if evalGate
+    if macdFinalState == 1
+        macdBullHit := true
+    if macdFinalState == -1
+        macdBearHit := true
+
+macdParticipates = macdObserve != "Ignore" and macdObserve != "Defer"
+
+//===============================================
+//  STOCHASTIC OSCILLATOR COMPONENT
+//===============================================
+
+groupStoch = "Stochastic Oscillator INPUTS"
+groupStochRng = "Stochastic Oscillator RANGE"
+groupStochQ = "Stochastic Oscillator QUALIFIERS"
+
+// --- Mode Selection ---
+stochMode = input.string(
+    "Stochastic RSI",
+    "Stochastic Mode",
+    options = ["Stochastic RSI", "Stochastic"],
+    group = groupStoch
+)
+
+// ───── Lengths
+stochRsiLen  = input.int(14, "RSI Length (Stochastic RSI)", minval = 1, group=groupStoch, tooltip = "Only used in Stochastic RSI calculation.")
+stochKLen    = input.int(8, "Stochastic (K) Length", minval = 1, group=groupStoch)
+stochKSmooth = input.int(3,  "K Smoothing", minval = 1, group=groupStoch)
+stochDSmooth = input.int(3,  "D Smoothing", minval = 1, group=groupStoch)
+
+// ───── Lookback / Lookahead
+stochLookback  = input.int(3, "Stochastic Lookback Bars", minval = 0, group=groupStochQ, tooltip = "Number of past bars used to measure recent stochastic movement magnitude. This setting is used only for threshold evaluation and noise suppression.")
+//stochLookahead = input.int(3, "Stochastic Lookahead Bars", minval = 0, group=groupStochQ)
+
+// ───── Thresholds
+stochDeadzone  = input.float(0.0, "Stochastic Deadzone", minval = 0, step=0.2, group=groupStochQ, tooltip = "Defines a neutral range (proximity) where stochastic movement is considered indecisive.")
+stochThreshold = input.float(0.0, "Stochastic Threshold", minval = 0, step=0.2, group=groupStochQ, tooltip = "Minimum average stochastic movement required to escape suppression. Calculated using the Lookback Bars window.")
+
+// ───── Range Filter
+stochRangeMode = input.string(
+    "Ignore",
+    "Stochastic Range Mode",
+    options = ["Ignore", "Neutralize", "Invalidate"],
+    tooltip = "Ignore - Range has no effect on signals. Neutralize - Signals outside the range will persist so long as other signals suggest. Invalidate - if outside the range, signal will not be valid.",
+    group = groupStochRng
+)
+
+stochMaxShort = input.float(100.0, "Max. %K Short", group = groupStochRng, inline = "MAX")
+stochMinShort = input.float(10.0,   "Min. %K Short ", group = groupStochRng, inline = "MIN")
+stochMinLong  = input.float(0.0,   "Min. %K Long ", group = groupStochRng, inline = "MIN")
+stochMaxLong  = input.float(90.0, "Max. %K Long", group = groupStochRng, inline = "MAX")
+
+var bool stochBullHit = false
+var bool stochBearHit = false
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+//  STOCHASTIC CALCULATION - Matches TradingView Default Indicators
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+var float rawKClose = na
+var float rawKHigh  = na
+var float rawKLow   = na
+
+
+f_fixNa(x) => na(x) ? 0.0 : x
+
+// --- Declare Final State
+var float stochFinalState = 0.0
+
+// ───── Base series
+baseClose = stochMode == "Stochastic RSI" ? ta.rsi(basePrice, stochRsiLen) : close
+
+// ───── Raw %K (TV-parity)
+
+if stochMode == "Stochastic RSI"
+    rsiSeries = ta.rsi(basePrice, stochRsiLen)
+
+    lowestRsi  = ta.lowest(rsiSeries, stochKLen)
+    highestRsi = ta.highest(rsiSeries, stochKLen)
+    rsiRange   = highestRsi - lowestRsi
+
+    rawKClose := rsiRange != 0 ? 100 * (rsiSeries - lowestRsi) / rsiRange : 50
+    rawKHigh  := rawKClose
+    rawKLow   := rawKClose
+else
+    hh = ta.highest(high, stochKLen)
+    ll = ta.lowest(low,  stochKLen)
+
+    PriceRange = hh - ll
+
+    rawKClose := PriceRange == 0 ? 0.0 : 100.0 * (close - ll) / PriceRange
+    rawKHigh  := PriceRange == 0 ? 0.0 : 100.0 * (high  - ll) / PriceRange
+    rawKLow   := PriceRange == 0 ? 0.0 : 100.0 * (low   - ll) / PriceRange
+
+    // Clamp (TV parity)
+    rawKClose := math.max(0.0, math.min(100.0, rawKClose))
+    rawKHigh  := math.max(0.0, math.min(100.0, rawKHigh))
+    rawKLow   := math.max(0.0, math.min(100.0, rawKLow))
+
+// ───── Smoothed %K
+stochK     = f_fixNa(ta.sma(rawKClose, stochKSmooth))
+stochHighK = f_fixNa(ta.sma(rawKHigh,  stochKSmooth))
+stochLowK  = f_fixNa(ta.sma(rawKLow,   stochKSmooth))
+
+// ───── %D
+stochD     = f_fixNa(ta.sma(stochK,     stochDSmooth))
+stochHighD = f_fixNa(ta.sma(stochHighK, stochDSmooth))
+stochLowD  = f_fixNa(ta.sma(stochLowK,  stochDSmooth))
+
+// --- Function to compute Stochastic state per source price
+f_stochState(srcK, srcD) =>
+    // ───── Range evaluation
+    inLongRange  = srcK >= stochMinLong  and srcK <= stochMaxLong and srcK > srcD
+    inShortRange = srcK >= stochMinShort and srcK <= stochMaxShort and srcK < srcD
+
+    // Invalidate range if configured
+    if stochRangeMode == "Invalidate" and not (inLongRange or inShortRange)
+        0  // hard fail → no vote
+    else
+        // ───── Deadzone evaluation
+        delta = math.abs(srcK - srcD)
+        if delta < stochDeadzone
+            0  // neutral
+        else
+            // ───── CONFIRM logic
+            if stochObsMode == "Confirm"
+                if stochThreshold == 0
+                    // Threshold = 0 → just K vs D
+                    srcK > srcD ? 1 : srcK < srcD ? -1 : 0
+                else
+                    // Threshold > 0 → require ΔK-D over lookback
+                    deltaPrev = math.abs(srcK[stochLookback] - srcD[stochLookback])
+                    deltaGain = delta - deltaPrev
+                    deltaGain >= stochThreshold ? (srcK > srcD ? 1 : srcK < srcD ? -1 : 0) : 0
+            else
+                0
+
+// --- Compute high / low / close states
+stochHighState = f_stochState(stochHighK, stochHighD)
+stochLowState = f_stochState(stochLowK, stochLowD)
+stochCloseState = f_stochState(stochK, stochD)
+
+// --- Extreme evaluation
+if evalPoint == "High"
+    stochFinalState := stochHighState
+else if evalPoint == "Low"
+    stochFinalState := stochLowState
+else if evalPoint == "Extreme"
+    if stochHighState > 0 or stochLowState > 0
+        stochFinalState := 1
+    else if stochHighState < 0 or stochLowState < 0
+        stochFinalState := -1
+    else
+        stochFinalState := 0
+else
+    stochFinalState := stochCloseState
+
+// --- Update hits
+stochBullHit := stochFinalState == 1
+stochBearHit := stochFinalState == -1
+
+stochParticipates = stochObsMode != "Ignore"
+
+///====================================================
+//=============== AGGREGATE STATE =====================
+//=====================================================
+
+bullVotes = 0
+bearVotes = 0
+neutralVotes = 0
+activeVotes = 0
+
+// --- RSI ---
+if rsiParticipates
+    activeVotes += 1
+    if rsiFinalState == 1
+        bullVotes += 1
+    else if rsiFinalState == -1
+        bearVotes += 1
+    else
+        neutralVotes += 1
+
+// --- EMA ---
+if emaParticipates
+    activeVotes += 1
+    if emaFinalState == 1
+        bullVotes += 1
+    else if emaFinalState == -1
+        bearVotes += 1
+    else
+        neutralVotes += 1
+
+// --- MACD ---
+if macdParticipates
+    activeVotes += 1
+    if macdFinalState == 1
+        bullVotes += 1
+    else if macdFinalState == -1
+        bearVotes += 1
+    else
+        neutralVotes += 1
+
+// --- Stochastic ---
+if stochParticipates
+    activeVotes += 1
+    if stochFinalState == 1
+        bullVotes += 1
+    else if stochFinalState == -1
+        bearVotes += 1
+    else
+        neutralVotes += 1
+
+// ===== Core Deferrence Gate (PRE-AGGREGATE) ====
+coreDeferBlock = rsiDeferBlock or emaDeferBlock or macdDeferBlock
+
+int aggregateState = coreDeferBlock ? 0 : aggregationMode == "Strict Consensus"  ? (activeVotes > 0 and bullVotes == activeVotes ? 1 :  activeVotes > 0 and bearVotes == activeVotes ? -1 : 0)  : (bullVotes > 0 and bearVotes == 0 ? 1 : bearVotes > 0 and bullVotes == 0 ? -1 : 0)
+
+// =====================================================
+// ===================== VWAP ==========================
+// =====================================================
+
+//-------------------- Tool Tips -----------------------
+
+vwapModeTT = "Defines how VWAP is evaluated relative to price and used within the signal logic.\n\n" + "• Ignore — VWAP is calculated and plotted, but does not participate in signal logic.\n\n" + "• Confirm — VWAP acts as directional confirmation (price relative to VWAP).\n\n" + "• Slope — VWAP direction (slope) determines bias, independent of price position.\n\n" + "• Reversion — VWAP is treated as a mean; signals form on statistically meaningful deviations and potential reversion.\n\n" + "• Noise Filter — VWAP suppresses signals that occur within insignificant price movement around VWAP."
+vwapAuthorityTT = "Determines how VWAP interacts with the aggregated signal from other components.\n\n" + "• Supplemental — VWAP can reinforce or provide direction when the aggregate is neutral, but will not invalidate an existing consensus.\n\n" + "• Absolute — VWAP can veto the aggregate signal if it conflicts, forcing a neutral result.\n\n" + "• Override — VWAP has final authority and may replace the aggregate direction when in disagreement.\n\n" + "Authority is applied after aggregation and before final signal expression."
+vwapThreshTT = "Minimum magnitude required for VWAP-based logic to engage.\n\n" + "Application depends on VWAP Mode:\n\n" + "• Confirm / Slope — Minimum VWAP directional momentum required to assert bias.\n\n" + "• Reversion — Minimum deviation magnitude required before a reversion signal is allowed.\n\n" + "• Noise Filter — Minimum VWAP movement required to prevent signals from being suppressed.\n\n" + "Higher values demand stronger VWAP conviction; lower values allow VWAP to participate more frequently."
+vwapDZTT = "Defines a fixed price range above and below VWAP where VWAP logic is suppressed.\n\n" + "When price is inside the deadzone, VWAP will not confirm, reject, or modify signals — it is treated as neutral.\n" + "Once price exits the deadzone, VWAP immediately resumes full authority based on the selected VWAP Mode and Authority.\n" + "This deadzone affects VWAP only and does not delay or defer the Core 4 signals."
+
+// -------------------- Inputs -------------------------
+
+vwapGroup = "VWAP"
+
+vwapSource = input.source(hlc3, "VWAP Source", group = vwapGroup)
+
+vwapMode = input.string(
+    "Ignore",
+    "VWAP Mode",
+    options = ["Ignore", "Confirm", "Slope", "Reversion", "Noise Filter"],
+    tooltip = vwapModeTT,
+    group = vwapGroup
+)
+
+vwapAuthority = input.string(
+    "Supplemental",
+    "VWAP Authority",
+    options = ["Supplemental", "Absolute", "Override"],
+    tooltip = vwapAuthorityTT,
+    group = vwapGroup
+)
+
+vwapDeadzone = input.float(
+    0.0,
+    "VWAP Deadzone (Price)",
+    minval = 0,
+    step = 0.01,
+    tooltip = vwapDZTT,
+    group = vwapGroup
+)
+
+vwapThreshold = input.float(
+    0.0,
+    "VWAP Momentum Threshold (Price)",
+    minval = 0,
+    step = 0.01,
+    tooltip = vwapThreshTT,
+    group = vwapGroup
+)
+
+vwapRecencyBars = input.int(
+    5,
+    "Recency Movement (Bars)",
+    minval = 1,
+    tooltip = "Number of bars used to calculate average momentum and direction of VWAP",
+    group = vwapGroup
+)
+
+vwapCrossOverride = input.bool(
+    false,
+    "VWAP Cross Override",
+    tooltip = "If selected, when candle opens on one side of VWAP and closes on the other side, colour changes to reflect that direction. *Applies in all VWAP modes except 'Ignore'",
+    group = vwapGroup
+)
+
+vwapCrossMagnitude = input.float(
+    0.0,
+    "VWAP Cross Magnitude (Price)",
+    minval = 0,
+    step = 0.01,
+    tooltip = "Amoount of change in price needed when crossing VWAP to suggest momentum and direction.",
+    group = vwapGroup
+)
+
+// -------------------- Core VWAP -----------------------
+
+vwapValue = ta.vwap(vwapSource)
+
+priceDelta    = close - vwapValue
+absPriceDelta = math.abs(priceDelta)
+
+insideDeadzone = absPriceDelta <= vwapDeadzone
+
+crossUp   = ta.crossover(close, vwapValue)
+crossDown = ta.crossunder(close, vwapValue)
+
+// -------------------- Recency / Momentum -------------
+
+avgSignedMovement = ta.sma(priceDelta, vwapRecencyBars)
+avgMagnitude      = math.abs(avgSignedMovement)
+
+hasMomentum = avgMagnitude >= vwapThreshold
+
+// -------------------- VWAP Cross Override --------------
+
+vwapCrossUpEvent =
+     open < vwapValue and close > vwapValue
+
+vwapCrossDownEvent =
+     open > vwapValue and close < vwapValue
+
+candleMagnitude = math.abs(close - open)
+hasCrossMagnitude = candleMagnitude >= vwapCrossMagnitude
+
+
+// -------------------- VWAP Expressed State ------------
+// Output: vwapState ∈ {-1, 0, +1}
+
+int vwapState = 0
+
+if vwapMode == "Ignore"
+    vwapState := 0
+
+else if vwapMode == "Confirm"
+    if not insideDeadzone
+        if priceDelta > 0
+            vwapState :=  1
+        else if priceDelta < 0
+            vwapState :=  -1
+
+else if vwapMode == "Slope"
+    // Slope mode: bullish if average signed movement > threshold, bearish if < -threshold
+    if not insideDeadzone and hasMomentum
+        vwapState := avgSignedMovement > 0 ? 1 : -1
+
+else if vwapMode == "Reversion"
+    // Distance from VWAP
+    vwapDelta = close - vwapValue
+    vwapDeltaPrev = close[1] - vwapValue[1]
+
+    // Average movement relative to VWAP
+    avgRelMovement = ta.sma(vwapDelta - vwapDeltaPrev, vwapRecencyBars)
+    avgReversionMagnitude = ta.sma(math.abs(vwapDelta - vwapDeltaPrev), vwapRecencyBars)
+
+    // Determine if price is moving toward or away from VWAP
+    distanceNow = vwapSource - vwapValue
+    distancePrev = vwapSource[1] - vwapValue[1]
+    deltaDistance = distanceNow - distancePrev
+
+    movingAway  = (distanceNow > 0 and deltaDistance > 0) or (distanceNow < 0 and deltaDistance < 0)
+    movingToward = (distanceNow > 0 and deltaDistance < 0) or (distanceNow < 0 and deltaDistance > 0)
+
+    // Assign vwapState
+    if insideDeadzone
+        vwapState := 0
+    else
+        if avgReversionMagnitude < vwapThreshold
+            // Movement exists but is too weak → suppress
+            vwapState := 0
+        else
+            if movingAway
+                vwapState := vwapDelta > 0 ? 1 : -1
+            else if movingToward
+                vwapState := vwapDelta > 0 ? -1 : 1
+            else
+                vwapState := 0
+
+else if vwapMode == "Noise Filter"
+    if insideDeadzone and not hasMomentum
+        vwapState := 0
+    else
+        if priceDelta > 0
+            vwapState := 1
+        else if priceDelta < 0
+            vwapState := -1
+
+// -------------------- VWAP Cross Override Application --
+
+if vwapCrossOverride and hasCrossMagnitude
+    if vwapCrossUpEvent
+        vwapState := 1
+    else if vwapCrossDownEvent
+        vwapState := -1
+
+int postVWAPState = aggregateState
+
+if vwapMode != "Ignore"
+    if vwapAuthority == "Supplemental"
+        if aggregateState == 0
+            postVWAPState := vwapState
+        else if vwapState != aggregateState
+            postVWAPState := aggregateState
+
+    else if vwapAuthority == "Absolute"
+        if vwapState != 0 and vwapState != aggregateState
+            postVWAPState := 0
+
+    else if vwapAuthority == "Override"
+        if vwapState != 0
+            postVWAPState := vwapState
+
+//======================================================
+//=============== BLOCK RESET ==========================
+//======================================================
+if barstate.isnew
+    rsiBullHit := false
+    rsiBearHit := false
+    emaBullHit := false
+    emaBearHit := false
+    macdBullHit := false
+    macdBearHit := false
+    stochBullHit := false
+    stochBearHit := false
+
+//====================================================
+//================== BOLLINGER BANDS =================
+//====================================================
+
+BBmodeTT = "Controls how Bollinger Bands interact with signals.\n\n" + "Off\n" + "Bollinger Bands are disabled and have no effect on signals.\n\n" + "Passive\n" + "Bollinger Bands act as a contextual filter. Signals are allowed to pass unless they violate Bollinger conditions. BBs do not create signals and do not force direction — they only block invalid ones.\n\n" + "Active\n" + "Bollinger Bands act as an active gate. Signals are evaluated only when a candle has an interaction with a valid Band."
+groupBB = "Bollinger Bands"
+
+// ---- Mode
+bbMode = input.string(
+    "Off",
+    "BB Mode",
+    options = ["Off", "Passive", "Active"],
+    tooltip = BBmodeTT,
+    group = groupBB
+)
+
+// ---- Band Scope
+bbBandScope = input.string(
+    "Outer",
+    "Band Scope",
+    options = ["Outer", "All"],
+    tooltip = "Outer = upper/lower only. All = includes mid band.",
+    group = groupBB
+)
+
+// ---- Parameters
+bbLength = input.int(21, "BB Length", minval = 1, group = groupBB)
+bbStdDev = input.float(2.0, "Std Deviation", minval = 0.1, step = 0.1, group = groupBB)
+
+bbSource = input.source(close, "BB Source", group = groupBB)
+
+bbMaType = input.string(
+    "SMA",
+    "BB Basis Type",
+    options = ["SMA", "EMA"],
+    group = groupBB
+)
+
+// ---- Runway (PRICE, not %)
+bbRunway = input.float(0.0, "Runway (Price)",  minval = 0,  step = 0.1, tooltip = "Minimum price distance required to consider inside-band continuation valid.",  group = groupBB)
+
+groupRealtime = "Bollinger Bands — Display Real-time Runway"
+runwayTT = "Display context-aware distance ($) from Bollinger Bands. If in Bullish Context, 'Runway' will display price as opportunity; 'Protection' will display distance to support. If Bearish, 'Protection' will show distance to resistance."
+
+showRealtimeRunway     = input.bool(true,  "Runway",     group = groupRealtime, inline = "RTR")
+showRealtimeMidline = input.bool(false, "Midline", group = groupRealtime, inline = "RTR")
+showRealtimeProtection = input.bool(false, "Protection", group = groupRealtime, tooltip = runwayTT, inline = "RTR")
+
+runwayBullColor      = input.color(color.rgb(109, 242, 252, 20), "Runway (Bull)       ", group = groupRealtime, inline = "RC1")
+runwayBearColor      = input.color(color.rgb(109, 242, 252, 20),   "Runway (Bear)       ", group = groupRealtime, inline = "RC1")
+
+protectionBullColor  = input.color(color.rgb(255, 82, 241, 40),   "Protection (Bull)", group = groupRealtime, inline = "RC2")
+protectionBearColor  = input.color(color.rgb(255, 82, 241, 40), "Protection (Bear)", group = groupRealtime, inline = "RC2")
+
+midlineColor         = input.color(color.rgb(255, 255, 255, 20),  "Midline", group = groupRealtime, inline = "RC3")
+
+// ---- Core BB calculation
+bbBasis =  bbMaType == "EMA" ? ta.ema(bbSource, bbLength) : ta.sma(bbSource, bbLength)
+
+bbDev   = bbStdDev * ta.stdev(bbSource, bbLength)
+bbUpper = bbBasis + bbDev
+bbLower = bbBasis - bbDev
+
+// ---- Candle interaction helpers
+wickHigh = high
+wickLow  = low
+bodyHigh = math.max(open, close)
+bodyLow  = math.min(open, close)
+
+// ---- Interaction flags (Outer)
+upperPierce = open < bbUpper and wickHigh > bbUpper and close < bbUpper
+lowerPierce = open > bbLower and wickLow  < bbLower and close > bbLower
+
+upperAccept = close > bbUpper
+lowerAccept = close < bbLower
+
+// ---- Midline interactions (STRUCTURALLY SYMMETRIC)
+midPierceUp = bbBandScope == "All" and open < bbBasis and wickHigh > bbBasis and close < bbBasis
+midPierceDn = bbBandScope == "All" and open > bbBasis and wickLow  < bbBasis and close > bbBasis
+
+midAcceptUp = bbBandScope == "All" and close > bbBasis
+midAcceptDn = bbBandScope == "All" and close < bbBasis
+
+midTouch = bbBandScope == "All" and low <= bbBasis and high >= bbBasis
+
+bbInteracted =
+     upperPierce or upperAccept or
+     lowerPierce or lowerAccept or
+     midPierceUp or midPierceDn or
+     midAcceptUp or midAcceptDn or
+     midTouch
+
+//-----------------------------------------------------
+//================ BB CONTEXT =========================
+//-----------------------------------------------------
+
+// Directional bias from participating components ONLY
+bbBullContext = postVWAPState == 1
+bbBearContext = postVWAPState == -1
+
+bbRunwayDistance = (
+    bbBullContext ? math.abs(close - bbUpper)
+                  : math.abs(close - bbLower)
+)
+
+bbProtectionDistance = (
+    bbBullContext ? math.abs(close - bbLower)
+                  : math.abs(close - bbUpper)
+)
+
+bbMidDistance = math.abs(close - bbBasis)
+
+//-----------------------------------------------------
+//================== BB LOGIC =========================
+//-----------------------------------------------------
+
+bool bbSuppresses = false
+int  bbFinalState = 0
+
+bool rejection  = false
+bool acceptance = false
+bool inside     = false
+bool runwayOk   = false
+
+if bbMode != "Off" and postVWAPState != 0
+
+    // -------- REJECTION (exhaustion)
+    rejection := (
+        (bbBullContext and upperPierce) or
+        (bbBearContext and lowerPierce) or
+        (bbBullContext and midPierceUp) or
+        (bbBearContext and midPierceDn)
+    )
+
+    // -------- ACCEPTANCE (strength)
+    acceptance :=
+         (bbBullContext and upperAccept) or
+         (bbBearContext and lowerAccept) or
+         (bbBandScope == "All" and (
+             (bbBullContext and midAcceptUp) or
+             (bbBearContext and midAcceptDn)
+         ))
+
+    // -------- INSIDE (continuation potential)
+    inside := bbInteracted and not rejection and not acceptance
+
+    // -------- Runway (price-based)
+    runwayOk := bbRunway == 0 ? true :
+         bbBullContext ? (bbUpper - close) >= bbRunway :
+         bbBearContext ? (close - bbLower) >= bbRunway :
+         false
+
+// ---- Participation flag (visual / debug only)
+bbParticipates = bbMode != "Off" and bbInteracted
+
+// --- Outer band environmental rejection ---
+bbEnvRejectUpper = wickHigh > bbUpper and close < bbUpper
+bbEnvRejectLower = wickLow  < bbLower and close > bbLower
+
+// --- Midline environmental rejection (optional) ---
+bbEnvRejectMidUp = midPierceUp
+bbEnvRejectMidDn = midPierceDn
+
+// --- BB interpretation of existing signals (NO logic changes) ---
+bbIsRejection  = rejection 
+bbIsAcceptance = acceptance
+
+// --- BB location context ---
+bbRejectUpper = bbIsRejection  and close > bbUpper
+bbRejectLower = bbIsRejection  and close < bbLower
+
+bbAcceptUpper = bbIsAcceptance and close > bbUpper
+bbAcceptLower = bbIsAcceptance and close < bbLower
+
+bbVisualBull = bbFinalState == 1
+bbVisualBear = bbFinalState == -1
+
+//====================================================
+//================== BB VALIDATION ===================
+//====================================================
+
+// Signal is invalid if exhaustion or no runway
+bbInvalid = rejection or not runwayOk
+
+int finalStateAfterBB = postVWAPState
+
+if postVWAPState != 0 and bbMode != "Off"
+
+    // PASSIVE: block invalid signals only
+    if bbMode == "Passive"
+        if bbInvalid
+            finalStateAfterBB := 0
+
+    // ACTIVE: require band interaction AND validity
+    if bbMode == "Active"
+        if bbInvalid or not bbInteracted
+            finalStateAfterBB := 0
+
+// -------------------- Final Output --------------------
+expressedState = finalStateAfterBB
+
+//====================================================
+//================== CANDLE COLOR =====================
+//====================================================
+
+bullColor = color.new(#2c6457, 10)
+bearColor = color.new(#b22d5b, 10)
+
+isBullCandle = close > open
+isBearCandle = close < open
+
+finalColor =  expressedState == 0 ? neutralColor : colorMode == "Absolute" ? expressedState == 1 ? bullColor : bearColor : colorMode == "Directional" ? expressedState == 1 and isBullCandle ? bullColor :  expressedState == -1 and isBearCandle ? bearColor :   neutralColor :  neutralColor
+
+// Direction Filter (visual only)
+if directionFilter == "Bullish" and expressedState == -1
+    finalColor := neutralColor
+if directionFilter == "Bearish" and expressedState == 1
+    finalColor := neutralColor
+
+barcolor(finalColor)
+
+// Aggregate bullish/bearish based on all components
+bullish = expressedState == 1
+bearish = expressedState == -1
+
+plotshape(bullish, title="Bullish Expression", style=shape.circle, location=location.abovebar, color=color.green, size=size.tiny, display = display.none)
+plotshape(bearish, title="Bearish Expression", style=shape.circle, location=location.belowbar, color=color.red, size=size.tiny, display = display.none)
+
+alertcondition(bullish, title="Bullish Alert", message="Aggregate bullish state triggered")
+alertcondition(bearish, title="Bearish Alert", message="Aggregate bearish state triggered")
+
+// --- VWAP plot for testing ---
+plot(vwapValue, color=color.orange, title="VWAP", linewidth=2, style=plot.style_line)
+
+// -------------------- VWAP Cross Visuals ----------------
+
+plotshape(
+    vwapCrossUpEvent and hasCrossMagnitude,
+    title = "VWAP Bullish Cross",
+    style = shape.circle,
+    location = location.abovebar,
+    size = size.small,
+    display   = display.none,
+    color = color.new(color.green, 0)
+)
+
+plotshape(
+    vwapCrossDownEvent and hasCrossMagnitude,
+    title = "VWAP Bearish Cross",
+    style = shape.circle,
+    location = location.belowbar,
+    size = size.small,
+    display   = display.none,
+    color = color.new(color.red, 0)
+)
+
+//----------- Bollinger Band Rejection Visuals -----------
+
+plot(
+    bbUpper,
+    title = "Bollinger Band Upper",
+    color = color.new(color.red, 0),
+    linewidth = 1,
+    display = display.none
+)
+
+plot(
+    bbBasis,
+    title = "Bollinger Band Mid",
+    color = color.new(color.gray, 0),
+    linewidth = 1,
+    display = display.none
+)
+
+plot(
+    bbLower,
+    title = "Bollinger Band Lower",
+    color = color.new(color.green, 0),
+    linewidth = 1,
+    display = display.none
+)
+
+plotshape(
+    bbEnvRejectUpper,
+    title     = "BB Rejection Upper",
+    style     = shape.square,
+    location  = location.abovebar,
+    size      = size.tiny,
+    color     = color.new(color.orange, 20),
+    display   = display.none
+)
+plotshape(
+    bbEnvRejectLower,
+    title     = "BB Rejection Lower",
+    style     = shape.square,
+    location  = location.belowbar,
+    size      = size.tiny,
+    color     = color.new(color.orange, 20),
+    display   = display.none
+)
+plotshape(
+    bbEnvRejectMidUp,
+    title     = "BB Midline Reject Up",
+    style     = shape.triangledown,
+    location  = location.abovebar,
+    size      = size.tiny,
+    color     = color.new(color.yellow, 40),
+    display   = display.none
+)
+
+plotshape(
+    bbEnvRejectMidDn,
+    title     = "BB Midline Reject Down",
+    style     = shape.triangleup,
+    location  = location.belowbar,
+    size      = size.tiny,
+    color     = color.new(color.yellow, 40),
+    display   = display.none
+)
+
+//-------------- Realtime Runway/Protection -------
+showRecentBars = bar_index >= last_bar_index - 5
+
+if showRecentBars
+
+    // RUNWAY
+    if showRealtimeRunway
+        label.new(
+            x = bar_index,
+            y = bbBullContext ? high : low,
+            text = str.tostring(bbRunwayDistance, format.mintick),
+            yloc = bbBullContext ? yloc.abovebar : yloc.belowbar,
+            style = label.style_none,
+            textcolor = bbBullContext ? runwayBullColor : runwayBearColor,
+            size = size.tiny)
+
+    // PROTECTION
+    if showRealtimeProtection
+        label.new(
+            x = bar_index,
+            y = bbBullContext ? low : high,
+            text = str.tostring(bbProtectionDistance, format.mintick),
+            yloc = bbBullContext ? yloc.belowbar : yloc.abovebar,
+            style = label.style_none,
+            textcolor = bbBullContext ? protectionBullColor : protectionBearColor,
+            size = size.tiny)
+
+    // MIDLINE
+    if showRecentBars and showRealtimeMidline
+        label.new(
+            x = bar_index,
+            y = bbBasis,
+            text = str.tostring(bbMidDistance, format.mintick),
+            yloc = yloc.price,
+            style = label.style_none,
+            textcolor = midlineColor,
+            size = size.tiny)

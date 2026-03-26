@@ -1,0 +1,375 @@
+//@version=5
+//Author: blntduman  2026 version: 07032026-v1.0
+indicator("Noise-Eliminating Chop Detection Engine Tool", shorttitle="NECDET Oscillator", overlay=false, scale=scale.right, max_bars_back=5000)
+
+// =====================
+// Helpers 
+// =====================
+eps = 1e-10
+
+tanh(x) =>
+    ep = math.exp(x)
+    en = math.exp(-x)
+    (ep - en) / (ep + en)
+
+clamp01(x) =>
+    math.max(0.0, math.min(1.0, x))
+
+clamp(x, lo, hi) =>
+    math.max(lo, math.min(hi, x))
+
+logistic01(z, k) =>
+    1.0 / (1.0 + math.exp(-k * z))
+
+// =====================
+// Inputs 
+// =====================
+groupCF = "Chop Firewall (No Visuals)"
+cfStrength = input.int(60, "CF Strength (0-100)", minval=0, maxval=100, group=groupCF)
+useAdvanced = input.bool(false, "Advanced Settings", group=groupCF)
+sepBoostK = input.float(0.35, "Sep Boost in Chop (Regime)", minval=0.0, maxval=2.0, step=0.05, group=groupCF)
+
+cfEntropyLen = useAdvanced ? input.int(60, "Entropy Window", minval=20, group=groupCF) : 60
+cfWickLen    = useAdvanced ? input.int(20, "Wick Window",    minval=5,  group=groupCF) : 20
+cfFlipLen    = useAdvanced ? input.int(30, "Flip Window",    minval=10, group=groupCF) : 30
+cfSmoothLen  = useAdvanced ? input.int(10, "Score Smooth",   minval=2,  group=groupCF) : 10
+
+wEntropy  = useAdvanced ? input.float(0.35, "Weight: Entropy",       minval=0.0, maxval=1.0, group=groupCF) : 0.35
+wDisagree = useAdvanced ? input.float(0.30, "Weight: Disagreement",  minval=0.0, maxval=1.0, group=groupCF) : 0.30
+wWick     = useAdvanced ? input.float(0.20, "Weight: Wick Noise",    minval=0.0, maxval=1.0, group=groupCF) : 0.20
+wFlip     = useAdvanced ? input.float(0.15, "Weight: Flip Rate",     minval=0.0, maxval=1.0, group=groupCF) : 0.15
+
+enterSaw = useAdvanced ? input.float(0.66, "Saw Enter Threshold", minval=0.0, maxval=1.0, group=groupCF)
+                       : (0.58 + (cfStrength / 100.0) * 0.14)
+exitSaw  = useAdvanced ? input.float(0.58, "Saw Exit Threshold",  minval=0.0, maxval=1.0, group=groupCF)
+                       : (enterSaw - (0.06 + (cfStrength / 100.0) * 0.04))
+
+sepLen  = useAdvanced ? input.int(30, "Separation Vol Window", minval=10, group=groupCF) : 30
+sepMult = useAdvanced ? input.float(0.60, "Separation Mult", step=0.05, group=groupCF)
+                      : (0.45 + (cfStrength / 100.0) * 0.35)
+
+groupRisk = "Risk / Size"
+useSizing  = input.bool(true, "CF-Based Position Sizing", group=groupRisk)
+baseQtyPct = input.float(20, "Base Position Size (% of equity)", minval=0.1, maxval=100, step=0.1, group=groupRisk)
+
+groupBD = "blntduman filter"
+bdBaseP     = input.float(10.0, "Base Period", minval=2.0, group=groupBD)
+bdMinP      = input.float(6.0,  "Min Period",  minval=2.0, group=groupBD)
+bdMaxP      = input.float(24.0, "Max Period",  minval=3.0, group=groupBD)
+
+bdAdaptLen  = input.int(30, "Adapt Window", minval=5, group=groupBD)
+bdJerkLen   = input.int(10, "Jerk Smooth",  minval=2, group=groupBD)
+
+bdNsrBoost  = input.float(1.10, "NSR Boost",  step=0.05, group=groupBD)
+bdJerkBoost = input.float(0.90, "Jerk Boost", step=0.05, group=groupBD)
+
+bdClampK    = input.float(2.20, "Nonlinear Clamp K", step=0.1, minval=0.5, group=groupBD)
+
+bdFastMul   = input.float(0.70, "Fast Period Mult", step=0.05, minval=0.2, group=groupBD)
+bdSlowMul   = input.float(1.60, "Slow Period Mult", step=0.05, minval=0.5, group=groupBD)
+
+groupExit = "Exit Lifecycle (B+C)"
+useClosePeak = input.bool(true, "Use CLOSE for Peak/Trough (anti-wick)", group=groupExit)
+ddFrac = input.float(0.25, "Meaningful Drawdown Fraction", minval=0.05, maxval=0.95, step=0.05, group=groupExit)
+ddSepMult = input.float(1.00, "Min Drawdown = ddSepMult * sep", minval=0.0, maxval=5.0, step=0.10, group=groupExit)
+ddBypassSepK = input.float(2.00, "Bypass Structure if Drawdown >= ddBypassSepK * sep", minval=0.0, maxval=10.0, step=0.10, group=groupExit)
+
+useDDDecay = input.bool(true, "Alpha Decay only when NO progress (carry-safe)", group=groupExit)
+ddDecayK   = input.float(0.02, "Decay rate k (per stale bar)", minval=0.0, maxval=0.20, step=0.005, group=groupExit)
+ddFloor    = input.float(0.12, "ddFrac floor (min)", minval=0.01, maxval=0.95, step=0.01, group=groupExit)
+
+entrySepK = input.float(0.75, "Entry Confirm = entrySepK * sep", minval=0.0, maxval=5.0, step=0.05, group=groupExit)
+stopSepK  = input.float(1.50, "Fail-safe Stop = stopSepK * sep", minval=0.0, maxval=10.0, step=0.10, group=groupExit)
+
+useConvexGate = input.bool(true, "Convexity Gate (Acceleration Filter)", group=groupExit)
+convLen   = input.int(3, "Convexity Smooth (EMA)", minval=1, maxval=20, group=groupExit)
+convMinK  = input.float(0.05, "Min Convexity = convMinK * sep", minval=0.0, maxval=2.0, step=0.01, group=groupExit)
+convMaxK  = input.float(0.60, "Max Convexity = convMaxK * sep (anti-parabolic)", minval=0.0, maxval=5.0, step=0.05, group=groupExit)
+
+groupReg = "Regime (Bayesian)"
+useBayesReg = input.bool(true, "Use Bayesian Regime (pTrend)", group=groupReg)
+
+regLen      = input.int(200, "Regime Memory (EMA)", minval=20, group=groupReg)
+sigLen      = input.int(60,  "Sigma EMA", minval=10, group=groupReg)
+phiLen      = input.int(80,  "MR phi EMA", minval=10, group=groupReg)
+devLen      = input.int(100, "Deviation Mean Len", minval=20, group=groupReg)
+floorSigma  = input.float(1e-6, "Sigma Floor", step=1e-6, group=groupReg)
+tempSoftmax = input.float(1.0, "Softmax Temperature", minval=0.1, step=0.1, group=groupReg)
+
+logiK = input.float(1.7, "Logistic slope k", minval=0.3, step=0.1, group=groupReg)
+
+
+// =====================
+// FiboSwarm core 
+// =====================
+var int[] periods = array.from(3, 5, 8, 11)
+float swarmSum = 0.0
+float totalWeight = 0.0
+
+ret = math.log(close / close[1])
+
+r   = ret
+muS = ta.ema(close, devLen)
+dev = close - muS
+dev1 = nz(dev[1], 0.0)
+
+muTr  = ta.ema(r, regLen)
+eTr   = r - muTr
+sigTr = math.sqrt(ta.ema(eTr * eTr, sigLen) + floorSigma)
+
+phiInst = (math.abs(dev1) > 1e-12) ? (-r / dev1) : 0.0
+phiHat  = ta.ema(phiInst, phiLen)
+phiHat  := math.max(0.0, math.min(phiHat, 5.0))
+
+muMr  = -phiHat * dev1 / math.max(close[1], 1e-12)
+eMr   = r - muMr
+sigMr = math.sqrt(ta.ema(eMr * eMr, sigLen) + floorSigma)
+
+llTr = -0.5 * (eTr / sigTr) * (eTr / sigTr) - math.log(sigTr)
+llMr = -0.5 * (eMr / sigMr) * (eMr / sigMr) - math.log(sigMr)
+
+var float STr = na
+var float SMr = na
+STr := na(STr) ? llTr : ta.ema(llTr, regLen)
+SMr := na(SMr) ? llMr : ta.ema(llMr, regLen)
+
+a = (STr - SMr) / tempSoftmax
+pTrend = useBayesReg ? (1.0 / (1.0 + math.exp(-a))) : 0.5
+pTrend := clamp01(pTrend)
+pChop  = 1.0 - pTrend
+
+for i = 0 to array.size(periods) - 1
+    len = array.get(periods, i)
+
+    meanRet = ta.sma(ret, len)
+    stdDev  = ta.stdev(ret, len)
+
+    normalized = (stdDev > eps) ? (ret - meanRet) / stdDev : 0.0
+    df = math.max(len - 1, 4.0)
+
+    t_val = normalized * math.sqrt(df / (df + normalized * normalized))
+    pct_t = (tanh(t_val / math.sqrt(df)) + 1) / 2
+    pct_t := clamp01(pct_t)
+
+    pct_l = logistic01(normalized, logiK)
+    pct_l := clamp01(pct_l)
+
+    percentile = pChop * pct_l + (1.0 - pChop) * pct_t
+    percentile := clamp01(percentile)
+
+    var float[] qArr = array.new_float(0)
+    array.clear(qArr)
+
+    for j = 0 to len - 1
+        v = close[j]
+        array.push(qArr, nz(v, close))
+
+    array.sort(qArr, order.ascending)
+
+    idx = math.floor(percentile * (len - 1))
+    idx := math.max(0, math.min(idx, len - 1))
+
+    priceLevel = array.get(qArr, idx)
+
+    weight = len
+    swarmSum += priceLevel * weight
+    totalWeight += weight
+
+rawSwarm = swarmSum / (totalWeight + eps)
+
+
+// =====================
+// blntduman filter 
+// =====================
+var float cfScore = na
+
+var float bdOutPrev = na
+e0    = rawSwarm - nz(bdOutPrev, rawSwarm)
+sigma = ta.ema(math.abs(e0), bdAdaptLen)
+cap   = bdClampK * sigma
+xRob  = nz(bdOutPrev, rawSwarm) + clamp(e0, -cap, cap)
+
+innov      = math.abs(rawSwarm - rawSwarm[1])
+smoothInnov= ta.ema(innov, bdAdaptLen)
+dirMove    = math.abs(ta.ema(rawSwarm - rawSwarm[1], bdAdaptLen))
+nsr        = smoothInnov / (dirMove + eps)
+nsrN       = nsr / (nsr + 1.0)
+
+jerk       = math.abs((rawSwarm - rawSwarm[1]) - (rawSwarm[1] - rawSwarm[2]))
+jerkS      = ta.ema(jerk, bdJerkLen)
+jerkN      = (jerkS / (smoothInnov + eps))
+jerkN01    = clamp01(jerkN / (jerkN + 1.0))
+
+dynP = bdBaseP * (1.0 + bdNsrBoost * nsrN + bdJerkBoost * jerkN01)
+dynP := clamp(dynP, bdMinP, bdMaxP)
+
+pFast = clamp(dynP * bdFastMul, bdMinP, bdMaxP)
+pSlow = clamp(dynP * bdSlowMul, bdMinP, bdMaxP)
+
+coeff_c1(p) =>
+    a1 = math.exp(-1.414 * math.pi / p)
+    b1 = 2.0 * a1 * math.cos(1.414 * math.pi / p)
+    c2 = b1
+    c3 = -a1 * a1
+    1.0 - c2 - c3
+
+coeff_c2(p) =>
+    a1 = math.exp(-1.414 * math.pi / p)
+    2.0 * a1 * math.cos(1.414 * math.pi / p)
+
+coeff_c3(p) =>
+    a1 = math.exp(-1.414 * math.pi / p)
+    -a1 * a1
+
+var float bdF1 = na
+var float bdF2 = na
+c1F = coeff_c1(pFast)
+c2F = coeff_c2(pFast)
+c3F = coeff_c3(pFast)
+yFast = c1F * xRob + c2F * nz(bdF1, xRob) + c3F * nz(bdF2, xRob)
+
+var float bdS1 = na
+var float bdS2 = na
+c1S = coeff_c1(pSlow)
+c2S = coeff_c2(pSlow)
+c3S = coeff_c3(pSlow)
+ySlow = c1S * xRob + c2S * nz(bdS1, xRob) + c3S * nz(bdS2, xRob)
+
+cfPrev      = nz(cfScore[1], exitSaw)
+mixFast_cf  = cfPrev <= exitSaw ? 1.0 : cfPrev >= enterSaw ? 0.0 : (1.0 - (cfPrev - exitSaw) / math.max(enterSaw - exitSaw, eps))
+
+mixFast     = mixFast_cf * (1.0 - nsrN) * (1.0 - jerkN01)
+mixFast     := clamp01(mixFast)
+mixFast := ta.ema(mixFast, 3)
+
+fiboSwarmSmooth = mixFast * yFast + (1.0 - mixFast) * ySlow
+
+bdF2 := bdF1
+bdF1 := yFast
+bdS2 := bdS1
+bdS1 := ySlow
+bdOutPrev := fiboSwarmSmooth
+
+
+// =====================
+// Chop Firewall 
+// =====================
+s1 = 3
+s2 = 5
+s3 = 8
+s4 = 13
+
+needBars = math.max(cfEntropyLen + 4, math.max(s4 + 1, math.max(cfWickLen + 2, cfFlipLen + 2)))
+ready = bar_index >= needBars
+
+var float[] cnt = array.new_float(8, 0.0)
+if ready
+    array.fill(cnt, 0.0)
+    for i = 0 to cfEntropyLen - 1
+        b0  = close[i]     > close[i + 1] ? 1 : 0
+        b1p = close[i + 1] > close[i + 2] ? 1 : 0
+        b2  = close[i + 2] > close[i + 3] ? 1 : 0
+        pat = b0 + 2 * b1p + 4 * b2
+        array.set(cnt, pat, array.get(cnt, pat) + 1.0)
+
+float ent = 0.0
+if ready
+    for k = 0 to 7
+        p = array.get(cnt, k) / (cfEntropyLen + eps)
+        ent += (p > 0 ? -p * math.log(p) : 0.0)
+
+entNorm = ready ? clamp01(ent / (math.log(8.0) + eps)) : 0.0
+
+dir1 = ready ? (close > close[s1] ? 1.0 : close < close[s1] ? -1.0 : 0.0) : 0.0
+dir2 = ready ? (close > close[s2] ? 1.0 : close < close[s2] ? -1.0 : 0.0) : 0.0
+dir3 = ready ? (close > close[s3] ? 1.0 : close < close[s3] ? -1.0 : 0.0) : 0.0
+dir4 = ready ? (close > close[s4] ? 1.0 : close < close[s4] ? -1.0 : 0.0) : 0.0
+
+dirMean = (dir1 + dir2 + dir3 + dir4) / 4.0
+disagreeRaw  = (math.abs(dir1 - dirMean) + math.abs(dir2 - dirMean) + math.abs(dir3 - dirMean) + math.abs(dir4 - dirMean)) / 4.0
+disagreeNorm = clamp01(disagreeRaw)
+
+barRange = high - low
+barBody  = math.abs(close - open)
+barWick  = math.max(0.0, barRange - barBody)
+
+sumN(src, len) =>
+    c = ta.cum(src)
+    c - nz(c[len], 0.0)
+
+sumWick  = sumN(barWick,  cfWickLen)
+sumRange = sumN(barRange, cfWickLen)
+
+wickNorm = clamp01(sumWick / (sumRange + eps))
+
+flip = (ret * ret[1] < 0) ? 1.0 : 0.0
+flipRate = ta.sma(flip, cfFlipLen)
+flipNorm = clamp01(flipRate)
+
+wSum = (wEntropy + wDisagree + wWick + wFlip) + eps
+cfScoreRaw = (wEntropy * entNorm + wDisagree * disagreeNorm + wWick * wickNorm + wFlip * flipNorm) / wSum
+cfScore := ta.ema(cfScoreRaw, cfSmoothLen)
+
+
+// =====================
+// Saw Gate (hysteresis) 
+// =====================
+var bool sawState = false
+if ready
+    if sawState and cfScore < exitSaw
+        sawState := false
+    else if (not sawState) and cfScore > enterSaw
+        sawState := true
+
+isSaw = (not ready) ? true : sawState
+
+
+// =====================
+// Separation 
+// =====================
+vol = ta.stdev(ret, sepLen)
+sep = sepMult * vol * close
+
+sepEff = sep * (1.0 + sepBoostK * pChop)
+
+
+// =====================
+// Convexity 
+// =====================
+slopeL = fiboSwarmSmooth - fiboSwarmSmooth[1]
+accL   = slopeL - (fiboSwarmSmooth[1] - fiboSwarmSmooth[2])
+accLS  = ta.ema(accL, convLen)
+
+convThr = convMinK * sepEff
+convCap = convMaxK * sepEff
+
+convexUp   = (not useConvexGate) or ((accLS >  convThr) and (accLS <  convCap))
+convexDown = (not useConvexGate) or ((accLS < -convThr) and (accLS > -convCap))
+
+
+// =====================
+// PRO Oscillator - MACD'den Daha İyi Görsel (Histogram + Signal Line)
+// =====================
+oscRaw = (close - fiboSwarmSmooth) / fiboSwarmSmooth * 100
+osc = ta.ema(oscRaw, 3)  // Hafif yumuşatılmış signal line
+
+// Histogram (momentum gücü ve yönü için renk değişimli)
+hist = oscRaw
+histColor = hist > 0 
+     ? (hist > hist[1] ? color.lime : color.green) 
+     : (hist < hist[1] ? color.maroon : color.red)
+
+// Çizimler
+plot(hist, title="PRO Histogram", style=plot.style_columns, color=histColor, linewidth=4)
+plot(osc, title="PRO Signal Line", color=color.orange, linewidth=3)
+
+// Zero line ve seviyeler (DÜZELTİLMİŞ - daha yakın ve mantıklı seviyeler)
+hline(0, "Zero Line", color=color.white, linewidth=2)
+
+// Dinamik OB/OS seviyeleri yerine sabit ama daha yakın değerler (çoğu markette uygun)
+hline(1.5, "Overbought", color=color.red, linestyle=hline.style_dashed, linewidth=1)
+hline(-1.5, "Oversold", color=color.green, linestyle=hline.style_dashed, linewidth=1)
+
+// EKSTRA: Daha hafif secondary seviyeler (isteğe bağlı görsel zenginlik)
+hline(1.0, "Mild OB", color=color.new(color.red, 50), linestyle=hline.style_dotted)
+hline(-1.0, "Mild OS", color=color.new(color.green, 50), linestyle=hline.style_dotted)

@@ -1,0 +1,192 @@
+//@version=6
+indicator(title="RSI Divergence (Regular + Hidden + Live) - StableLogic", shorttitle="Divergence", format=format.price, precision=2, overlay=false, max_lines_count=500, max_labels_count=500, max_bars_back=4000)
+
+
+// 1. SETTINGS
+
+rsiLen = input.int(14, "RSI Length", group="Settings")
+src    = input.source(close, "Source", group="Settings")
+rsi    = ta.rsi(src, rsiLen)
+
+// Pivot Settings
+lb  = input.int(5, "Pivot Lookback (Delay)", minval=1, group="Settings", tooltip="Standard is 5. Lower = Faster/Riskier.")
+limit = input.int(20, "History Depth", group="Settings")
+
+// Live Settings
+showLive = input.bool(true, "Show Live (Pending)?", group="Live Settings")
+
+// Visuals
+colRegBull = input.color(color.green, "Regular Bullish", group="Visuals")
+colHidBull = input.color(color.lime,  "Hidden Bullish",  group="Visuals")
+colRegBear = input.color(color.red,   "Regular Bearish", group="Visuals")
+colHidBear = input.color(color.maroon,"Hidden Bearish",  group="Visuals")
+colLive    = input.color(color.orange, "Live Pending", group="Visuals")
+
+
+// 1.1 VISUAL ZONES (UPDATED - GRADIENT)
+rsiPlot = plot(rsi, "RSI", color=#7E57C2, linewidth=1)
+h_ob = hline(70, "OB Level", color=color.gray, linestyle=hline.style_dotted)
+h_os = hline(30, "OS Level", color=color.gray, linestyle=hline.style_dotted)
+h_mid = hline(50, "Mid Level", color=color.new(color.gray, 50), linestyle=hline.style_dotted)
+midLinePlot = plot(50, color = na, editable = false, display = display.none)
+fill(rsiPlot, midLinePlot, 100, 70, top_color = color.new(color.green, 0), bottom_color = color.new(color.green, 100),  title = "Overbought Gradient Fill")
+fill(rsiPlot, midLinePlot, 30,  0,  top_color = color.new(color.red, 100), bottom_color = color.new(color.red, 0),      title = "Oversold Gradient Fill")
+fill(h_ob, h_os, color=color.rgb(126, 87, 194, 90), title="RSI Background Fill")
+
+// 2. LOGIC: FIND CONFIRMED PIVOTS
+bool isPH = not na(ta.pivothigh(rsi, lb, lb))
+bool isPL = not na(ta.pivotlow(rsi, lb, lb))
+
+float val_rsi_h = rsi[lb]
+float val_rsi_l = rsi[lb]
+float val_pr_h  = high[lb]
+float val_pr_l  = low[lb]
+int   loc_idx   = bar_index[lb]
+
+var rsi_highs   = array.new_float(0)
+var price_highs = array.new_float(0)
+var idx_highs   = array.new_int(0)
+
+var rsi_lows    = array.new_float(0)
+var price_lows  = array.new_float(0)
+var idx_lows    = array.new_int(0)
+
+clean_arrays(arr) =>
+    if array.size(arr) > limit
+        array.pop(arr)
+
+if isPH
+    array.unshift(rsi_highs, val_rsi_h)
+    array.unshift(price_highs, val_pr_h)
+    array.unshift(idx_highs, loc_idx)
+    clean_arrays(rsi_highs)
+    clean_arrays(price_highs)
+    clean_arrays(idx_highs)
+
+if isPL
+    array.unshift(rsi_lows, val_rsi_l)
+    array.unshift(price_lows, val_pr_l)
+    array.unshift(idx_lows, loc_idx)
+    clean_arrays(rsi_lows)
+    clean_arrays(price_lows)
+    clean_arrays(idx_lows)
+
+// Checks if the RSI line crosses the mathematical divergence line between two points
+check_rsi_cross(idx1, val1, idx2, val2, is_high) =>
+    bool crossed = false
+    int bars_between = idx2 - idx1
+    if bars_between > 1
+        float slope = (val2 - val1) / bars_between
+        for i = 1 to bars_between - 1
+            int offset = idx2 - (idx1 + i)
+            float line_val = val1 + slope * i
+            float check_val = rsi[offset]
+            if is_high and check_val > line_val
+                crossed := true
+                break
+            if not is_high and check_val < line_val
+                crossed := true
+                break
+    crossed
+
+// 3. DRAWING LOGIC (LAST BAR ONLY)
+
+var line[] view_lines = array.new_line(0)
+var label[] view_labels = array.new_label(0)
+
+if barstate.islast
+    // Garbage Collection
+    if array.size(view_lines) > 0
+        for l in view_lines
+            line.delete(l)
+        array.clear(view_lines)
+    if array.size(view_labels) > 0
+        for lb in view_labels
+            label.delete(lb)
+        array.clear(view_labels)
+        
+    // 1. BEARISH CHECK (Highs)
+    if array.size(rsi_highs) >= 2
+        for i = 0 to array.size(rsi_highs) - 2
+            float rA = array.get(rsi_highs, i)   // Recent
+            float pA = array.get(price_highs, i)
+            int   iA = array.get(idx_highs, i)
+            float rB = array.get(rsi_highs, i+1) // Older
+            float pB = array.get(price_highs, i+1)
+            int   iB = array.get(idx_highs, i+1)
+            
+            // Logic
+            bool isRegBear = pA > pB and rA < rB  // Price HH, RSI LH
+            bool isHidBear = pA < pB and rA > rB  // Price LH, RSI HH
+            
+            if isRegBear or isHidBear
+                color lc = isRegBear ? colRegBear : colHidBear
+                string txt = isRegBear ? "R Bear" : "H Bear"
+                
+                // Draw only if divergence exists
+                line ln = line.new(iB, rB, iA, rA, color=lc, width=2)
+                array.push(view_lines, ln)
+                label lb = label.new(iA, rA, txt, color=lc, style=label.style_label_down, textcolor=color.white, size=size.tiny)
+                array.push(view_labels, lb)
+
+    // 2. BULLISH CHECK (Lows)
+    if array.size(rsi_lows) >= 2
+        for i = 0 to array.size(rsi_lows) - 2
+            float rA = array.get(rsi_lows, i)
+            float pA = array.get(price_lows, i)
+            int   iA = array.get(idx_lows, i)
+            float rB = array.get(rsi_lows, i+1)
+            float pB = array.get(price_lows, i+1)
+            int   iB = array.get(idx_lows, i+1)
+            
+            // Logic
+            bool isRegBull = pA < pB and rA > rB // Price LL, RSI HL
+            bool isHidBull = pA > pB and rA < rB // Price HL, RSI LL
+            
+            if isRegBull or isHidBull
+                color lc = isRegBull ? colRegBull : colHidBull
+                string txt = isRegBull ? "R Bull" : "H Bull"
+                
+                // Draw only if divergence exists
+                line ln = line.new(iB, rB, iA, rA, color=lc, width=2)
+                array.push(view_lines, ln)
+                label lb = label.new(iA, rA, txt, color=lc, style=label.style_label_up, textcolor=color.white, size=size.tiny)
+                array.push(view_labels, lb)
+                
+    // LIVE LINES (PENDING)
+    if showLive
+        // Live High Check
+        if array.size(rsi_highs) > 0
+            float last_rh = array.get(rsi_highs, 0)
+            float last_ph = array.get(price_highs, 0)
+            int   last_ih = array.get(idx_highs, 0)
+            
+            bool pendRegBear = high > last_ph and rsi < last_rh
+            bool pendHidBear = high < last_ph and rsi > last_rh
+            
+            if pendRegBear or pendHidBear
+                // Ensure the line hasn't been broken by RSI between the pivot and now
+                if not check_rsi_cross(last_ih, last_rh, bar_index, rsi, true)
+                    string ltxt = pendRegBear ? "Pend R-Bear" : "Pend H-Bear"
+                    line liveLn = line.new(last_ih, last_rh, bar_index, rsi, color=colLive, width=1, style=line.style_dashed)
+                    array.push(view_lines, liveLn)
+                    label liveLb = label.new(bar_index, rsi, ltxt, color=colLive, style=label.style_label_down, textcolor=color.white, size=size.tiny)
+                    array.push(view_labels, liveLb)
+
+        // Live Low Check
+        if array.size(rsi_lows) > 0
+            float last_rl = array.get(rsi_lows, 0)
+            float last_pl = array.get(price_lows, 0)
+            int   last_il = array.get(idx_lows, 0)
+            
+            bool pendRegBull = low < last_pl and rsi > last_rl
+            bool pendHidBull = low > last_pl and rsi < last_rl
+            
+            if pendRegBull or pendHidBull
+                // Ensure the line hasn't been broken by RSI between the pivot and now
+                if not check_rsi_cross(last_il, last_rl, bar_index, rsi, false)
+                    string ltxt = pendRegBull ? "Pend R-Bull" : "Pend H-Bull"
+                    line liveLn = line.new(last_il, last_rl, bar_index, rsi, color=colLive, width=1, style=line.style_dashed)
+                    array.push(view_lines, liveLn)
+                    label liveLb = label.new(bar_index, rsi, ltxt, color=colLive, style=label.style_label_up, textcolor=color.white, size=size.tiny)
+                    array.push(view_labels, liveLb)

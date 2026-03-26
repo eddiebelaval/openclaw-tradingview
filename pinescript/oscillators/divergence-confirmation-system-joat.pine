@@ -1,0 +1,996 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © officialjackofalltrades
+//@version=6
+indicator("Divergence Confirmation System [JOAT]", shorttitle="DCS [JOAT]", overlay=false, max_bars_back=500, max_lines_count=500)
+
+// ─────────────────────────────────────────────────────────────────────────────────
+// CONFIGURATION
+// ─────────────────────────────────────────────────────────────────────────────────
+
+g_oscillators = "Oscillator Settings"
+g_divergence = "Divergence Detection"
+g_confirmation = "Confirmation Rules"
+g_visual = "Visualization"
+
+// Oscillator Periods
+rsi_period = input.int(14, "RSI Period", minval=5, maxval=50, group=g_oscillators)
+mfi_period = input.int(14, "MFI Period", minval=5, maxval=50, group=g_oscillators)
+stoch_period = input.int(14, "Stochastic Period", minval=5, maxval=50, group=g_oscillators)
+macd_fast = input.int(12, "MACD Fast", minval=5, maxval=50, group=g_oscillators)
+macd_slow = input.int(26, "MACD Slow", minval=10, maxval=100, group=g_oscillators)
+macd_signal = input.int(9, "MACD Signal", minval=5, maxval=30, group=g_oscillators)
+
+// Divergence Settings
+pivot_left = input.int(5, "Pivot Left Bars", minval=2, maxval=20, group=g_divergence)
+pivot_right = input.int(2, "Pivot Right Bars", minval=1, maxval=10, group=g_divergence)
+detect_hidden = input.bool(true, "Detect Hidden Divergences", group=g_divergence)
+max_pivot_distance = input.int(60, "Max Pivot Distance", minval=20, maxval=200, group=g_divergence)
+
+// Confirmation Requirements
+min_oscillators = input.int(2, "Minimum Oscillator Confirmation", minval=1, maxval=4, group=g_confirmation)
+require_volume_confirm = input.bool(false, "Require Volume Confirmation", group=g_confirmation)
+
+// Visual
+show_divergence_lines = input.bool(true, "Show Divergence Lines", group=g_visual)
+show_labels = input.bool(true, "Show Labels", group=g_visual)
+primary_oscillator = input.string("RSI", "Primary Display", options=["RSI", "MFI", "Stochastic", "MACD"], group=g_visual)
+
+// ─────────────────────────────────────────────────────────────────────────────────
+// COLOR SYSTEM - CYAN/RED DIVERGENCE SIGNALS (Oscillator Theme)
+// ─────────────────────────────────────────────────────────────────────────────────
+
+color c_bull_regular = #00ffff          // Electric cyan (bullish divergence)
+color c_bull_hidden = #00cccc           // Bright cyan
+color c_bear_regular = #ff0033          // Electric red (bearish divergence)
+color c_bear_hidden = #ff3366           // Bright red-pink
+color c_rsi = #00ffff                   // Electric cyan
+color c_mfi = #ff0033                   // Electric red
+color c_stoch = #00ff99                 // Aqua green
+color c_macd = #ff6600                  // Orange
+color c_gradient_1 = #0080ff            // Bright blue (gradient layer)
+color c_gradient_2 = #ff0080            // Bright pink (gradient layer)
+color c_text = #ffffff                  // Pure white
+color c_background = #0d0d0d            // Almost black
+color c_dashboard_bg = #0a0a0f          // Almost black
+color c_dashboard_border = #00ffff      // Electric cyan border
+
+// ─────────────────────────────────────────────────────────────────────────────────
+// OSCILLATOR CALCULATIONS
+// ─────────────────────────────────────────────────────────────────────────────────
+
+// RSI
+float rsi = ta.rsi(close, rsi_period)
+
+// MFI (Money Flow Index)
+float mfi = ta.mfi(hlc3, mfi_period)
+
+// Stochastic
+float stoch_k = ta.stoch(close, high, low, stoch_period)
+
+// MACD
+[macd_line, signal_line, macd_hist] = ta.macd(close, macd_fast, macd_slow, macd_signal)
+
+// ─────────────────────────────────────────────────────────────────────────────────
+// PIVOT DETECTION
+// ─────────────────────────────────────────────────────────────────────────────────
+
+// Price Pivots
+float price_high = ta.pivothigh(high, pivot_left, pivot_right)
+float price_low = ta.pivotlow(low, pivot_left, pivot_right)
+
+// Oscillator Pivots
+float rsi_high = ta.pivothigh(rsi, pivot_left, pivot_right)
+float rsi_low = ta.pivotlow(rsi, pivot_left, pivot_right)
+
+float mfi_high = ta.pivothigh(mfi, pivot_left, pivot_right)
+float mfi_low = ta.pivotlow(mfi, pivot_left, pivot_right)
+
+float stoch_high = ta.pivothigh(stoch_k, pivot_left, pivot_right)
+float stoch_low = ta.pivotlow(stoch_k, pivot_left, pivot_right)
+
+float macd_high = ta.pivothigh(macd_hist, pivot_left, pivot_right)
+float macd_low = ta.pivotlow(macd_hist, pivot_left, pivot_right)
+
+// ─────────────────────────────────────────────────────────────────────────────────
+// DIVERGENCE DETECTION FUNCTIONS
+// ─────────────────────────────────────────────────────────────────────────────────
+
+// Store pivot history
+var array<float> price_highs = array.new_float(0)
+var array<int> price_high_bars = array.new_int(0)
+var array<float> price_lows = array.new_float(0)
+var array<int> price_low_bars = array.new_int(0)
+
+// Update pivot arrays
+if not na(price_high)
+    array.push(price_highs, price_high)
+    array.push(price_high_bars, bar_index - pivot_right)
+    if array.size(price_highs) > 10
+        array.shift(price_highs)
+        array.shift(price_high_bars)
+
+if not na(price_low)
+    array.push(price_lows, price_low)
+    array.push(price_low_bars, bar_index - pivot_right)
+    if array.size(price_lows) > 10
+        array.shift(price_lows)
+        array.shift(price_low_bars)
+
+// Bullish Regular Divergence Detection
+f_detect_bull_regular_div(float osc_val, float osc_pivot) =>
+    bool detected = false
+    
+    if not na(osc_pivot) and not na(price_low) and array.size(price_lows) >= 2
+        int last_idx = array.size(price_lows) - 1
+        int prev_idx = array.size(price_lows) - 2
+        
+        float curr_price = array.get(price_lows, last_idx)
+        float prev_price = array.get(price_lows, prev_idx)
+        int curr_bar = array.get(price_low_bars, last_idx)
+        int prev_bar = array.get(price_low_bars, prev_idx)
+        
+        // Price makes lower low, oscillator makes higher low
+        if curr_price < prev_price and osc_pivot > osc_pivot[curr_bar - prev_bar]
+            if (bar_index - pivot_right - prev_bar) <= max_pivot_distance
+                detected := true
+    
+    detected
+
+// Bearish Regular Divergence Detection
+f_detect_bear_regular_div(float osc_val, float osc_pivot) =>
+    bool detected = false
+    
+    if not na(osc_pivot) and not na(price_high) and array.size(price_highs) >= 2
+        int last_idx = array.size(price_highs) - 1
+        int prev_idx = array.size(price_highs) - 2
+        
+        float curr_price = array.get(price_highs, last_idx)
+        float prev_price = array.get(price_highs, prev_idx)
+        int curr_bar = array.get(price_high_bars, last_idx)
+        int prev_bar = array.get(price_high_bars, prev_idx)
+        
+        // Price makes higher high, oscillator makes lower high
+        if curr_price > prev_price and osc_pivot < osc_pivot[curr_bar - prev_bar]
+            if (bar_index - pivot_right - prev_bar) <= max_pivot_distance
+                detected := true
+    
+    detected
+
+// Bullish Hidden Divergence Detection
+f_detect_bull_hidden_div(float osc_val, float osc_pivot) =>
+    bool detected = false
+    
+    if detect_hidden and not na(osc_pivot) and not na(price_low) and array.size(price_lows) >= 2
+        int last_idx = array.size(price_lows) - 1
+        int prev_idx = array.size(price_lows) - 2
+        
+        float curr_price = array.get(price_lows, last_idx)
+        float prev_price = array.get(price_lows, prev_idx)
+        int curr_bar = array.get(price_low_bars, last_idx)
+        int prev_bar = array.get(price_low_bars, prev_idx)
+        
+        // Price makes higher low, oscillator makes lower low
+        if curr_price > prev_price and osc_pivot < osc_pivot[curr_bar - prev_bar]
+            if (bar_index - pivot_right - prev_bar) <= max_pivot_distance
+                detected := true
+    
+    detected
+
+// Bearish Hidden Divergence Detection
+f_detect_bear_hidden_div(float osc_val, float osc_pivot) =>
+    bool detected = false
+    
+    if detect_hidden and not na(osc_pivot) and not na(price_high) and array.size(price_highs) >= 2
+        int last_idx = array.size(price_highs) - 1
+        int prev_idx = array.size(price_highs) - 2
+        
+        float curr_price = array.get(price_highs, last_idx)
+        float prev_price = array.get(price_highs, prev_idx)
+        int curr_bar = array.get(price_high_bars, last_idx)
+        int prev_bar = array.get(price_high_bars, prev_idx)
+        
+        // Price makes lower high, oscillator makes higher high
+        if curr_price < prev_price and osc_pivot > osc_pivot[curr_bar - prev_bar]
+            if (bar_index - pivot_right - prev_bar) <= max_pivot_distance
+                detected := true
+    
+    detected
+
+// ─────────────────────────────────────────────────────────────────────────────────
+// DIVERGENCE DETECTION
+// ─────────────────────────────────────────────────────────────────────────────────
+
+// RSI Divergences
+bool rsi_bull_reg = f_detect_bull_regular_div(rsi, rsi_low)
+bool rsi_bear_reg = f_detect_bear_regular_div(rsi, rsi_high)
+bool rsi_bull_hid = f_detect_bull_hidden_div(rsi, rsi_low)
+bool rsi_bear_hid = f_detect_bear_hidden_div(rsi, rsi_high)
+
+// MFI Divergences
+bool mfi_bull_reg = f_detect_bull_regular_div(mfi, mfi_low)
+bool mfi_bear_reg = f_detect_bear_regular_div(mfi, mfi_high)
+bool mfi_bull_hid = f_detect_bull_hidden_div(mfi, mfi_low)
+bool mfi_bear_hid = f_detect_bear_hidden_div(mfi, mfi_high)
+
+// Stochastic Divergences
+bool stoch_bull_reg = f_detect_bull_regular_div(stoch_k, stoch_low)
+bool stoch_bear_reg = f_detect_bear_regular_div(stoch_k, stoch_high)
+bool stoch_bull_hid = f_detect_bull_hidden_div(stoch_k, stoch_low)
+bool stoch_bear_hid = f_detect_bear_hidden_div(stoch_k, stoch_high)
+
+// MACD Divergences
+bool macd_bull_reg = f_detect_bull_regular_div(macd_hist, macd_low)
+bool macd_bear_reg = f_detect_bear_regular_div(macd_hist, macd_high)
+bool macd_bull_hid = f_detect_bull_hidden_div(macd_hist, macd_low)
+bool macd_bear_hid = f_detect_bear_hidden_div(macd_hist, macd_high)
+
+// ─────────────────────────────────────────────────────────────────────────────────
+// CONFIRMATION AGGREGATION
+// ─────────────────────────────────────────────────────────────────────────────────
+
+// Count confirmations
+int bull_reg_count = (rsi_bull_reg ? 1 : 0) + (mfi_bull_reg ? 1 : 0) + (stoch_bull_reg ? 1 : 0) + (macd_bull_reg ? 1 : 0)
+int bear_reg_count = (rsi_bear_reg ? 1 : 0) + (mfi_bear_reg ? 1 : 0) + (stoch_bear_reg ? 1 : 0) + (macd_bear_reg ? 1 : 0)
+int bull_hid_count = (rsi_bull_hid ? 1 : 0) + (mfi_bull_hid ? 1 : 0) + (stoch_bull_hid ? 1 : 0) + (macd_bull_hid ? 1 : 0)
+int bear_hid_count = (rsi_bear_hid ? 1 : 0) + (mfi_bear_hid ? 1 : 0) + (stoch_bear_hid ? 1 : 0) + (macd_bear_hid ? 1 : 0)
+
+// Confirmed signals
+bool confirmed_bull_regular = bull_reg_count >= min_oscillators
+bool confirmed_bear_regular = bear_reg_count >= min_oscillators
+bool confirmed_bull_hidden = bull_hid_count >= min_oscillators
+bool confirmed_bear_hidden = bear_hid_count >= min_oscillators
+
+// Volume confirmation (optional)
+float vol_avg = ta.sma(volume, 20)
+bool vol_confirm = volume > vol_avg * 1.2
+
+bool final_bull_regular = confirmed_bull_regular and (not require_volume_confirm or vol_confirm)
+bool final_bear_regular = confirmed_bear_regular and (not require_volume_confirm or vol_confirm)
+bool final_bull_hidden = confirmed_bull_hidden and (not require_volume_confirm or vol_confirm)
+bool final_bear_hidden = confirmed_bear_hidden and (not require_volume_confirm or vol_confirm)
+
+// ─────────────────────────────────────────────────────────────────────────────────
+// ADVANCED FEATURES - 6-OSCILLATOR SYSTEM (CCI + STOCH RSI)
+// ─────────────────────────────────────────────────────────────────────────────────
+
+// CCI (Commodity Channel Index)
+float cci = ta.cci(close, 20)
+float cci_high = ta.pivothigh(cci, pivot_left, pivot_right)
+float cci_low = ta.pivotlow(cci, pivot_left, pivot_right)
+
+// Stochastic RSI
+float rsi_for_stoch = ta.rsi(close, rsi_period)
+float stoch_rsi_k = ta.stoch(rsi_for_stoch, rsi_for_stoch, rsi_for_stoch, stoch_period)
+float stoch_rsi_high = ta.pivothigh(stoch_rsi_k, pivot_left, pivot_right)
+float stoch_rsi_low = ta.pivotlow(stoch_rsi_k, pivot_left, pivot_right)
+
+// CCI Divergences
+bool cci_bull_reg = f_detect_bull_regular_div(cci, cci_low)
+bool cci_bear_reg = f_detect_bear_regular_div(cci, cci_high)
+bool cci_bull_hid = f_detect_bull_hidden_div(cci, cci_low)
+bool cci_bear_hid = f_detect_bear_hidden_div(cci, cci_high)
+
+// Stoch RSI Divergences
+bool srsi_bull_reg = f_detect_bull_regular_div(stoch_rsi_k, stoch_rsi_low)
+bool srsi_bear_reg = f_detect_bear_regular_div(stoch_rsi_k, stoch_rsi_high)
+bool srsi_bull_hid = f_detect_bull_hidden_div(stoch_rsi_k, stoch_rsi_low)
+bool srsi_bear_hid = f_detect_bear_hidden_div(stoch_rsi_k, stoch_rsi_high)
+
+// Recalculate confirmation counts including CCI and Stoch RSI
+int total_bull_reg_count = bull_reg_count + (cci_bull_reg ? 1 : 0) + (srsi_bull_reg ? 1 : 0)
+int total_bear_reg_count = bear_reg_count + (cci_bear_reg ? 1 : 0) + (srsi_bear_reg ? 1 : 0)
+int total_bull_hid_count = bull_hid_count + (cci_bull_hid ? 1 : 0) + (srsi_bull_hid ? 1 : 0)
+int total_bear_hid_count = bear_hid_count + (cci_bear_hid ? 1 : 0) + (srsi_bear_hid ? 1 : 0)
+
+// ─────────────────────────────────────────────────────────────────────────────────
+// ADVANCED FEATURES - DIVERGENCE STRENGTH SCORING
+// ─────────────────────────────────────────────────────────────────────────────────
+
+// Calculate divergence strength (0-100)
+f_divergence_strength(int osc_count, bool vol_confirm_param, float price_momentum) =>
+    float score = 0.0
+    
+    // Oscillator count (0-50 points)
+    score += osc_count * 8.33  // 6 oscillators max = 50 points
+    
+    // Volume confirmation (0-25 points)
+    score += vol_confirm_param ? 25 : 0
+    
+    // Price momentum (0-25 points)
+    float momentum_score = math.min(math.abs(price_momentum) * 5, 25)
+    score += momentum_score
+    
+    math.min(score, 100)
+
+float price_momentum = (close - close[10]) / close[10] * 100
+
+float bull_div_strength = f_divergence_strength(total_bull_reg_count + total_bull_hid_count, vol_confirm, price_momentum)
+float bear_div_strength = f_divergence_strength(total_bear_reg_count + total_bear_hid_count, vol_confirm, -price_momentum)
+
+// Strength classification
+string div_strength_class = 
+     bull_div_strength >= 75 or bear_div_strength >= 75 ? "Very Strong" :
+     bull_div_strength >= 60 or bear_div_strength >= 60 ? "Strong" :
+     bull_div_strength >= 40 or bear_div_strength >= 40 ? "Moderate" :
+     "Weak"
+
+// ─────────────────────────────────────────────────────────────────────────────────
+// ADVANCED FEATURES - MULTI-TIMEFRAME DIVERGENCE
+// ─────────────────────────────────────────────────────────────────────────────────
+
+// Check divergences on higher timeframe
+f_get_htf_divergence(string tf) =>
+    [htf_rsi, htf_price_high, htf_price_low] = request.security(syminfo.tickerid, tf,
+         [ta.rsi(close, rsi_period), high, low],
+         lookahead=barmerge.lookahead_off)
+    
+    float htf_rsi_high = ta.pivothigh(htf_rsi, pivot_left, pivot_right)
+    float htf_rsi_low = ta.pivotlow(htf_rsi, pivot_left, pivot_right)
+    
+    bool htf_bull = f_detect_bull_regular_div(htf_rsi, htf_rsi_low)
+    bool htf_bear = f_detect_bear_regular_div(htf_rsi, htf_rsi_high)
+    
+    [htf_bull, htf_bear]
+
+[htf_bull_div, htf_bear_div] = f_get_htf_divergence("15")
+
+// MTF divergence confirmation
+bool mtf_bull_confirmed = final_bull_regular and htf_bull_div
+bool mtf_bear_confirmed = final_bear_regular and htf_bear_div
+
+// ─────────────────────────────────────────────────────────────────────────────────
+// ADVANCED FEATURES - DIVERGENCE CLUSTERING
+// ─────────────────────────────────────────────────────────────────────────────────
+
+// Detect divergence clusters (multiple divergences in short period)
+var array<int> div_bars = array.new_int(0)
+
+if final_bull_regular or final_bear_regular
+    array.push(div_bars, bar_index)
+    
+    // Keep last 20 divergences
+    if array.size(div_bars) > 20
+        array.shift(div_bars)
+
+// Count divergences in last 50 bars
+int recent_div_count = 0
+if array.size(div_bars) > 0
+    for i = 0 to array.size(div_bars) - 1
+        int div_bar = array.get(div_bars, i)
+        if bar_index - div_bar <= 50
+            recent_div_count += 1
+
+bool in_div_cluster = recent_div_count >= 3
+string cluster_intensity = recent_div_count >= 5 ? "High" :
+                          recent_div_count >= 3 ? "Moderate" : "Low"
+
+// ─────────────────────────────────────────────────────────────────────────────────
+// VISUALIZATION
+// ─────────────────────────────────────────────────────────────────────────────────
+
+// Select primary oscillator to display
+float display_osc = 
+     primary_oscillator == "RSI" ? rsi :
+     primary_oscillator == "MFI" ? mfi :
+     primary_oscillator == "Stochastic" ? stoch_k :
+     macd_hist
+
+color display_color = 
+     primary_oscillator == "RSI" ? c_rsi :
+     primary_oscillator == "MFI" ? c_mfi :
+     primary_oscillator == "Stochastic" ? c_stoch :
+     c_macd
+
+// Plot primary oscillator with gradient effect
+plot(display_osc, "Primary Oscillator", color=display_color, linewidth=3, style=plot.style_line)
+
+// Add shadow effect for depth
+plot(display_osc, "Shadow", color=color.new(display_color, 70), linewidth=6, style=plot.style_line)
+
+// Reference lines with institutional styling
+hline(70, "Overbought", color=color.new(c_bear_regular, 60), linestyle=hline.style_dotted, linewidth=1)
+hline(30, "Oversold", color=color.new(c_bull_regular, 60), linestyle=hline.style_dotted, linewidth=1)
+hline(50, "Midline", color=color.new(c_text, 70), linestyle=hline.style_solid, linewidth=2)
+
+// Background zones for confirmed divergences with gradient intensity
+float zone_intensity = math.min(100, (total_bull_reg_count + total_bull_hid_count) * 15)
+bgcolor(final_bull_regular ? color.new(c_bull_regular, 92) : na, title="Bullish Regular Divergence")
+bgcolor(final_bear_regular ? color.new(c_bear_regular, 92) : na, title="Bearish Regular Divergence")
+bgcolor(final_bull_hidden ? color.new(c_bull_hidden, 95) : na, title="Bullish Hidden Divergence")
+bgcolor(final_bear_hidden ? color.new(c_bear_hidden, 95) : na, title="Bearish Hidden Divergence")
+
+// Oscillator histogram with gradient coloring
+float hist_value = display_osc - 50
+color hist_color = hist_value > 0 ? 
+     color.from_gradient(hist_value, 0, 50, color.new(c_bull_regular, 70), color.new(c_bull_regular, 20)) :
+     color.from_gradient(hist_value, -50, 0, color.new(c_bear_regular, 20), color.new(c_bear_regular, 70))
+
+plot(hist_value, "Oscillator Histogram", color=hist_color, style=plot.style_histogram, linewidth=3, histbase=0)
+
+// Labels with enhanced styling and information
+if show_labels
+    // Only show labels when divergence strength is significant (>60%) to avoid clutter
+    if final_bull_regular and bull_div_strength >= 60
+        string label_text = "BULL DIV\n" + str.tostring(total_bull_reg_count) + "/6"
+        label.new(bar_index, display_osc - 10, label_text, color=color.new(c_bull_regular, 0), 
+                  textcolor=color.white, style=label.style_label_up, size=size.small,
+                  tooltip="Bullish Regular Divergence\nOscillators: " + str.tostring(total_bull_reg_count) + "/6\nStrength: " + str.tostring(bull_div_strength, "#") + "%")
+    
+    if final_bear_regular and bear_div_strength >= 60
+        string label_text = "BEAR DIV\n" + str.tostring(total_bear_reg_count) + "/6"
+        label.new(bar_index, display_osc + 10, label_text, color=color.new(c_bear_regular, 0), 
+                  textcolor=color.white, style=label.style_label_down, size=size.small,
+                  tooltip="Bearish Regular Divergence\nOscillators: " + str.tostring(total_bear_reg_count) + "/6\nStrength: " + str.tostring(bear_div_strength, "#") + "%")
+    
+    // Hidden divergences shown as small circles only when very strong
+    if final_bull_hidden and bull_div_strength >= 70
+        label.new(bar_index, display_osc - 5, "H", color=color.new(c_bull_hidden, 10), 
+                  textcolor=color.white, style=label.style_circle, size=size.tiny,
+                  tooltip="Bullish Hidden Divergence\nStrength: " + str.tostring(bull_div_strength, "#") + "%")
+    
+    if final_bear_hidden and bear_div_strength >= 70
+        label.new(bar_index, display_osc + 5, "H", color=color.new(c_bear_hidden, 10), 
+                  textcolor=color.white, style=label.style_circle, size=size.tiny,
+                  tooltip="Bearish Hidden Divergence\nStrength: " + str.tostring(bear_div_strength, "#") + "%")
+
+// ─────────────────────────────────────────────────────────────────────────────────
+// HIGH-ACCURACY SIGNALS (Limited to prevent overlapping)
+// ─────────────────────────────────────────────────────────────────────────────────
+
+// Signal cooldown system - minimum 15 bars between signals
+var int last_signal_bar = -999
+int bars_since_signal = bar_index - last_signal_bar
+bool cooldown_passed = bars_since_signal >= 15
+
+// EXTREME CONVICTION SIGNALS - Only show when 4+ oscillators confirm AND strength >75%
+bool extreme_bull_signal = (total_bull_reg_count >= 4) and bull_div_strength >= 75 and 
+                           final_bull_regular and cooldown_passed and not final_bull_regular[1]
+
+bool extreme_bear_signal = (total_bear_reg_count >= 4) and bear_div_strength >= 75 and 
+                           final_bear_regular and cooldown_passed and not final_bear_regular[1]
+
+// MTF CONFIRMATION SIGNALS - Show when both current TF and HTF align
+bool mtf_bull_signal = mtf_bull_confirmed and not mtf_bull_confirmed[1] and 
+                       bull_div_strength >= 65 and cooldown_passed
+
+bool mtf_bear_signal = mtf_bear_confirmed and not mtf_bear_confirmed[1] and 
+                       bear_div_strength >= 65 and cooldown_passed
+
+// Update cooldown
+if extreme_bull_signal or extreme_bear_signal or mtf_bull_signal or mtf_bear_signal
+    last_signal_bar := bar_index
+
+// Plot ELITE DIVERGENCE signals on oscillator
+plotshape(
+     extreme_bull_signal,
+     title="BULL DIV",
+     style=shape.labelup,
+     location=location.bottom,
+     color=color.new(c_bull_regular, 0),
+     textcolor=color.white,
+     text="BULL\nDIV",
+     size=size.normal
+)
+
+plotshape(
+     extreme_bear_signal,
+     title="BEAR DIV", 
+     style=shape.labeldown,
+     location=location.top,
+     color=color.new(c_bear_regular, 0),
+     textcolor=color.white,
+     text="BEAR\nDIV",
+     size=size.normal
+)
+
+// Additional confirmation signals (smaller)
+plotshape(
+     mtf_bull_signal and not extreme_bull_signal,
+     title="BULL CONF",
+     style=shape.triangleup,
+     location=location.bottom,
+     color=color.new(c_bull_hidden, 0),
+     size=size.small
+)
+
+plotshape(
+     mtf_bear_signal and not extreme_bear_signal,
+     title="BEAR CONF",
+     style=shape.triangledown,
+     location=location.top,
+     color=color.new(c_bear_hidden, 0),
+     size=size.small
+)
+
+// ═══════════════════════════════════════════════════════════════════════════════════
+// PRECISE CHART SIGNALS - INSTITUTIONAL GRADE
+// ═══════════════════════════════════════════════════════════════════════════════════
+
+// Calculate volume_sma_20 in global scope (moved from later)
+float volume_sma_20 = ta.sma(volume, 20)
+
+// High Volume Signals - Removed per user request (yellow circles were too cluttered)
+
+// Calculate institutional flow variables (moved from later)
+float delta = volume * (close > open ? 1 : close < open ? -1 : 0)
+float cumulative_delta = ta.cum(delta)
+float delta_sma = ta.sma(delta, 20)
+
+bool institutional_buying = delta > delta_sma * 2 and volume > volume_sma_20 * 1.5
+bool institutional_selling = delta < delta_sma * -2 and volume > volume_sma_20 * 1.5
+
+// Institutional Flow Signals - When smart money is active with enhanced accuracy
+// Enhanced conditions: require volume confirmation + price action + delta alignment
+bool inst_buy_signal = institutional_buying and barstate.isconfirmed and close > open and delta > 0 and volume > volume_sma_20 * 1.8 and (rsi < 50 or display_osc < 50)
+
+bool inst_sell_signal = institutional_selling and barstate.isconfirmed and close < open and delta < 0 and volume > volume_sma_20 * 1.8 and (rsi > 50 or display_osc > 50)
+
+var int last_inst_signal = -999
+bool inst_cooldown = bar_index - last_inst_signal >= 20
+
+if (inst_buy_signal or inst_sell_signal) and inst_cooldown
+    last_inst_signal := bar_index
+
+plotshape(
+     inst_buy_signal and inst_cooldown,
+     title="INST BUY",
+     style=shape.labelup,
+     location=location.bottom,
+     color=color.new(#00ff88, 0),
+     text="INST\nBUY",
+     textcolor=color.black,
+     size=size.small
+)
+
+plotshape(
+     inst_sell_signal and inst_cooldown,
+     title="INST SELL",
+     style=shape.labeldown,
+     location=location.top,
+     color=color.new(#ff0044, 0),
+     text="INST\nSELL",
+     textcolor=color.white,
+     size=size.small
+)
+
+// Divergence Circle Markers - Hollow circles with DIV text for confirmed divergences
+bool div_bull_circle = (final_bull_regular or final_bull_hidden) and bull_div_strength >= 60 and display_osc < 40 and barstate.isconfirmed
+bool div_bear_circle = (final_bear_regular or final_bear_hidden) and bear_div_strength >= 60 and display_osc > 60 and barstate.isconfirmed
+
+var int last_div_circle = -999
+bool div_circle_cooldown = bar_index - last_div_circle >= 18
+
+if (div_bull_circle or div_bear_circle) and div_circle_cooldown
+    last_div_circle := bar_index
+
+// Bullish Divergence Circle - Gradient cyan/blue
+plotshape(
+     div_bull_circle and div_circle_cooldown,
+     title="BULL DIV CIRCLE",
+     style=shape.circle,
+     location=location.bottom,
+     color=color.new(c_bull_regular, 0),
+     text="DIV",
+     textcolor=color.white,
+     size=size.small
+)
+
+// Bearish Divergence Circle - Hollow red
+plotshape(
+     div_bear_circle and div_circle_cooldown,
+     title="BEAR DIV CIRCLE",
+     style=shape.circle,
+     location=location.top,
+     color=color.new(c_bear_regular, 0),
+     text="DIV",
+     textcolor=color.white,
+     size=size.small
+)
+
+// Multi-Oscillator Confirmation Signals - When 3+ oscillators align
+bool multi_osc_bull = total_bull_reg_count >= 3 and display_osc < 40 and barstate.isconfirmed
+bool multi_osc_bear = total_bear_reg_count >= 3 and display_osc > 60 and barstate.isconfirmed
+var int last_multi_signal = -999
+bool multi_cooldown = bar_index - last_multi_signal >= 20
+
+if (multi_osc_bull or multi_osc_bear) and multi_cooldown
+    last_multi_signal := bar_index
+
+// Use labels instead of plotshape for dynamic text
+if multi_osc_bull and multi_cooldown
+    label.new(bar_index, display_osc - 15, str.tostring(total_bull_reg_count) + "/6\nCONF", 
+              color=color.new(#00ff00, 0), textcolor=color.black, 
+              style=label.style_label_up, size=size.small)
+
+if multi_osc_bear and multi_cooldown
+    label.new(bar_index, display_osc + 15, str.tostring(total_bear_reg_count) + "/6\nCONF", 
+              color=color.new(#ff0000, 0), textcolor=color.white, 
+              style=label.style_label_down, size=size.small)
+
+// ═══════════════════════════════════════════════════════════════════════════════════
+// INSTITUTIONAL ENHANCEMENTS - VOLUME PROFILE & MARKET STRUCTURE
+// ═══════════════════════════════════════════════════════════════════════════════════
+
+// Market Structure Detection - Define arrays first
+var array<float> structure_highs = array.new_float(0)
+var array<float> structure_lows = array.new_float(0)
+
+// Volume Profile Analysis
+var array<float> vp_price_levels = array.new_float(0)
+var array<float> vp_volume_levels = array.new_float(0)
+int vp_bins = 20
+int vp_lookback = 100
+
+// Calculate in global scope for consistency
+float vp_high_global = ta.highest(high, vp_lookback)
+float vp_low_global = ta.lowest(low, vp_lookback)
+
+if bar_index % 5 == 0  // Update every 5 bars for performance
+    array.clear(vp_price_levels)
+    array.clear(vp_volume_levels)
+    
+    float vp_high = vp_high_global
+    float vp_low = vp_low_global
+    float price_range = vp_high - vp_low
+    float bin_size = price_range / vp_bins
+    
+    // Initialize volume profile bins
+    for i = 0 to vp_bins - 1
+        array.push(vp_price_levels, vp_low + bin_size * i)
+        array.push(vp_volume_levels, 0.0)
+    
+    // Accumulate volume in bins
+    for i = 0 to math.min(vp_lookback - 1, bar_index)
+        float bar_price = close[i]
+        float bar_vol = volume[i]
+        int bin_idx = math.floor((bar_price - vp_low) / bin_size)
+        bin_idx := math.max(0, math.min(vp_bins - 1, bin_idx))
+        
+        float current_vol = array.get(vp_volume_levels, bin_idx)
+        array.set(vp_volume_levels, bin_idx, current_vol + bar_vol)
+
+// Find Volume Point of Control (VPOC)
+float vpoc_price = na
+float max_volume = 0.0
+if array.size(vp_volume_levels) > 0
+    for i = 0 to array.size(vp_volume_levels) - 1
+        float vol = array.get(vp_volume_levels, i)
+        if vol > max_volume
+            max_volume := vol
+            vpoc_price := array.get(vp_price_levels, i)
+
+// Market Structure Detection - Update arrays
+float swing_high = ta.pivothigh(high, 10, 5)
+float swing_low = ta.pivotlow(low, 10, 5)
+
+if not na(swing_high) and barstate.isconfirmed
+    array.unshift(structure_highs, swing_high)
+    if array.size(structure_highs) > 5
+        array.pop(structure_highs)
+
+if not na(swing_low) and barstate.isconfirmed
+    array.unshift(structure_lows, swing_low)
+    if array.size(structure_lows) > 5
+        array.pop(structure_lows)
+
+// ═══════════════════════════════════════════════════════════════════════════════════
+// INSTITUTIONAL PRECISION SIGNALS - ENHANCED MULTI-CONDITION SYSTEM
+// ═══════════════════════════════════════════════════════════════════════════════════
+
+// Zero-Lag Enhanced Signals (inspired by reference indicators)
+int zl_length = 21
+int zl_lag = int(math.floor((zl_length - 1) / 2))
+float zl_rsi = ta.ema(rsi + (rsi - rsi[zl_lag]), zl_length)
+float zl_mfi = ta.ema(mfi + (mfi - mfi[zl_lag]), zl_length)
+
+// Volume-Weighted Divergence Strength
+float vol_weight = volume / ta.sma(volume, 50)
+float weighted_bull_strength = bull_div_strength * vol_weight
+float weighted_bear_strength = bear_div_strength * vol_weight
+
+// Market Structure Bias (moved from later in code)
+bool higher_highs = array.size(structure_highs) >= 2 ? array.get(structure_highs, 0) > array.get(structure_highs, 1) : false
+bool higher_lows = array.size(structure_lows) >= 2 ? array.get(structure_lows, 0) > array.get(structure_lows, 1) : false
+bool lower_highs = array.size(structure_highs) >= 2 ? array.get(structure_highs, 0) < array.get(structure_highs, 1) : false
+bool lower_lows = array.size(structure_lows) >= 2 ? array.get(structure_lows, 0) < array.get(structure_lows, 1) : false
+
+string market_structure = higher_highs and higher_lows ? "BULLISH" : 
+                         lower_highs and lower_lows ? "BEARISH" : "RANGING"
+
+// Smart Money Concepts - VPOC Analysis
+float atr = ta.atr(14)
+bool above_vpoc = close > vpoc_price
+
+// Market Structure Confirmation
+bool structure_bull_confirm = market_structure == "BULLISH" or (market_structure == "RANGING" and above_vpoc)
+bool structure_bear_confirm = market_structure == "BEARISH" or (market_structure == "RANGING" and not above_vpoc)
+
+// Institutional Flow Alignment
+bool flow_bull_align = institutional_buying or (not institutional_selling and delta > 0)
+bool flow_bear_align = institutional_selling or (not institutional_buying and delta < 0)
+
+// PRECISION LONG SIGNALS - Multiple Conditions
+bool precision_long_1 = extreme_bull_signal and structure_bull_confirm and flow_bull_align and weighted_bull_strength > 80
+bool precision_long_2 = total_bull_reg_count >= 3 and zl_rsi < 35 and above_vpoc and vol_weight > 1.2
+bool precision_long_3 = final_bull_regular and institutional_buying and vol_weight > 1.3
+
+// PRECISION SHORT SIGNALS - Multiple Conditions  
+bool precision_short_1 = extreme_bear_signal and structure_bear_confirm and flow_bear_align and weighted_bear_strength > 80
+bool precision_short_2 = total_bear_reg_count >= 3 and zl_rsi > 65 and not above_vpoc and vol_weight > 1.2
+bool precision_short_3 = final_bear_regular and institutional_selling and vol_weight > 1.3
+
+// Signal Cooldown for Precision Signals
+var int last_precision_signal_bar = -999
+int bars_since_precision = bar_index - last_precision_signal_bar
+bool precision_cooldown_ok = bars_since_precision >= 25
+
+// ELITE PRECISION SIGNALS
+bool elite_precision_long = (precision_long_1 or precision_long_2 or precision_long_3) and precision_cooldown_ok and barstate.isconfirmed
+bool elite_precision_short = (precision_short_1 or precision_short_2 or precision_short_3) and precision_cooldown_ok and barstate.isconfirmed
+
+// Update precision cooldown
+if elite_precision_long or elite_precision_short
+    last_precision_signal_bar := bar_index
+
+// Plot PRECISION SIGNALS - Larger and More Prominent
+plotshape(
+     elite_precision_long,
+     title="PRECISION LONG",
+     style=shape.labelup,
+     location=location.bottom,
+     color=color.new(#00ff88, 0),
+     textcolor=color.black,
+     text="ELITE\nLONG",
+     size=size.large
+)
+
+plotshape(
+     elite_precision_short,
+     title="PRECISION SHORT",
+     style=shape.labeldown,
+     location=location.top,
+     color=color.new(#ff0044, 0),
+     textcolor=color.white,
+     text="ELITE\nSHORT",
+     size=size.large
+)
+
+// X marks removed per user request - replaced with institutional precision signals above
+
+// ─────────────────────────────────────────────────────────────────────────────────
+// ENHANCED INSTITUTIONAL DASHBOARD
+// ─────────────────────────────────────────────────────────────────────────────────
+
+var table dashboard = table.new(position.top_right, 4, 14, bgcolor=color.new(c_dashboard_bg, 5), 
+                                 border_width=2, border_color=color.new(c_dashboard_border, 30))
+
+if barstate.islast
+    // Header
+    table.cell(dashboard, 0, 0, "DIVERGENCE SYSTEM [JOAT]", text_color=c_bull_regular, text_size=size.normal, 
+               bgcolor=color.new(c_dashboard_bg, 0))
+    table.merge_cells(dashboard, 0, 0, 3, 0)
+    
+    // Oscillator Status Header
+    table.cell(dashboard, 0, 1, "OSCILLATOR", text_color=c_text, text_size=size.small, bgcolor=color.new(c_gradient_1, 10))
+    table.cell(dashboard, 1, 1, "VALUE", text_color=c_text, text_size=size.small, bgcolor=color.new(c_gradient_1, 10))
+    table.cell(dashboard, 2, 1, "BULL", text_color=c_bull_regular, text_size=size.small, bgcolor=color.new(c_gradient_1, 10))
+    table.cell(dashboard, 3, 1, "BEAR", text_color=c_bear_regular, text_size=size.small, bgcolor=color.new(c_gradient_1, 10))
+    
+    // RSI
+    table.cell(dashboard, 0, 2, "RSI", text_color=c_rsi, text_size=size.small)
+    table.cell(dashboard, 1, 2, str.tostring(rsi, "#.#"), text_color=c_text, text_size=size.small)
+    string rsi_bull = (rsi_bull_reg or rsi_bull_hid) ? "DIV" : "-"
+    string rsi_bear = (rsi_bear_reg or rsi_bear_hid) ? "DIV" : "-"
+    table.cell(dashboard, 2, 2, rsi_bull, text_color=(rsi_bull_reg or rsi_bull_hid) ? c_bull_regular : color.gray, text_size=size.small)
+    table.cell(dashboard, 3, 2, rsi_bear, text_color=(rsi_bear_reg or rsi_bear_hid) ? c_bear_regular : color.gray, text_size=size.small)
+    
+    // MFI
+    table.cell(dashboard, 0, 3, "MFI", text_color=c_mfi, text_size=size.small)
+    table.cell(dashboard, 1, 3, str.tostring(mfi, "#.#"), text_color=c_text, text_size=size.small)
+    string mfi_bull = (mfi_bull_reg or mfi_bull_hid) ? "DIV" : "-"
+    string mfi_bear = (mfi_bear_reg or mfi_bear_hid) ? "DIV" : "-"
+    table.cell(dashboard, 2, 3, mfi_bull, text_color=(mfi_bull_reg or mfi_bull_hid) ? c_bull_regular : color.gray, text_size=size.small)
+    table.cell(dashboard, 3, 3, mfi_bear, text_color=(mfi_bear_reg or mfi_bear_hid) ? c_bear_regular : color.gray, text_size=size.small)
+    
+    // Stochastic
+    table.cell(dashboard, 0, 4, "STOCH", text_color=c_stoch, text_size=size.small)
+    table.cell(dashboard, 1, 4, str.tostring(stoch_k, "#.#"), text_color=c_text, text_size=size.small)
+    string stoch_bull = (stoch_bull_reg or stoch_bull_hid) ? "DIV" : "-"
+    string stoch_bear = (stoch_bear_reg or stoch_bear_hid) ? "DIV" : "-"
+    table.cell(dashboard, 2, 4, stoch_bull, text_color=(stoch_bull_reg or stoch_bull_hid) ? c_bull_regular : color.gray, text_size=size.small)
+    table.cell(dashboard, 3, 4, stoch_bear, text_color=(stoch_bear_reg or stoch_bear_hid) ? c_bear_regular : color.gray, text_size=size.small)
+    
+    // MACD
+    table.cell(dashboard, 0, 5, "MACD", text_color=c_macd, text_size=size.small)
+    table.cell(dashboard, 1, 5, str.tostring(macd_hist, "#.##"), text_color=c_text, text_size=size.small)
+    string macd_bull = (macd_bull_reg or macd_bull_hid) ? "DIV" : "-"
+    string macd_bear = (macd_bear_reg or macd_bear_hid) ? "DIV" : "-"
+    table.cell(dashboard, 2, 5, macd_bull, text_color=(macd_bull_reg or macd_bull_hid) ? c_bull_regular : color.gray, text_size=size.small)
+    table.cell(dashboard, 3, 5, macd_bear, text_color=(macd_bear_reg or macd_bear_hid) ? c_bear_regular : color.gray, text_size=size.small)
+    
+    // Separator
+    table.cell(dashboard, 0, 6, "━━━━━━━━━━━━━━━━━━━━", text_color=c_gradient_1, text_size=size.small)
+    table.merge_cells(dashboard, 0, 6, 3, 6)
+    
+    // Divergence Summary
+    table.cell(dashboard, 0, 7, "TOTAL DIV", text_color=c_text, text_size=size.small)
+    table.cell(dashboard, 1, 7, str.tostring(total_bull_reg_count) + "/6", text_color=c_bull_regular, text_size=size.normal)
+    table.cell(dashboard, 2, 7, str.tostring(total_bear_reg_count) + "/6", text_color=c_bear_regular, text_size=size.normal)
+    table.cell(dashboard, 3, 7, "", text_color=c_text, text_size=size.small)
+    
+    // Strength
+    float max_str = math.max(bull_div_strength, bear_div_strength)
+    table.cell(dashboard, 0, 8, "STRENGTH", text_color=c_text, text_size=size.small)
+    table.cell(dashboard, 1, 8, str.tostring(max_str, "#") + "%", 
+               text_color=max_str >= 75 ? #00ff00 : max_str >= 60 ? #ffeb3b : c_text, text_size=size.normal)
+    table.cell(dashboard, 2, 8, div_strength_class, text_color=c_text, text_size=size.small)
+    table.merge_cells(dashboard, 2, 8, 3, 8)
+    
+    // Market Structure
+    table.cell(dashboard, 0, 9, "STRUCTURE", text_color=c_text, text_size=size.small)
+    color struct_col = market_structure == "BULLISH" ? c_bull_regular : market_structure == "BEARISH" ? c_bear_regular : c_text
+    table.cell(dashboard, 1, 9, market_structure, text_color=struct_col, text_size=size.normal)
+    table.merge_cells(dashboard, 1, 9, 3, 9)
+    
+    // Volume Analysis
+    table.cell(dashboard, 0, 10, "VOLUME", text_color=c_text, text_size=size.small)
+    float vol_ratio = volume / volume_sma_20
+    color vol_col = vol_ratio > 1.5 ? #00ff00 : vol_ratio > 1.0 ? #ffeb3b : color.gray
+    table.cell(dashboard, 1, 10, str.tostring(vol_ratio, "#.#") + "x", text_color=vol_col, text_size=size.normal)
+    string vol_status = vol_ratio > 1.5 ? "HIGH" : vol_ratio > 1.0 ? "AVG" : "LOW"
+    table.cell(dashboard, 2, 10, vol_status, text_color=vol_col, text_size=size.small)
+    table.merge_cells(dashboard, 2, 10, 3, 10)
+    
+    // VPOC Distance
+    table.cell(dashboard, 0, 11, "VPOC DIST", text_color=c_text, text_size=size.small)
+    float vpoc_dist = not na(vpoc_price) ? ((close - vpoc_price) / close) * 100 : 0
+    color vpoc_col = vpoc_dist > 0 ? c_bull_regular : c_bear_regular
+    table.cell(dashboard, 1, 11, str.tostring(math.abs(vpoc_dist), "#.#") + "%", text_color=vpoc_col, text_size=size.normal)
+    string vpoc_pos = vpoc_dist > 0 ? "ABOVE" : "BELOW"
+    table.cell(dashboard, 2, 11, vpoc_pos, text_color=vpoc_col, text_size=size.small)
+    table.merge_cells(dashboard, 2, 11, 3, 11)
+    
+    // Order Flow
+    table.cell(dashboard, 0, 12, "ORDER FLOW", text_color=c_text, text_size=size.small)
+    string flow_txt = institutional_buying ? "INST BUY" : institutional_selling ? "INST SELL" : "NEUTRAL"
+    color flow_col = institutional_buying ? c_bull_regular : institutional_selling ? c_bear_regular : color.gray
+    table.cell(dashboard, 1, 12, flow_txt, text_color=flow_col, text_size=size.normal)
+    table.merge_cells(dashboard, 1, 12, 3, 12)
+    
+    // Current Signal
+    table.cell(dashboard, 0, 13, "SIGNAL", text_color=c_text, text_size=size.small)
+    string curr_signal = final_bull_regular ? "BULL DIV" : final_bear_regular ? "BEAR DIV" : final_bull_hidden ? "BULL HID" : final_bear_hidden ? "BEAR HID" : "WAIT"
+    color sig_col = (final_bull_regular or final_bull_hidden) ? c_bull_regular : (final_bear_regular or final_bear_hidden) ? c_bear_regular : color.gray
+    table.cell(dashboard, 1, 13, curr_signal, text_color=sig_col, text_size=size.normal)
+    table.merge_cells(dashboard, 1, 13, 3, 13)
+
+
+
+// ─────────────────────────────────────────────────────────────────────────────────
+// ADVANCED FEATURES - GRADIENT RIBBON VISUALIZATION (9-LAYER SMOOTH GRADIENT)
+// ─────────────────────────────────────────────────────────────────────────────────
+
+// Calculate ribbon intensity based on divergence strength
+float ribbon_intensity = 0.0
+color ribbon_base_color = c_text
+
+if final_bull_regular or final_bull_hidden
+    ribbon_intensity := math.min(0.7, bull_div_strength / 100)
+    ribbon_base_color := c_bull_regular
+else if final_bear_regular or final_bear_hidden
+    ribbon_intensity := math.min(0.7, bear_div_strength / 100)
+    ribbon_base_color := c_bear_regular
+
+// Only show ribbon when divergence is active
+bool show_ribbon = (final_bull_regular or final_bear_regular or final_bull_hidden or final_bear_hidden) and ribbon_intensity > 0
+
+// Calculate ribbon levels (9 layers for smooth gradient)
+float ribbon_center = 50  // Midline
+float ribbon_range = 20 * ribbon_intensity
+float ribbon_top = ribbon_center + ribbon_range
+float ribbon_bottom = ribbon_center - ribbon_range
+
+float step = (ribbon_top - ribbon_bottom) / 9.0
+
+float r_lev_1 = ribbon_bottom + step * 1
+float r_lev_2 = ribbon_bottom + step * 2
+float r_lev_3 = ribbon_bottom + step * 3
+float r_lev_4 = ribbon_bottom + step * 4
+float r_lev_5 = ribbon_bottom + step * 5
+float r_lev_6 = ribbon_bottom + step * 6
+float r_lev_7 = ribbon_bottom + step * 7
+float r_lev_8 = ribbon_bottom + step * 8
+
+// Gradient transparency system (9 levels)
+float t_base = 75.0
+float t_step = (100.0 - t_base) / 9.0
+
+color r_c_0 = color.new(ribbon_base_color, t_base)
+color r_c_1 = color.new(ribbon_base_color, math.min(100, t_base + t_step * 1))
+color r_c_2 = color.new(ribbon_base_color, math.min(100, t_base + t_step * 2))
+color r_c_3 = color.new(ribbon_base_color, math.min(100, t_base + t_step * 3))
+color r_c_4 = color.new(ribbon_base_color, math.min(100, t_base + t_step * 4))
+color r_c_5 = color.new(ribbon_base_color, math.min(100, t_base + t_step * 5))
+color r_c_6 = color.new(ribbon_base_color, math.min(100, t_base + t_step * 6))
+color r_c_7 = color.new(ribbon_base_color, math.min(100, t_base + t_step * 7))
+color r_c_8 = color.new(ribbon_base_color, math.min(100, t_base + t_step * 8))
+
+// Plot ribbon layers
+p_r_bottom = plot(show_ribbon ? ribbon_bottom : na, "Ribbon Bottom", display=display.none)
+p_r_1 = plot(show_ribbon ? r_lev_1 : na, "R1", display=display.none)
+p_r_2 = plot(show_ribbon ? r_lev_2 : na, "R2", display=display.none)
+p_r_3 = plot(show_ribbon ? r_lev_3 : na, "R3", display=display.none)
+p_r_4 = plot(show_ribbon ? r_lev_4 : na, "R4", display=display.none)
+p_r_5 = plot(show_ribbon ? r_lev_5 : na, "R5", display=display.none)
+p_r_6 = plot(show_ribbon ? r_lev_6 : na, "R6", display=display.none)
+p_r_7 = plot(show_ribbon ? r_lev_7 : na, "R7", display=display.none)
+p_r_8 = plot(show_ribbon ? r_lev_8 : na, "R8", display=display.none)
+p_r_top = plot(show_ribbon ? ribbon_top : na, "Ribbon Top", display=display.none)
+
+// Fill ribbon with gradient
+bool up_ribbon = final_bull_regular or final_bull_hidden
+
+fill(p_r_bottom, p_r_1, top_color=(up_ribbon ? r_c_1 : r_c_0), bottom_color=(up_ribbon ? r_c_0 : r_c_1), title="Ribbon Z1")
+fill(p_r_1, p_r_2, top_color=(up_ribbon ? r_c_2 : r_c_1), bottom_color=(up_ribbon ? r_c_1 : r_c_2), title="Ribbon Z2")
+fill(p_r_2, p_r_3, top_color=(up_ribbon ? r_c_3 : r_c_2), bottom_color=(up_ribbon ? r_c_2 : r_c_3), title="Ribbon Z3")
+fill(p_r_3, p_r_4, top_color=(up_ribbon ? r_c_4 : r_c_3), bottom_color=(up_ribbon ? r_c_3 : r_c_4), title="Ribbon Z4")
+fill(p_r_4, p_r_5, top_color=(up_ribbon ? r_c_5 : r_c_4), bottom_color=(up_ribbon ? r_c_4 : r_c_5), title="Ribbon Z5")
+fill(p_r_5, p_r_6, top_color=(up_ribbon ? r_c_6 : r_c_5), bottom_color=(up_ribbon ? r_c_5 : r_c_6), title="Ribbon Z6")
+fill(p_r_6, p_r_7, top_color=(up_ribbon ? r_c_7 : r_c_6), bottom_color=(up_ribbon ? r_c_6 : r_c_7), title="Ribbon Z7")
+fill(p_r_7, p_r_8, top_color=(up_ribbon ? r_c_8 : r_c_7), bottom_color=(up_ribbon ? r_c_7 : r_c_8), title="Ribbon Z8")
+fill(p_r_8, p_r_top, top_color=color.new(ribbon_base_color, 100), bottom_color=(up_ribbon ? r_c_8 : color.new(ribbon_base_color, 100)), title="Ribbon Z9")
+
+// ─────────────────────────────────────────────────────────────────────────────────
+// ADVANCED FEATURES - DIVERGENCE LINE DRAWING
+// ─────────────────────────────────────────────────────────────────────────────────
+
+// Draw divergence lines (last 10 divergences)
+var array<line> div_lines = array.new_line(0)
+
+if show_divergence_lines and final_bull_regular and barstate.isconfirmed
+    // Draw line from previous low to current low
+    if array.size(price_lows) >= 2
+        int prev_bar = array.get(price_low_bars, array.size(price_low_bars) - 2)
+        float prev_price = array.get(price_lows, array.size(price_lows) - 2)
+        int curr_bar = bar_index
+        float curr_price = low
+        
+        line div_line = line.new(prev_bar, prev_price, curr_bar, curr_price,
+                                 color=color.new(c_bull_regular, 30), width=2, style=line.style_dashed)
+        array.push(div_lines, div_line)
+        
+        // Keep only last 10 lines
+        if array.size(div_lines) > 10
+            line.delete(array.shift(div_lines))
+
+if show_divergence_lines and final_bear_regular and barstate.isconfirmed
+    if array.size(price_highs) >= 2
+        int prev_bar = array.get(price_high_bars, array.size(price_high_bars) - 2)
+        float prev_price = array.get(price_highs, array.size(price_highs) - 2)
+        int curr_bar = bar_index
+        float curr_price = high
+        
+        line div_line = line.new(prev_bar, prev_price, curr_bar, curr_price,
+                                 color=color.new(c_bear_regular, 30), width=2, style=line.style_dashed)
+        array.push(div_lines, div_line)
+        
+        if array.size(div_lines) > 10
+            line.delete(array.shift(div_lines))
+
+// ─────────────────────────────────────────────────────────────────────────────────
+// ENHANCED ALERTS
+// ─────────────────────────────────────────────────────────────────────────────────
+
+alertcondition(final_bull_regular, "Bullish Regular Divergence", "DCS: Confirmed bullish regular divergence")
+alertcondition(final_bear_regular, "Bearish Regular Divergence", "DCS: Confirmed bearish regular divergence")
+alertcondition(final_bull_hidden, "Bullish Hidden Divergence", "DCS: Confirmed bullish hidden divergence")
+alertcondition(final_bear_hidden, "Bearish Hidden Divergence", "DCS: Confirmed bearish hidden divergence")
+alertcondition(mtf_bull_confirmed, "MTF Bullish Divergence", "DCS: Multi-timeframe bullish divergence confirmed")
+alertcondition(mtf_bear_confirmed, "MTF Bearish Divergence", "DCS: Multi-timeframe bearish divergence confirmed")
+alertcondition(bull_div_strength >= 75, "Very Strong Bull Div", "DCS: Very strong bullish divergence (75%+ strength)")
+alertcondition(bear_div_strength >= 75, "Very Strong Bear Div", "DCS: Very strong bearish divergence (75%+ strength)")
+alertcondition(in_div_cluster and not in_div_cluster[1], "Divergence Cluster", "DCS: Entered divergence cluster zone")
+
+// ═══════════════════════════════════════════════════════════════════════════════════
+// END OF DIVERGENCE CONFIRMATION SYSTEM
+// ═══════════════════════════════════════════════════════════════════════════════════

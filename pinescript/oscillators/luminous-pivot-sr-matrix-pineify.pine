@@ -1,0 +1,192 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// This source code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © Pineify
+
+//======================================================================//
+//                    ____  _            _  __                          //
+//                   |  _ \(_)_ __   ___(_)/ _|_   _                    //
+//                   | |_) | | '_ \ / _ \ | |_| | | |                   //
+//                   |  __/| | | | |  __/ |  _| |_| |                   //
+//                   |_|   |_|_| |_|\___|_|_|  \__, |                   //
+//                                             |___/                    //
+//======================================================================//
+
+
+//@version=6
+indicator("Luminous Pivot S&R Matrix [Pineify]", shorttitle="Luminous S&R", overlay=true, max_boxes_count=500, max_lines_count=500)
+
+// ========================================================================= //
+// Settings
+// ========================================================================= //
+
+// --- Core Settings ---
+// Controls the main behavior of pivot detection and zone construction
+grpMain = "Core Settings"
+
+// Number of bars to the left and right used to confirm a pivot point.
+// Higher values = fewer but more significant pivot levels; lower values = more frequent, minor pivots.
+pivotLen = input.int(15, "Pivot Lookback", minval=3, group=grpMain, tooltip="Determines the sensitivity of pivot detection. Higher values find major tops/bottoms.")
+
+// Multiplier applied to the 14-period ATR to define the vertical thickness of each S/R zone.
+// Larger values create wider zones that account for more volatility; smaller values create tighter zones.
+atrMult = input.float(0.8, "Zone ATR Multiplier", minval=0.1, step=0.1, group=grpMain, tooltip="Expands the Support/Resistance zones based on market volatility.")
+
+// Maximum number of support zones and resistance zones displayed simultaneously.
+// Oldest zones are removed first when the limit is exceeded, keeping the chart uncluttered.
+maxZones = input.int(5, "Max Active Zones (per side)", minval=1, maxval=50, group=grpMain, tooltip="Limits the number of lines/boxes to keep the chart clean.")
+
+// --- Style Settings ---
+grpStyle = "Style Settings"
+supCol = input.color(#089981, "Support Color", group=grpStyle)
+resCol = input.color(#f23645, "Resistance Color", group=grpStyle)
+
+// Controls the transparency of the zone box fill and border (0 = fully opaque, 100 = fully transparent)
+zoneTransp = input.int(85, "Zone Transparency", minval=0, maxval=100, group=grpStyle)
+
+// ========================================================================= //
+// User-Defined Types (UDT)
+// ========================================================================= //
+
+// Encapsulates all data for a single support or resistance zone:
+//   price   — the exact pivot price (center of the zone)
+//   top/btm — upper and lower boundaries derived from ATR
+//   lvlLine — horizontal line drawn at the pivot price
+//   lvlBox  — semi-transparent box spanning from top to btm
+//   active  — whether the zone has NOT yet been broken by price
+type Zone
+    float price
+    float top
+    float btm
+    line lvlLine
+    box lvlBox
+    bool active
+
+// Persistent arrays that accumulate Zone objects across bars.
+// `var` ensures they are initialized only once and retain state bar-to-bar.
+// New zones are inserted at the front (index 0); oldest zones sit at the back.
+var array<Zone> supZones = array.new<Zone>()
+var array<Zone> resZones = array.new<Zone>()
+
+// ========================================================================= //
+// Calculations
+// ========================================================================= //
+
+// ATR-based half-width for zone construction.
+// Uses a fixed 14-period ATR scaled by the user's multiplier.
+atr = ta.atr(14) * atrMult
+
+// Pivot detection — returns non-na only when a confirmed pivot is found.
+// Because pivots require `pivotLen` bars of confirmation to the right,
+// the detected pivot actually occurred `pivotLen` bars ago.
+ph = ta.pivothigh(high, pivotLen, pivotLen)
+pl = ta.pivotlow(low, pivotLen, pivotLen)
+
+// --- Detect Pivot High → Create Resistance Zone ---
+// A pivot high is confirmed when the high at bar_index[pivotLen] is the highest
+// among `pivotLen` bars on each side.
+if not na(ph)
+    // Zone boundaries: pivot price ± half of the ATR value at the pivot bar.
+    // atr[pivotLen] is used because the pivot itself occurred pivotLen bars ago.
+    zTop = ph + atr[pivotLen] / 2
+    zBtm = ph - atr[pivotLen] / 2
+    
+    // Draw a horizontal line at the exact pivot price from the pivot bar to the current bar
+    l = line.new(bar_index[pivotLen], ph, bar_index, ph, color=resCol, style=line.style_solid)
+
+    // Draw a semi-transparent box representing the resistance zone width
+    b = box.new(bar_index[pivotLen], zTop, bar_index, zBtm, border_color=color.new(resCol, zoneTransp), bgcolor=color.new(resCol, zoneTransp))
+    
+    // Insert the new zone at the front of the array (most recent first)
+    resZones.unshift(Zone.new(ph, zTop, zBtm, l, b, true))
+    
+    // If the array exceeds the user-defined limit, remove the oldest zone
+    // and delete its associated drawings to free chart resources
+    if resZones.size() > maxZones
+        popped = resZones.pop()
+        popped.lvlLine.delete()
+        popped.lvlBox.delete()
+
+// --- Detect Pivot Low → Create Support Zone ---
+// Mirror logic of the resistance detection above, applied to pivot lows.
+if not na(pl)
+    zTop = pl + atr[pivotLen] / 2
+    zBtm = pl - atr[pivotLen] / 2
+    
+    l = line.new(bar_index[pivotLen], pl, bar_index, pl, color=supCol, style=line.style_solid)
+    b = box.new(bar_index[pivotLen], zTop, bar_index, zBtm, border_color=color.new(supCol, zoneTransp), bgcolor=color.new(supCol, zoneTransp))
+    
+    supZones.unshift(Zone.new(pl, zTop, zBtm, l, b, true))
+    
+    if supZones.size() > maxZones
+        popped = supZones.pop()
+        popped.lvlLine.delete()
+        popped.lvlBox.delete()
+
+// ========================================================================= //
+// Dynamic Management & Breakout Detection
+// ========================================================================= //
+
+// Flags that track whether a breakout occurred on the current bar.
+// Reset to false each bar; set to true if any zone is invalidated.
+bullBreak = false
+bearBreak = false
+
+// --- Manage Resistance Zones ---
+// Iterate in reverse so that index removal (if ever added) stays safe.
+// For each active resistance zone:
+//   1. Extend its line and box rightward to the current bar
+//   2. Check if price has closed above the pivot price (breakout)
+//   3. If broken: deactivate the zone, flag a bullish breakout,
+//      and visually dim the zone (gray fill + dashed line)
+if resZones.size() > 0
+    for i = resZones.size() - 1 to 0
+        Zone z = resZones.get(i)
+        if z.active
+            z.lvlLine.set_x2(bar_index)
+            z.lvlBox.set_right(bar_index)
+            
+            // Breakout condition: close above the resistance pivot price
+            if close > z.price 
+                z.active := false
+                bullBreak := true
+                z.lvlBox.set_bgcolor(color.new(color.gray, 90)) 
+                z.lvlLine.set_style(line.style_dashed)
+
+// --- Manage Support Zones ---
+// Same logic as resistance management, but checks for close below support.
+if supZones.size() > 0
+    for i = supZones.size() - 1 to 0
+        Zone z = supZones.get(i)
+        if z.active
+            z.lvlLine.set_x2(bar_index)
+            z.lvlBox.set_right(bar_index)
+            
+            // Breakout condition: close below the support pivot price
+            if close < z.price 
+                z.active := false
+                bearBreak := true
+                z.lvlBox.set_bgcolor(color.new(color.gray, 90))
+                z.lvlLine.set_style(line.style_dashed)
+
+// ========================================================================= //
+// Breakout Signals & Styling
+// ========================================================================= //
+
+// Plot triangle markers on breakout bars:
+//   Bullish breakout → green triangle below the bar
+//   Bearish breakout → red triangle above the bar
+plotshape(bullBreak, title="Bull Breakout", style=shape.triangleup, location=location.belowbar, color=supCol, size=size.small)
+plotshape(bearBreak, title="Bear Breakout", style=shape.triangledown, location=location.abovebar, color=resCol, size=size.small)
+
+// Color the entire breakout candle to make it stand out:
+//   Green for bullish breakouts, red for bearish breakouts, no color otherwise
+barcolor(bullBreak ? supCol : bearBreak ? resCol : na, title="Breakout Candle Color")
+
+// ========================================================================= //
+// Alerts
+// ========================================================================= //
+
+// Configurable alert conditions that traders can attach to their alert system.
+// Fires once per bar close when the corresponding breakout flag is true.
+alertcondition(bullBreak, title="Bullish Breakout", message="Price broke above an active resistance zone!")
+alertcondition(bearBreak, title="Bearish Breakout", message="Price broke below an active support zone!")

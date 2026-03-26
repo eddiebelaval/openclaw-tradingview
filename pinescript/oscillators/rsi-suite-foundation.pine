@@ -1,0 +1,623 @@
+//@version=6
+indicator(title = "RSI Suite (Foundation)", shorttitle = "RSI Suite", overlay = false, max_labels_count = 500)
+
+//──────────────────────────────────────────────────────────────────────────────
+// Inputs
+//──────────────────────────────────────────────────────────────────────────────
+// General
+grpGeneral          = "General"
+showInfo            = input.bool(false, "General Description", group = grpGeneral, tooltip = "• Displays a compact guide inside the script output.\n• Use it as a quick reminder of major features and modes.\n• Disable it for a cleaner chart if you already know the setup.")
+useConfirmedOnly    = input.bool(true, "Confirmed Values (Non-Repainting)", group = grpGeneral, tooltip = '• ON (recommended): Uses only confirmed bar values (no intrabar updates).\n• OFF: Updates intrabar and can visually appear to repaint while a candle is still open.\n• HTF request.security values still update on HTF bar close by design.')
+
+// RSI
+grpRSI          = "RSI Configuration"
+rsiLen          = input.int(14, "RSI Length", minval = 1, group = grpRSI, inline = "rsi_core")
+rsiSrc          = input.source(close, "⠀Source", group = grpRSI, inline = "rsi_core")
+plotOBOS        = input.bool(false, "OB/OS Levels", group = grpRSI, inline = "rsi_core", tooltip = "• RSI Length: Number of bars used for RSI calculation.\n• Source: Price source used by RSI (for example Close, HLC3).\n• Plot OB/OS Levels: Shows overbought and oversold guide lines in the pane.")
+
+regimeMode      = input.string("Mid (50)", "Regime⠀", options = ["Mid (50)", "Range (40/60)", "Trend (20/80)", "Custom (low/high)"], group = grpRSI, inline = "rsi_reg")
+regimeLow       = input.float(45.0, "⠀Low", step = 1, group = grpRSI, inline = "rsi_reg")
+regimeHigh      = input.float(55.0, "⠀High", step = 1, group = grpRSI, inline = "rsi_reg", tooltip = "• Regime Mode: Chooses how Bull/Bear/Neutral zones are defined.\n• Low: Lower threshold used by the custom regime mode.\n• High: Upper threshold used by the custom regime mode.")
+
+bgMode          = input.string("RSI (CTF) Regime", "BG Mode", options = ["None", "RSI (CTF) Regime", "RSI (HTF) Regime"], group = grpRSI, inline = "rsi_bg")
+bgTfOpt         = input.string("Auto", "⠀RSI HTF BG", options = ["Auto", "1H", "4H", "D", "W", "M"], group = grpRSI, inline = "rsi_bg", tooltip = "• BG Mode: Controls whether and how regime background coloring is drawn.\n• RSI HTF BG: Defines the higher timeframe used for HTF regime background.\n• Auto picks a practical higher timeframe based on the current chart timeframe.")
+
+midLevel        = input.float(50.0, "Mid", step = 1, group = grpRSI, inline = "rsi_levels")
+obLevel         = input.float(70.0, "⠀OB", step = 1, group = grpRSI, inline = "rsi_levels")
+osLevel         = input.float(30.0, "⠀OS", step = 1, group = grpRSI, inline = "rsi_levels", tooltip = "• Mid: Center reference level used for crosses and regime logic.\n• OB: Overbought guide level.\n• OS: Oversold guide level.")
+
+showNeutralBg   = input.bool(false, "Show Neutral BG", group = grpRSI, tooltip = "• When enabled, neutral regime candles get a faint background color.\n• When disabled, only Bull/Bear regimes are highlighted.")
+smoothOn        = input.bool(false, "Smooth RSI", group = grpRSI, inline = "rsi_smooth")
+smoothLen       = input.int(5, "⠀Smoothing Length", minval = 1, group = grpRSI, inline = "rsi_smooth", tooltip = "• Smooth RSI: Applies SMA smoothing to the RSI plot.\n• Smoothing Length: Number of bars used for smoothing.\n• Higher values reduce noise but add lag.")
+
+// Signals
+grpSig              = "RSI Signals"
+sigType             = input.string("None", "Signal Type", options = ["None", "RSI Mid Cross", "RSI Pivot Break", "RSI Pivot Trendline Break"], group = grpSig, tooltip = "• Defines which signal engine drives long/short markers and signal alerts.\n• None: Signal engine disabled (no new long/short signals).\n• RSI Mid Cross: Signals on RSI crosses above/below the configured Mid level.\n• RSI Pivot Break: Signals when RSI breaks the latest confirmed pivot high/low level.\n• RSI Pivot Trendline Break: Builds pivot trendlines and signals on breaks of those lines.\n• Pivot-based modes depend heavily on Pivot Left/Right: larger values usually mean fewer but stronger setups.\n• 'Pivot Break: Once per Pivot' only affects RSI Pivot Break mode (suppresses repeated triggers on the same pivot).\n• Optional filter: 'Contrarian Regime Filter (MR)' keeps longs to Bear/Neutral and shorts to Bull/Neutral regimes.")
+frLeft              = input.int(1,  "RSI Pivot Left Bars", minval = 1, group = grpSig, inline = "sig_fractal")
+frRight             = input.int(1,  "⠀RSI Pivot Right Bars", minval = 1, group = grpSig, inline = "sig_fractal", tooltip = "• RSI Pivot Left Bars: Bars to the left required for pivot validation.\n• RSI Pivot Right Bars: Bars to the right required for pivot confirmation.\n• Larger values produce fewer but stronger pivots.")
+sigOncePerPivot     = input.bool(true, "Pivot Break: Once per Pivot", group = grpSig, tooltip = "• Limits pivot break alerts/signals to one trigger per pivot structure.\n• Helps reduce duplicate signals in choppy conditions.")
+sigTlMinStep        = input.float(0.0, "Pivot TL: Min RSI change", minval = 0.0, step = 0.1, group = grpSig, tooltip = "• Minimum RSI difference required between consecutive pivots of the same type.\n• 0 disables filtering.\n• Useful to ignore tiny pivot fluctuations.")
+sigTlExtendRight    = input.bool(true, "Pivot TL: Extend lines right", group = grpSig, tooltip = "• Extends pivot trendlines into future bars for easier break monitoring.\n• Disable to keep trendlines only between anchor pivots.")
+sigTlShowPivotMarks = input.bool(false, "Pivot TL: Show pivot markers", group = grpSig, tooltip = "• Draws visual markers at pivot points used by trendline logic.\n• Helpful for debugging and educational use.")
+filterSignalsByRegime = input.bool(false, "Contrarian Regime Filter (MR)", group = grpSig, tooltip = "• Mean-reversion / countertrend filter for generated signals.\n• Longs allowed only in Bear/Neutral regimes.\n• Shorts allowed only in Bull/Neutral regimes.")
+
+// Divergence
+grpDiv              = "RSI Divergence"
+divEnabledInput     = input.bool(true, "Divergence", group = grpDiv, inline = "div_type")
+divType             = input.string("Both", "⠀⠀⠀⠀Type", options = ["Classic", "Hidden", "Both"], group = grpDiv, inline = "div_type")
+divPreview          = input.bool(true, "Preview", group = grpDiv, inline = "div_type", tooltip = "• Divergence: Master switch for divergence detection.\n• Type: Limits detection to Classic, Hidden, or both.\n• Preview: Shows early, unconfirmed divergence candidates.")
+divLeft             = input.int(3, "Pivot Left⠀⠀⠀⠀⠀⠀⠀⠀", minval = 1, group = grpDiv, inline = "div_pivots")
+divRight            = input.int(3, "⠀Pivot Right⠀⠀⠀", minval = 1, group = grpDiv, inline = "div_pivots", tooltip = "• Pivot Left: Left bars required for divergence pivot detection.\n• Pivot Right: Right bars required before a pivot is confirmed.\n• Higher settings reduce noise and signal frequency.")
+divPreviewRight     = input.int(1, "Preview Right⠀⠀⠀⠀⠀", minval = 1, group = grpDiv, inline = "div_prev")
+divMarkerDistance   = input.float(2.0, "⠀Marker Distance", minval = 0.1, step = 0.1, group = grpDiv, inline = "div_prev", tooltip = "• Preview Right: Right-side bars used for preview pivots.\n• Marker Distance: Vertical offset of divergence markers from RSI value.\n• Increase distance to reduce overlap with lines/labels.")
+
+divMinBarsBetween   = input.int(5, "Bars between pivots", minval = 1, group = grpDiv, inline = "div_dist")
+divMaxBarsBetween   = input.int(120, "⠀Max bars⠀⠀⠀⠀⠀⠀", minval = 2, group = grpDiv, inline = "div_dist", tooltip = "• Bars between pivots: Minimum spacing for valid pivot pairs.\n• Max bars: Maximum spacing allowed for the same pivot pair.\n• Together they constrain divergence matching distance.")
+
+divCooldownBars     = input.int(10, "Cooldown bars⠀⠀⠀⠀", minval = 0, group = grpDiv, inline = "div_cool")
+divContextFilter    = input.string("Off", "⠀Context Filter⠀⠀", inline = "div_cool", options = ["Off", "Bull only when RSI < mid", "Bear only when RSI > mid", "Bull only in OS zone", "Bear only in OB zone", "By Range Regime"], group = grpDiv, tooltip = "• Cooldown bars: Minimum bars before another divergence can trigger.\n• Context Filter: Extra directional filter based on RSI zone/regime context.\n• Use filters to improve selectivity in volatile markets.")
+
+divMinRsiDelta      = input.float(2.0, "Min RSI delta⠀⠀⠀⠀⠀", minval = 0.0, step = 0.1, group = grpDiv, inline = "div_mag")
+divMinPriceDeltaPct = input.float(0.1, "⠀Min price delta %", minval = 0.0, step = 0.1, group = grpDiv, inline = "div_mag", tooltip = "• Min RSI delta: Minimum RSI separation between divergence pivots.\n• Min price delta %: Minimum percentage price separation between pivots.\n• Raise values to suppress weak micro-divergences.")
+divPriceSource      = input.string("High/Low", "Price Source⠀⠀⠀⠀⠀", options = ["High/Low", "Close", "HLC3"], group = grpDiv, inline = "div_src")
+divShowPreviewLegend = input.bool(true, "Show preview legend in status", group = grpDiv, inline = "div_src", tooltip = "• Price Source: Price series used for divergence comparison.\n• Show preview legend in status: Adds preview-state information to the status header text.")
+
+// MTF
+grpMTF          = "RSI MTF Context"
+mtfTableOpt     = input.string("Tiny", "Show MTF Table", options = ["None", "Tiny", "Small", "Normal"], group = grpMTF, tooltip = "• Controls visibility and text size of the MTF context table.\n• None hides the table entirely.")
+tf1             = input.timeframe("240", "", group = grpMTF, inline = "mtf_row")
+tf2             = input.timeframe("D",   "", group = grpMTF, inline = "mtf_row")
+tf3             = input.timeframe("W",   "", group = grpMTF, inline = "mtf_row")
+tf4             = input.timeframe("M",   "", group = grpMTF, inline = "mtf_row", tooltip = "• Configures the four timeframes used by the MTF table.\n• Values are evaluated in listed order and shown as separate columns.\n• Choose a progression from lower to higher timeframes for best context.")
+
+// Status header
+grpStatus       = "Status Header"
+statusSize      = input.string("Tiny", "Show Status Header", options = ["None", "Tiny", "Small", "Normal"], group = grpStatus, inline = "status_a")
+statusPosition  = input.string("top_left", "⠀Position", options = ["top_left", "top_right", "bottom_left", "bottom_right"], group = grpStatus, inline = "status_a", tooltip = "• Show Status Header: controls visibility and text size of the status table (None = hidden).\n• Position: selects the chart corner where the status table is anchored.\n• Header columns show: RSI, Regime, optional HTF RSI, Align score (with threshold N), active Regime Mode, and Flags.\n• Flags currently report runtime mode and context markers: NR/RT, optional DIV PREVIEW*, and REG SWAP (if custom regime low/high were swapped internally).\n• Practical workflow: use the header for fast context, then validate entries with signal markers, divergences, and/or MTF table.\n• Smaller sizes fit monitoring layouts; larger sizes are better for analysis or presentation.\n• If the chart is crowded, placing the table in a bottom corner often improves readability.")
+showStatus      = statusSize != "None"
+showHtfInStatus = input.bool(true, "Show HTF RSI in Header⠀", group = grpStatus, inline = "status_b")
+alignIncludeCTF = input.bool(false, "Include CTF in Align score", group = grpStatus, inline = "status_b", tooltip = "• Show HTF RSI in Header: Adds HTF RSI value to the status row.\n• Include CTF in Align score: Counts current chart timeframe in MTF alignment score.")
+
+// Alerts
+grpAlerts           = "Alerts"
+alRsiMidCrossUp     = input.bool(false, "RSI Mid Cross Up", group = grpAlerts, tooltip = "• Triggers alerts when RSI crosses above the configured mid level.")
+alRsiMidCrossDn     = input.bool(false, "RSI Mid Cross Down", group = grpAlerts, tooltip = "• Triggers alerts when RSI crosses below the configured mid level.")
+alDivBullClassicConf = input.bool(false, "Bull Div Classic (Confirmed)", group = grpAlerts, tooltip = "• Alerts on confirmed bullish classic divergence signals.")
+alDivBearClassicConf = input.bool(false, "Bear Div Classic (Confirmed)", group = grpAlerts, tooltip = "• Alerts on confirmed bearish classic divergence signals.")
+alDivBullHiddenConf  = input.bool(false, "Bull Div Hidden (Confirmed)", group = grpAlerts, tooltip = "• Alerts on confirmed bullish hidden divergence signals.")
+alDivBearHiddenConf  = input.bool(false, "Bear Div Hidden (Confirmed)", group = grpAlerts, tooltip = "• Alerts on confirmed bearish hidden divergence signals.")
+alDivBullAnyConf     = input.bool(false, "Bull Div Any (Confirmed)", group = grpAlerts, tooltip = "• Alerts on any confirmed bullish divergence (classic or hidden).")
+alDivBearAnyConf     = input.bool(false, "Bear Div Any (Confirmed)", group = grpAlerts, tooltip = "• Alerts on any confirmed bearish divergence (classic or hidden).")
+alDivBullPreview     = input.bool(false, "Bull Div Preview", group = grpAlerts, tooltip = "• Alerts on preview-stage bullish divergence candidates before confirmation.")
+alDivBearPreview     = input.bool(false, "Bear Div Preview", group = grpAlerts, tooltip = "• Alerts on preview-stage bearish divergence candidates before confirmation.")
+alSigLong            = input.bool(false, "Signal Long", group = grpAlerts, tooltip = "• Alerts when the active signal engine emits a long signal.")
+alSigShort           = input.bool(false, "Signal Short", group = grpAlerts, tooltip = "• Alerts when the active signal engine emits a short signal.")
+alRegimeChange       = input.bool(false, "Regime Change (CTF)", group = grpAlerts, tooltip = "• Alerts whenever the current timeframe regime changes state.")
+alRegimeChangeHTF    = input.bool(false, "Regime Change (HTF)", group = grpAlerts, tooltip = "• Alerts whenever the higher timeframe regime changes state.")
+alMtfAlignAboveN     = input.bool(false, "MTF Align >= N", group = grpAlerts, inline = "al_align")
+alMtfAlignBelowN     = input.bool(false, "MTF Align < N", group = grpAlerts, inline = "al_align")
+alignThresholdN      = input.int(3, "⠀N", minval = 0, maxval = 5, group = grpAlerts, inline = "al_align", tooltip = "• MTF Align >= N: Enables alignment-threshold alerting.\n• N: Minimum number of aligned timeframes required to trigger.")
+
+//──────────────────────────────────────────────────────────────────────────────
+// Helpers
+//──────────────────────────────────────────────────────────────────────────────
+f_confirmed_float(x) =>
+    useConfirmedOnly ? (barstate.isconfirmed ? x : nz(x[1], x)) : x
+
+f_confirmed_bool(x) =>
+    prevValid = bar_index > 0 and (x[1] == true or x[1] == false)
+    useConfirmedOnly ? (barstate.isconfirmed ? x : (prevValid ? x[1] : x)) : x
+
+f_sec_nr(tf, expr) =>
+    request.security(
+         syminfo.tickerid,
+         tf,
+         useConfirmedOnly ? (barstate.isconfirmed ? expr : nz(expr[1], expr)) : expr,
+         gaps = barmerge.gaps_off,
+         lookahead = barmerge.lookahead_off
+    )
+
+f_auto_htf() =>
+    if timeframe.isintraday
+        timeframe.multiplier <= 15 ? "60" : timeframe.multiplier <= 120 ? "240" : "D"
+    else if timeframe.isdaily
+        "W"
+    else if timeframe.isweekly
+        "M"
+    else
+        "M"
+
+f_htf_opt(opt) =>
+    opt == "1H" ? "60" :
+     opt == "4H" ? "240" :
+     opt == "D" ? "D" :
+     opt == "W" ? "W" :
+     "M"
+
+f_table_size(opt) =>
+    opt == "Tiny" ? size.tiny : opt == "Small" ? size.small : size.normal
+
+f_fmt(v) =>
+    str.tostring(v, "#.##")
+
+f_regime_thresholds(mode, mid, lowCustom, highCustom) =>
+    float bullT = na
+    float bearT = na
+    if mode == "Mid (50)"
+        bullT := mid
+        bearT := mid
+    else if mode == "Range (40/60)"
+        bullT := 60.0
+        bearT := 40.0
+    else if mode == "Trend (20/80)"
+        bullT := 80.0
+        bearT := 20.0
+    else
+        bullT := highCustom
+        bearT := lowCustom
+    [bullT, bearT]
+
+f_regime_state(mode, rsi, bullT, bearT) =>
+    mode == "Mid (50)" ? (rsi >= bullT ? 1 : -1) : (rsi >= bullT ? 1 : rsi <= bearT ? -1 : 0)
+
+f_regime_name(state) =>
+    state == 1 ? "Bull" : state == -1 ? "Bear" : "Neutral"
+
+f_cell_bg(v, bullT, bearT, mode) =>
+    st = f_regime_state(mode, v, bullT, bearT)
+    st == 1 ? color.new(color.lime, 80) : st == -1 ? color.new(color.red, 80) : color.new(color.gray, 85)
+
+f_atPivot(_pivotSeries, _src, _right, _occ) =>
+    ta.valuewhen(not na(_pivotSeries), _src[_right], _occ)
+
+f_line_value_at(_x1, _y1, _x2, _y2, _x) =>
+    _x2 == _x1 ? na : (_y2 + (_y2 - _y1) * (_x - _x2) / (_x2 - _x1))
+
+//──────────────────────────────────────────────────────────────────────────────
+// RSI
+//──────────────────────────────────────────────────────────────────────────────
+bgTf = bgTfOpt == "Auto" ? f_auto_htf() : f_htf_opt(bgTfOpt)
+regLowEff = math.min(regimeLow, regimeHigh)
+regHighEff = math.max(regimeLow, regimeHigh)
+regWasSwapped = regimeMode == "Custom (low/high)" and regimeLow > regimeHigh
+
+rsiRaw   = ta.rsi(rsiSrc, rsiLen)
+rsiBase  = f_confirmed_float(rsiRaw)
+rsiPlotV = smoothOn ? f_confirmed_float(ta.sma(rsiBase, smoothLen)) : rsiBase
+
+[bullThresh, bearThresh] = f_regime_thresholds(regimeMode, midLevel, regLowEff, regHighEff)
+regimeStateC = f_regime_state(regimeMode, rsiPlotV, bullThresh, bearThresh)
+
+needHtfForBg = bgMode == "RSI (HTF) Regime"
+needHtfForStatus = showStatus and showHtfInStatus
+needHtfForAlert = alRegimeChangeHTF
+needRsiHtf = needHtfForBg or needHtfForStatus or needHtfForAlert
+rsiHtf = needRsiHtf ? f_sec_nr(bgTf, ta.rsi(rsiSrc, rsiLen)) : na
+regimeStateHtf = needRsiHtf ? f_regime_state(regimeMode, rsiHtf, bullThresh, bearThresh) : na
+
+rsiColor = regimeStateC == 1 ? color.new(color.lime, 30) : regimeStateC == -1 ? color.new(color.red, 30) : color.new(color.gray, 30)
+
+plot(rsiPlotV, "RSI", color = rsiColor, linewidth = 1)
+hline(midLevel, "Mid", color = color.new(color.gray, 60))
+hline(plotOBOS ? obLevel : na, "OB", color = color.new(color.red, 60))
+hline(plotOBOS ? osLevel : na, "OS", color = color.new(color.lime, 60))
+
+bgFromState(state) =>
+    state == 1 ? color.new(color.lime, 88) : state == -1 ? color.new(color.red, 88) : showNeutralBg ? color.new(color.gray, 90) : na
+
+bg_ctf = bgMode == "RSI (CTF) Regime" ? bgFromState(regimeStateC) : na
+bg_htf = bgMode == "RSI (HTF) Regime" ? bgFromState(regimeStateHtf) : na
+bgcolor(bgMode == "RSI (CTF) Regime" ? bg_ctf : bgMode == "RSI (HTF) Regime" ? bg_htf : na, title = "Regime background")
+
+rsiCrossUp = f_confirmed_bool(ta.crossover(rsiPlotV, midLevel))
+rsiCrossDn = f_confirmed_bool(ta.crossunder(rsiPlotV, midLevel))
+alertcondition(alRsiMidCrossUp and rsiCrossUp, "RSI Crosses Above Mid", "RSI crossed above the mid level.")
+alertcondition(alRsiMidCrossDn and rsiCrossDn, "RSI Crosses Below Mid", "RSI crossed below the mid level.")
+
+//──────────────────────────────────────────────────────────────────────────────
+// RSI Divergence (Pivot-Based): Preview + Confirm
+//──────────────────────────────────────────────────────────────────────────────
+_DIV_RANGE_LEN = 200
+_DIV_FLOOR_PCT = 0.020
+_DIV_CEIL_MULT = 1.35
+
+divEnabled     = divEnabledInput
+previewAllowed = divEnabled and divPreview
+showClassicDiv = divType == "Classic" or divType == "Both"
+showHiddenDiv  = divType == "Hidden" or divType == "Both"
+
+srcLow = divPriceSource == "Close" ? close : divPriceSource == "HLC3" ? hlc3 : low
+srcHigh = divPriceSource == "Close" ? close : divPriceSource == "HLC3" ? hlc3 : high
+
+osc = divEnabled ? rsiPlotV : na
+dynBasis = divEnabled ? ta.ema(math.abs(ta.change(osc)), 50) : na
+rangeBasis = divEnabled ? (ta.highest(osc, _DIV_RANGE_LEN) - ta.lowest(osc, _DIV_RANGE_LEN)) : na
+
+float plC = na
+float phC = na
+if divEnabled
+    plC := ta.pivotlow(srcLow, divLeft, divRight)
+    phC := ta.pivothigh(srcHigh, divLeft, divRight)
+
+pricePL_C      = f_atPivot(plC, srcLow, divRight, 0)
+pricePL_C_prev = f_atPivot(plC, srcLow, divRight, 1)
+oscAtPL_C      = f_atPivot(plC, osc, divRight, 0)
+oscAtPL_C_prev = f_atPivot(plC, osc, divRight, 1)
+pricePH_C      = f_atPivot(phC, srcHigh, divRight, 0)
+pricePH_C_prev = f_atPivot(phC, srcHigh, divRight, 1)
+oscAtPH_C      = f_atPivot(phC, osc, divRight, 0)
+oscAtPH_C_prev = f_atPivot(phC, osc, divRight, 1)
+
+plBar_C0 = ta.valuewhen(not na(plC), bar_index - divRight, 0)
+plBar_C1 = ta.valuewhen(not na(plC), bar_index - divRight, 1)
+phBar_C0 = ta.valuewhen(not na(phC), bar_index - divRight, 0)
+phBar_C1 = ta.valuewhen(not na(phC), bar_index - divRight, 1)
+
+barsBetweenPL = plBar_C0 - plBar_C1
+barsBetweenPH = phBar_C0 - phBar_C1
+plDistOk = not na(barsBetweenPL) and barsBetweenPL >= divMinBarsBetween and barsBetweenPL <= divMaxBarsBetween
+phDistOk = not na(barsBetweenPH) and barsBetweenPH >= divMinBarsBetween and barsBetweenPH <= divMaxBarsBetween
+
+plRsiDeltaOk = not na(oscAtPL_C) and not na(oscAtPL_C_prev) and math.abs(oscAtPL_C - oscAtPL_C_prev) >= divMinRsiDelta
+phRsiDeltaOk = not na(oscAtPH_C) and not na(oscAtPH_C_prev) and math.abs(oscAtPH_C - oscAtPH_C_prev) >= divMinRsiDelta
+plPriceDeltaPct = not na(pricePL_C) and not na(pricePL_C_prev) and pricePL_C_prev != 0.0 ? math.abs(pricePL_C - pricePL_C_prev) / math.abs(pricePL_C_prev) * 100.0 : na
+phPriceDeltaPct = not na(pricePH_C) and not na(pricePH_C_prev) and pricePH_C_prev != 0.0 ? math.abs(pricePH_C - pricePH_C_prev) / math.abs(pricePH_C_prev) * 100.0 : na
+plPriceDeltaOk = not na(plPriceDeltaPct) and plPriceDeltaPct >= divMinPriceDeltaPct
+phPriceDeltaOk = not na(phPriceDeltaPct) and phPriceDeltaPct >= divMinPriceDeltaPct
+
+bullContextOk = true
+if divContextFilter == "Bull only when RSI < mid"
+    bullContextOk := rsiPlotV < midLevel
+else if divContextFilter == "Bull only in OS zone"
+    bullContextOk := rsiPlotV <= osLevel
+else if divContextFilter == "By Range Regime"
+    bullContextOk := regimeStateC <= 0
+
+bearContextOk = true
+if divContextFilter == "Bear only when RSI > mid"
+    bearContextOk := rsiPlotV > midLevel
+else if divContextFilter == "Bear only in OB zone"
+    bearContextOk := rsiPlotV >= obLevel
+else if divContextFilter == "By Range Regime"
+    bearContextOk := regimeStateC >= 0
+
+divBaseFiltersBull_C = plDistOk and plRsiDeltaOk and plPriceDeltaOk and bullContextOk
+divBaseFiltersBear_C = phDistOk and phRsiDeltaOk and phPriceDeltaOk and bearContextOk
+
+divBullClassic_C_raw = divEnabled and showClassicDiv and not na(plC) and pricePL_C < pricePL_C_prev and oscAtPL_C > oscAtPL_C_prev and divBaseFiltersBull_C
+divBearClassic_C_raw = divEnabled and showClassicDiv and not na(phC) and pricePH_C > pricePH_C_prev and oscAtPH_C < oscAtPH_C_prev and divBaseFiltersBear_C
+divBullHidden_C_raw  = divEnabled and showHiddenDiv and not na(plC) and pricePL_C > pricePL_C_prev and oscAtPL_C < oscAtPL_C_prev and divBaseFiltersBull_C
+divBearHidden_C_raw  = divEnabled and showHiddenDiv and not na(phC) and pricePH_C < pricePH_C_prev and oscAtPH_C > oscAtPH_C_prev and divBaseFiltersBear_C
+
+divBull_C_raw = divBullClassic_C_raw or divBullHidden_C_raw
+divBear_C_raw = divBearClassic_C_raw or divBearHidden_C_raw
+
+var int lastBullDivBar = na
+var int lastBearDivBar = na
+bullCooldownOk = divCooldownBars <= 0 or na(lastBullDivBar) or (bar_index - lastBullDivBar) >= divCooldownBars
+bearCooldownOk = divCooldownBars <= 0 or na(lastBearDivBar) or (bar_index - lastBearDivBar) >= divCooldownBars
+
+divBull_C = divBull_C_raw and bullCooldownOk
+divBear_C = divBear_C_raw and bearCooldownOk
+
+if divBull_C
+    lastBullDivBar := bar_index
+if divBear_C
+    lastBearDivBar := bar_index
+
+dynAtPL_C      = f_atPivot(plC, dynBasis, divRight, 0)
+dynAtPH_C      = f_atPivot(phC, dynBasis, divRight, 0)
+rangeAtPL_C    = f_atPivot(plC, rangeBasis, divRight, 0)
+rangeAtPH_C    = f_atPivot(phC, rangeBasis, divRight, 0)
+
+dynOffPL_C = nz(dynAtPL_C, 0.0) * divMarkerDistance
+dynOffPH_C = nz(dynAtPH_C, 0.0) * divMarkerDistance
+floorOffPL_C = nz(rangeAtPL_C, 0.0) * _DIV_FLOOR_PCT * divMarkerDistance
+floorOffPH_C = nz(rangeAtPH_C, 0.0) * _DIV_FLOOR_PCT * divMarkerDistance
+rawOffsetPL_C = math.max(dynOffPL_C, floorOffPL_C)
+rawOffsetPH_C = math.max(dynOffPH_C, floorOffPH_C)
+markerOffsetPL_C = math.min(rawOffsetPL_C, floorOffPL_C * _DIV_CEIL_MULT)
+markerOffsetPH_C = math.min(rawOffsetPH_C, floorOffPH_C * _DIV_CEIL_MULT)
+
+bullY_C = oscAtPL_C - markerOffsetPL_C
+bearY_C = oscAtPH_C + markerOffsetPH_C
+
+plot(divBull_C ? bullY_C : na, title = "Bull Div (CONF)", style = plot.style_circles, linewidth = 2, offset = -divRight, color = color.new(color.green, 0))
+plot(divBear_C ? bearY_C : na, title = "Bear Div (CONF)", style = plot.style_circles, linewidth = 2, offset = -divRight, color = color.new(color.red, 0))
+
+float plP = na
+float phP = na
+if previewAllowed
+    plP := ta.pivotlow(srcLow, divLeft, divPreviewRight)
+    phP := ta.pivothigh(srcHigh, divLeft, divPreviewRight)
+
+pricePL_P      = f_atPivot(plP, srcLow, divPreviewRight, 0)
+pricePL_P_prev = f_atPivot(plP, srcLow, divPreviewRight, 1)
+oscAtPL_P      = f_atPivot(plP, osc, divPreviewRight, 0)
+oscAtPL_P_prev = f_atPivot(plP, osc, divPreviewRight, 1)
+pricePH_P      = f_atPivot(phP, srcHigh, divPreviewRight, 0)
+pricePH_P_prev = f_atPivot(phP, srcHigh, divPreviewRight, 1)
+oscAtPH_P      = f_atPivot(phP, osc, divPreviewRight, 0)
+oscAtPH_P_prev = f_atPivot(phP, osc, divPreviewRight, 1)
+
+plBar_P0 = ta.valuewhen(not na(plP), bar_index - divPreviewRight, 0)
+plBar_P1 = ta.valuewhen(not na(plP), bar_index - divPreviewRight, 1)
+phBar_P0 = ta.valuewhen(not na(phP), bar_index - divPreviewRight, 0)
+phBar_P1 = ta.valuewhen(not na(phP), bar_index - divPreviewRight, 1)
+
+barsBetweenPL_P = plBar_P0 - plBar_P1
+barsBetweenPH_P = phBar_P0 - phBar_P1
+plDistOk_P = not na(barsBetweenPL_P) and barsBetweenPL_P >= divMinBarsBetween and barsBetweenPL_P <= divMaxBarsBetween
+phDistOk_P = not na(barsBetweenPH_P) and barsBetweenPH_P >= divMinBarsBetween and barsBetweenPH_P <= divMaxBarsBetween
+
+plRsiDeltaOk_P = not na(oscAtPL_P) and not na(oscAtPL_P_prev) and math.abs(oscAtPL_P - oscAtPL_P_prev) >= divMinRsiDelta
+phRsiDeltaOk_P = not na(oscAtPH_P) and not na(oscAtPH_P_prev) and math.abs(oscAtPH_P - oscAtPH_P_prev) >= divMinRsiDelta
+plPriceDeltaPct_P = not na(pricePL_P) and not na(pricePL_P_prev) and pricePL_P_prev != 0.0 ? math.abs(pricePL_P - pricePL_P_prev) / math.abs(pricePL_P_prev) * 100.0 : na
+phPriceDeltaPct_P = not na(pricePH_P) and not na(pricePH_P_prev) and pricePH_P_prev != 0.0 ? math.abs(pricePH_P - pricePH_P_prev) / math.abs(pricePH_P_prev) * 100.0 : na
+plPriceDeltaOk_P = not na(plPriceDeltaPct_P) and plPriceDeltaPct_P >= divMinPriceDeltaPct
+phPriceDeltaOk_P = not na(phPriceDeltaPct_P) and phPriceDeltaPct_P >= divMinPriceDeltaPct
+
+divBaseFiltersBull_P = plDistOk_P and plRsiDeltaOk_P and plPriceDeltaOk_P and bullContextOk
+divBaseFiltersBear_P = phDistOk_P and phRsiDeltaOk_P and phPriceDeltaOk_P and bearContextOk
+
+divBullClassic_P = previewAllowed and showClassicDiv and not na(plP) and pricePL_P < pricePL_P_prev and oscAtPL_P > oscAtPL_P_prev and divBaseFiltersBull_P
+divBearClassic_P = previewAllowed and showClassicDiv and not na(phP) and pricePH_P > pricePH_P_prev and oscAtPH_P < oscAtPH_P_prev and divBaseFiltersBear_P
+divBullHidden_P  = previewAllowed and showHiddenDiv and not na(plP) and pricePL_P > pricePL_P_prev and oscAtPL_P < oscAtPL_P_prev and divBaseFiltersBull_P
+divBearHidden_P  = previewAllowed and showHiddenDiv and not na(phP) and pricePH_P < pricePH_P_prev and oscAtPH_P > oscAtPH_P_prev and divBaseFiltersBear_P
+
+divBull_P = divBullClassic_P or divBullHidden_P
+divBear_P = divBearClassic_P or divBearHidden_P
+
+dynAtPL_P      = f_atPivot(plP, dynBasis, divPreviewRight, 0)
+dynAtPH_P      = f_atPivot(phP, dynBasis, divPreviewRight, 0)
+rangeAtPL_P    = f_atPivot(plP, rangeBasis, divPreviewRight, 0)
+rangeAtPH_P    = f_atPivot(phP, rangeBasis, divPreviewRight, 0)
+
+dynOffPL_P = nz(dynAtPL_P, 0.0) * divMarkerDistance
+dynOffPH_P = nz(dynAtPH_P, 0.0) * divMarkerDistance
+floorOffPL_P = nz(rangeAtPL_P, 0.0) * _DIV_FLOOR_PCT * divMarkerDistance
+floorOffPH_P = nz(rangeAtPH_P, 0.0) * _DIV_FLOOR_PCT * divMarkerDistance
+rawOffsetPL_P = math.max(dynOffPL_P, floorOffPL_P)
+rawOffsetPH_P = math.max(dynOffPH_P, floorOffPH_P)
+markerOffsetPL_P = math.min(rawOffsetPL_P, floorOffPL_P * _DIV_CEIL_MULT)
+markerOffsetPH_P = math.min(rawOffsetPH_P, floorOffPH_P * _DIV_CEIL_MULT)
+
+bullY_P = oscAtPL_P - markerOffsetPL_P
+bearY_P = oscAtPH_P + markerOffsetPH_P
+
+plot(divBull_P ? bullY_P : na, title = "Bull Div (PREVIEW)", style = plot.style_circles, linewidth = 1, offset = -divPreviewRight, color = color.new(color.green, 20))
+plot(divBear_P ? bearY_P : na, title = "Bear Div (PREVIEW)", style = plot.style_circles, linewidth = 1, offset = -divPreviewRight, color = color.new(color.red, 20))
+
+alertcondition(alDivBullClassicConf and divBullClassic_C_raw and bullCooldownOk, "Bullish RSI divergence (Classic)", "Classic bullish RSI divergence confirmed")
+alertcondition(alDivBearClassicConf and divBearClassic_C_raw and bearCooldownOk, "Bearish RSI divergence (Classic)", "Classic bearish RSI divergence confirmed")
+alertcondition(alDivBullHiddenConf and divBullHidden_C_raw and bullCooldownOk, "Bullish RSI divergence (Hidden)", "Hidden bullish RSI divergence confirmed")
+alertcondition(alDivBearHiddenConf and divBearHidden_C_raw and bearCooldownOk, "Bearish RSI divergence (Hidden)", "Hidden bearish RSI divergence confirmed")
+alertcondition(alDivBullAnyConf and divBull_C, "Bullish RSI divergence", "Bullish RSI divergence confirmed")
+alertcondition(alDivBearAnyConf and divBear_C, "Bearish RSI divergence", "Bearish RSI divergence confirmed")
+alertcondition(alDivBullPreview and divBull_P, "Bullish RSI divergence (Preview)", "Preview bullish RSI divergence (may invalidate)")
+alertcondition(alDivBearPreview and divBear_P, "Bearish RSI divergence (Preview)", "Preview bearish RSI divergence (may invalidate)")
+
+//──────────────────────────────────────────────────────────────────────────────
+// MTF RSI Table + Alignment
+//──────────────────────────────────────────────────────────────────────────────
+showMtfTable = mtfTableOpt != "None"
+needAlign = showMtfTable or showStatus or alMtfAlignAboveN or alMtfAlignBelowN
+
+rsi_tf1 = needAlign ? f_sec_nr(tf1, ta.rsi(rsiSrc, rsiLen)) : na
+rsi_tf2 = needAlign ? f_sec_nr(tf2, ta.rsi(rsiSrc, rsiLen)) : na
+rsi_tf3 = needAlign ? f_sec_nr(tf3, ta.rsi(rsiSrc, rsiLen)) : na
+rsi_tf4 = needAlign ? f_sec_nr(tf4, ta.rsi(rsiSrc, rsiLen)) : na
+
+up1 = needAlign and rsi_tf1 >= bullThresh ? 1 : 0
+up2 = needAlign and rsi_tf2 >= bullThresh ? 1 : 0
+up3 = needAlign and rsi_tf3 >= bullThresh ? 1 : 0
+up4 = needAlign and rsi_tf4 >= bullThresh ? 1 : 0
+ctfUp = alignIncludeCTF and rsiPlotV >= bullThresh ? 1 : 0
+alignScore = up1 + up2 + up3 + up4 + ctfUp
+alignMax = alignIncludeCTF ? 5 : 4
+alignThresholdEff = math.min(alignThresholdN, alignMax)
+alignOk = needAlign and alignScore >= alignThresholdEff
+alignOkC = f_confirmed_bool(alignOk)
+alignOkPrev = bar_index > 0 and (alignOkC[1] == true or alignOkC[1] == false) ? alignOkC[1] : false
+alignCrossUp = alignOkC and not alignOkPrev
+alignCrossDn = not alignOkC and alignOkPrev
+
+var table tMtf = na
+if showMtfTable and na(tMtf)
+    tMtf := table.new(position.top_right, 4, 2, frame_color = color.new(color.gray, 70), frame_width = 1, border_width = 1)
+if not showMtfTable and not na(tMtf)
+    table.delete(tMtf)
+    tMtf := na
+if barstate.islast and showMtfTable and not na(tMtf)
+    sz = f_table_size(mtfTableOpt)
+    table.cell(tMtf, 0, 0, tf1, text_color = color.white, text_size = sz, bgcolor = color.new(color.gray, 80))
+    table.cell(tMtf, 1, 0, tf2, text_color = color.white, text_size = sz, bgcolor = color.new(color.gray, 80))
+    table.cell(tMtf, 2, 0, tf3, text_color = color.white, text_size = sz, bgcolor = color.new(color.gray, 80))
+    table.cell(tMtf, 3, 0, tf4, text_color = color.white, text_size = sz, bgcolor = color.new(color.gray, 80))
+    table.cell(tMtf, 0, 1, f_fmt(rsi_tf1), text_color = color.white, text_size = sz, bgcolor = f_cell_bg(rsi_tf1, bullThresh, bearThresh, regimeMode))
+    table.cell(tMtf, 1, 1, f_fmt(rsi_tf2), text_color = color.white, text_size = sz, bgcolor = f_cell_bg(rsi_tf2, bullThresh, bearThresh, regimeMode))
+    table.cell(tMtf, 2, 1, f_fmt(rsi_tf3), text_color = color.white, text_size = sz, bgcolor = f_cell_bg(rsi_tf3, bullThresh, bearThresh, regimeMode))
+    table.cell(tMtf, 3, 1, f_fmt(rsi_tf4), text_color = color.white, text_size = sz, bgcolor = f_cell_bg(rsi_tf4, bullThresh, bearThresh, regimeMode))
+
+//──────────────────────────────────────────────────────────────────────────────
+// Status Header
+//──────────────────────────────────────────────────────────────────────────────
+var table tStatus = na
+var string lastStatusPosition = ""
+statusPos = statusPosition == "top_right" ? position.top_right : statusPosition == "bottom_left" ? position.bottom_left : statusPosition == "bottom_right" ? position.bottom_right : position.top_left
+if showStatus and (na(tStatus) or statusPosition != lastStatusPosition)
+    if not na(tStatus)
+        table.delete(tStatus)
+    tStatus := table.new(statusPos, 6, 2, frame_color = color.new(color.gray, 80), frame_width = 1, border_width = 1)
+    lastStatusPosition := statusPosition
+if not showStatus and not na(tStatus)
+    table.delete(tStatus)
+    tStatus := na
+    lastStatusPosition := ""
+if barstate.islast and showStatus and not na(tStatus)
+    ssz = f_table_size(statusSize)
+    table.cell(tStatus, 0, 0, "RSI", text_color = color.white, text_size = ssz, bgcolor = color.new(color.gray, 80))
+    table.cell(tStatus, 1, 0, "Regime", text_color = color.white, text_size = ssz, bgcolor = color.new(color.gray, 80))
+    table.cell(tStatus, 2, 0, "HTF RSI", text_color = color.white, text_size = ssz, bgcolor = color.new(color.gray, 80))
+    table.cell(tStatus, 3, 0, "Align", text_color = color.white, text_size = ssz, bgcolor = color.new(color.gray, 80))
+    table.cell(tStatus, 4, 0, "Mode", text_color = color.white, text_size = ssz, bgcolor = color.new(color.gray, 80))
+    table.cell(tStatus, 5, 0, "Flags", text_color = color.white, text_size = ssz, bgcolor = color.new(color.gray, 80))
+
+    table.cell(tStatus, 0, 1, f_fmt(rsiPlotV), text_color = color.white, text_size = ssz, bgcolor = color.new(color.black, 70))
+    table.cell(tStatus, 1, 1, f_regime_name(regimeStateC), text_color = color.white, text_size = ssz, bgcolor = f_cell_bg(rsiPlotV, bullThresh, bearThresh, regimeMode))
+    table.cell(tStatus, 2, 1, showHtfInStatus and needRsiHtf ? f_fmt(rsiHtf) : "-", text_color = color.white, text_size = ssz, bgcolor = color.new(color.black, 70))
+    table.cell(tStatus, 3, 1, str.tostring(alignScore) + "/" + str.tostring(alignMax) + " (N=" + str.tostring(alignThresholdEff) + ")", text_color = color.white, text_size = ssz, bgcolor = color.new(color.black, 70))
+    table.cell(tStatus, 4, 1, regimeMode, text_color = color.white, text_size = ssz, bgcolor = color.new(color.black, 70))
+    previewFlag = divShowPreviewLegend and previewAllowed ? "DIV PREVIEW*" : ""
+    regSwapFlag = regWasSwapped ? "REG SWAP" : ""
+    nrFlag = useConfirmedOnly ? "NR" : "RT"
+    statusFlags = nrFlag + (previewFlag == "" ? "" : " | " + previewFlag) + (regSwapFlag == "" ? "" : " | " + regSwapFlag)
+    table.cell(tStatus, 5, 1, statusFlags, text_color = color.white, text_size = ssz, bgcolor = color.new(color.black, 70))
+
+//──────────────────────────────────────────────────────────────────────────────
+// Optional signals
+//──────────────────────────────────────────────────────────────────────────────
+sigEnabled = sigType != "None"
+sigPivotTl = sigEnabled and sigType == "RSI Pivot Trendline Break"
+
+fractalHigh = sigEnabled and sigType == "RSI Pivot Break" ? ta.pivothigh(rsiPlotV, frLeft, frRight) : na
+fractalLow  = sigEnabled and sigType == "RSI Pivot Break" ? ta.pivotlow(rsiPlotV, frLeft, frRight) : na
+pivotTlHigh = sigPivotTl ? ta.pivothigh(rsiPlotV, frLeft, frRight) : na
+pivotTlLow  = sigPivotTl ? ta.pivotlow(rsiPlotV, frLeft, frRight) : na
+
+plot(sigTlShowPivotMarks ? pivotTlHigh : na, title = "RSI Pivot TL High", style = plot.style_circles, color = color.new(color.lime, 0), linewidth = 1, offset = -frRight)
+plot(sigTlShowPivotMarks ? pivotTlLow : na, title = "RSI Pivot TL Low", style = plot.style_circles, color = color.new(color.red, 0), linewidth = 1, offset = -frRight)
+
+var float lastFractalHigh = na
+var float lastFractalLow  = na
+var bool highFired = false
+var bool lowFired = false
+
+if not na(fractalHigh)
+    lastFractalHigh := fractalHigh
+    highFired := false
+if not na(fractalLow)
+    lastFractalLow := fractalLow
+    lowFired := false
+
+baseFractalBreakLong = sigEnabled and sigType == "RSI Pivot Break" and not na(lastFractalHigh) and ta.crossover(rsiPlotV, lastFractalHigh)
+baseFractalBreakShort = sigEnabled and sigType == "RSI Pivot Break" and not na(lastFractalLow) and ta.crossunder(rsiPlotV, lastFractalLow)
+
+fractalBreakLong = baseFractalBreakLong and (not sigOncePerPivot or not highFired)
+fractalBreakShort = baseFractalBreakShort and (not sigOncePerPivot or not lowFired)
+
+if fractalBreakLong and sigOncePerPivot
+    highFired := true
+if fractalBreakShort and sigOncePerPivot
+    lowFired := true
+
+var int pivotTlHiPrevX = na
+var float pivotTlHiPrevY = na
+var int pivotTlHiLastX = na
+var float pivotTlHiLastY = na
+var int pivotTlLoPrevX = na
+var float pivotTlLoPrevY = na
+var int pivotTlLoLastX = na
+var float pivotTlLoLastY = na
+var line pivotTlHiLine = na
+var line pivotTlLoLine = na
+
+if not na(pivotTlHigh)
+    pivotX = bar_index - frRight
+    pivotY = pivotTlHigh
+    acceptPivot = na(pivotTlHiLastY) or sigTlMinStep <= 0.0 or math.abs(pivotY - pivotTlHiLastY) >= sigTlMinStep
+    if acceptPivot
+        pivotTlHiPrevX := pivotTlHiLastX
+        pivotTlHiPrevY := pivotTlHiLastY
+        pivotTlHiLastX := pivotX
+        pivotTlHiLastY := pivotY
+
+        if not na(pivotTlHiPrevX) and not na(pivotTlHiLastX)
+            if na(pivotTlHiLine)
+                pivotTlHiLine := line.new(pivotTlHiPrevX, pivotTlHiPrevY, pivotTlHiLastX, pivotTlHiLastY, xloc = xloc.bar_index, extend = sigTlExtendRight ? extend.right : extend.none, color = color.new(color.lime, 0), width = 1)
+            else
+                line.set_xy1(pivotTlHiLine, pivotTlHiPrevX, pivotTlHiPrevY)
+                line.set_xy2(pivotTlHiLine, pivotTlHiLastX, pivotTlHiLastY)
+                line.set_extend(pivotTlHiLine, sigTlExtendRight ? extend.right : extend.none)
+
+if not na(pivotTlLow)
+    pivotX = bar_index - frRight
+    pivotY = pivotTlLow
+    acceptPivot = na(pivotTlLoLastY) or sigTlMinStep <= 0.0 or math.abs(pivotY - pivotTlLoLastY) >= sigTlMinStep
+    if acceptPivot
+        pivotTlLoPrevX := pivotTlLoLastX
+        pivotTlLoPrevY := pivotTlLoLastY
+        pivotTlLoLastX := pivotX
+        pivotTlLoLastY := pivotY
+
+        if not na(pivotTlLoPrevX) and not na(pivotTlLoLastX)
+            if na(pivotTlLoLine)
+                pivotTlLoLine := line.new(pivotTlLoPrevX, pivotTlLoPrevY, pivotTlLoLastX, pivotTlLoLastY, xloc = xloc.bar_index, extend = sigTlExtendRight ? extend.right : extend.none, color = color.new(color.red, 0), width = 1)
+            else
+                line.set_xy1(pivotTlLoLine, pivotTlLoPrevX, pivotTlLoPrevY)
+                line.set_xy2(pivotTlLoLine, pivotTlLoLastX, pivotTlLoLastY)
+                line.set_extend(pivotTlLoLine, sigTlExtendRight ? extend.right : extend.none)
+
+pivotTlHaveHi = not na(pivotTlHiPrevX) and not na(pivotTlHiLastX)
+pivotTlHaveLo = not na(pivotTlLoPrevX) and not na(pivotTlLoLastX)
+pivotTlHiNow = pivotTlHaveHi and bar_index >= pivotTlHiLastX ? f_line_value_at(pivotTlHiPrevX, pivotTlHiPrevY, pivotTlHiLastX, pivotTlHiLastY, bar_index) : na
+pivotTlLoNow = pivotTlHaveLo and bar_index >= pivotTlLoLastX ? f_line_value_at(pivotTlLoPrevX, pivotTlLoPrevY, pivotTlLoLastX, pivotTlLoLastY, bar_index) : na
+
+pivotTlBreakLong = sigPivotTl and not na(pivotTlHiNow) and ta.crossover(rsiPlotV, pivotTlHiNow)
+pivotTlBreakShort = sigPivotTl and not na(pivotTlLoNow) and ta.crossunder(rsiPlotV, pivotTlLoNow)
+
+sigLongBase = sigType == "RSI Mid Cross" ? ta.crossover(rsiPlotV, midLevel) : sigType == "RSI Pivot Break" ? fractalBreakLong : sigType == "RSI Pivot Trendline Break" ? pivotTlBreakLong : false
+sigShortBase = sigType == "RSI Mid Cross" ? ta.crossunder(rsiPlotV, midLevel) : sigType == "RSI Pivot Break" ? fractalBreakShort : sigType == "RSI Pivot Trendline Break" ? pivotTlBreakShort : false
+
+regimeSignalLongOk = not filterSignalsByRegime or regimeStateC <= 0
+regimeSignalShortOk = not filterSignalsByRegime or regimeStateC >= 0
+
+sigLong = sigEnabled and sigLongBase and regimeSignalLongOk
+sigShort = sigEnabled and sigShortBase and regimeSignalShortOk
+
+sigLongC  = f_confirmed_bool(sigLong)
+sigShortC = f_confirmed_bool(sigShort)
+
+plotshape(sigEnabled and sigLongC,  title = "Long Signal",  style = shape.triangleup,   location = location.bottom, size = size.tiny, color = color.new(color.lime, 0))
+plotshape(sigEnabled and sigShortC, title = "Short Signal", style = shape.triangledown, location = location.top,    size = size.tiny, color = color.new(color.red,  0))
+
+alertcondition(alSigLong and sigEnabled and sigLongC,  "RSI Long Signal",  "RSI-based long signal triggered.")
+alertcondition(alSigShort and sigEnabled and sigShortC, "RSI Short Signal", "RSI-based short signal triggered.")
+
+//──────────────────────────────────────────────────────────────────────────────
+// Regime and alignment alerts
+//──────────────────────────────────────────────────────────────────────────────
+var int lastRegimeC = na
+var int lastRegimeH = na
+regimeChangeC = false
+regimeChangeH = false
+if barstate.isconfirmed
+    regimeChangeC := not na(lastRegimeC) and regimeStateC != lastRegimeC
+    lastRegimeC := regimeStateC
+    if needRsiHtf
+        regimeChangeH := not na(lastRegimeH) and regimeStateHtf != lastRegimeH
+        lastRegimeH := regimeStateHtf
+
+alertcondition(alRegimeChange and regimeChangeC, "Regime Change (CTF)", "CTF RSI regime changed.")
+alertcondition(alRegimeChangeHTF and needRsiHtf and regimeChangeH, "Regime Change (HTF)", "HTF RSI regime changed.")
+alertcondition(alMtfAlignAboveN and alignCrossUp, "MTF Alignment >= N (Cross Up)", "RSI alignment score crossed up above the configured threshold.")
+alertcondition(alMtfAlignBelowN and alignCrossDn, "MTF Alignment < N (Cross Down)", "RSI alignment score crossed down below the configured threshold.")
+
+//──────────────────────────────────────────────────────────────────────────────
+// Info Panel
+//──────────────────────────────────────────────────────────────────────────────
+var table tInfo = na
+if showInfo and na(tInfo)
+    tInfo := table.new(position.bottom_right, 1, 8, frame_color = color.new(color.gray, 80), frame_width = 1)
+if not showInfo and not na(tInfo)
+    table.delete(tInfo)
+    tInfo := na
+if barstate.islast and showInfo and not na(tInfo)
+    table.cell(tInfo, 0, 0, "RSI Suite (Foundation)", text_size = size.small, text_color = color.gray, bgcolor = color.new(color.black, 80))
+    table.cell(tInfo, 0, 1, "• Regime modes: Mid(50), Range(40/60), Trend(20/80), Custom", text_size = size.small, text_color = color.gray, bgcolor = color.new(color.black, 85))
+    table.cell(tInfo, 0, 2, "• Divergence preview may invalidate until confirmed", text_size = size.small, text_color = color.gray, bgcolor = color.new(color.black, 85))
+    table.cell(tInfo, 0, 3, "• Confirmed divergence requires RightBars = " + str.tostring(divRight), text_size = size.small, text_color = color.gray, bgcolor = color.new(color.black, 85))
+    table.cell(tInfo, 0, 4, "• MTF context table is non-forward-shifted", text_size = size.small, text_color = color.gray, bgcolor = color.new(color.black, 85))
+    table.cell(tInfo, 0, 5, "• Align alert triggers on threshold crosses, not persistent state", text_size = size.small, text_color = color.gray, bgcolor = color.new(color.black, 85))
+    table.cell(tInfo, 0, 6, "• NR/RT: NR = confirmed-only, RT = intrabar live updates", text_size = size.small, text_color = color.gray, bgcolor = color.new(color.black, 85))
+    table.cell(tInfo, 0, 7, "• Contrarian filter is mean-reversion context (countertrend)", text_size = size.small, text_color = color.gray, bgcolor = color.new(color.black, 85))

@@ -1,0 +1,138 @@
+//@version=6
+indicator("SYMO2020 Genius: Sentinel Smart Filter + Liquidity Sweep)", overlay=true, max_lines_count=500, max_labels_count=500)
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// 1) الإعدادات
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+grpSMC   = "--- SMC Logic ---"
+htfTF    = input.timeframe("60", "HTF for Sweep", group=grpSMC)
+atrLen   = input.int(14, "ATR Period", group=grpSMC)
+slMult   = input.float(1.5, "SL Multiplier", group=grpSMC)
+
+// إضافات أمان داخل نفس الجروب
+htfPivotLen   = input.int(5,  "HTF Pivot Len (Liquidity)", minval=2, maxval=20, group=grpSMC)
+sweepAtrMult  = input.float(0.20, "Min Sweep Pierce (ATR x)", step=0.05, group=grpSMC)
+confirmBars   = input.int(15, "Max bars to confirm", minval=3, maxval=60, group=grpSMC)
+useTrendFilter= input.bool(true, "Trend Filter (HTF EMA200)", group=grpSMC)
+useReclaim    = input.bool(true, "Require Reclaim above Liquidity", group=grpSMC)
+useBreakHigh  = input.bool(true, "Require Break of prev High", group=grpSMC)
+
+grpSent  = "--- Smart Filters ---"
+tasi_sym = input.symbol("TADAWUL:TASI", "TASI Symbol", group=grpSent)
+rsi_lim  = input.int(60, "RSI Safe Limit", group=grpSent)
+vol_mul  = input.float(1.5, "Volume Spike", group=grpSent)
+
+// إضافات احترافية داخل نفس الجروب
+rsLookback = input.int(5, "Relative Strength Lookback", minval=2, maxval=30, group=grpSent)
+useRS      = input.bool(true, "Use Relative Strength vs TASI", group=grpSent)
+minRS      = input.float(0.0, "Min RS (stock% - tasi%)", step=0.1, group=grpSent)
+useVol     = input.bool(true, "Use Volume Filter", group=grpSent)
+useRSI     = input.bool(true, "Use RSI Safe Filter", group=grpSent)
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// 2) الحسابات الفنية (القوة النسبية + فلاتر)
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+atr = ta.atr(atrLen)
+
+// تاسي نفس فاصل الشارت (بدون إعادة رسم)
+tasi_c = request.security(tasi_sym, timeframe.period, close, barmerge.gaps_off, barmerge.lookahead_off)
+
+// مقارنة أداء على rsLookback (أثبت من شمعة واحدة)
+tasi_ret  = (tasi_c - tasi_c[rsLookback]) / tasi_c[rsLookback]
+stock_ret = (close  - close[rsLookback])  / close[rsLookback]
+rs_value  = (stock_ret - tasi_ret) * 100.0  // كنسبة مئوية تقريبية
+
+is_strong = rs_value >= minRS
+barcolor(useRS and is_strong ? color.new(#00ff08, 0) : na)
+
+rsi_v   = ta.rsi(close, 14)
+avg_vol = ta.sma(volume, 20)
+vol_ok  = volume > (avg_vol * vol_mul)
+safe_zone = rsi_v < rsi_lim
+
+sent_ok = (not useRS  or is_strong) and (not useVol or vol_ok) and (not useRSI or safe_zone)
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// 3) منطق الـ BOOM (Sweep + Reclaim + Confirm)
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// نأخذ Pivot Low من HTF كسيولة “حقيقية” بدل low[1]
+htfPL = request.security(syminfo.tickerid, htfTF, ta.pivotlow(low, htfPivotLen, htfPivotLen), barmerge.gaps_off, barmerge.lookahead_off)
+htfEMA200 = request.security(syminfo.tickerid, htfTF, ta.ema(close, 200), barmerge.gaps_off, barmerge.lookahead_off)
+
+// آخر Pivot Low معروف على HTF
+var float lastLiq = na
+if not na(htfPL)
+    lastLiq := htfPL
+
+// فلتر اتجاه عام (اختياري)
+trend_ok = not useTrendFilter or (close > htfEMA200)
+
+// Sweep “معتبر”: كسر السيولة بمقدار ATR
+pierce = not na(lastLiq) and (low < (lastLiq - atr * sweepAtrMult))
+
+// Reclaim: إغلاق فوق مستوى السيولة
+reclaim = pierce and (close > lastLiq)
+
+// متغيرات حالة الصفقة
+var bool gotSweep = false
+var int  sweepBar = na
+
+if pierce and not gotSweep
+    gotSweep := true
+    sweepBar := bar_index
+
+// ينتهي مفعول السوييب لو طال الزمن بدون تأكيد
+withinWindow = gotSweep and not na(sweepBar) and (bar_index - sweepBar <= confirmBars)
+if gotSweep and not withinWindow
+    gotSweep := false
+    sweepBar := na
+
+// شروط التأكيد
+breakHigh = close > high[1]
+confirm_ok =
+     trend_ok and sent_ok and withinWindow and
+     (not useReclaim  or (close > lastLiq)) and
+     (not useBreakHigh or breakHigh)
+
+// إشارة نهائية “BUY”
+boomSignal = confirm_ok and (not useReclaim or reclaim or close > lastLiq)
+
+// بعد تحقق الإشارة، ريست للحالة (عشان ما تتكرر على نفس السوييب)
+if boomSignal
+    gotSweep := false
+    sweepBar := na
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// 4) اللوحة الجانبية (The Smart Dashboard)
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+var table dash = table.new(position.top_right, 2, 6, bgcolor=color.new(color.black, 20), border_width=1, border_color=color.gray)
+
+finalAction =
+     boomSignal ? "BUY ✅" :
+     (gotSweep and sent_ok and trend_ok ? "GET READY 🚀" : "WAITING")
+
+if barstate.islast
+    table.cell(dash, 0, 0, "Trend Context", text_color=color.white, bgcolor=color.gray)
+    table.cell(dash, 1, 0, close > htfEMA200 ? "BULLISH 🟢" : "BEARISH 🔴", text_color=color.white)
+
+    table.cell(dash, 0, 1, "RS vs TASI", text_color=color.white, bgcolor=color.gray)
+    table.cell(dash, 1, 1, useRS ? (is_strong ? "STRONG ✅" : "Normal") : "OFF", text_color=is_strong ? color.lime : color.white)
+
+    table.cell(dash, 0, 2, "Volume Status", text_color=color.white, bgcolor=color.gray)
+    table.cell(dash, 1, 2, useVol ? (vol_ok ? "SPIKE 🔥" : "Low") : "OFF", text_color=vol_ok ? color.orange : color.white)
+
+    table.cell(dash, 0, 3, "RSI Safe?", text_color=color.white, bgcolor=color.gray)
+    table.cell(dash, 1, 3, useRSI ? (safe_zone ? "YES ✅" : "OVERBOUGHT ⚠️") : "OFF", text_color=safe_zone ? color.lime : color.red)
+
+    table.cell(dash, 0, 4, "Sweep State", text_color=color.white, bgcolor=color.gray)
+    table.cell(dash, 1, 4, gotSweep ? (withinWindow ? "ARMED ⏳" : "EXPIRED") : "NONE", text_color=gotSweep ? color.yellow : color.white)
+
+    table.cell(dash, 0, 5, "FINAL ACTION", text_color=color.black, bgcolor=color.yellow)
+    table.cell(dash, 1, 5, finalAction, text_color=color.white)
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// 5) التنبيهات (Alerts)
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+alertcondition(boomSignal, "Genius Hybrid BUY", "BUY ✅ فرصة دخول على {{ticker}} | Sweep+Confirm+Filters")
+if boomSignal
+    label.new(bar_index, low, "BUY ✅", style=label.style_label_up, color=color.new(color.green, 0), textcolor=color.white)

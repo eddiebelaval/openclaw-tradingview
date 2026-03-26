@@ -1,0 +1,379 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © Uncle_the_shooter
+
+//@version=6
+indicator('Volume Regime Shift + TP/SL', overlay = false, precision = 4, max_boxes_count = 500, max_labels_count = 500, max_lines_count = 500)
+
+// COMMON SETTINGS
+short_length   = input.int(5,    'Short Period', minval = 1, group = 'Volume Regime')
+long_length    = input.int(100,  'Long Period', minval = 1, group = 'Volume Regime')
+low_mult       = input.float(0.7, 'Low Volume Multiplier', step = 0.1, group = 'Volume Regime')
+normal_mult    = input.float(1.2, 'Normal Volume Multiplier', step = 0.1, group = 'Volume Regime')
+high_mult      = input.float(1.8, 'High Volume Multiplier', step = 0.1, group = 'Volume Regime')
+maxBars        = input.int(100,  'Max Box Length (bars)', minval = 10, group = 'Boxes')
+
+// COLORS
+low_c1    = input.color(color.rgb(210, 235, 235), 'Low Volume Start', group = 'Colors')
+low_c2    = input.color(color.rgb(170, 220, 215), 'Low Volume End', group = 'Colors')
+
+norm_c1   = input.color(color.rgb(130, 210, 200), 'Normal Volume Start', group = 'Colors')
+norm_c2   = input.color(color.rgb(90, 195, 185),  'Normal Volume End', group = 'Colors')
+
+high_c1   = input.color(color.rgb(60, 180, 170),  'High Volume Start', group = 'Colors')
+high_c2   = input.color(color.rgb(40, 160, 155),  'High Volume End', group = 'Colors')
+
+ext_c1    = input.color(color.rgb(30, 145, 145),  'Extreme Volume Start', group = 'Colors')
+ext_c2    = input.color(color.rgb(20, 120, 125),  'Extreme Volume End', group = 'Colors')
+
+// LABEL COLORS
+buyLabelColor  = input.color(#26a69a, 'Buy Label Color', group = 'Labels')
+sellLabelColor = input.color(#ef5350,  'Sell Label Color', group = 'Labels')
+
+buyColorLight  = color.new(buyLabelColor,  40)
+sellColorLight = color.new(sellLabelColor, 40)
+buyFill        = color.new(buyLabelColor,  70)
+sellFill       = color.new(sellLabelColor, 70)
+
+// VISUAL SIGNALS
+show_buy_sell_labels = input.bool(true,  "Show BUY/SELL Labels",          group = "Signals")
+show_triangles       = input.bool(true,  "Show Triangle Signals (plotshape)", group = "Signals")
+
+// TP/SL TARGETS
+show_targets   = input.bool(true,  "Show TP/SL Targets", group = "Targets")
+use_atr_sl     = input.bool(true,  "SL = ATR × instead of %", group = "Targets")
+atr_period     = input.int(14,     "ATR Period", minval=1, group = "Targets")
+sl_atr_mult    = input.float(1.5,  "SL ATR Multiplier", step=0.1, group = "Targets")
+sl_percent     = input.float(1.0,  "SL % from Entry", step=0.1, group = "Targets")
+
+rr_tp1         = input.float(1.0,  "TP1 Risk-Reward Ratio", step=0.1, group = "Targets")
+rr_tp2         = input.float(2.0,  "TP2 Risk-Reward Ratio", step=0.1, group = "Targets")
+rr_tp3         = input.float(3.0,  "TP3 Risk-Reward Ratio", step=0.1, group = "Targets")
+
+// DISPLAY
+show_sl_level  = input.bool(true,  "Show SL Level",  group = "Display")
+show_tp1_level = input.bool(true,  "Show TP1 Level", group = "Display")
+show_tp2_level = input.bool(true,  "Show TP2 Level", group = "Display")
+show_tp3_level = input.bool(true,  "Show TP3 Level", group = "Display")
+
+// CALCULATIONS
+vol_short  = ta.sma(volume, short_length)
+vol_long   = ta.sma(volume, long_length)
+vol_regime = vol_short / math.max(vol_long, 0.000001)
+atr_val    = ta.atr(atr_period)
+
+// GRADIENT FUNCTION
+f_gradient(val, min_val, max_val, c1, c2) =>
+    frac_raw = (val - min_val) / math.max(max_val - min_val, 1e-10)
+    frac = math.max(0., math.min(1., frac_raw))
+    r = math.round(color.r(c1) + (color.r(c2) - color.r(c1)) * frac)
+    g = math.round(color.g(c1) + (color.g(c2) - color.g(c1)) * frac)
+    b = math.round(color.b(c1) + (color.b(c2) - color.b(c1)) * frac)
+    color.rgb(r, g, b)
+
+col_low     = f_gradient(vol_regime, 0, low_mult, low_c1, low_c2)
+col_normal  = f_gradient(vol_regime, low_mult, normal_mult, norm_c1, norm_c2)
+col_high    = f_gradient(vol_regime, normal_mult, high_mult, high_c1, high_c2)
+col_extreme = f_gradient(vol_regime, high_mult, high_mult * 1.8, ext_c1, ext_c2)
+
+final_color = vol_regime < low_mult ? col_low : vol_regime < normal_mult ? col_normal : vol_regime < high_mult ? col_high : col_extreme
+
+// OSCILLATOR
+plot(vol_regime, 'Volume Regime', final_color, style = plot.style_columns)
+plot(vol_regime, 'Line', color = color.new(color.white, 70), linewidth = 1)
+
+hline(low_mult,    'Low',    color = color.gray, linestyle = hline.style_dotted)
+hline(normal_mult, 'Normal', color = color.gray, linestyle = hline.style_dotted)
+hline(high_mult,   'High',   color = color.gray, linestyle = hline.style_dotted)
+
+// HIGH VOLUME BOXES
+isHighVol = vol_regime > high_mult
+
+var box   activeBox   = na
+var float boxTop      = na
+var float boxBottom   = na
+var int   boxStartBar = na
+var bool  building    = false
+var bool  boxActive   = false
+
+startSequence = isHighVol and not building and not boxActive
+
+if startSequence
+    building    := true
+    boxActive   := true
+    boxTop      := high
+    boxBottom   := low
+    boxStartBar := bar_index
+    activeBox   := box.new(bar_index, high, bar_index + 1, low, 
+         bgcolor = color.new(#787b86, 88), 
+         border_color = color.new(#787b86, 40), 
+         force_overlay = true)
+
+if building and isHighVol
+    boxTop    := math.max(boxTop, high)
+    boxBottom := math.min(boxBottom, low)
+
+if building and not isHighVol
+    building := false
+
+if boxActive
+    box.set_right(activeBox, bar_index + 1)
+    box.set_top(activeBox, boxTop)
+    box.set_bottom(activeBox, boxBottom)
+
+// BREAKOUTS
+breakoutUp   = boxActive and close > boxTop
+breakoutDown = boxActive and close < boxBottom
+
+barsAlive = bar_index - boxStartBar
+timeout   = boxActive and barsAlive > maxBars
+
+// TP/SL LEVELS
+var int   trade_dir       = 0
+var float sl_level        = na
+var float extreme_level   = na
+var line  entry_line      = na
+var label entry_label     = na
+var line  sl_line         = na
+var label sl_label        = na
+var line  tp1_line        = na
+var label tp1_label       = na
+var line  tp2_line        = na
+var label tp2_label       = na
+var line  tp3_line        = na
+var label tp3_label       = na
+var line  extreme_line    = na
+var linefill risk_fill    = na
+var linefill reward_fill  = na
+var int   entry_bar       = na
+
+if breakoutUp
+    if show_buy_sell_labels
+        label.new(bar_index, boxBottom, 'BUY', style = label.style_label_up, color = color.new(buyLabelColor, 40), textcolor = color.white, size = size.small, force_overlay = true)
+    
+    box.set_right(activeBox, bar_index)
+    box.set_bgcolor(activeBox, color.new(buyLabelColor, 82))
+    box.set_border_color(activeBox, buyLabelColor)
+    
+    box.set_extend(activeBox, extend.none)
+    boxActive := false
+    activeBox := na
+
+    if show_targets
+        line.delete(entry_line)
+        label.delete(entry_label)
+        line.delete(sl_line)
+        label.delete(sl_label)
+        line.delete(tp1_line)
+        label.delete(tp1_label)
+        line.delete(tp2_line)
+        label.delete(tp2_label)
+        line.delete(tp3_line)
+        label.delete(tp3_label)
+        line.delete(extreme_line)
+        linefill.delete(risk_fill)
+        linefill.delete(reward_fill)
+
+        trade_dir := 1
+        entry_bar := bar_index
+        float entry_price = close
+        float risk_dist = use_atr_sl ? atr_val * sl_atr_mult : entry_price * (sl_percent / 100)
+        sl_level := entry_price - risk_dist
+
+        float tp1_p = entry_price + risk_dist * rr_tp1
+        float tp2_p = entry_price + risk_dist * rr_tp2
+        float tp3_p = entry_price + risk_dist * rr_tp3
+
+        float max_tp = na
+        if show_tp3_level
+            max_tp := tp3_p
+        if show_tp2_level
+            max_tp := na(max_tp) ? tp2_p : math.max(max_tp, tp2_p)
+        if show_tp1_level
+            max_tp := na(max_tp) ? tp1_p : math.max(max_tp, tp1_p)
+        extreme_level := max_tp
+
+        entry_line := line.new(bar_index, entry_price, bar_index + 1, entry_price, color = buyLabelColor, width = 1, extend = extend.right, force_overlay = true)
+        entry_label := label.new(bar_index, entry_price, "BUY " + str.tostring(entry_price, format.mintick), style = label.style_label_left, color = buyLabelColor, textcolor = color.white, size = size.small, force_overlay = true)
+
+        if show_sl_level
+            sl_line := line.new(bar_index, sl_level, bar_index + 1, sl_level, color = sellColorLight, width = 1, style = line.style_dashed, extend = extend.right, force_overlay = true)
+            sl_label := label.new(bar_index, sl_level, "SL " + str.tostring(sl_level, format.mintick), style = label.style_label_left, color = sellColorLight, textcolor = color.white, size = size.small, force_overlay = true)
+
+        if show_tp1_level
+            tp1_line := line.new(bar_index, tp1_p, bar_index + 1, tp1_p, color = buyColorLight, width = 1, extend = extend.right, force_overlay = true)
+            tp1_label := label.new(bar_index, tp1_p, "TP1 " + str.tostring(tp1_p, format.mintick), style = label.style_label_left, color = buyColorLight, textcolor = color.white, size = size.small, force_overlay = true)
+
+        if show_tp2_level
+            tp2_line := line.new(bar_index, tp2_p, bar_index + 1, tp2_p, color = buyColorLight, width = 1, extend = extend.right, force_overlay = true)
+            tp2_label := label.new(bar_index, tp2_p, "TP2 " + str.tostring(tp2_p, format.mintick), style = label.style_label_left, color = buyColorLight, textcolor = color.white, size = size.small, force_overlay = true)
+
+        if show_tp3_level
+            tp3_line := line.new(bar_index, tp3_p, bar_index + 1, tp3_p, color = buyColorLight, width = 1, style = line.style_dotted, extend = extend.right, force_overlay = true)
+            tp3_label := label.new(bar_index, tp3_p, "TP3 " + str.tostring(tp3_p, format.mintick), style = label.style_label_left, color = buyColorLight, textcolor = color.white, size = size.small, force_overlay = true)
+
+        if show_sl_level
+            risk_fill := linefill.new(entry_line, sl_line, sellFill)
+
+        float max_tp_for_fill = entry_price
+        if show_tp1_level
+            max_tp_for_fill := math.max(max_tp_for_fill, tp1_p)
+        if show_tp2_level
+            max_tp_for_fill := math.max(max_tp_for_fill, tp2_p)
+        if show_tp3_level
+            max_tp_for_fill := math.max(max_tp_for_fill, tp3_p)
+
+        if max_tp_for_fill > entry_price
+            extreme_line := line.new(bar_index, max_tp_for_fill, bar_index + 1, max_tp_for_fill, color = na, extend = extend.right, force_overlay = true)
+            reward_fill := linefill.new(entry_line, extreme_line, buyFill)
+
+if breakoutDown
+    if show_buy_sell_labels
+        label.new(bar_index, boxTop, 'SELL', style = label.style_label_down, color = color.new(sellLabelColor, 40), textcolor = color.white, size = size.small, force_overlay = true)
+    
+    box.set_right(activeBox, bar_index)
+    box.set_bgcolor(activeBox, color.new(sellLabelColor, 82))
+    box.set_border_color(activeBox, sellLabelColor)
+    
+    box.set_extend(activeBox, extend.none)
+    boxActive := false
+    activeBox := na
+
+    if show_targets
+        line.delete(entry_line)
+        label.delete(entry_label)
+        line.delete(sl_line)
+        label.delete(sl_label)
+        line.delete(tp1_line)
+        label.delete(tp1_label)
+        line.delete(tp2_line)
+        label.delete(tp2_label)
+        line.delete(tp3_line)
+        label.delete(tp3_label)
+        line.delete(extreme_line)
+        linefill.delete(risk_fill)
+        linefill.delete(reward_fill)
+
+        trade_dir := -1
+        entry_bar := bar_index
+        float entry_price = close
+        float risk_dist = use_atr_sl ? atr_val * sl_atr_mult : entry_price * (sl_percent / 100)
+        sl_level := entry_price + risk_dist
+
+        float tp1_p = entry_price - risk_dist * rr_tp1
+        float tp2_p = entry_price - risk_dist * rr_tp2
+        float tp3_p = entry_price - risk_dist * rr_tp3
+
+        float min_tp = na
+        if show_tp3_level
+            min_tp := tp3_p
+        if show_tp2_level
+            min_tp := na(min_tp) ? tp2_p : math.min(min_tp, tp2_p)
+        if show_tp1_level
+            min_tp := na(min_tp) ? tp1_p : math.min(min_tp, tp1_p)
+        extreme_level := min_tp
+
+        entry_line := line.new(bar_index, entry_price, bar_index + 1, entry_price, color = sellLabelColor, width = 1, extend = extend.right, force_overlay = true)
+        entry_label := label.new(bar_index, entry_price, "SELL " + str.tostring(entry_price, format.mintick), style = label.style_label_left, color = sellLabelColor, textcolor = color.white, size = size.small, force_overlay = true)
+
+        if show_sl_level
+            sl_line := line.new(bar_index, sl_level, bar_index + 1, sl_level, color = sellColorLight, width = 1, style = line.style_dashed, extend = extend.right, force_overlay = true)
+            sl_label := label.new(bar_index, sl_level, "SL " + str.tostring(sl_level, format.mintick), style = label.style_label_left, color = sellColorLight, textcolor = color.white, size = size.small, force_overlay = true)
+
+        if show_tp1_level
+            tp1_line := line.new(bar_index, tp1_p, bar_index + 1, tp1_p, color = buyColorLight, width = 1, extend = extend.right, force_overlay = true)
+            tp1_label := label.new(bar_index, tp1_p, "TP1 " + str.tostring(tp1_p, format.mintick), style = label.style_label_left, color = buyColorLight, textcolor = color.white, size = size.small, force_overlay = true)
+
+        if show_tp2_level
+            tp2_line := line.new(bar_index, tp2_p, bar_index + 1, tp2_p, color = buyColorLight, width = 1, extend = extend.right, force_overlay = true)
+            tp2_label := label.new(bar_index, tp2_p, "TP2 " + str.tostring(tp2_p, format.mintick), style = label.style_label_left, color = buyColorLight, textcolor = color.white, size = size.small, force_overlay = true)
+
+        if show_tp3_level
+            tp3_line := line.new(bar_index, tp3_p, bar_index + 1, tp3_p, color = buyColorLight, width = 1, style = line.style_dotted, extend = extend.right, force_overlay = true)
+            tp3_label := label.new(bar_index, tp3_p, "TP3 " + str.tostring(tp3_p, format.mintick), style = label.style_label_left, color = buyColorLight, textcolor = color.white, size = size.small, force_overlay = true)
+
+        if show_sl_level
+            risk_fill := linefill.new(entry_line, sl_line, sellFill)
+
+        float min_tp_for_fill = entry_price
+        if show_tp1_level
+            min_tp_for_fill := math.min(min_tp_for_fill, tp1_p)
+        if show_tp2_level
+            min_tp_for_fill := math.min(min_tp_for_fill, tp2_p)
+        if show_tp3_level
+            min_tp_for_fill := math.min(min_tp_for_fill, tp3_p)
+
+        if min_tp_for_fill < entry_price
+            extreme_line := line.new(bar_index, min_tp_for_fill, bar_index + 1, min_tp_for_fill, color = na, extend = extend.right, force_overlay = true)
+            reward_fill := linefill.new(entry_line, extreme_line, buyFill)
+
+// POSITION EXTENSION
+if trade_dir != 0
+    label.set_x(entry_label, bar_index)
+    if not na(sl_label)
+        label.set_x(sl_label, bar_index)
+    if not na(tp1_label)
+        label.set_x(tp1_label, bar_index)
+    if not na(tp2_label)
+        label.set_x(tp2_label, bar_index)
+    if not na(tp3_label)
+        label.set_x(tp3_label, bar_index)
+
+    bool sl_hit = false
+    bool tp_hit = false
+    if trade_dir == 1
+        sl_hit := low <= sl_level
+        tp_hit := not na(extreme_level) and high >= extreme_level
+    else if trade_dir == -1
+        sl_hit := high >= sl_level
+        tp_hit := not na(extreme_level) and low <= extreme_level
+
+    if bar_index > entry_bar and (sl_hit or tp_hit)
+        line.set_extend(entry_line, extend.none)
+        line.set_x2(entry_line, bar_index)
+        if not na(sl_line)
+            line.set_extend(sl_line, extend.none)
+            line.set_x2(sl_line, bar_index)
+        if not na(tp1_line)
+            line.set_extend(tp1_line, extend.none)
+            line.set_x2(tp1_line, bar_index)
+        if not na(tp2_line)
+            line.set_extend(tp2_line, extend.none)
+            line.set_x2(tp2_line, bar_index)
+        if not na(tp3_line)
+            line.set_extend(tp3_line, extend.none)
+            line.set_x2(tp3_line, bar_index)
+        if not na(extreme_line)
+            line.set_extend(extreme_line, extend.none)
+            line.set_x2(extreme_line, bar_index)
+        trade_dir := 0
+
+// TIMEOUT
+if timeout
+    box.set_right(activeBox, bar_index)
+    box.set_extend(activeBox, extend.none)
+    box.delete(activeBox)
+    boxActive := false
+    activeBox := na
+
+// TRIANGLE SIGNALS
+plotshape(show_triangles and breakoutUp,   
+     title = "Buy Signal",  
+     style = shape.triangleup, 
+     location = location.belowbar, 
+     color = buyLabelColor, 
+     size = size.tiny,
+     textcolor = color.white, 
+     force_overlay = true)
+
+plotshape(show_triangles and breakoutDown, 
+     title = "Sell Signal", 
+     style = shape.triangledown, 
+     location = location.abovebar, 
+     color = sellLabelColor, 
+     size = size.tiny,
+     textcolor = color.white, 
+     force_overlay = true)
+
+// ALERT CONDITIONS
+alertcondition(breakoutUp,   title = "Buy Breakout Signal",  message = "Volume Regime Shift BUY Signal")
+alertcondition(breakoutDown, title = "Sell Breakout Signal", message = "Volume Regime Shift SELL Signal")

@@ -1,0 +1,1045 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © Ki11a_B
+
+//@version=6
+indicator("BK AK-Blackbird", shorttitle="🐦‍⬛", overlay=false, precision=2, max_labels_count=500, max_lines_count=500, max_boxes_count=50)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// INPUT GROUPS
+// ─────────────────────────────────────────────────────────────────────────────
+var GP_FALCON   = "═══════ 🦅 FALCON OSCILLATOR ═══════"
+var GP_FOOT     = "═══════ 🔬 FOOTPRINT ORDER FLOW ═══════"
+var GP_TIME     = "═══════ ⏰ TIME BLOCK INTELLIGENCE ═══════"
+var GP_SESSION  = "═══════ 📍 SESSION LINES ═══════"
+var GP_SIGNALS  = "═══════ 🎯 PEAK/VALLEY SIGNALS ═══════"
+var GP_DASH     = "═══════ 📈 DASHBOARD ═══════"
+var GP_COLORS   = "═══════ 🎨 COLORS ═══════"
+
+// ─────────────────────────────────────────────────────────────────────────────
+// FALCON INPUTS
+// ─────────────────────────────────────────────────────────────────────────────
+showFalcon   = input.bool(true, "Show Falcon Oscillator", group=GP_FALCON)
+tooltipBars  = input.int(400, "Hover Tooltip Range (bars)", minval=50, maxval=490, step=10, group=GP_FALCON,
+     tooltip="How many recent bars get hover tooltips.\nDefault 400 reserves ~100 label slots for signal labels.\nSignal labels (peaks/valleys) are SACRED — they never get evicted.\nMax 490 (leaves 10 for signals). Lower = more signal headroom.")
+lenDI        = input.int(14, "DI Length", minval=1, maxval=50, group=GP_FALCON)
+lenADX       = input.int(14, "ADX Smoothing", minval=1, maxval=50, group=GP_FALCON)
+sigLen       = input.int(5, "Signal Length", minval=1, maxval=20, group=GP_FALCON)
+trendThresh  = input.float(25.0, "Trend Threshold (ADX)", minval=5.0, maxval=60.0, step=0.5, group=GP_FALCON)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// FOOTPRINT INPUTS
+// ─────────────────────────────────────────────────────────────────────────────
+enableFootprint  = input.bool(true, "Enable Footprint Order Flow", group=GP_FOOT,
+     tooltip="Requires TradingView Premium/Ultimate.\nAdds delta divergence, absorption detection, POC context, and signal quality scoring.\nDegrades gracefully if data unavailable.")
+fpTicksPerRow    = input.int(50, "Ticks Per Row", minval=5, maxval=500, step=5, group=GP_FOOT,
+     tooltip="Default 50 = 12.5 NQ pts/row on 15m (2-5 rows/bar).\n25 = more granular, 100 = broader zones.\nTune based on your timeframe & instrument.")
+fpValueArea      = input.int(70, "Value Area %", minval=50, maxval=90, step=5, group=GP_FOOT,
+     tooltip="Standard 70%. Defines VAH/VAL boundaries.")
+fpAbsorpVolMult  = input.float(1.5, "Absorption: Volume Threshold (x avg)", minval=1.0, maxval=5.0, step=0.1, group=GP_FOOT,
+     tooltip="Volume must exceed this multiple of 20-bar average to qualify as absorption candidate.")
+fpAbsorpDeltaCap = input.float(0.25, "Absorption: Max Delta Ratio", minval=0.05, maxval=0.50, step=0.05, group=GP_FOOT,
+     tooltip="abs(delta)/totalVol must be BELOW this to confirm absorption.\n0.25 = delta is <25% of total volume (two-sided flow).")
+fpDivLookback    = input.int(3, "Divergence Lookback", minval=1, maxval=10, group=GP_FOOT,
+     tooltip="Bars to look back for sustained divergence between momentum and delta.")
+showFPColorShift = input.bool(true, "Color Shift on FP Confirmation", group=GP_FOOT,
+     tooltip="Oscillator line brightens when footprint confirms, dims on divergence.")
+
+// ─────────────────────────────────────────────────────────────────────────────
+// TIME BLOCK INPUTS
+// ─────────────────────────────────────────────────────────────────────────────
+enableTimeBlocks = input.bool(true, "Enable Time Block Intelligence", group=GP_TIME,
+     tooltip="The ZENITH edge - normalizes signals by time of day")
+showTimeZones    = input.bool(true, "Show Time Block Background", group=GP_TIME)
+showBlockInfo    = input.bool(true, "Show Block in Dashboard", group=GP_TIME)
+
+weightOpenDrive  = input.float(0.7, "Open Drive (9:30-10)", minval=0.1, maxval=2.0, step=0.1, group=GP_TIME,
+     tooltip="Morning volatility - signals less reliable")
+weightTrendEst   = input.float(1.0, "Trend Est (10-11:30)", minval=0.1, maxval=2.0, step=0.1, group=GP_TIME,
+     tooltip="Prime trending time - baseline reliability")
+weightLunch      = input.float(0.5, "Lunch (11:30-1)", minval=0.1, maxval=2.0, step=0.1, group=GP_TIME,
+     tooltip="Algo chop - avoid trading")
+weightAfternoon  = input.float(1.5, "Afternoon (2-3:30)", minval=0.1, maxval=2.0, step=0.1, group=GP_TIME,
+     tooltip="PREMIUM time - best signals of day")
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SESSION LINE INPUTS
+// ─────────────────────────────────────────────────────────────────────────────
+showRTHOpen  = input.bool(true, "Show RTH Open (9:30 ET)", group=GP_SESSION)
+rthOpenColor = input.color(color.new(#FFFFFF, 30), "RTH Open Color", group=GP_SESSION)
+showETHOpen  = input.bool(true, "Show ETH Open (6:00 PM ET)", group=GP_SESSION)
+ethOpenColor = input.color(color.new(#666666, 30), "ETH Open Color", group=GP_SESSION)
+hideSessionHTF = input.bool(true, "Auto-Hide Session Lines Above 144min", group=GP_SESSION,
+     tooltip="When enabled, RTH/ETH vertical lines are hidden on\ntimeframes above 144 minutes (e.g. 4H, D, W).\nOn higher TFs these lines stack up and clutter the chart.")
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SIGNAL INPUTS
+// ─────────────────────────────────────────────────────────────────────────────
+showSignals   = input.bool(true, "Show Peak/Valley Signals", group=GP_SIGNALS)
+extremePct    = input.float(0.80, "Extreme Zone %", minval=0.5, maxval=0.9, step=0.05, group=GP_SIGNALS,
+     tooltip="How far into band = extreme (0.65 = 65% of band distance)")
+cooldownBars  = input.int(6, "Signal Cooldown", minval=1, maxval=30, group=GP_SIGNALS,
+     tooltip="Minimum bars between signals to prevent overtrading")
+minQuality    = input.float(0.0, "Min Quality to Show Signal", minval=0.0, maxval=80.0, step=5.0, group=GP_SIGNALS,
+     tooltip="0 = show all signals. Set higher to filter weak setups.\n50+ = require at least some footprint confirmation.\n70+ = strong confirmation only.")
+
+// ─────────────────────────────────────────────────────────────────────────────
+// DASHBOARD INPUTS
+// ─────────────────────────────────────────────────────────────────────────────
+showDash = input.bool(true, "Show Dashboard", group=GP_DASH)
+dashPos  = input.string("Top Left", "Position", options=["Top Right", "Top Left", "Bottom Right", "Bottom Left"], group=GP_DASH)
+dashSize = input.string("Normal", "Size", options=["Small", "Normal", "Large"], group=GP_DASH)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// COLOR INPUTS
+// ─────────────────────────────────────────────────────────────────────────────
+bullColor   = input.color(color.new(#00E676, 0), "Bull", group=GP_COLORS)
+bearColor   = input.color(color.new(#FF5252, 0), "Bear", group=GP_COLORS)
+obZoneColor = input.color(color.new(#FF6B6B, 0), "OB Zone", group=GP_COLORS)
+osZoneColor = input.color(color.new(#4ECDC4, 0), "OS Zone", group=GP_COLORS)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// TIME BLOCK CONSTANTS
+// ─────────────────────────────────────────────────────────────────────────────
+var int BLOCK_NONE          = 0
+var int BLOCK_NY_OPEN_DRIVE = 1
+var int BLOCK_NY_TREND_EST  = 2
+var int BLOCK_NY_LUNCH      = 3
+var int BLOCK_NY_AFTERNOON  = 4
+var int BLOCK_OVERNIGHT     = 5
+
+// ─────────────────────────────────────────────────────────────────────────────
+// TIME BLOCK FUNCTIONS
+// ─────────────────────────────────────────────────────────────────────────────
+f_getCurrentBlock() =>
+    int h = hour(time, "America/New_York")
+    int m = minute(time, "America/New_York")
+    int timeVal = h * 100 + m
+    int result = BLOCK_NONE
+    if timeVal >= 930 and timeVal < 1000
+        result := BLOCK_NY_OPEN_DRIVE
+    else if timeVal >= 1000 and timeVal < 1130
+        result := BLOCK_NY_TREND_EST
+    else if timeVal >= 1130 and timeVal < 1300
+        result := BLOCK_NY_LUNCH
+    else if timeVal >= 1400 and timeVal < 1530
+        result := BLOCK_NY_AFTERNOON
+    else
+        result := BLOCK_OVERNIGHT
+    result
+
+f_getBlockName(int block) =>
+    switch block
+        BLOCK_NY_OPEN_DRIVE => "OPEN"
+        BLOCK_NY_TREND_EST  => "TREND"
+        BLOCK_NY_LUNCH      => "LUNCH"
+        BLOCK_NY_AFTERNOON  => "PM★"
+        BLOCK_OVERNIGHT     => "NIGHT"
+        => "N/A"
+
+f_getBlockWeight(int block) =>
+    switch block
+        BLOCK_NY_OPEN_DRIVE => weightOpenDrive
+        BLOCK_NY_TREND_EST  => weightTrendEst
+        BLOCK_NY_LUNCH      => weightLunch
+        BLOCK_NY_AFTERNOON  => weightAfternoon
+        => 1.0
+
+f_getBlockColor(int block) =>
+    switch block
+        BLOCK_NY_OPEN_DRIVE => color.new(#FFA726, 95)
+        BLOCK_NY_TREND_EST  => color.new(#42A5F5, 96)
+        BLOCK_NY_LUNCH      => color.new(#EF5350, 93)
+        BLOCK_NY_AFTERNOON  => color.new(#66BB6A, 94)
+        => color.new(color.gray, 97)
+
+f_getBlockTooltip(int block, float weight) =>
+    string tip = "⏰ " + f_getBlockName(block) + " | Weight: " + str.tostring(weight, "#.#") + "x\n━━━━━━━━━━━━━━\n"
+    if block == BLOCK_NY_OPEN_DRIVE
+        tip += "⚠️ OPEN DRIVE (9:30-10:00)\n• Stop hunts & traps common\n• Fake breakouts both ways\n• Reduce size 50%\n• Wait for 10:00 for real direction"
+    else if block == BLOCK_NY_TREND_EST
+        tip += "✅ TREND EST (10:00-11:30)\n• Real direction emerges\n• Clean trends develop\n• Full size appropriate"
+    else if block == BLOCK_NY_LUNCH
+        tip += "🚫 LUNCH (11:30-1:00)\n• Algo chop dominates\n• Both sides get trapped\n• Stay flat, preserve capital"
+    else if block == BLOCK_NY_AFTERNOON
+        tip += "🔥 AFTERNOON (2:00-3:30)\n• Best signals of entire day\n• Real institutional flow\n• Maximum opportunity"
+    else
+        tip += "🌙 OVERNIGHT\n• Low liquidity, wide spreads"
+    tip
+
+f_getDashPos() =>
+    switch dashPos
+        "Top Right"    => position.top_right
+        "Top Left"     => position.top_left
+        "Bottom Right"  => position.bottom_right
+        "Bottom Left"   => position.bottom_left
+        => position.top_right
+
+f_getDashTextSize() =>
+    switch dashSize
+        "Small"  => size.tiny
+        "Normal" => size.small
+        "Large"  => size.normal
+        => size.small
+
+f_getDashHeaderSize() =>
+    switch dashSize
+        "Small"  => size.small
+        "Normal" => size.normal
+        "Large"  => size.large
+        => size.normal
+
+// ─────────────────────────────────────────────────────────────────────────────
+// TIME BLOCK TRACKING
+// ─────────────────────────────────────────────────────────────────────────────
+int currentBlock       = enableTimeBlocks ? f_getCurrentBlock() : BLOCK_NONE
+float currentBlockWeight = enableTimeBlocks ? f_getBlockWeight(currentBlock) : 1.0
+string currentBlockName  = enableTimeBlocks ? f_getBlockName(currentBlock) : "N/A"
+color currentBlockBg     = enableTimeBlocks ? f_getBlockColor(currentBlock) : na
+
+// ─────────────────────────────────────────────────────────────────────────────
+// FALCON CORE CALCULATION
+// ─────────────────────────────────────────────────────────────────────────────
+float up      = ta.change(high)
+float down    = -ta.change(low)
+float plusDM   = na(up) ? na : (up > down and up > 0 ? up : 0)
+float minusDM  = na(down) ? na : (down > up and down > 0 ? down : 0)
+float trur     = ta.rma(ta.tr, lenDI)
+float plus     = fixnan(100 * ta.rma(plusDM, lenDI) / trur)
+float minus    = fixnan(100 * ta.rma(minusDM, lenDI) / trur)
+float sum      = plus + minus
+float diff     = plus - minus
+float adx      = 100 * ta.rma(math.abs(diff) / (sum == 0 ? 1 : sum), lenADX)
+
+// Zenith (Signed DX)
+float zenRaw = sum == 0 ? 0.0 : (diff / sum) * 100.0
+float zenSig = ta.ema(zenRaw, sigLen)
+float zenVel = zenRaw - nz(zenRaw[1])
+
+// Dynamic bands
+int dynLen    = 100
+float dynMult = 1.6
+float band    = dynMult * ta.stdev(zenRaw, dynLen)
+float upper   = +band
+float lower   = -band
+
+// Regime
+bool inTrend = adx >= trendThresh
+
+// Extreme zones
+float extremeUpper = upper * extremePct
+float extremeLower = lower * extremePct
+bool nearOB        = zenRaw >= extremeUpper
+bool nearOS        = zenRaw <= extremeLower
+
+// ─────────────────────────────────────────────────────────────────────────────
+// FOOTPRINT ORDER FLOW ENGINE
+// ─────────────────────────────────────────────────────────────────────────────
+// NOTE: request.footprint() must be called at global scope (Pine v6 requirement).
+// Returns na when data is unavailable (non-Premium, unsupported instrument, etc.).
+// The entire footprint layer degrades gracefully — existing signals never break.
+// ─────────────────────────────────────────────────────────────────────────────
+
+footprint fp = request.footprint(fpTicksPerRow, fpValueArea)
+bool fpAvailable = enableFootprint and not na(fp)
+
+// ── Extract raw footprint metrics ──
+var float fpDelta    = na
+var float fpBuyVol   = na
+var float fpSellVol  = na
+var float fpTotalVol = na
+var float fpPocHi    = na
+var float fpPocLo    = na
+var float fpVahHi    = na
+var float fpValLo    = na
+
+if fpAvailable
+    fpDelta    := fp.delta()
+    fpBuyVol   := fp.buy_volume()
+    fpSellVol  := fp.sell_volume()
+    fpTotalVol := fp.total_volume()
+
+    volume_row pocRow = fp.poc()
+    if not na(pocRow)
+        fpPocHi := pocRow.up_price()
+        fpPocLo := pocRow.down_price()
+
+    volume_row vahRow = fp.vah()
+    if not na(vahRow)
+        fpVahHi := vahRow.up_price()
+
+    volume_row valRow = fp.val()
+    if not na(valRow)
+        fpValLo := valRow.down_price()
+else
+    fpDelta    := na
+    fpBuyVol   := na
+    fpSellVol  := na
+    fpTotalVol := na
+    fpPocHi    := na
+    fpPocLo    := na
+    fpVahHi    := na
+    fpValLo    := na
+
+// ── Derived footprint metrics ──
+
+// Delta ratio: what % of volume is directional (-1 to +1)
+float fpDeltaRatio = (fpAvailable and fpTotalVol > 0) ? fpDelta / fpTotalVol : na
+
+// Absorption: high volume but near-zero net delta = two-sided institutional flow
+float fpVolAvg    = ta.sma(fpTotalVol, 20)
+bool  fpHighVol   = fpAvailable and not na(fpVolAvg) and fpVolAvg > 0 and (fpTotalVol > fpAbsorpVolMult * fpVolAvg)
+bool  fpLowDelta  = fpAvailable and not na(fpDeltaRatio) and (math.abs(fpDeltaRatio) < fpAbsorpDeltaCap)
+bool  fpAbsorption = fpHighVol and fpLowDelta
+
+// Delta divergence (sustained over lookback)
+// Bearish div: momentum rising but delta consistently negative (stealth distribution)
+// Bullish div: momentum falling but delta consistently positive (stealth accumulation)
+float fpDeltaSum = ta.cum(fpAvailable and not na(fpDelta) ? fpDelta : 0.0)
+float fpDeltaRecent = fpDeltaSum - nz(fpDeltaSum[fpDivLookback])
+bool  fpBearDiv = fpAvailable and (zenRaw > 0) and (zenVel > 0) and (fpDeltaRecent < 0)
+bool  fpBullDiv = fpAvailable and (zenRaw < 0) and (zenVel < 0) and (fpDeltaRecent > 0)
+
+// POC position within bar (0.0 = bar low, 1.0 = bar high)
+// POC high in bar = distribution (sellers accepting high prices but not pushing higher)
+// POC low in bar  = accumulation (buyers absorbing at lows)
+float barRange    = high - low
+float fpPocMid    = (not na(fpPocHi) and not na(fpPocLo)) ? (fpPocHi + fpPocLo) / 2.0 : na
+float fpPocPos    = (not na(fpPocMid) and barRange > 0) ? (fpPocMid - low) / barRange : na
+
+// ── Footprint Bias (aggregate read) ──
+// +2 strong bull, +1 lean bull, 0 neutral, -1 lean bear, -2 strong bear
+var int fpBias = 0
+if fpAvailable
+    int bias = 0
+    if not na(fpDeltaRatio)
+        if fpDeltaRatio > 0.3
+            bias += 2
+        else if fpDeltaRatio > 0.1
+            bias += 1
+        else if fpDeltaRatio < -0.3
+            bias -= 2
+        else if fpDeltaRatio < -0.1
+            bias -= 1
+    if fpAbsorption
+        // Absorption at extremes adds context
+        if nearOB
+            bias -= 1   // absorption at highs = potential ceiling
+        else if nearOS
+            bias += 1   // absorption at lows = potential floor
+    if fpBearDiv
+        bias -= 1
+    if fpBullDiv
+        bias += 1
+    fpBias := math.max(-2, math.min(2, bias))
+else
+    fpBias := 0
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SIGNAL DETECTION (Enhanced with Footprint Quality)
+// ─────────────────────────────────────────────────────────────────────────────
+var int barsSincePeak   = 999
+var int barsSinceValley = 999
+barsSincePeak   += 1
+barsSinceValley += 1
+
+bool sigCrossDown = ta.crossunder(zenRaw, zenSig)
+bool sigCrossUp   = ta.crossover(zenRaw, zenSig)
+
+int   extremeLookback     = 3
+float wasInUpperExtreme   = ta.highest(nearOB ? 1.0 : 0.0, extremeLookback)
+float wasInLowerExtreme   = ta.highest(nearOS ? 1.0 : 0.0, extremeLookback)
+bool  inOrNearUpperExtreme = nearOB or wasInUpperExtreme > 0
+bool  inOrNearLowerExtreme = nearOS or wasInLowerExtreme > 0
+
+bool rawPeak   = sigCrossDown and inOrNearUpperExtreme and (zenVel < 0) and (barsSincePeak >= cooldownBars)
+bool rawValley = sigCrossUp   and inOrNearLowerExtreme and (zenVel > 0) and (barsSinceValley >= cooldownBars)
+
+// Time block gate
+bool peakCandidate   = false
+bool valleyCandidate = false
+if enableTimeBlocks
+    peakCandidate   := rawPeak   and (currentBlockWeight >= 0.6)
+    valleyCandidate := rawValley and (currentBlockWeight >= 0.6)
+else
+    peakCandidate   := rawPeak
+    valleyCandidate := rawValley
+
+// ── Signal Quality Score (0-100) ──
+// Composite conviction metric combining momentum, footprint, and context.
+// 40 = base (signal fired on momentum alone)
+// +20 delta confirms direction
+// +15 absorption detected at extreme
+// +10 delta divergence present (stealth reversal)
+// +10 POC position confirms
+// +5  premium time block
+// +5  trending regime (ADX)
+// Cap at 100.
+
+float peakQuality   = 0.0
+float valleyQuality = 0.0
+
+if peakCandidate
+    peakQuality := 40.0
+    if fpAvailable
+        // Delta confirming selling pressure
+        if not na(fpDelta) and fpDelta < 0
+            peakQuality += 20.0
+        // Bearish divergence (stealth distribution)
+        if fpBearDiv
+            peakQuality += 10.0
+        // Absorption at the highs (someone capping the rally)
+        if fpAbsorption and nearOB
+            peakQuality += 15.0
+        // POC in upper bar = acceptance at highs, potential exhaustion
+        if not na(fpPocPos) and fpPocPos > 0.6
+            peakQuality += 10.0
+    // Context bonuses
+    if enableTimeBlocks and currentBlock == BLOCK_NY_AFTERNOON
+        peakQuality += 5.0
+    if inTrend
+        peakQuality += 5.0
+    peakQuality := math.min(peakQuality, 100.0)
+
+if valleyCandidate
+    valleyQuality := 40.0
+    if fpAvailable
+        // Delta confirming buying pressure
+        if not na(fpDelta) and fpDelta > 0
+            valleyQuality += 20.0
+        // Bullish divergence (stealth accumulation)
+        if fpBullDiv
+            valleyQuality += 10.0
+        // Absorption at the lows (someone defending the floor)
+        if fpAbsorption and nearOS
+            valleyQuality += 15.0
+        // POC in lower bar = acceptance at lows, potential spring
+        if not na(fpPocPos) and fpPocPos < 0.4
+            valleyQuality += 10.0
+    // Context bonuses
+    if enableTimeBlocks and currentBlock == BLOCK_NY_AFTERNOON
+        valleyQuality += 5.0
+    if inTrend
+        valleyQuality += 5.0
+    valleyQuality := math.min(valleyQuality, 100.0)
+
+// Apply quality filter
+bool peakSignal   = peakCandidate   and (peakQuality   >= minQuality)
+bool valleySignal = valleyCandidate and (valleyQuality >= minQuality)
+
+if peakSignal
+    barsSincePeak := 0
+if valleySignal
+    barsSinceValley := 0
+
+// Track last signal quality for dashboard persistence
+var float lastSignalQuality = na
+if peakSignal
+    lastSignalQuality := peakQuality
+if valleySignal
+    lastSignalQuality := valleyQuality
+
+// ─────────────────────────────────────────────────────────────────────────────
+// VOLUME CALCULATIONS (fallback when footprint unavailable)
+// ─────────────────────────────────────────────────────────────────────────────
+float volMA  = ta.sma(volume, 20)
+float relVol = volMA > 0 ? volume / volMA : 1.0
+
+// ─────────────────────────────────────────────────────────────────────────────
+// COLORS (Enhanced with footprint confirmation shift)
+// ─────────────────────────────────────────────────────────────────────────────
+// When footprint confirms the oscillator direction, the line brightens.
+// When footprint diverges, the line dims (warning: flow doesn't match momentum).
+
+bool fpConfirmsBull = fpAvailable and not na(fpDelta) and zenRaw > 0 and fpDelta > 0
+bool fpConfirmsBear = fpAvailable and not na(fpDelta) and zenRaw < 0 and fpDelta < 0
+bool fpDiverges     = fpAvailable and not na(fpDelta) and ((zenRaw > 0 and fpDelta < 0) or (zenRaw < 0 and fpDelta > 0))
+
+color zenColor = zenRaw > nz(zenRaw[1]) ? bullColor : bearColor
+if showFPColorShift and fpAvailable
+    if fpConfirmsBull
+        zenColor := color.new(#00FF88, 0)   // Bright confirmed bull
+    else if fpConfirmsBear
+        zenColor := color.new(#FF3333, 0)   // Bright confirmed bear
+    else if fpDiverges
+        zenColor := color.new(#FFD700, 30)  // Gold dimmed = divergence warning
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PLOTTING SETUP - FULL PANE FOR OSCILLATOR
+// ─────────────────────────────────────────────────────────────────────────────
+float oscMax = 100.0
+float oscMin = 0.0
+
+float zenRange  = upper - lower
+float zenNorm   = zenRange > 0 ? (zenRaw - lower) / zenRange : 0.5
+float zenScaled = showFalcon ? (oscMin + zenNorm * (oscMax - oscMin)) : na
+
+float sigNorm      = zenRange > 0 ? (zenSig - lower) / zenRange : 0.5
+float zenSigScaled = showFalcon ? (oscMin + sigNorm * (oscMax - oscMin)) : na
+
+// Extreme zones scaled
+float extremeUpperScaled = showFalcon ? (oscMin + extremePct * (oscMax - oscMin)) : na
+float extremeLowerScaled = showFalcon ? (oscMin + (1.0 - extremePct) * (oscMax - oscMin)) : na
+
+// ─────────────────────────────────────────────────────────────────────────────
+// TIME BLOCK BACKGROUND
+// ─────────────────────────────────────────────────────────────────────────────
+bgcolor(showTimeZones and enableTimeBlocks ? currentBlockBg : na, title="Time Block BG")
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SESSION VERTICAL LINES (RTH / ETH) — FIX: timeVal crossing detection
+// ─────────────────────────────────────────────────────────────────────────────
+// Uses timeVal threshold crossing — works on ALL timeframes including 1h, 2h, 4h
+// where bar boundaries don't land exactly on 9:30 or 18:00.
+// Previous logic required nyHour == 9 && nyMin >= 30 which fails when a bar
+// spans 9:00→10:00 (1h chart) — neither endpoint is hour=9/min=30.
+// ─────────────────────────────────────────────────────────────────────────────
+int nyHour     = hour(time, "America/New_York")
+int nyMin      = minute(time, "America/New_York")
+int nyHourPrev = hour(time[1], "America/New_York")
+int nyMinPrev  = minute(time[1], "America/New_York")
+int currTimeVal = nyHour * 100 + nyMin
+int prevTimeVal = nyHourPrev * 100 + nyMinPrev
+
+// RTH Open: 9:30 ET — detect bar that crosses the 930 threshold
+// Timeframe gate: 144 min = 8640 seconds
+bool sessionLinesAllowed = not hideSessionHTF or (timeframe.in_seconds() <= 8640)
+
+bool isRTHOpen = (currTimeVal >= 930 and prevTimeVal < 930)
+// ETH Open: 18:00 ET — detect bar that crosses the 1800 threshold
+bool isETHOpen = (currTimeVal >= 1800 and prevTimeVal < 1800)
+
+if showRTHOpen and isRTHOpen and sessionLinesAllowed
+    line.new(bar_index, -50, bar_index, 150, color=rthOpenColor, style=line.style_dashed, width=2, extend=extend.none)
+
+if showETHOpen and isETHOpen and sessionLinesAllowed
+    line.new(bar_index, -50, bar_index, 150, color=ethOpenColor, style=line.style_dashed, width=1, extend=extend.none)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PLOTTING - STRUCTURE LINES
+// ─────────────────────────────────────────────────────────────────────────────
+hline(50,  "Mid",  color=color.new(color.gray, 70), linestyle=hline.style_dotted, linewidth=2)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// EXTREME ZONES (Filled backgrounds)
+// ─────────────────────────────────────────────────────────────────────────────
+// OB/OS zones — solid lines at 100/0, shading above/below only
+h_obEdge  = hline(150, "OB Edge",  color=color.new(color.black, 100), linewidth=1)
+h_obLevel = hline(100, "OB Level", color=color.new(obZoneColor, 30),  linewidth=2, linestyle=hline.style_solid)
+h_osLevel = hline(0,   "OS Level", color=color.new(osZoneColor, 30),  linewidth=2, linestyle=hline.style_solid)
+h_osEdge  = hline(-50,  "OS Edge", color=color.new(color.black, 100), linewidth=1)
+
+fill(h_obEdge,  h_obLevel, color=color.new(obZoneColor, 88), title="OB Zone")
+fill(h_osLevel, h_osEdge,  color=color.new(osZoneColor, 88), title="OS Zone")
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PLOTTING - FALCON OSCILLATOR (line widths reduced by 1 each)
+// ─────────────────────────────────────────────────────────────────────────────
+plot(zenScaled,    "Zenith", linewidth=2, color=zenColor)
+plot(zenSigScaled, "Signal", linewidth=1, color=color.new(color.white, 30))
+
+// ─────────────────────────────────────────────────────────────────────────────
+// INSTITUTIONAL HOVER TOOLTIPS — Per-Bar State Labels
+// ─────────────────────────────────────────────────────────────────────────────
+// Invisible labels on recent confirmed bars with full institutional-grade state readout.
+// Covers: Zenith, velocity, regime, bands, zone position, time block,
+// footprint (delta, absorption, divergence, POC, bias), and volume context.
+// Only created on last `tooltipBars` confirmed bars + live bar.
+// This reserves (500 − tooltipBars) label slots for signal labels (peaks/valleys),
+// ensuring trading signals are NEVER evicted from the chart.
+// barstate.isconfirmed prevents tooltip repainting on the live bar's intra-bar ticks.
+// ─────────────────────────────────────────────────────────────────────────────
+bool tooltipInRange = (last_bar_index - bar_index) < tooltipBars
+bool tooltipAllowed = showFalcon and tooltipInRange and (barstate.isconfirmed or barstate.islast)
+
+if tooltipAllowed
+    // ── Zone read ──
+    string zoneStr = nearOB ? "⚠️ OVERBOUGHT" : nearOS ? "⚠️ OVERSOLD" : zenRaw > 0 ? "BULL ZONE" : "BEAR ZONE"
+
+    // ── Band position (0-100% within dynamic bands) ──
+    float bandPct = zenRange > 0 ? ((zenRaw - lower) / zenRange) * 100.0 : 50.0
+
+    // ── Momentum read ──
+    string momStr  = math.abs(zenVel) < 1.0 ? "STALLING" : zenVel > 5.0 ? "ACCELERATING ↑↑" : zenVel < -5.0 ? "ACCELERATING ↓↓" : zenVel > 0 ? "RISING ↑" : "FALLING ↓"
+
+    // ── Build tooltip ──
+    string tt = "🐦‍⬛ BLACKBIRD STATE\n━━━━━━━━━━━━━━━━━━━━━━━━\n"
+    tt += "\n🦅 FALCON OSCILLATOR\n"
+    tt += "   Zenith:   " + str.tostring(zenRaw, "#.##") + "  |  Signal: " + str.tostring(zenSig, "#.##") + "\n"
+    tt += "   Velocity: " + str.tostring(zenVel, "+#.##;-#.##") + "  →  " + momStr + "\n"
+    tt += "   Band %:   " + str.tostring(bandPct, "#.#") + "%  |  Zone: " + zoneStr + "\n"
+    tt += "   Upper:    " + str.tostring(upper, "#.#") + "  |  Lower: " + str.tostring(lower, "#.#") + "\n"
+
+    tt += "\n📊 REGIME\n"
+    tt += "   ADX:      " + str.tostring(adx, "#.##") + "  →  " + (inTrend ? "TRENDING ✅" : "RANGING ⬜") + "\n"
+    tt += "   +DI:      " + str.tostring(plus, "#.#") + "  |  -DI: " + str.tostring(minus, "#.#") + "\n"
+    tt += "   DI Spread: " + str.tostring(diff, "+#.#;-#.#") + (math.abs(diff) > 20 ? " (WIDE)" : math.abs(diff) < 5 ? " (TIGHT)" : "") + "\n"
+
+    if enableTimeBlocks
+        tt += "\n⏰ TIME BLOCK\n"
+        tt += "   Block:    " + currentBlockName + "  |  Weight: " + str.tostring(currentBlockWeight, "#.#") + "x\n"
+        string timeRead = currentBlock == BLOCK_NY_OPEN_DRIVE ? "⚠️ TRAP ZONE — reduce size" : currentBlock == BLOCK_NY_TREND_EST ? "✅ PRIME — full size OK" : currentBlock == BLOCK_NY_LUNCH ? "🚫 CHOP — stay flat" : currentBlock == BLOCK_NY_AFTERNOON ? "🔥 PREMIUM — best setups" : "🌙 LOW LIQ — wide stops"
+        tt += "   Read:     " + timeRead + "\n"
+
+    tt += "\n📈 VOLUME\n"
+    tt += "   Rel Vol:  " + str.tostring(relVol, "#.##") + "x" + (relVol > 2.0 ? " 🔥 SURGING" : relVol > 1.5 ? " ⚡ ELEVATED" : relVol < 0.5 ? " 💤 DEAD" : "") + "\n"
+
+    if fpAvailable
+        tt += "\n🔬 FOOTPRINT ORDER FLOW\n"
+        if not na(fpDelta)
+            tt += "   Delta:    " + str.tostring(fpDelta, "+#.#;-#.#") + "\n"
+            tt += "   Δ Ratio:  " + str.tostring(fpDeltaRatio, "+#.###;-#.###") + (math.abs(nz(fpDeltaRatio)) > 0.3 ? " (ONE-SIDED)" : " (balanced)") + "\n"
+        if not na(fpBuyVol) and not na(fpSellVol)
+            tt += "   Buy Vol:  " + str.tostring(fpBuyVol, "#") + "  |  Sell: " + str.tostring(fpSellVol, "#") + "\n"
+        tt += "   Absorb:   " + (fpAbsorption ? "YES ⚠ (high vol, low delta)" : "No") + "\n"
+        tt += "   Bear Div: " + (fpBearDiv ? "YES ⚠ (stealth distribution)" : "No") + "\n"
+        tt += "   Bull Div: " + (fpBullDiv ? "YES ⚠ (stealth accumulation)" : "No") + "\n"
+        if not na(fpPocPos)
+            string pocRead = fpPocPos > 0.7 ? "HIGH (distribution)" : fpPocPos < 0.3 ? "LOW (accumulation)" : "MID (balanced)"
+            tt += "   POC Pos:  " + str.tostring(fpPocPos, "#.##") + " → " + pocRead + "\n"
+        string biasLabel = fpBias == 2 ? "STRONG BULL ++" : fpBias == 1 ? "LEAN BULL +" : fpBias == -1 ? "LEAN BEAR -" : fpBias == -2 ? "STRONG BEAR --" : "NEUTRAL"
+        tt += "   FP Bias:  " + biasLabel + "\n"
+    else if enableFootprint
+        tt += "\n🔬 FOOTPRINT: Data unavailable\n"
+
+    // ── Institutional context line ──
+    string edgeRead = ""
+    if nearOB and fpAvailable and fpAbsorption
+        edgeRead := "\n🏛️ EDGE: Absorption at highs — watch for institutional capping"
+    else if nearOS and fpAvailable and fpAbsorption
+        edgeRead := "\n🏛️ EDGE: Absorption at lows — watch for institutional floor defense"
+    else if fpBearDiv
+        edgeRead := "\n🏛️ EDGE: Stealth distribution — momentum up but flow is selling"
+    else if fpBullDiv
+        edgeRead := "\n🏛️ EDGE: Stealth accumulation — momentum down but flow is buying"
+    else if nearOB and zenVel < -2
+        edgeRead := "\n🏛️ EDGE: OB + decelerating — exhaustion forming"
+    else if nearOS and zenVel > 2
+        edgeRead := "\n🏛️ EDGE: OS + accelerating up — reversal energy building"
+    tt += edgeRead
+
+    label.new(bar_index, zenScaled, "",
+         style=label.style_none,
+         color=color.new(color.black, 100),
+         textcolor=color.new(color.white, 100),
+         size=size.tiny,
+         tooltip=tt)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SIGNALS (Icons with quality-based sizing)
+// ─────────────────────────────────────────────────────────────────────────────
+f_qualityEmoji(float q) =>
+    q >= 85 ? "🔥" : q >= 70 ? "⚡" : q >= 50 ? "✦" : ""
+
+f_qualitySize(float q) =>
+    q >= 85 ? size.large : q >= 70 ? size.normal : size.small
+
+if showSignals and peakSignal
+    string qualTag  = f_qualityEmoji(peakQuality)
+    string sigLabel = qualTag + "▼"
+    string fpInfo   = fpAvailable ? "\n\n🔬 FOOTPRINT:\nΔ Delta: " + str.tostring(fpDelta, "#.#") + "\nΔ Ratio: " + str.tostring(fpDeltaRatio, "#.##") + "\nAbsorption: " + (fpAbsorption ? "YES ⚠" : "No") + "\nPOC Pos: " + str.tostring(fpPocPos, "#.##") + "\nBear Div: " + (fpBearDiv ? "YES ⚠" : "No") : ""
+    label.new(bar_index, oscMax, sigLabel,
+         style=label.style_none,
+         color=color.new(color.black, 100),
+         textcolor=bearColor,
+         size=f_qualitySize(peakQuality),
+         tooltip="🔴 PEAK SIGNAL | Quality: " + str.tostring(peakQuality, "#") + "/100\n━━━━━━━━━━━━\nMomentum exhausted in OB zone\n\nBlock: " + currentBlockName + " (" + str.tostring(currentBlockWeight, "#.#") + "x)\nZenith: " + str.tostring(zenRaw, "#.#") + "\nVelocity: " + str.tostring(zenVel, "#.#") + fpInfo)
+
+if showSignals and valleySignal
+    string qualTag  = f_qualityEmoji(valleyQuality)
+    string sigLabel = qualTag + "▲"
+    string fpInfo   = fpAvailable ? "\n\n🔬 FOOTPRINT:\nΔ Delta: " + str.tostring(fpDelta, "#.#") + "\nΔ Ratio: " + str.tostring(fpDeltaRatio, "#.##") + "\nAbsorption: " + (fpAbsorption ? "YES ⚠" : "No") + "\nPOC Pos: " + str.tostring(fpPocPos, "#.##") + "\nBull Div: " + (fpBullDiv ? "YES ⚠" : "No") : ""
+    label.new(bar_index, oscMin, sigLabel,
+         style=label.style_none,
+         color=color.new(color.black, 100),
+         textcolor=bullColor,
+         size=f_qualitySize(valleyQuality),
+         tooltip="🟢 VALLEY SIGNAL | Quality: " + str.tostring(valleyQuality, "#") + "/100\n━━━━━━━━━━━━\nMomentum exhausted in OS zone\n\nBlock: " + currentBlockName + " (" + str.tostring(currentBlockWeight, "#.#") + "x)\nZenith: " + str.tostring(zenRaw, "#.#") + "\nVelocity: " + str.tostring(zenVel, "#.#") + fpInfo)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// DASHBOARD (Expanded with Footprint Metrics)
+// ─────────────────────────────────────────────────────────────────────────────
+int dashCols = enableFootprint ? 11 : 8
+var table dash = table.new(f_getDashPos(), dashCols, 2, bgcolor=color.new(#000000, 10), border_width=2, border_color=color.new(#333333, 50))
+
+if showDash and barstate.islast
+    string blockTooltip = enableTimeBlocks ? f_getBlockTooltip(currentBlock, currentBlockWeight) : "Time blocks disabled"
+
+    // ── Build institutional tooltips for every cell ──
+
+    // ZEN tooltip: Real-time + Strategy + Secrets
+    string zenZone = nearOB ? "OVERBOUGHT" : nearOS ? "OVERSOLD" : zenRaw > 0 ? "BULL TERRITORY" : "BEAR TERRITORY"
+    float bandPctDash = zenRange > 0 ? ((zenRaw - lower) / zenRange) * 100.0 : 50.0
+    string ttZen = "🦅 ZENITH (Signed DX)\n━━━━━━━━━━━━━━━━━━━━━━━━\n"
+    ttZen += "\n📡 REAL-TIME\n"
+    ttZen += "   Value:    " + str.tostring(zenRaw, "#.##") + "\n"
+    ttZen += "   Signal:   " + str.tostring(zenSig, "#.##") + "\n"
+    ttZen += "   Spread:   " + str.tostring(zenRaw - zenSig, "+#.##;-#.##") + (zenRaw > zenSig ? " (above signal)" : " (below signal)") + "\n"
+    ttZen += "   Band Pos: " + str.tostring(bandPctDash, "#.#") + "% | Zone: " + zenZone + "\n"
+    ttZen += "   Bands:    [" + str.tostring(lower, "#.#") + " / " + str.tostring(upper, "#.#") + "]\n"
+    ttZen += "\n🎯 STRATEGY\n"
+    if nearOB
+        ttZen += "   ⚠️ Approaching exhaustion ceiling\n"
+        ttZen += "   • Watch for signal cross DOWN through signal line\n"
+        ttZen += "   • Tighten longs, prepare short entries\n"
+        ttZen += "   • If velocity decelerating → exhaustion imminent\n"
+    else if nearOS
+        ttZen += "   ⚠️ Approaching exhaustion floor\n"
+        ttZen += "   • Watch for signal cross UP through signal line\n"
+        ttZen += "   • Cover shorts, prepare long entries\n"
+        ttZen += "   • If velocity accelerating up → reversal building\n"
+    else if zenRaw > zenSig and zenRaw > 0
+        ttZen += "   ✅ Bull momentum with signal confirmation\n"
+        ttZen += "   • Trend continuation — hold longs\n"
+        ttZen += "   • Add on pullbacks to signal line\n"
+    else if zenRaw < zenSig and zenRaw < 0
+        ttZen += "   ✅ Bear momentum with signal confirmation\n"
+        ttZen += "   • Trend continuation — hold shorts\n"
+        ttZen += "   • Add on bounces to signal line\n"
+    else
+        ttZen += "   ⬜ Transitional — wait for clean setup\n"
+        ttZen += "   • Zenith/Signal crossing = regime shift\n"
+    ttZen += "\n🏛️ SECRETS\n"
+    ttZen += "   • Zenith = (DI+ − DI−) / (DI+ + DI−) × 100\n"
+    ttZen += "   • Normalized to dynamic Bollinger bands (100-bar)\n"
+    ttZen += "   • OB/OS zones are NOT fixed — they breathe with vol\n"
+    ttZen += "   • Signal line cross IN extreme zone = highest conviction\n"
+    ttZen += "   • Zenith diverging from price = stealth reversal warning"
+
+    // VEL tooltip
+    string momRead = math.abs(zenVel) < 1.0 ? "STALLING" : zenVel > 5.0 ? "SURGING ↑↑" : zenVel < -5.0 ? "SURGING ↓↓" : zenVel > 2.0 ? "ACCELERATING ↑" : zenVel < -2.0 ? "ACCELERATING ↓" : zenVel > 0 ? "RISING ↑" : "FALLING ↓"
+    string ttVel = "⚡ VELOCITY (Zenith Rate of Change)\n━━━━━━━━━━━━━━━━━━━━━━━━\n"
+    ttVel += "\n📡 REAL-TIME\n"
+    ttVel += "   Velocity:  " + str.tostring(zenVel, "+#.##;-#.##") + "\n"
+    ttVel += "   Momentum:  " + momRead + "\n"
+    ttVel += "   Direction:  Zenith is " + (zenVel > 0 ? "GAINING" : "LOSING") + " momentum\n"
+    ttVel += "\n🎯 STRATEGY\n"
+    if math.abs(zenVel) < 1.0
+        ttVel += "   🔇 STALL — momentum dying\n"
+        ttVel += "   • If in OB/OS → reversal setup forming\n"
+        ttVel += "   • If mid-range → chop ahead, reduce size\n"
+        ttVel += "   • Wait for velocity expansion to re-engage\n"
+    else if (zenVel > 0 and zenRaw > 0) or (zenVel < 0 and zenRaw < 0)
+        ttVel += "   🟢 ALIGNED — velocity confirms direction\n"
+        ttVel += "   • Trend is healthy, ride it\n"
+        ttVel += "   • Watch for velocity to peak then fade\n"
+    else
+        ttVel += "   ⚠️ COUNTER — velocity fighting direction\n"
+        ttVel += "   • Momentum shifting against position\n"
+        ttVel += "   • Early warning of regime change\n"
+    ttVel += "\n🏛️ SECRETS\n"
+    ttVel += "   • Velocity = Zenith[0] − Zenith[1] (1-bar delta)\n"
+    ttVel += "   • Peak velocity BEFORE peak price = divergence\n"
+    ttVel += "   • Velocity stalling at extremes = THE signal\n"
+    ttVel += "   • |Vel| > 5 = institutional urgency, not retail\n"
+    ttVel += "   • Velocity flip (+ to −) in OB = peak confirmation"
+
+    // ADX tooltip
+    string adxRead = adx >= 40 ? "STRONG TREND" : adx >= 25 ? "TRENDING" : adx >= 20 ? "WEAK/EMERGING" : "NO TREND"
+    string ttADX = "📊 ADX (Average Directional Index)\n━━━━━━━━━━━━━━━━━━━━━━━━\n"
+    ttADX += "\n📡 REAL-TIME\n"
+    ttADX += "   ADX:    " + str.tostring(adx, "#.##") + " → " + adxRead + "\n"
+    ttADX += "   +DI:    " + str.tostring(plus, "#.#") + "\n"
+    ttADX += "   −DI:    " + str.tostring(minus, "#.#") + "\n"
+    ttADX += "   Spread: " + str.tostring(math.abs(diff), "#.#") + (math.abs(diff) > 20 ? " (WIDE — strong bias)" : math.abs(diff) < 5 ? " (TIGHT — no edge)" : " (moderate)") + "\n"
+    ttADX += "   Thresh: " + str.tostring(trendThresh, "#.#") + "\n"
+    ttADX += "\n🎯 STRATEGY\n"
+    if adx >= 40
+        ttADX += "   🔥 STRONG TREND — don't fade it\n"
+        ttADX += "   • Counter-trend signals are TRAPS\n"
+        ttADX += "   • Only trade WITH the DI direction\n"
+        ttADX += "   • Widen stops — trend will shake out weak hands\n"
+    else if adx >= 25
+        ttADX += "   ✅ TRENDING — signals are reliable\n"
+        ttADX += "   • Trade in DI direction on pullbacks\n"
+        ttADX += "   • Normal stop placement\n"
+    else if adx >= 20
+        ttADX += "   ⚠️ WEAK — trend trying to form\n"
+        ttADX += "   • Reduce size, wider stops\n"
+        ttADX += "   • Wait for ADX to confirm above " + str.tostring(trendThresh, "#") + "\n"
+    else
+        ttADX += "   🚫 NO TREND — range/chop\n"
+        ttADX += "   • Fade extremes only\n"
+        ttADX += "   • Do NOT chase breakouts\n"
+        ttADX += "   • Tighten targets, expect mean reversion\n"
+    ttADX += "\n🏛️ SECRETS\n"
+    ttADX += "   • ADX measures STRENGTH, not direction\n"
+    ttADX += "   • ADX rising from <20 = new trend birth (get in early)\n"
+    ttADX += "   • ADX > 45 then declining = trend exhaustion phase\n"
+    ttADX += "   • DI crossovers WITH rising ADX = real; without = fake\n"
+    ttADX += "   • ADX < 20 for 10+ bars → explosive move brewing"
+
+    // MODE tooltip
+    string ttMode = "🔀 REGIME MODE\n━━━━━━━━━━━━━━━━━━━━━━━━\n"
+    ttMode += "\n📡 REAL-TIME\n"
+    ttMode += "   Mode:   " + (inTrend ? "TRENDING ✅" : "RANGING ⬜") + "\n"
+    ttMode += "   ADX:    " + str.tostring(adx, "#.#") + " vs Threshold: " + str.tostring(trendThresh, "#.#") + "\n"
+    ttMode += "\n🎯 STRATEGY\n"
+    if inTrend
+        ttMode += "   TREND MODE active:\n"
+        ttMode += "   • Signals get +5 quality bonus\n"
+        ttMode += "   • Trade WITH dominant DI direction\n"
+        ttMode += "   • Let winners run, trail stops\n"
+        ttMode += "   • Counter-trend = lower probability\n"
+    else
+        ttMode += "   RANGE MODE active:\n"
+        ttMode += "   • Fade OB/OS extremes\n"
+        ttMode += "   • Take profits quickly at midline\n"
+        ttMode += "   • Both sides get trapped — tight stops\n"
+        ttMode += "   • Best to reduce size or sit out\n"
+    ttMode += "\n🏛️ SECRETS\n"
+    ttMode += "   • Regime detection prevents the #1 retail mistake:\n"
+    ttMode += "     using trend strategy in range (and vice versa)\n"
+    ttMode += "   • Institutions USE range to accumulate/distribute\n"
+    ttMode += "   • Range → Trend transition = biggest opportunities\n"
+    ttMode += "   • Watch for ADX hooking up from <20 = breakout"
+
+    // VOL tooltip
+    string volRead = relVol > 2.5 ? "EXTREME 🔥🔥" : relVol > 2.0 ? "SURGING 🔥" : relVol > 1.5 ? "ELEVATED ⚡" : relVol > 1.0 ? "NORMAL" : relVol > 0.5 ? "BELOW AVG" : "DEAD 💤"
+    string ttVol = "📈 RELATIVE VOLUME\n━━━━━━━━━━━━━━━━━━━━━━━━\n"
+    ttVol += "\n📡 REAL-TIME\n"
+    ttVol += "   Rel Vol:  " + str.tostring(relVol, "#.##") + "x of 20-bar SMA\n"
+    ttVol += "   Raw Vol:  " + str.tostring(volume, "#") + "\n"
+    ttVol += "   Avg Vol:  " + str.tostring(volMA, "#") + "\n"
+    ttVol += "   Status:   " + volRead + "\n"
+    ttVol += "\n🎯 STRATEGY\n"
+    if relVol > 2.0
+        ttVol += "   🔥 HIGH VOLUME — institutional participation\n"
+        ttVol += "   • Moves are REAL, not noise\n"
+        ttVol += "   • Breakouts likely to follow through\n"
+        ttVol += "   • If at OB/OS → climactic volume = reversal\n"
+    else if relVol > 1.0
+        ttVol += "   ✅ NORMAL — standard conditions\n"
+        ttVol += "   • Signals valid at face value\n"
+    else
+        ttVol += "   💤 LOW VOLUME — caution\n"
+        ttVol += "   • Moves are unreliable, likely to reverse\n"
+        ttVol += "   • Breakouts will fail — fade them\n"
+        ttVol += "   • Reduce size or wait for volume\n"
+    ttVol += "\n🏛️ SECRETS\n"
+    ttVol += "   • Volume confirms; price deceives\n"
+    ttVol += "   • Breakout + low vol = TRAP (institutional fake)\n"
+    ttVol += "   • High vol + no follow-through = absorption\n"
+    ttVol += "   • Volume spike at extreme = climactic exhaustion\n"
+    ttVol += "   • Rising price + declining volume = distribution"
+
+    // SIG tooltip
+    string sigState = peakSignal ? "🔴 PEAK ACTIVE" : valleySignal ? "🟢 VALLEY ACTIVE" : "⬜ NO SIGNAL"
+    string ttSig = "🎯 SIGNAL STATUS\n━━━━━━━━━━━━━━━━━━━━━━━━\n"
+    ttSig += "\n📡 REAL-TIME\n"
+    ttSig += "   Status:    " + sigState + "\n"
+    ttSig += "   Cooldown:  Peak: " + str.tostring(barsSincePeak) + " bars | Valley: " + str.tostring(barsSinceValley) + " bars\n"
+    ttSig += "   Required:  " + str.tostring(cooldownBars) + " bars between signals\n"
+    ttSig += "   Min Qual:  " + str.tostring(minQuality, "#") + "\n"
+    if not na(lastSignalQuality)
+        ttSig += "   Last Qual: " + str.tostring(lastSignalQuality, "#") + "/100\n"
+    ttSig += "\n🎯 STRATEGY\n"
+    if peakSignal
+        ttSig += "   🔴 PEAK FIRED — bearish reversal setup\n"
+        ttSig += "   • Zenith crossed below signal in OB zone\n"
+        ttSig += "   • Velocity confirming deceleration\n"
+        ttSig += "   • Quality " + str.tostring(peakQuality, "#") + ": " + (peakQuality >= 85 ? "ELITE — full size" : peakQuality >= 70 ? "STRONG — standard size" : peakQuality >= 50 ? "DECENT — reduced size" : "WEAK — small or skip") + "\n"
+    else if valleySignal
+        ttSig += "   🟢 VALLEY FIRED — bullish reversal setup\n"
+        ttSig += "   • Zenith crossed above signal in OS zone\n"
+        ttSig += "   • Velocity confirming acceleration\n"
+        ttSig += "   • Quality " + str.tostring(valleyQuality, "#") + ": " + (valleyQuality >= 85 ? "ELITE — full size" : valleyQuality >= 70 ? "STRONG — standard size" : valleyQuality >= 50 ? "DECENT — reduced size" : "WEAK — small or skip") + "\n"
+    else
+        ttSig += "   ⬜ WAITING — no active signal\n"
+        ttSig += "   • Next peak needs: OB zone + cross down + velocity < 0\n"
+        ttSig += "   • Next valley needs: OS zone + cross up + velocity > 0\n"
+    ttSig += "\n🏛️ SECRETS\n"
+    ttSig += "   • Quality 85+ fires maybe 2-3x per day — these are gold\n"
+    ttSig += "   • Quality < 50 = momentum only, no flow confirmation\n"
+    ttSig += "   • Cooldown prevents overtrading the same move\n"
+    ttSig += "   • Afternoon (2-3:30) signals get +5 quality bonus\n"
+    ttSig += "   • Signal + absorption + divergence = the holy grail"
+
+    // Row 0: Labels (with tooltips on headers too)
+    table.cell(dash, 0, 0, "ZEN",    text_color=color.gray, text_size=f_getDashTextSize(), tooltip=ttZen)
+    table.cell(dash, 1, 0, "VEL",    text_color=color.gray, text_size=f_getDashTextSize(), tooltip=ttVel)
+    table.cell(dash, 2, 0, "ADX",    text_color=color.gray, text_size=f_getDashTextSize(), tooltip=ttADX)
+    table.cell(dash, 3, 0, "MODE",   text_color=color.gray, text_size=f_getDashTextSize(), tooltip=ttMode)
+
+    int col = 4
+    if showBlockInfo and enableTimeBlocks
+        table.cell(dash, col, 0, "BLOCK",  text_color=color.gray, text_size=f_getDashTextSize(), tooltip=blockTooltip)
+        col += 1
+        table.cell(dash, col, 0, "WT",     text_color=color.gray, text_size=f_getDashTextSize(), tooltip=blockTooltip)
+        col += 1
+
+    table.cell(dash, col, 0, "VOL", text_color=color.gray, text_size=f_getDashTextSize(), tooltip=ttVol)
+    col += 1
+
+    // ── Footprint-specific tooltips ──
+    string ttDelta = ""
+    string ttFPBias = ""
+    string ttQual = ""
+
+    if enableFootprint
+        // DELTA tooltip
+        ttDelta := "🔬 DELTA (Net Order Flow)\n━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        ttDelta += "\n📡 REAL-TIME\n"
+        if fpAvailable and not na(fpDelta)
+            ttDelta += "   Delta:     " + str.tostring(fpDelta, "+#.#;-#.#") + "\n"
+            ttDelta += "   Δ Ratio:   " + str.tostring(fpDeltaRatio, "+#.###;-#.###") + "\n"
+            ttDelta += "   Buy Vol:   " + str.tostring(nz(fpBuyVol), "#") + "\n"
+            ttDelta += "   Sell Vol:  " + str.tostring(nz(fpSellVol), "#") + "\n"
+            ttDelta += "   Total Vol: " + str.tostring(nz(fpTotalVol), "#") + "\n"
+            ttDelta += "   Flow:      " + (nz(fpDeltaRatio) > 0.3 ? "AGGRESSIVE BUYING" : nz(fpDeltaRatio) < -0.3 ? "AGGRESSIVE SELLING" : nz(fpDeltaRatio) > 0.1 ? "Lean buy" : nz(fpDeltaRatio) < -0.1 ? "Lean sell" : "BALANCED") + "\n"
+        else
+            ttDelta += "   Data: UNAVAILABLE\n"
+            ttDelta += "   (Requires Premium + supported instrument)\n"
+        ttDelta += "\n🎯 STRATEGY\n"
+        ttDelta += "   • Delta confirms WHO is in control\n"
+        ttDelta += "   • Price up + delta negative = DISTRIBUTION (bearish)\n"
+        ttDelta += "   • Price down + delta positive = ACCUMULATION (bullish)\n"
+        ttDelta += "   • |Ratio| > 0.3 = one-sided flow, trend continuation\n"
+        ttDelta += "   • |Ratio| < 0.1 = balanced, reversal possible\n"
+        ttDelta += "\n🏛️ SECRETS\n"
+        ttDelta += "   • Delta = Buy volume − Sell volume (footprint level)\n"
+        ttDelta += "   • NOT the same as tick delta — this is REAL order flow\n"
+        ttDelta += "   • Large delta + no price move = absorption (trapped)\n"
+        ttDelta += "   • Delta divergence over " + str.tostring(fpDivLookback) + " bars = stealth reversal\n"
+        ttDelta += "   • Market makers show intent through delta, not price"
+
+        table.cell(dash, col, 0, "DELTA", text_color=color.gray, text_size=f_getDashTextSize(), tooltip=ttDelta)
+        col += 1
+
+        // FP BIAS tooltip
+        ttFPBias := "🔬 FOOTPRINT BIAS (Aggregate Read)\n━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        ttFPBias += "\n📡 REAL-TIME\n"
+        string biasLabel = fpBias == 2 ? "STRONG BULL ++" : fpBias == 1 ? "LEAN BULL +" : fpBias == -1 ? "LEAN BEAR −" : fpBias == -2 ? "STRONG BEAR −−" : "NEUTRAL"
+        ttFPBias += "   Bias:       " + biasLabel + " (" + str.tostring(fpBias) + ")\n"
+        ttFPBias += "   Absorption: " + (fpAbsorption ? "YES ⚠" : "No") + "\n"
+        ttFPBias += "   Bear Div:   " + (fpBearDiv ? "YES ⚠ (stealth distribution)" : "No") + "\n"
+        ttFPBias += "   Bull Div:   " + (fpBullDiv ? "YES ⚠ (stealth accumulation)" : "No") + "\n"
+        if not na(fpPocPos)
+            string pocRead = fpPocPos > 0.7 ? "HIGH → distribution" : fpPocPos < 0.3 ? "LOW → accumulation" : "MID → balanced"
+            ttFPBias += "   POC Pos:    " + str.tostring(fpPocPos, "#.##") + " → " + pocRead + "\n"
+        ttFPBias += "\n🎯 STRATEGY\n"
+        ttFPBias += "   • Bias ±2: Strong conviction — trade with it\n"
+        ttFPBias += "   • Bias ±1: Lean — confirm with other factors\n"
+        ttFPBias += "   • Bias 0:  Neutral — no edge from flow\n"
+        ttFPBias += "   • Bias vs Zenith mismatch = DIVERGENCE WARNING\n"
+        ttFPBias += "\n🏛️ SECRETS\n"
+        ttFPBias += "   • Bias = composite of delta + absorption + divergence + POC\n"
+        ttFPBias += "   • Score range: −2 to +2 (clamped)\n"
+        ttFPBias += "   • Absorption at extremes adds ±1 (floor/ceiling defense)\n"
+        ttFPBias += "   • This IS the institutional read — they can't hide flow\n"
+        ttFPBias += "   • When bias flips while price holds = trap is set"
+
+        table.cell(dash, col, 0, "FP",    text_color=color.gray, text_size=f_getDashTextSize(), tooltip=ttFPBias)
+        col += 1
+
+        // QUAL tooltip
+        ttQual := "⭐ SIGNAL QUALITY SCORE\n━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        ttQual += "\n📡 REAL-TIME\n"
+        if not na(lastSignalQuality)
+            ttQual += "   Last Score: " + str.tostring(lastSignalQuality, "#") + "/100\n"
+            ttQual += "   Grade:      " + (lastSignalQuality >= 85 ? "🔥 ELITE" : lastSignalQuality >= 70 ? "⚡ STRONG" : lastSignalQuality >= 50 ? "✦ DECENT" : "○ WEAK") + "\n"
+        else
+            ttQual += "   No signal scored yet\n"
+        ttQual += "\n🎯 STRATEGY\n"
+        ttQual += "   85-100 🔥 ELITE — Full size, high conviction\n"
+        ttQual += "   70-84  ⚡ STRONG — Standard size, good setup\n"
+        ttQual += "   50-69  ✦ DECENT — Reduced size, needs confirmation\n"
+        ttQual += "   40-49  ○ WEAK — Momentum only, skip or tiny size\n"
+        ttQual += "\n📐 SCORING BREAKDOWN\n"
+        ttQual += "   40 pts: Base (signal fired on momentum)\n"
+        ttQual += "   +20:    Delta confirms direction\n"
+        ttQual += "   +15:    Absorption at extreme zone\n"
+        ttQual += "   +10:    Delta divergence (stealth reversal)\n"
+        ttQual += "   +10:    POC position confirms\n"
+        ttQual += "   +5:     Afternoon time block (PM★)\n"
+        ttQual += "   +5:     Trending regime (ADX)\n"
+        ttQual += "\n🏛️ SECRETS\n"
+        ttQual += "   • 85+ signals appear 2-3x per day MAX\n"
+        ttQual += "   • Without footprint data, max score = 50\n"
+        ttQual += "   • Quality filter at " + str.tostring(minQuality, "#") + " — adjust in settings\n"
+        ttQual += "   • The edge: Quality 85+ has ALL layers confirming\n"
+        ttQual += "   • If you only trade 85+, you trade like an institution"
+
+        table.cell(dash, col, 0, "QUAL",  text_color=color.gray, text_size=f_getDashTextSize(), tooltip=ttQual)
+        col += 1
+
+    table.cell(dash, col, 0, "SIG", text_color=color.gray, text_size=f_getDashTextSize(), tooltip=ttSig)
+
+    // Row 1: Values (with same tooltips for hover anywhere in column)
+    table.cell(dash, 0, 1, str.tostring(zenRaw, "#.#"),
+         text_color=zenRaw > 0 ? bullColor : bearColor, text_size=f_getDashHeaderSize(), tooltip=ttZen)
+    table.cell(dash, 1, 1, str.tostring(zenVel, "+#.#;-#.#"),
+         text_color=zenVel > 0 ? bullColor : bearColor, text_size=f_getDashTextSize(), tooltip=ttVel)
+    table.cell(dash, 2, 1, str.tostring(adx, "#.#"),
+         text_color=inTrend ? color.yellow : color.gray, text_size=f_getDashTextSize(), tooltip=ttADX)
+    table.cell(dash, 3, 1, inTrend ? "TREND" : "RANGE",
+         text_color=inTrend ? color.yellow : color.gray, text_size=f_getDashTextSize(), tooltip=ttMode)
+
+    col := 4
+    if showBlockInfo and enableTimeBlocks
+        color blockCol = currentBlockWeight >= 1.2 ? color.new(#66BB6A, 0) :
+             currentBlockWeight <= 0.7 ? color.new(#EF5350, 0) : color.orange
+        table.cell(dash, col, 1, currentBlockName, text_color=blockCol,
+             text_size=f_getDashTextSize(), tooltip=blockTooltip)
+        col += 1
+        table.cell(dash, col, 1, str.tostring(currentBlockWeight, "#.#") + "x",
+             text_color=blockCol, text_size=f_getDashTextSize(), tooltip=blockTooltip)
+        col += 1
+
+    table.cell(dash, col, 1, str.tostring(relVol, "#.#") + "x",
+         text_color=relVol > 1.5 ? color.yellow : color.white, text_size=f_getDashTextSize(), tooltip=ttVol)
+    col += 1
+
+    if enableFootprint
+        if fpAvailable and not na(fpDelta)
+            string deltaStr = str.tostring(fpDelta, "+#.#;-#.#")
+            color deltaCol  = fpDelta > 0 ? bullColor : fpDelta < 0 ? bearColor : color.gray
+            table.cell(dash, col, 1, deltaStr, text_color=deltaCol, text_size=f_getDashTextSize(), tooltip=ttDelta)
+        else
+            table.cell(dash, col, 1, "---", text_color=color.gray, text_size=f_getDashTextSize(), tooltip=ttDelta)
+        col += 1
+
+        string biasStr = fpBias == 2 ? "BULL++" : fpBias == 1 ? "BULL" : fpBias == -1 ? "BEAR" : fpBias == -2 ? "BEAR--" : "NEUT"
+        color biasCol = fpBias > 0 ? bullColor : fpBias < 0 ? bearColor : color.gray
+        table.cell(dash, col, 1, biasStr, text_color=biasCol, text_size=f_getDashTextSize(), tooltip=ttFPBias)
+        col += 1
+
+        if not na(lastSignalQuality)
+            color qualCol = lastSignalQuality >= 85 ? color.new(#FFD700, 0) : lastSignalQuality >= 70 ? bullColor : lastSignalQuality >= 50 ? color.orange : color.gray
+            table.cell(dash, col, 1, str.tostring(lastSignalQuality, "#"), text_color=qualCol, text_size=f_getDashTextSize(), tooltip=ttQual)
+        else
+            table.cell(dash, col, 1, "---", text_color=color.gray, text_size=f_getDashTextSize(), tooltip=ttQual)
+        col += 1
+
+    string sigText  = peakSignal ? "PEAK" : valleySignal ? "VALLEY" : "---"
+    color  sigColor = peakSignal ? bearColor : valleySignal ? bullColor : color.gray
+    table.cell(dash, col, 1, sigText, text_color=sigColor, text_size=f_getDashTextSize(), tooltip=ttSig)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ALERTS (Enhanced with Quality Tiers)
+// ─────────────────────────────────────────────────────────────────────────────
+alertcondition(peakSignal, "Peak", "ZENITH: Peak signal detected")
+alertcondition(valleySignal, "Valley", "ZENITH: Valley signal detected")
+
+alertcondition(peakSignal and peakQuality >= 70, "Peak ⚡ Strong",
+     "ZENITH: STRONG peak signal (Quality 70+) — footprint confirmed")
+alertcondition(valleySignal and valleyQuality >= 70, "Valley ⚡ Strong",
+     "ZENITH: STRONG valley signal (Quality 70+) — footprint confirmed")
+
+alertcondition(peakSignal and peakQuality >= 85, "Peak 🔥 Elite",
+     "ZENITH: ELITE peak signal (Quality 85+) — full confluence")
+alertcondition(valleySignal and valleyQuality >= 85, "Valley 🔥 Elite",
+     "ZENITH: ELITE valley signal (Quality 85+) — full confluence")
+
+alertcondition(enableTimeBlocks and currentBlock == BLOCK_NY_AFTERNOON and peakSignal,
+     "Afternoon Peak ★", "ZENITH: Afternoon peak (1.5x weight)")
+alertcondition(enableTimeBlocks and currentBlock == BLOCK_NY_AFTERNOON and valleySignal,
+     "Afternoon Valley ★", "ZENITH: Afternoon valley (1.5x weight)")
+
+alertcondition(fpAbsorption and nearOB, "Absorption at Highs ⚠",
+     "ZENITH: Absorption detected at OB zone — institutional capping possible")
+alertcondition(fpAbsorption and nearOS, "Absorption at Lows ⚠",
+     "ZENITH: Absorption detected at OS zone — institutional floor defense possible")
+
+// ─────────────────────────────────────────────────────────────────────────────
+// END OF SCRIPT
+// ─────────────────────────────────────────────────────────────────────────────

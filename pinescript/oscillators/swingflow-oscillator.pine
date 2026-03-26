@@ -1,0 +1,244 @@
+//@version=6
+indicator("SwingFlow Oscillator", shorttitle="SFO", overlay=false, max_bars_back=500)
+
+// ================================================================
+//  SwingFlow Oscillator v10
+//  Две уникальные МА как осциллятор в отдельной панели.
+//  Вся логика фильтрации сохранена.
+// ================================================================
+
+// ─── НАСТРОЙКИ ──────────────────────────────────────────────────
+g1 = "MA"
+ermaLen     = input.int(13,   "ERMA Length",         minval=3,   maxval=300,        group=g1)
+orcaLen     = input.int(34,   "ORCA Length",         minval=5,   maxval=500,        group=g1)
+
+g2 = "Сигнал"
+confirmBars = input.int(3,    "Confirm bars",        minval=1,   maxval=6,          group=g2)
+cooldown    = input.int(15,   "Cooldown bars",       minval=5,   maxval=50,         group=g2)
+
+g3 = "ATR Volatility"
+atrLen      = input.int(14,   "ATR Length",          minval=5,   maxval=50,         group=g3)
+atrSmth     = input.int(20,   "ATR Smooth",          minval=5,   maxval=100,        group=g3)
+atrMult     = input.float(1.1,"ATR Mult",            minval=1.0, maxval=2.0, step=0.05, group=g3)
+
+g4 = "ADX Trend"
+adxLen      = input.int(14,   "ADX Length",          minval=5,   maxval=50,         group=g4)
+adxTh       = input.int(22,   "ADX Trend Threshold", minval=10,  maxval=50,         group=g4)
+
+g5 = "ORCA Slope"
+slopeLen    = input.int(5,    "Slope Bars",          minval=2,   maxval=20,         group=g5)
+showSlope   = input.bool(true,"Show Slope",                                         group=g5)
+
+g6 = "HTF Filter"
+htfTF       = input.timeframe("240", "HTF Timeframe",                               group=g6)
+htfOn       = input.bool(true,      "Enable HTF Filter",                            group=g6)
+htfSlpLen   = input.int(3,          "HTF Slope Bars",  minval=1, maxval=10,         group=g6)
+
+// ================================================================
+//  ERMA — Energy-Relative Moving Average
+//  Вес каждого бара = (тело / диапазон) ^ 1.5
+//  Импульсные свечи двигают MA сильно, дожи — почти нет
+// ================================================================
+ermaVal() =>
+    sw = 0.0
+    sp = 0.0
+    for i = 0 to ermaLen - 1
+        r = high[i] - low[i]
+        b = math.abs(close[i] - open[i])
+        e = r > 0.0 ? b / r : 0.01
+        w = math.pow(e, 1.5)
+        sw += w
+        sp += w * close[i]
+    sw > 0.0 ? sp / sw : close
+
+// ================================================================
+//  ORCA — Oscillation-Removed Cumulative Average
+//  EMA + сглаженное отклонение * 0.618
+//  Медленная честная MA, разворот = смена структуры
+// ================================================================
+orcaVal(float src, int len) =>
+    b = ta.ema(src, len)
+    d = src - b
+    s = ta.ema(d, math.max(math.round(len / 3), 2))
+    b + s * 0.618
+
+// ─── МА ─────────────────────────────────────────────────────────
+eRaw  = ermaVal()
+oRaw  = orcaVal(close, orcaLen)
+base  = ta.sma(close, orcaLen)
+erma  = (eRaw / base - 1.0) * 100.0
+orca  = (oRaw / base - 1.0) * 100.0
+diff  = erma - orca
+
+// ─── ОБЛАКО ─────────────────────────────────────────────────────
+strongTh = 0.08
+cloudCol = diff > strongTh  ? color.new(#00E676, 25) :
+           diff > 0.0       ? color.new(#00E676, 62) :
+           diff < -strongTh ? color.new(#FF1744, 25) :
+           diff < 0.0       ? color.new(#FF1744, 62) :
+                               color.new(#546E7A, 80)
+
+// ─── ATR VOLATILITY FILTER ──────────────────────────────────────
+// Сигнал только когда ATR расширяется 2+ бара — не от одной свечи
+atrNow    = ta.atr(atrLen)
+atrAvg    = ta.sma(atrNow, atrSmth)
+atrOK     = atrNow > atrAvg * atrMult and atrNow[1] > atrAvg[1] * (atrMult * 0.95)
+
+// ─── ADX TREND DETECTOR ─────────────────────────────────────────
+atrD    = ta.atr(adxLen)
+upm     = high - high[1]
+dnm     = low[1] - low
+pDM     = upm > dnm and upm > 0.0 ? upm : 0.0
+mDM     = dnm > upm and dnm > 0.0 ? dnm : 0.0
+pDI     = 100.0 * ta.rma(pDM, adxLen) / math.max(atrD, 1e-10)
+mDI     = 100.0 * ta.rma(mDM, adxLen) / math.max(atrD, 1e-10)
+dSum    = pDI + mDI
+adx     = ta.rma(dSum > 0.0 ? 100.0 * math.abs(pDI - mDI) / dSum : 0.0, adxLen)
+
+isTrend  = adx >= adxTh
+isBullTr = isTrend and pDI > mDI
+isBearTr = isTrend and mDI > pDI
+isFlat   = not isTrend
+
+// ─── ORCA SLOPE (текущий ТФ) ────────────────────────────────────
+oSlope    = (oRaw - oRaw[slopeLen]) / math.max(oRaw[slopeLen], 1e-10) * 100.0
+oSlopeUp  = oSlope > 0.0
+oSlpNorm  = oSlope * (100.0 / math.max(math.abs(ta.highest(math.abs(oSlope), 100)), 0.001))
+oSlpPlot  = math.max(math.min(oSlpNorm, 5.0), -5.0)
+
+// ─── HTF FILTER ─────────────────────────────────────────────────
+// Только голый close с HTF, EMA считается здесь
+htfEmaNow  = request.security(syminfo.tickerid, htfTF, ta.ema(close, 34), lookahead=barmerge.lookahead_off)
+htfEmaPrev = request.security(syminfo.tickerid, htfTF, ta.ema(close, 34)[3], lookahead=barmerge.lookahead_off)
+htfSlope   = htfEmaNow - htfEmaPrev
+htfBull    = htfOn and htfSlope > 0.0
+htfBear    = htfOn and htfSlope < 0.0
+
+// ─── ADAPTIVE RSI ───────────────────────────────────────────────
+// В тренде границы шире, во флэте уже
+rsi       = ta.rsi(close, 14)
+rsiBC     = isTrend ? 68.0 : 55.0
+rsiBF     = isTrend ? 32.0 : 45.0
+rsiWasLo  = ta.lowest(rsi,  5) < 50.0
+rsiWasHi  = ta.highest(rsi, 5) > 50.0
+rsiBuy    = rsi < rsiBC
+rsiSell   = rsi > rsiBF
+
+// ─── СВЕЧНОЙ АНАЛИЗ ─────────────────────────────────────────────
+cRng    = high - low
+cBdy    = math.abs(close - open)
+uWick   = high - math.max(close, open)
+lWick   = math.min(close, open) - low
+isBull  = close > open
+isBear  = close < open
+
+hammer  = lWick >= cBdy * 2.0 and uWick <= cBdy * 0.3 and cBdy > cRng * 0.1
+star    = uWick >= cBdy * 2.0 and lWick <= cBdy * 0.3 and cBdy > cRng * 0.1
+bullEng = isBull and close[1] < open[1] and close > open[1] and open < close[1]
+bearEng = isBear and close[1] > open[1] and close < open[1] and open > close[1]
+
+bBon    = (hammer  ? 1 : 0) + (bullEng ? 1 : 0)
+sBon    = (star    ? 1 : 0) + (bearEng ? 1 : 0)
+
+// ─── ОБЪЁМ ──────────────────────────────────────────────────────
+volOK   = volume > ta.sma(volume, 20) * 1.1
+
+// ─── БАЗОВЫЕ УСЛОВИЯ ────────────────────────────────────────────
+bBase   = diff > 0.0 and rsiWasLo and rsiBuy  and volOK and close > oRaw
+sBase   = diff < 0.0 and rsiWasHi and rsiSell and volOK and close < oRaw
+
+// Структурный фильтр текущего ТФ:
+// BUY  блокируется в медвежьем тренде с падающей ORCA
+// SELL блокируется в бычьем тренде с растущей ORCA
+bBase  := bBase and not (isBearTr and not oSlopeUp)
+sBase  := sBase and not (isBullTr and oSlopeUp)
+
+// HTF фильтр: не торговать против старшей структуры
+bBase  := bBase and not htfBear
+sBase  := sBase and not htfBull
+
+// ─── СЧЁТЧИК ПОДТВЕРЖДЕНИЙ ──────────────────────────────────────
+var int lastB = -50
+var int lastS = -50
+
+var int bCnt  = 0
+var int sCnt  = 0
+
+cUp   = ta.crossover(diff,  0.0)
+cDown = ta.crossunder(diff, 0.0)
+
+if cUp
+    bCnt := 1
+    sCnt := 0
+else if cDown
+    sCnt := 1
+    bCnt := 0
+else if diff > 0.0 and bCnt > 0
+    bCnt := bCnt + 1
+else if diff < 0.0 and sCnt > 0
+    sCnt := sCnt + 1
+else
+    bCnt := 0
+    sCnt := 0
+
+bEff    = bCnt + bBon
+sEff    = sCnt + sBon
+
+bullSig = bEff >= confirmBars and bBase and atrOK and (bar_index - lastB) > cooldown
+bearSig = sEff >= confirmBars and sBase and atrOK and (bar_index - lastS) > cooldown
+
+if bullSig
+    lastB := bar_index
+if bearSig
+    lastS := bar_index
+
+// ================================================================
+//  ОТРИСОВКА
+// ================================================================
+
+bgcolor(isFlat ? color.new(#37474F, 93) : na, title="Flat bg")
+bgcolor(bullSig ? color.new(#00E676, 70) : na, title="BUY flash")
+bgcolor(bearSig ? color.new(#FF1744, 70) : na, title="SELL flash")
+
+hline(0, "", color=color.new(#546E7A, 50), linestyle=hline.style_dashed, linewidth=1)
+
+pE = plot(erma, "ERMA", color=color.new(#FFFFFF, 10), linewidth=2)
+pO = plot(orca, "ORCA", color=color.new(#FFFFFF, 50), linewidth=1)
+fill(pE, pO, color=cloudCol, title="Cloud")
+
+sCol = oSlpPlot > 0.0 ? color.new(#00E676, 30) : color.new(#FF1744, 30)
+plot(showSlope ? oSlpPlot : na, "ORCA Slope", color=sCol, linewidth=1, style=plot.style_area)
+
+// ─── ТАБЛИЦА ────────────────────────────────────────────────────
+var table tbl = table.new(position.top_right, 2, 5,
+     bgcolor=color.new(#0D1117, 10), border_color=color.new(#30363D, 40), border_width=1)
+
+if barstate.islast
+    // Реальный сигнал с учётом HTF и структурных фильтров
+    buyAllowed  = diff > 0.0 and not htfBear and not (isBearTr and not oSlopeUp)
+    sellAllowed = diff < 0.0 and not htfBull and not (isBullTr and oSlopeUp)
+    zTxt = buyAllowed  and diff > strongTh  ? "STRONG BUY"  : buyAllowed  and diff > 0.0       ? "WEAK BUY"   : sellAllowed and diff < -strongTh ? "STRONG SELL" : sellAllowed and diff < 0.0       ? "WEAK SELL"  : "WAIT"
+    zCol = buyAllowed  and diff > strongTh  ? color.new(#00E676, 0) : buyAllowed  and diff > 0.0       ? color.new(#69F0AE, 0) : sellAllowed and diff < -strongTh ? color.new(#FF1744, 0) : sellAllowed and diff < 0.0       ? color.new(#EF9A9A, 0) : color.new(#78909C, 0)
+    mTxt = isBullTr ? "BULL TREND" : isBearTr ? "BEAR TREND" : "FLAT"
+    mCol = isBullTr ? color.new(#00E676, 0) : isBearTr ? color.new(#FF1744, 0) : color.new(#78909C, 0)
+    hTxt = htfBull  ? "BULL ▲" : htfBear ? "BEAR ▼" : "FLAT"
+    hCol = htfBull  ? color.new(#00E676, 0) : htfBear ? color.new(#FF1744, 0) : color.new(#78909C, 0)
+    aCol = atrOK    ? color.new(#00E676, 0) : color.new(#EF9A9A, 0)
+    spCol = oSlopeUp ? color.new(#00E676, 0) : color.new(#FF1744, 0)
+    lb   = color.new(#8B949E, 0)
+    bg   = color.new(#0D1117, 10)
+
+    table.cell(tbl, 0, 0, "Signal",        text_color=lb,   bgcolor=bg, text_size=size.small)
+    table.cell(tbl, 1, 0, zTxt,            text_color=zCol, bgcolor=bg, text_size=size.small)
+    table.cell(tbl, 0, 1, "HTF " + htfTF, text_color=lb,   bgcolor=bg, text_size=size.small)
+    table.cell(tbl, 1, 1, hTxt,            text_color=hCol, bgcolor=bg, text_size=size.small)
+    table.cell(tbl, 0, 2, "Market",        text_color=lb,   bgcolor=bg, text_size=size.small)
+    table.cell(tbl, 1, 2, mTxt,            text_color=mCol, bgcolor=bg, text_size=size.small)
+    table.cell(tbl, 0, 3, "ORCA Slope",    text_color=lb,   bgcolor=bg, text_size=size.small)
+    table.cell(tbl, 1, 3, oSlopeUp ? "UP ▲" : "DOWN ▼", text_color=spCol, bgcolor=bg, text_size=size.small)
+    table.cell(tbl, 0, 4, "Volatility",    text_color=lb,   bgcolor=bg, text_size=size.small)
+    table.cell(tbl, 1, 4, atrOK ? "EXPANDING" : "COMPRESSED", text_color=aCol, bgcolor=bg, text_size=size.small)
+
+// ─── АЛЕРТЫ ─────────────────────────────────────────────────────
+alertcondition(bullSig, "SFO BUY",  "SwingFlow — BUY")
+alertcondition(bearSig, "SFO SELL", "SwingFlow — SELL")

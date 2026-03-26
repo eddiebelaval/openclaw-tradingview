@@ -1,0 +1,670 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © KioseffTrading
+
+//@version=6
+indicator("Volume Spread Analysis IQ [TradingIQ]", overlay = false, 
+                                                   max_labels_count    = 500, 
+                                                   max_lines_count     = 500, 
+                                                   max_boxes_count     = 500, 
+                                                   max_polylines_count = 100
+                                                    )
+
+import Trading-IQ/ICTlibrary/6 as IQ
+
+var groupMain   = "Main Settings"
+var groupBars   = "Bar Interpretation"
+var groupVolSpr = "Spread / Volume"
+var groupBg     = "Background Context"
+var groupPat    = "Pattern Rules"
+var groupAdv    = "Advanced Mode"
+
+volDotCol        = input.color(#ff9ef9, title = "Effort Dot Color", group = groupMain)
+spreadDotCol     = input.color(#e9e2ff, title = "Result Dot Color", group = groupMain)
+effortOspreadCol = input.color(#5b9cf6, title = "Effort > Result", group = groupMain)
+spreadOeffortCol = input.color(#faa1a4, title = "Result > Effort", group = groupMain)
+trendRule        = input.bool  (true, "Should trend influence background bias?", tooltip = "When enabled, your trend classifier helps push the background toward bullish or bearish. Turn this off if you want background based only on VSA scoring.", group = groupMain)
+bgLookbackIn     = input.string("Medium", "VSA Lookback", options = ["Small", "Medium", "High"], tooltip = "Controls how many bars are used to judge the recent VSA background. Small reacts faster. High is slower but steadier.", group = groupMain)
+
+showEVRcandle    = input.bool(defval = true, title = "Show Effort Vs. Result Per Candle", group = "Candle Labels")
+spreadColUltraN  = input.color(defval = #e9e2ff, title = "Ultra Narrow Spread Color", tooltip = "Color used for bars classified as Ultra Narrow spread.", group = "Candle Labels", active = showEVRcandle)
+spreadColUltraW  = input.color(defval = #6929f2, title = "Ultra Wide Spread Color", tooltip = "Color used for bars classified as Ultra Wide spread.", group = "Candle Labels", active = showEVRcandle)
+volColUltraN     = input.color(defval = #e9e2ff, title = "Ultra Low Volume Color", tooltip = "Color used for volume classified as Ultra Low.", group = "Candle Labels", active = showEVRcandle)
+volColUltraW     = input.color(defval = #6929f2, title = "Ultra High Volume Color", tooltip = "Color used for volume classified as Ultra High.", group = "Candle Labels", active = showEVRcandle)
+
+bodySense        = input.string("Standard", "What's a small body to you?", options = ["Loose", "Standard", "Strict"], tooltip = "Loose will classify more candles as small-body. Strict will only classify very compact bodies as small-body.", group = groupBars)
+wickSense        = input.string("Standard", "What's a long wick to you?", options = ["Loose", "Standard", "Strict"], tooltip = "Loose treats more candles as having long rejection wicks. Strict requires a more obvious wick imbalance.", group = groupBars)
+closeSense       = input.string("Standard","How close should a close be to the high or low?",options = ["Loose", "Standard", "Strict"],tooltip = "Loose accepts closes that are near the edge. Strict requires the close to be much closer to the high or low before it is classified that way.",group = groupBars)
+spreadSense      = input.string("Standard","What's a narrow spread to you?",options = ["Loose", "Standard", "Strict"],tooltip = "Loose labels more bars as narrow spread. Strict only labels clearly compressed bars as narrow.",group = groupVolSpr)
+lowVolSense      = input.string("Standard","What's low volume to you?",options = ["Loose", "Standard", "Strict"],tooltip = "Loose allows more bars to count as low volume. Strict requires volume to stand out as clearly quiet or inactive.",group = groupVolSpr)
+highVolSense     = input.string("Standard","What's high volume to you?",options = ["Loose", "Standard", "Strict"],tooltip = "Loose allows more bars to count as high volume. Strict requires volume to stand out more clearly as active or climactic.",group = groupVolSpr)
+bgSense          = input.string("Standard","How much background proof do you want?",options = ["Loose", "Standard", "Strict"],tooltip = "Loose lets background strength or weakness appear sooner. Strict requires more evidence before background bias is accepted.",group = groupBg)
+noDemandTrad     = input.bool  (false,"Use traditional No Demand rules?",tooltip = "Uses the simpler textbook-style logic: up bar, narrow spread, and volume less than the previous two bars. Turning this off uses your broader interpretation.",group = groupPat)
+noSupplyTrad     = input.bool  (false,"Use traditional No Supply rules?",tooltip = "Uses the simpler textbook-style inverse of No Demand: down bar, narrow spread, and volume less than the previous two bars. Turning this off uses your broader interpretation.",group = groupPat)
+shakeOutTrad     = input.bool  (false,"Require clear uptrend for Shakeout?",tooltip = "When enabled, Shakeouts are only allowed when your trend classifier is clearly bullish. This makes the signal more selective.",group = groupPat)
+
+
+upThrustTrad        = input.bool(false,"Require clear downtrend for Upthrust?",tooltip = "When enabled, Upthrusts are only allowed when your trend classifier is clearly bearish. This makes the signal more selective.",group = groupPat)
+showAdvanced        = input.bool(false, "Enable advanced overrides?", tooltip = "Shows the raw numeric thresholds behind the friendly settings. Most users should leave this off unless they want precise control.", group = groupAdv)
+advSmallBodyThresh  = input.float(0.10, "Small body threshold", minval = 0.01, maxval = 0.50, step = 0.01, tooltip = "Maximum body-to-range ratio for a candle to count as small-body. Lower values make the definition stricter.", group = groupAdv,  active = showAdvanced)
+advLongWickThresh   = input.float(0.45,"Long wick threshold",minval = 0.10,maxval = 0.90,step = 0.01,tooltip = "Minimum wick-to-range ratio needed for a wick to count as a meaningful rejection wick.",group = groupAdv, active = showAdvanced)
+advCloseThresh      = input.float(0.60, "Close position threshold", minval = 0.10, maxval = 0.95, step = 0.05, tooltip = "Controls how far toward the high or low the close must be before it is classified as a high close or low close.", group = groupAdv,  active = showAdvanced)
+advNarrowRankMax    = input.float(30, "Narrow spread rank max", minval = 1, maxval = 99, step = 1, tooltip = "Maximum spread percentile rank for a bar to count as narrow. Lower values make narrow spread harder to qualify.", group = groupAdv,  active = showAdvanced)
+advWideRankMin      = input.float(70, "Wide spread rank min", minval = 1, maxval = 99, step = 1, tooltip = "Minimum spread percentile rank for a bar to count as wide.", group = groupAdv, active = showAdvanced)
+advUltraWideRankMin = input.float(90, "Ultra wide spread rank min", minval = 1, maxval = 99, step = 1, tooltip = "Minimum spread percentile rank for a bar to count as ultra wide.", group = groupAdv, active = showAdvanced)
+advLowVolRankMax    = input.float(30, "Low volume rank max", minval = 1, maxval = 99, step = 1, tooltip = "Maximum volume percentile rank for a bar to count as low volume.", group = groupAdv, active = showAdvanced)
+advHighVolRankMin   = input.float(70,"High volume rank min",minval = 1,maxval = 99,step = 1,tooltip = "Minimum volume percentile rank for a bar to count as high volume.",group = groupAdv,active = showAdvanced)
+advUltraHighRankMin = input.float(90, "Ultra high volume rank min", minval = 1, maxval = 99, step = 1, tooltip = "Minimum volume percentile rank for a bar to count as ultra high volume.", group = groupAdv, active = showAdvanced)
+advBgThresh         = input.float(2.0, "Background threshold", minval = 0.0, maxval = 20.0, step = 0.25, tooltip = "How strong net VSA scoring must be before background is labeled strong or weak.", group = groupAdv, active = showAdvanced)
+advAppearThresh     = input.float(1.0, "Background appearing threshold", minval = 0.0, maxval = 20.0, step = 0.25, tooltip = "How much net score change is needed before strength or weakness is considered to be appearing.", group = groupAdv, active = showAdvanced)
+
+
+[direction, pointArr, timeArr] = IQ.IQZZsimple(3, high, low, false)
+
+
+var bgLookback = switch bgLookbackIn
+    "Small"  => 5
+    "Medium" => 10
+    =>          20
+
+var smallBodyThresh = switch
+    showAdvanced               => advSmallBodyThresh
+    bodySense == "Loose"       => 0.15
+    bodySense == "Standard"    => 0.10
+    =>                            0.07
+
+var rejBodyMax = switch
+    showAdvanced               => math.min(0.95, advLongWickThresh)
+    wickSense == "Loose"       => 0.55
+    wickSense == "Standard"    => 0.45
+    =>                            0.35
+
+var rejWickThresh = switch
+    showAdvanced               => advLongWickThresh
+    wickSense == "Loose"       => 0.35
+    wickSense == "Standard"    => 0.45
+    =>                            0.55
+
+var closeThresh = switch
+    showAdvanced               => advCloseThresh
+    closeSense == "Loose"      => 0.45
+    closeSense == "Standard"   => 0.60
+    =>                            0.75
+
+var spreadNormalMin = switch
+    showAdvanced               => advNarrowRankMax
+    spreadSense == "Loose"     => 35
+    spreadSense == "Standard"  => 30
+    =>                            20
+
+var spreadWideMin = switch
+    showAdvanced               => advWideRankMin
+    spreadSense == "Loose"     => 65
+    spreadSense == "Standard"  => 70
+    =>                            80
+
+var spreadUltraWideMin = switch
+    showAdvanced               => advUltraWideRankMin
+    spreadSense == "Loose"     => 85
+    spreadSense == "Standard"  => 90
+    =>                            95
+
+var spreadUltraNarrowMax = switch
+    showAdvanced               => math.max(1, advNarrowRankMax * 0.33)
+    spreadSense == "Loose"     => 15
+    spreadSense == "Standard"  => 10
+    =>                            5
+
+var lowVolMax = switch
+    showAdvanced               => advLowVolRankMax
+    lowVolSense == "Loose"     => 35
+    lowVolSense == "Standard"  => 30
+    =>                            20
+
+var ultraLowVolMax = switch
+    showAdvanced               => math.max(1, advLowVolRankMax * 0.33)
+    lowVolSense == "Loose"     => 15
+    lowVolSense == "Standard"  => 10
+    =>                            5
+
+var highVolMin = switch
+    showAdvanced               => advHighVolRankMin
+    highVolSense == "Loose"    => 65
+    highVolSense == "Standard" => 70
+    =>                            80
+
+var ultraHighVolMin = switch
+    showAdvanced               => advUltraHighRankMin
+    highVolSense == "Loose"    => 85
+    highVolSense == "Standard" => 90
+    =>                            95
+
+var bgThresh = switch
+    showAdvanced               => advBgThresh
+    bgSense == "Loose"         => 1.5
+    bgSense == "Standard"      => 2.0
+    =>                            3.0
+
+var appearThresh = switch
+    showAdvanced               => advAppearThresh
+    bgSense == "Loose"         => 0.5
+    bgSense == "Standard"      => 1.0
+    =>                            1.5
+
+method pushShift(array<float> id, float value) => 
+
+    id.push(value)
+
+    if id.size() > 100
+        id.shift()
+
+    id.percentrank(id.size() - 1)
+
+strongMove() =>
+
+    log   = math.log(close / close[3])
+    mean  = ta.sma  (log, 20) 
+    stdev = ta.stdev(log, 20, true)
+    
+    (log - mean) / stdev 
+
+
+var volRankArr = array.new<float>(), var spreadRankArr = array.new<float>()
+
+barRange     = high - low
+
+volRank      = volRankArr   .pushShift(volume) 
+spreadRank   = spreadRankArr.pushShift(barRange)
+
+R            = nz(((close - low) - (high - close)) / barRange, 0)
+barDirection = math.sign(close - close[1])
+upBar        = barDirection > 0
+downBar      = barDirection < 0
+
+[volClass, effort] = switch
+
+    volRank >= ultraHighVolMin => ["Ultra High", "High Effort"]
+    volRank >= highVolMin      => ["High", "High Effort"]
+    volRank >= lowVolMax       => ["Normal", "Normal"]
+    volRank >= ultraLowVolMax  => ["Low", "Low Effort"]
+    =>                            ["Ultra Low", "Low Effort"]
+
+spreadClass = switch
+    spreadRank >= spreadUltraWideMin   => "Ultra Wide"
+    spreadRank >= spreadWideMin        => "Wide"
+    spreadRank >= spreadNormalMin      => "Normal"
+    spreadRank >= spreadUltraNarrowMax => "Narrow"
+    =>                                    "Ultra Narrow"
+
+closePos = switch
+    R >=  closeThresh => "High"
+    R <= -closeThresh => "Low"
+    =>                  "Middle"
+
+body           = math.abs(close - open)
+upperWick      = high - math.max(open, close)
+lowerWick      = math.min(open, close) - low
+
+bodyRatio      = nz(body / barRange), upperWickRatio = nz(upperWick / barRange), lowerWickRatio = nz(lowerWick / barRange)
+
+smallBody      = bodyRatio <= smallBodyThresh
+upRej          = upperWickRatio >= rejWickThresh and upperWickRatio > lowerWickRatio and bodyRatio <= rejBodyMax
+lowRej         = lowerWickRatio >= rejWickThresh and lowerWickRatio > upperWickRatio and bodyRatio <= rejBodyMax
+wideB          = bodyRatio >= 0.60
+
+shape = switch
+
+    upRej     => "Upper Rejection"
+    lowRej    => "Lower Rejection"
+    smallBody => "Small-Body"
+    wideB     => "Wide-Body"
+    =>           "Balanced"
+
+result = switch
+
+    upBar and closePos == "High" and (spreadClass == "Ultra Wide" or spreadClass == "Wide") =>
+        "Strong Upward"
+
+    upBar and closePos == "High" and spreadClass == "Normal" =>
+        "Moderate Upward"
+
+    upBar and closePos == "Middle" and (spreadClass == "Ultra Wide" or spreadClass == "Wide") =>
+        "Questionable Upward"
+
+    upBar and (closePos == "Middle" or closePos == "High") and (spreadClass == "Narrow" or spreadClass == "Ultra Narrow") =>
+        "Weak Upward"
+
+    upBar and closePos == "Low" =>
+        "Poor Upward"
+
+    downBar and closePos == "Low" and (spreadClass == "Ultra Wide" or spreadClass == "Wide") =>
+        "Strong Downward"
+
+    downBar and closePos == "Low" and spreadClass == "Normal" =>
+        "Moderate Downward"
+
+    downBar and closePos == "Middle" and (spreadClass == "Ultra Wide" or spreadClass == "Wide") =>
+        "Questionable Downward"
+
+    downBar and (closePos == "Middle" or closePos == "Low") and (spreadClass == "Narrow" or spreadClass == "Ultra Narrow") =>
+        "Weak Downward"
+
+    downBar and closePos == "High" =>
+        "Poor Downward"
+
+    barDirection == 0 and closePos == "High" and (spreadClass == "Ultra Wide" or spreadClass == "Wide") =>
+        "Upward Bias"
+
+    barDirection == 0 and closePos == "Low" and (spreadClass == "Ultra Wide" or spreadClass == "Wide") =>
+        "Downward Bias"
+
+    barDirection == 0 and closePos == "Middle" and (spreadClass == "Ultra Wide" or spreadClass == "Wide") =>
+        "Neutral Wide"
+
+    =>
+        "Neutral"
+
+upResult =
+
+     result == "Strong Upward"
+  or result == "Moderate Upward"
+  or result == "Questionable Upward"
+  or result == "Weak Upward"
+  or result == "Poor Upward"
+  or result == "Upward Bias"
+
+downResult =
+     result == "Strong Downward"
+  or result == "Moderate Downward"
+  or result == "Questionable Downward"
+  or result == "Weak Downward"
+  or result == "Poor Downward"
+  or result == "Downward Bias"
+
+effortVsResult = switch
+
+    effort == "High Effort" and result == "Strong Upward" =>
+        "Bullish Efficiency"
+
+    effort == "High Effort" and result == "Strong Downward" =>
+        "Bearish Efficiency"
+
+    effort == "High Effort" and upResult and result != "Strong Upward" =>
+        "Possible Hidden Weakness"
+
+    effort == "High Effort" and downResult and result != "Strong Downward" =>
+        "Possible Hidden Strength"
+
+    effort == "High Effort" and (result == "Neutral" or result == "Neutral Wide") =>
+        "Compression / Absorption"
+
+    effort == "Low Effort" and result == "Strong Upward" =>
+        "Easy Upward Movement"
+
+    effort == "Low Effort" and result == "Strong Downward" =>
+        "Easy Downward Movement"
+
+    effort == "Low Effort" =>
+        "Low-Effort / Low-Result"
+
+    effort == "Normal" and (result == "Strong Upward" or result == "Moderate Upward") =>
+        "Constructive Upward"
+
+    effort == "Normal" and (result == "Strong Downward" or result == "Moderate Downward") =>
+        "Constructive Downward"
+
+    effort == "Normal" =>
+        "Neutral / Mixed"
+
+    =>
+        "Unclassified"
+
+bullScore = switch
+
+    effortVsResult == "Bullish Efficiency"   => 3
+    effortVsResult == "Easy Upward Movement" => 1
+    effortVsResult == "Constructive Upward"  => 2
+
+    => 0.0
+
+bearScore = switch
+
+    effortVsResult == "Bearish Efficiency"     => 3
+    effortVsResult == "Easy Downward Movement" => 1
+    effortVsResult == "Constructive Downward"  => 2
+
+    => 0.0
+
+strengthScore = math.sum(bullScore, bgLookback)
+weaknessScore = math.sum(bearScore, bgLookback)
+
+if trendRule
+
+    switch direction == 1 
+
+        true => strengthScore += 5 
+        =>      weaknessScore += 5
+
+netScore = strengthScore - weaknessScore
+
+background = switch
+
+    netScore > bgThresh  => "Strong"
+    netScore < -bgThresh => "Weak"
+
+    => "Neutral"
+
+strongBg = background == "Strong"
+weakBg   = background == "Weak"
+
+bgConditionCol = color.from_gradient(netScore, -10, 10, color.rgb(255, 116, 116), #55ffda)
+
+volLessP2         = volume < volume[1] and volume < volume[2]
+lowVolVsa         = effort == "Low Effort" or volLessP2
+
+narrowSpread = spreadClass == "Narrow" or spreadClass == "Ultra Narrow" 
+
+noDemand = switch noDemandTrad
+    
+    false => upBar
+             and (lowVolVsa or (volLessP2))
+             and narrowSpread
+             and closePos == "Middle"
+
+    => upBar and volLessP2 and narrowSpread
+
+noSupply = switch noSupplyTrad
+
+    false => downBar
+             and (lowVolVsa or (volLessP2))
+             and narrowSpread
+             and closePos == "Middle"
+
+    => downBar and volLessP2 and narrowSpread
+
+noDemandConfirmed = noDemand[1] and close < close[1]
+noSupplyConfirmed = noSupply[1] and close > close[1]
+
+upthrust =
+     shape        == "Upper Rejection"
+ and closePos     == "Middle"
+ and (spreadClass == "Normal" or spreadClass == "Wide" or spreadClass == "Ultra Wide")
+ and weakBg
+ and (upThrustTrad ? direction == -1 : true)
+
+shakeout =
+     shape        == "Lower Rejection"
+ and (closePos    == "Middle" or closePos    == "High")
+ and (spreadClass == "Normal" or spreadClass == "Wide" or spreadClass == "Ultra Wide")
+ and strongBg
+ and (shakeOutTrad ? direction == 1 : true)
+
+
+var stopVolActive = false 
+
+z = strongMove()
+
+if z <= -2 
+
+    stopVolActive := true 
+
+if ta.barssince(stopVolActive) == 5
+    stopVolActive := false 
+
+stoppingVolume =
+     downBar
+ and effort == "High Effort"
+ and (narrowSpread or spreadClass == "Normal")
+ and closePos == "Middle" and stopVolActive
+
+
+plotcandle(open, high, low, close, 
+         color         = color.new(bgConditionCol, 0), 
+         wickcolor     = color.new(bgConditionCol, 25), 
+         bordercolor   = #00000000, 
+         display       = display.pane, 
+         force_overlay = true
+         )
+
+spreadRankEasy = switch 
+
+    spreadRank == 100 => 10 
+    spreadRank > 90 => 9 
+    spreadRank > 80 => 8 
+    spreadRank > 70 => 7 
+    spreadRank > 60 => 6 
+    spreadRank > 50 => 5 
+    spreadRank > 40 => 4 
+    spreadRank > 30 => 3
+    spreadRank > 20 => 2
+    => 1
+
+effortRankEasy = switch 
+
+    volRank == 100 => 10 
+    volRank > 90 => 9 
+    volRank > 80 => 8 
+    volRank > 70 => 7 
+    volRank > 60 => 6 
+    volRank > 50 => 5 
+    volRank > 40 => 4 
+    volRank > 30 => 3
+    volRank > 20 => 2
+    => 1
+
+colCandle       = color.from_gradient(spreadRank, 0, 100, spreadColUltraN, spreadColUltraW)
+colCandleEffort = color.from_gradient(volRank, 0, 100, volColUltraN, volColUltraW)
+
+if last_bar_index - bar_index <= 500 
+
+    if showEVRcandle 
+
+        tip = "Effort: " + volClass + "\n" + "Result: " + result + "\nState: " + effortVsResult
+
+        label.new(bar_index, high,color = #00000000, 
+                                 text          = "R: " + str.tostring(spreadRankEasy), 
+                                 textcolor     = colCandle, 
+                                 force_overlay = true, 
+                                 size          = size.auto, 
+                                 tooltip       = tip
+                                 )
+
+        label.new(bar_index, low, color = #00000000, 
+                                 text = "E: " + str.tostring(effortRankEasy), 
+                                 textcolor     = colCandleEffort, 
+                                 force_overlay = true, 
+                                 style         = label.style_label_up, 
+                                 size          = size.auto, 
+                                 tooltip       = tip
+                                 )
+
+plot(1,  style = plot.style_circles, color = color.new(color.gray, 50), display = display.pane, linewidth = 2)
+plot(2,  style = plot.style_circles, color = color.new(color.gray, 50), display = display.pane, linewidth = 2)
+plot(3,  style = plot.style_circles, color = color.new(color.gray, 50), display = display.pane, linewidth = 2)
+plot(4,  style = plot.style_circles, color = color.new(color.gray, 50), display = display.pane, linewidth = 2)
+plot(5,  style = plot.style_circles, color = color.new(color.gray, 50), display = display.pane, linewidth = 2)
+plot(6,  style = plot.style_circles, color = color.new(color.gray, 50), display = display.pane, linewidth = 2)
+plot(7,  style = plot.style_circles, color = color.new(color.gray, 50), display = display.pane, linewidth = 2)
+plot(8,  style = plot.style_circles, color = color.new(color.gray, 50), display = display.pane, linewidth = 2)
+plot(9,  style = plot.style_circles, color = color.new(color.gray, 50), display = display.pane, linewidth = 2)
+plot(10, style = plot.style_circles, color = color.new(color.gray, 50), display = display.pane, linewidth = 2)
+
+plot(effortRankEasy, style = plot.style_circles , color = volDotCol, display = display.all, linewidth = 2, title = "Effort")
+plot(effortRankEasy, style = plot.style_circles , color = color.new(volDotCol, 85), display = display.pane, linewidth = 4)
+plot(effortRankEasy, style = plot.style_circles , color = color.new(volDotCol, 90), display = display.pane, linewidth = 6)
+plot(effortRankEasy, style = plot.style_circles , color = color.new(volDotCol, 95), display = display.pane, linewidth = 8)
+plot(effortRankEasy, style = plot.style_circles , color = color.new(volDotCol, 98), display = display.pane, linewidth = 11)
+
+plot(spreadRankEasy, style = plot.style_circles , color = spreadDotCol, display = display.all, linewidth = 2, title = "Result")
+plot(spreadRankEasy, style = plot.style_circles , color = color.new(spreadDotCol, 85), display = display.pane, linewidth = 4)
+plot(spreadRankEasy, style = plot.style_circles , color = color.new(spreadDotCol, 90), display = display.pane, linewidth = 6)
+plot(spreadRankEasy, style = plot.style_circles , color = color.new(spreadDotCol, 95), display = display.pane, linewidth = 8)
+plot(spreadRankEasy, style = plot.style_circles , color = color.new(spreadDotCol, 98), display = display.pane, linewidth = 11)
+
+diff = math.abs(spreadRankEasy - effortRankEasy)
+
+diffCol = switch diff >= 3
+
+    true => spreadRankEasy > effortRankEasy ? spreadOeffortCol : effortOspreadCol
+    =>      color(na)
+
+plot(diff >= 3 ? 0 : na, style = plot.style_circles , color = diffCol , display = display.pane, linewidth = 2)
+plot(diff >= 3 ? 0 : na, style = plot.style_circles , color = color.new(diffCol, 85), display = display.pane, linewidth = 4)
+plot(diff >= 3 ? 0 : na, style = plot.style_circles , color = color.new(diffCol, 90), display = display.pane, linewidth = 6)
+plot(diff >= 3 ? 0 : na, style = plot.style_circles , color = color.new(diffCol, 95), display = display.pane, linewidth = 8)
+plot(diff >= 3 ? 0 : na, style = plot.style_circles , color = color.new(diffCol, 98), display = display.pane, linewidth = 11)
+
+upTrend = direction == 1, downTrend = direction == -1, upA = "▴", dnA = "▾"
+
+plotshape(noDemandConfirmed and upTrend, offset = -1, text = "ND" + upA, 
+                                     style         = shape.triangledown, 
+                                     color         = #00000000, 
+                                     textcolor     = color.new(color.rgb(255, 116, 116), 25),
+                                     force_overlay = true, 
+                                     display       = display.pane
+                                     )
+
+plotshape(noDemandConfirmed and downTrend, offset = -1, text = "ND" + dnA, 
+                                     style         = shape.triangledown, 
+                                     color         = #00000000, 
+                                     textcolor     = color.new(color.rgb(255, 116, 116), 25),
+                                     force_overlay = true, 
+                                     display       = display.pane
+                                     )
+
+plotshape(noSupplyConfirmed and upTrend, offset = -1, text = "NS" + upA, 
+                                     style         = shape.triangledown, 
+                                     color         = #00000000, 
+                                     textcolor     = color.new(#55ffda, 25),
+                                     location      = location.belowbar, 
+                                     force_overlay = true, 
+                                     display       = display.pane)
+
+plotshape(noSupplyConfirmed and downTrend, offset = -1, text = "NS" + dnA, 
+                                     style         = shape.triangledown, 
+                                     color         = #00000000, 
+                                     textcolor     = color.new(#55ffda, 25),
+                                     location      = location.belowbar, 
+                                     force_overlay = true, 
+                                     display       = display.pane
+                                     )
+
+plotshape(upthrust[1] and downBar and close < close[1], text = "UT", offset = -1, 
+                                     style         = shape.triangledown, 
+                                     color         = #00000000, 
+                                     textcolor     = color.new(color.rgb(255, 116, 116), 25),
+                                     force_overlay = true, 
+                                     display       = display.pane
+                                     )
+plotshape(shakeout[1] and upBar   and close > close[1], text = "SO", offset = -1, 
+                                     style         = shape.triangledown, 
+                                     color         = #00000000, 
+                                     textcolor     = color.new(#55ffda, 25),
+                                     location      = location.belowbar,
+                                     force_overlay = true, 
+                                     display       = display.pane
+                                     )
+plotshape(stoppingVolume, text = "STV", 
+                                     style         = shape.triangledown, 
+                                     color         = #00000000, 
+                                     textcolor     = color.new(strongBg ? #55ffda : color.rgb(255, 116, 116), 25), 
+                                     location      = location.belowbar,
+                                     force_overlay = true, 
+                                     display       = display.pane
+                                     )
+
+if barstate.islast 
+
+    var expCol = #181b27
+    var tab    = table.new(position.top_right, 99, 99, 
+                                    bgcolor       = #20222C, 
+                                    border_color  = #363843, 
+                                    frame_color   = #363843, 
+                                    border_width  = 1, 
+                                    frame_width   = 1                                  
+                                    )
+
+    effortText = "", spreadText = ""
+
+    for i = 1 to effortRankEasy
+
+        effortText += "█"
+
+    if effortRankEasy != 10
+        for i = effortRankEasy to 9
+            
+            effortText += "░"
+
+
+    for i = 1 to spreadRankEasy
+
+        spreadText += "█"
+
+    if spreadRankEasy != 10
+        for i = spreadRankEasy to 9
+            
+            spreadText += "░"
+
+    tab.cell(0, 0, text = "Effort Vs. Result", 
+                         text_color = color.white, 
+                         text_size  = size.small, 
+                         bgcolor   = expCol
+                         )
+
+    tab.cell(0, 2, text = "Effort", 
+                         text_color = color.white, 
+                         text_size  = size.small, 
+                         bgcolor    = expCol
+                         )
+
+    tab.cell(1, 2, text = effortText, 
+                         text_color = colCandleEffort, 
+                         text_size  = size.small, 
+                         bgcolor    = expCol
+                         )
+
+    tab.cell(2, 2, text = str.tostring(effortRankEasy), 
+                         text_color = color.white, 
+                         text_size  = size.small, 
+                         bgcolor    = expCol
+                         )
+
+    tab.cell(0, 3, text = "Result", 
+                         text_color = color.white, 
+                         text_size  = size.small, 
+                         bgcolor    = expCol
+                         )
+
+    tab.cell(1, 3, text = spreadText, 
+                         text_color = colCandle, 
+                         text_size  = size.small, 
+                         bgcolor    = expCol
+                         )
+
+    tab.cell(2, 3, text = str.tostring(spreadRankEasy), 
+                         text_color = color.white, 
+                         text_size  = size.small, 
+                         bgcolor    = expCol
+                         )
+
+    tab.cell(0, 4, text = effortVsResult, 
+                         text_color = color.white, 
+                         text_size  = size.small, 
+                         bgcolor    = expCol)
+
+    tab.merge_cells(0, 0, 2, 0), tab.merge_cells(0, 4, 2, 4)
+
+    var lab = array.new<label>(10) 
+
+    for labs in lab 
+        labs.delete()
+
+    for i = 0 to 9
+
+        loc = i + 1
+        txt = str.tostring(loc)
+
+        lab.set(i, label.new(bar_index, loc, text = txt, size = size.small, 
+                                                     textcolor = chart.fg_color, 
+                                                     style     = label.style_label_left, 
+                                                     color     = #00000000
+                                                     ))

@@ -1,0 +1,600 @@
+//@version=6
+indicator(
+ "Machine Learning Tomahawk [VynthraQuant]",
+ shorttitle="ML Tomahawk [VynthraQuant]",
+ overlay=false,
+ max_bars_back=500
+ )
+
+// ══════════════════════════════════════════════════════════════════
+// VQ BRAND COLORS
+// ══════════════════════════════════════════════════════════════════
+var color VQ_CYAN    = #44e9db
+var color VQ_MAG     = #c742df
+var color VQ_DARK    = #0a0e17
+var color VQ_GREY    = #1a1f2e
+var color VQ_WHITE   = #e0e8f0
+var color VQ_DIM     = #3a4459
+
+// ══════════════════════════════════════════════════════════════════
+// GROUPS
+// ══════════════════════════════════════════════════════════════════
+const string G1 = "Tomahawk Core"
+const string G2 = "Thresholds"
+const string G3 = "KNN Machine Learning"
+const string G4 = "Filtering"
+const string G5 = "Performance Tracking"
+const string G6 = "Self-Optimization"
+const string G7 = "UI Settings"
+
+// ══════════════════════════════════════════════════════════════════
+// INPUTS
+// ══════════════════════════════════════════════════════════════════
+src         = input.source(close, "Source",         group=G1, inline="core")
+mainLen     = input.int(14,  "Main Length",         group=G1, inline="core", minval=1)
+sigLen      = input.int(9,   "Signal Length",       group=G1, inline="core", minval=1)
+vzoLen      = input.int(14,  "VZO Length",          group=G1, inline="vzo",  minval=2)
+useVol      = input.bool(true,"Use Volume (VZO)",   group=G1, inline="vzo")
+bbLen       = input.int(20,  "BB Length",           group=G1, inline="bb",   minval=2)
+bbMult      = input.float(2.0,"BB Sigma",           group=G1, inline="bb",   step=0.25)
+useSmooth   = input.bool(true,"Apply Smoothing",    group=G1, inline="sm")
+smoothType  = input.string("EMA","Smoother",
+     options=["SMA","EMA","WMA","RMA","DEMA","TEMA"],group=G1, inline="sm")
+smoothLen   = input.int(3,   "Smooth Length",       group=G1, inline="sm",   minval=1)
+
+obLevel     = input.float( 0.40, "Overbought",  step=0.05, group=G2, inline="lvl")
+osLevel     = input.float(-0.40, "Oversold",    step=0.05, group=G2, inline="lvl")
+extremeOB   = input.float( 0.70, "Extreme OB",  step=0.05, group=G2, inline="lvl")
+extremeOS   = input.float(-0.70, "Extreme OS",  step=0.05, group=G2, inline="lvl")
+
+useKnn      = input.bool(true,  "Enable KNN ML",                       group=G3, inline="knn")
+knnNeighbors= input.int(8,   "K Neighbors", minval=3, maxval=50,       group=G3, inline="knn")
+knnLookback = input.int(150, "Historical Period", minval=50, maxval=500,group=G3, inline="knn2")
+knnWeight   = input.float(0.6,"ML Weight", minval=0.0, maxval=1.0, step=0.1, group=G3, inline="knn2")
+featureCount= input.int(4, "Number of Features",
+     tooltip="1=Tomahawk 2=VZO 3=BB%B 4=PriceMom 5=VolMom",           group=G3)
+
+useFilter      = input.bool(true,"Apply Additional Filtering",          group=G4)
+filterMethod   = input.string("Adaptive","Filter Method",
+     options=["None","Adaptive","Kalman","Hull"],                        group=G4)
+filterStrength = input.float(0.3,"Filter Strength", minval=0.1, step=0.1, group=G4)
+
+winRateLen  = input.int(50,  "Win Rate Period",  minval=10, maxval=200, group=G5, inline="wr")
+earlyBars   = input.int(3,   "Early Entry Bars", minval=1,  maxval=10,  group=G5, inline="wr")
+profitTarget= input.float(2.0,"Profit Target %", minval=0.5, step=0.5, group=G5, inline="wr2")
+stopLoss    = input.float(1.5,"Stop Loss %",     minval=0.5, step=0.5,  group=G5, inline="wr2")
+
+enableOpt   = input.bool(true,  "Enable Self-Optimization",             group=G6, inline="opt")
+optWindow   = input.int(50,  "Opt Window", minval=20, maxval=100,       group=G6, inline="opt")
+adaptThresh = input.bool(true,  "Adaptive Thresholds",                  group=G6, inline="opt2")
+
+showTable   = input.bool(true,  "Show Table",               group=G7)
+showZones   = input.bool(true,  "Show Signal Zones",        group=G7)
+showML      = input.bool(true,  "Show ML Prediction",       group=G7)
+showEarly   = input.bool(false, "Show Early Signal Shapes", group=G7)
+lineW       = input.int(2, "Line Width", 1, 4, 1,           group=G7)
+paintCandles= input.bool(true,  "Paint Candles",            group=G7)
+
+// ══════════════════════════════════════════════════════════════════
+// TOMAHAWK CORE
+// ══════════════════════════════════════════════════════════════════
+dirVol  = src > src[1] ? volume : -volume
+vp      = ta.ema(dirVol, vzoLen)
+tv      = ta.ema(volume,  vzoLen)
+vzo     = tv != 0 ? vp / tv : 0.0
+
+bbBasis = ta.sma(src, bbLen)
+bbDev   = bbMult * ta.stdev(src, bbLen)
+bbMR    = bbDev != 0 ? (src - bbBasis) / (bbDev * 2.0) : 0.0
+
+tomRaw  = useVol ? vzo * 0.60 + bbMR * 0.40 : bbMR
+
+dema(s, l) =>
+    e = ta.ema(s, l)
+    2.0 * e - ta.ema(e, l)
+tema(s, l) =>
+    e1 = ta.ema(s, l)
+    e2 = ta.ema(e1, l)
+    e3 = ta.ema(e2, l)
+    3.0 * e1 - 3.0 * e2 + e3
+applySmooth(s, t, l) =>
+    switch t
+        "SMA"  => ta.sma(s, l)
+        "EMA"  => ta.ema(s, l)
+        "WMA"  => ta.wma(s, l)
+        "RMA"  => ta.rma(s, l)
+        "DEMA" => dema(s, l)
+        "TEMA" => tema(s, l)
+        => ta.ema(s, l)
+
+tomBase     = ta.ema(tomRaw, mainLen)
+standardTom = useSmooth ? applySmooth(tomBase, smoothType, smoothLen) : tomBase
+
+// ══════════════════════════════════════════════════════════════════
+// FEATURES
+// ══════════════════════════════════════════════════════════════════
+normalize(value, length) =>
+    hi = ta.highest(value, length)
+    lo = ta.lowest(value, length)
+    r  = hi - lo
+    r != 0 ? (value - lo) / r : 0.5
+
+normVZO      = normalize(vzo,  knnLookback)
+normBBMR     = normalize(bbMR, knnLookback)
+priceMom     = ta.roc(close, 5)
+normPriceMom = normalize(priceMom, knnLookback)
+volMom       = ta.roc(volume, 3)
+normVolMom   = normalize(volMom, knnLookback)
+
+// ══════════════════════════════════════════════════════════════════
+// SELF-OPTIMIZATION
+// ══════════════════════════════════════════════════════════════════
+var int   stable_periods = 0
+var int   last_optimal_k = 8
+var float adaptive_upper = 0.40
+var float adaptive_lower = -0.40
+
+volatility_regime = ta.atr(14) / ta.sma(ta.atr(14), 50)
+
+updateParamPerf() =>
+    var float k8_perf  = 0.0
+    var float k14_perf = 0.0
+    var float k21_perf = 0.0
+    var int   opt_cnt  = 0
+    if bar_index > optWindow
+        acc8  = 0.0
+        acc14 = 0.0
+        acc21 = 0.0
+        for i = 1 to 20
+            if i < bar_index
+                sig8  = standardTom[i] >  obLevel       or standardTom[i] <  osLevel
+                sig14 = standardTom[i] >  obLevel * 0.9 or standardTom[i] <  osLevel * 0.9
+                sig21 = standardTom[i] >  obLevel * 1.1 or standardTom[i] <  osLevel * 1.1
+                fmov  = math.abs(ta.roc(close[i], 5)) > 1.5
+                if sig8 and fmov
+                    acc8  += 1
+                if sig14 and fmov
+                    acc14 += 1
+                if sig21 and fmov
+                    acc21 += 1
+        k8_perf  := acc8  / 20.0
+        k14_perf := acc14 / 20.0
+        k21_perf := acc21 / 20.0
+        opt_cnt  += 1
+    [k8_perf, k14_perf, k21_perf, opt_cnt]
+
+[k8p, k14p, k21p, optCnt] = updateParamPerf()
+
+getRegimeParams() =>
+    high_v = volatility_regime > 1.2
+    low_v  = volatility_regime < 0.8
+    rk = high_v ? 14 : low_v ? 21 : 8
+    rw = high_v ? 0.7 : low_v ? 0.5 : 0.6
+    [rk, rw]
+[regimeK, regimeW] = getRegimeParams()
+
+optimizedK = if enableOpt and optCnt > 5
+    if k8p > k14p and k8p > k21p
+        8
+    else if k14p > k21p
+        14
+    else
+        21
+else
+    regimeK
+
+if optimizedK != last_optimal_k
+    stable_periods := 0
+    last_optimal_k := optimizedK
+else
+    stable_periods += 1
+
+stability_score = math.min(stable_periods / 20.0, 1.0)
+
+if adaptThresh and bar_index > 50
+    vol_adj = (volatility_regime - 1.0) * 0.05
+    adaptive_upper := math.max(0.25, math.min(0.60,  obLevel + vol_adj))
+    adaptive_lower := math.min(-0.25, math.max(-0.60, osLevel - vol_adj))
+else
+    adaptive_upper := obLevel
+    adaptive_lower := osLevel
+
+overfitting_score = if optCnt > 10
+    rc = 0
+    for i = 1 to 10
+        if optimizedK[i] != optimizedK[i - 1]
+            rc += 1
+    rc / 10.0
+else
+    0.0
+
+is_overfitting = overfitting_score > 0.3
+final_k = is_overfitting ? knnNeighbors : optimizedK
+final_w = is_overfitting ? knnWeight    : regimeW
+
+// ══════════════════════════════════════════════════════════════════
+// KNN ALGORITHM
+// ══════════════════════════════════════════════════════════════════
+euclideanDist(float[] v1, float[] v2) =>
+    s  = 0.0
+    sz = math.min(array.size(v1), array.size(v2))
+    for i = 0 to sz - 1
+        d = array.get(v1, i) - array.get(v2, i)
+        s += d * d
+    math.sqrt(s)
+
+Knn_Tomahawk() =>
+    tom_out    = standardTom
+    confidence = 0.0
+
+    var float[] curF = array.new_float()
+    array.clear(curF)
+    array.push(curF, normalize(standardTom, knnLookback))
+    array.push(curF, normVZO)
+    if featureCount >= 3
+        array.push(curF, normBBMR)
+    if featureCount >= 4
+        array.push(curF, normPriceMom)
+    if featureCount >= 5
+        array.push(curF, normVolMom)
+
+    var float[] dists = array.new_float()
+    var int[]   idxs  = array.new_int()
+    array.clear(dists)
+    array.clear(idxs)
+
+    for i = 1 to knnLookback
+        if i < bar_index
+            var float[] hF = array.new_float()
+            array.clear(hF)
+            array.push(hF, normalize(standardTom[i], knnLookback))
+            array.push(hF, normalize(vzo[i],          knnLookback))
+            if featureCount >= 3
+                array.push(hF, normalize(bbMR[i],      knnLookback))
+            if featureCount >= 4
+                array.push(hF, normalize(priceMom[i],  knnLookback))
+            if featureCount >= 5
+                array.push(hF, normalize(volMom[i],    knnLookback))
+            if array.size(curF) == array.size(hF)
+                array.push(dists, euclideanDist(curF, hF))
+                array.push(idxs,  i)
+
+    if array.size(dists) > 1
+        for i = 0 to array.size(dists) - 2
+            for j = 0 to array.size(dists) - 2 - i
+                if array.get(dists, j) > array.get(dists, j + 1)
+                    td = array.get(dists, j)
+                    array.set(dists, j,     array.get(dists, j + 1))
+                    array.set(dists, j + 1, td)
+                    ti = array.get(idxs, j)
+                    array.set(idxs,  j,     array.get(idxs,  j + 1))
+                    array.set(idxs,  j + 1, ti)
+
+    if array.size(dists) >= final_k
+        wsum = 0.0
+        wtot = 0.0
+        for i = 0 to final_k - 1
+            idx  = array.get(idxs,  i)
+            dist = array.get(dists, i)
+            w    = dist < 0.001 ? 1000.0 : 1.0 / dist
+            if idx < bar_index
+                wsum += standardTom[idx - 1] * w
+                wtot += w
+        if wtot > 0
+            knnPred    = wsum / wtot
+            tom_out   := (1.0 - final_w) * standardTom + final_w * knnPred
+            variance   = 0.0
+            for i = 0 to final_k - 1
+                idx = array.get(idxs, i)
+                if idx < bar_index
+                    variance += math.pow(standardTom[idx - 1] - knnPred, 2)
+            variance   := variance / final_k
+            confidence := math.max(0.0, 1.0 - variance * 10.0) * stability_score
+
+    [tom_out, confidence]
+
+[mlTom, mlConf] = Knn_Tomahawk()
+
+if not useKnn
+    mlTom  := standardTom
+    mlConf := 0.5
+
+// ══════════════════════════════════════════════════════════════════
+// FILTERING
+// ══════════════════════════════════════════════════════════════════
+var float aT = mlTom
+var float kT = mlTom
+
+filteredTom = switch filterMethod
+    "Adaptive" =>
+        alpha = filterStrength * mlConf
+        aT   := alpha * mlTom + (1.0 - alpha) * nz(aT[1], mlTom)
+        aT
+    "Kalman" =>
+        kT   := nz(kT[1], mlTom) + filterStrength * (mlTom - nz(kT[1], mlTom))
+        kT
+    "Hull" =>
+        hL  = math.max(2, math.round(1.0 / filterStrength))
+        hL2 = math.max(1, hL / 2)
+        ta.wma(2.0 * ta.wma(mlTom, hL2) - ta.wma(mlTom, hL), math.round(math.sqrt(hL)))
+    => mlTom
+
+finalTom   = useFilter ? filteredTom : mlTom
+signalLine = ta.ema(finalTom, sigLen)
+hist       = finalTom - signalLine
+
+// ══════════════════════════════════════════════════════════════════
+// SIGNAL CLASSIFICATION
+// ══════════════════════════════════════════════════════════════════
+isOB   = finalTom >  adaptive_upper
+isOS   = finalTom <  adaptive_lower
+isExOB = finalTom >  extremeOB
+isExOS = finalTom <  extremeOS
+
+detectEarly() =>
+    mom  = ta.roc(finalTom, 2)
+    acc  = ta.roc(mom, 1)
+    pred = finalTom + mom * earlyBars
+    apOB = finalTom < adaptive_upper and pred >  adaptive_upper and mom > 0
+    apOS = finalTom > adaptive_lower and pred <  adaptive_lower and mom < 0
+    conf = math.abs(acc) > 0.005 and math.sign(acc) == math.sign(mom) ? 0.8 : 0.5
+    [apOB, apOS, conf]
+
+[earlyOB, earlyOS, earlyConf] = detectEarly()
+
+generateSignal() =>
+    sig   = "NEUTRAL"
+    sconf = 0.5
+    early = false
+    if isExOB
+        sig   := "STRONG_SELL"
+        sconf := mlConf * 0.9
+    else if isExOS
+        sig   := "STRONG_BUY"
+        sconf := mlConf * 0.9
+    else if isOB
+        sig   := "SELL"
+        sconf := mlConf * 0.8
+    else if isOS
+        sig   := "BUY"
+        sconf := mlConf * 0.8
+    else if earlyOB and earlyConf > 0.7
+        sig   := "EARLY_SELL"
+        sconf := earlyConf * 0.7
+        early := true
+    else if earlyOS and earlyConf > 0.7
+        sig   := "EARLY_BUY"
+        sconf := earlyConf * 0.7
+        early := true
+    [sig, sconf, early]
+
+[signal, sigConf, isEarlyEntry] = generateSignal()
+
+// ══════════════════════════════════════════════════════════════════
+// WIN RATE
+// ══════════════════════════════════════════════════════════════════
+calcWinRate() =>
+    var bool[]  trades = array.new_bool()
+    var float   wr     = 0.0
+    var int     scnt   = 0
+    var float   entry  = na
+    var string  curSig = na
+    var int     bars   = 0
+
+    changed = signal != curSig[1] and signal != "NEUTRAL"
+    if changed
+        if not na(entry) and not na(curSig)
+            isBuy = str.contains(curSig, "BUY")
+            ret   = isBuy ? (close - entry) / entry * 100.0 : (entry - close) / entry * 100.0
+            array.push(trades, ret > 0)
+            if array.size(trades) > winRateLen
+                array.shift(trades)
+            scnt += 1
+        entry  := close
+        curSig := signal
+        bars   := 0
+
+    if not na(curSig) and curSig != "NEUTRAL"
+        bars += 1
+        if not na(entry)
+            isBuy = str.contains(curSig, "BUY")
+            ret   = isBuy ? (close - entry) / entry * 100.0 : (entry - close) / entry * 100.0
+            hit   = ret >= profitTarget
+            stp   = ret <= -stopLoss
+            tout  = bars >= 20
+            if hit or stp or tout
+                array.push(trades, hit)
+                if array.size(trades) > winRateLen
+                    array.shift(trades)
+                scnt  += 1
+                entry  := na
+                curSig := "NEUTRAL"
+                bars   := 0
+
+    if array.size(trades) > 0
+        w = 0
+        for i = 0 to array.size(trades) - 1
+            if array.get(trades, i)
+                w += 1
+        wr := w / array.size(trades) * 100.0
+    [wr, scnt]
+
+[winRate, sigCount] = calcWinRate()
+
+// ══════════════════════════════════════════════════════════════════
+// VQ CHART COLORS
+// ══════════════════════════════════════════════════════════════════
+rising   = hist > hist[1]
+bullHist = rising ? color.new(VQ_CYAN, 0)  : color.new(VQ_CYAN, 55)
+bearHist = rising ? color.new(VQ_MAG,  55) : color.new(VQ_MAG,  0)
+histCol  = hist >= 0 ? bullHist : bearHist
+
+getLineColor(val) =>
+    val >  0.60 ? color.new(VQ_CYAN, 0)  :
+     val >  0.30 ? color.new(VQ_CYAN, 25) :
+     val >  0.00 ? color.new(VQ_CYAN, 55) :
+     val > -0.30 ? color.new(VQ_MAG,  55) :
+     val > -0.60 ? color.new(VQ_MAG,  25) :
+                   color.new(VQ_MAG,   0)
+
+mainLineCol = getLineColor(finalTom)
+barCol      = finalTom > 0 ? color.new(VQ_CYAN, 20) : color.new(VQ_MAG, 20)
+plotcandle(open, high, low, close,"", paintCandles ? barCol : na, paintCandles ? barCol : na, 
+ bordercolor = paintCandles ? barCol : na, force_overlay = true)
+
+// ══════════════════════════════════════════════════════════════════
+// PLOTS
+// ══════════════════════════════════════════════════════════════════
+exOBLine = hline(extremeOB, "Extreme OB",
+     color=color.new(VQ_MAG,  40), linestyle=hline.style_solid,  linewidth=1)
+zeroLine = hline(0, "Zero",
+     color=color.new(VQ_WHITE,55), linestyle=hline.style_dotted, linewidth=1)
+exOSLine = hline(extremeOS, "Extreme OS",
+     color=color.new(VQ_CYAN, 40), linestyle=hline.style_solid,  linewidth=1)
+topBound = hline( 1.0, "", color=color.new(color.black, 100))
+botBound = hline(-1.0, "", color=color.new(color.black, 100))
+
+fill(topBound, exOBLine, color=color.new(#1a0520, 55))
+fill(exOSLine, botBound, color=color.new(#041a18, 55))
+
+obPlot   = plot(showZones ? adaptive_upper : na, "OB",
+     color=color.new(VQ_MAG,  35), linewidth=1, style=plot.style_line)
+osPlot   = plot(showZones ? adaptive_lower : na, "OS",
+     color=color.new(VQ_CYAN, 35), linewidth=1, style=plot.style_line)
+exOBPlot = plot(extremeOB, display=display.none)
+exOSPlot = plot(extremeOS, display=display.none)
+fill(obPlot, exOBPlot, color=color.new(VQ_MAG,  88))
+fill(osPlot, exOSPlot, color=color.new(VQ_CYAN, 88))
+
+mainPlot   = plot(finalTom, "ML Tomahawk", mainLineCol, lineW, plot.style_line)
+zeroPlot   = plot(0, display=display.none)
+shaderPlot = plot(ta.ema(finalTom, 30), display=display.none)
+
+fill(shaderPlot, mainPlot, mainLineCol)
+fill(mainPlot, zeroPlot,
+     finalTom > 0 ? finalTom : 0.0,
+     finalTom > 0 ? 0.0 : finalTom,
+     finalTom > 0 ? color.new(VQ_CYAN, 15) : na,
+     finalTom < 0 ? color.new(VQ_MAG,  15) : na)
+
+plot(hist, "Histogram", color=histCol, style=plot.style_histogram, linewidth=4)
+
+mlPredCol = mlConf > 0.7 ? color.new(VQ_CYAN, 0) : color.new(VQ_CYAN, 65)
+plot(showML and useKnn ? mlTom : na, "ML Prediction", mlPredCol, 1, plot.style_circles)
+
+earlyOB_sig = earlyOB and ta.crossover(earlyConf, 0.7)
+earlyOS_sig = earlyOS and ta.crossover(earlyConf, 0.7)
+plotshape(showEarly and earlyOB_sig, "Early Sell",
+     shape.triangledown, location.top,    color.new(VQ_MAG,  10), size=size.small)
+plotshape(showEarly and earlyOS_sig, "Early Buy",
+     shape.triangleup,   location.bottom, color.new(VQ_CYAN, 10), size=size.small)
+
+bgcolor(isExOB ? color.new(VQ_MAG,  93) :
+        isExOS ? color.new(VQ_CYAN, 93) :
+        isOB   ? color.new(VQ_MAG,  96) :
+        isOS   ? color.new(VQ_CYAN, 96) : na)
+
+// ══════════════════════════════════════════════════════════════════
+// VQ INFO TABLE
+// ══════════════════════════════════════════════════════════════════
+if barstate.islast and showTable
+    sigText  = isExOB                     ? "EXTREME OB" :
+               isExOS                     ? "EXTREME OS" :
+               isOB                       ? "OVERBOUGHT" :
+               isOS                       ? "OVERSOLD"   :
+               ta.crossover(finalTom,  0) ? "LONG"       :
+               ta.crossunder(finalTom, 0) ? "SHORT"      : "NEUTRAL"
+
+    sigCol   = str.contains(sigText, "OB") or sigText == "SHORT" ? VQ_MAG  :
+               str.contains(sigText, "OS") or sigText == "LONG"  ? VQ_CYAN :
+               color.new(VQ_WHITE, 40)
+
+    confPct  = mlConf * 100.0
+    confCol  = confPct > 70 ? VQ_CYAN : confPct > 40 ? color.new(VQ_WHITE, 20) : color.new(VQ_MAG, 30)
+
+    wrCol    = winRate > 55 ? VQ_CYAN : winRate > 45 ? color.new(VQ_WHITE, 20) : VQ_MAG
+    stabCol  = stability_score > 0.7 ? VQ_CYAN : color.new(VQ_WHITE, 30)
+    ovfCol   = is_overfitting ? VQ_MAG : VQ_CYAN
+    earlyCol = isEarlyEntry   ? color.new(VQ_MAG, 10) : color.new(VQ_WHITE, 50)
+
+    var table t = table.new(
+         position.top_right, 2, 15,
+         bgcolor=color.new(VQ_DARK, 10),
+         border_color=color.new(VQ_CYAN, 60),
+         frame_color=VQ_CYAN,
+         frame_width=1,
+         border_width=1)
+
+    t.merge_cells(0, 0, 1, 0)
+
+    t.cell(0, 0, "ML TOMAHAWK", bgcolor=color.new(VQ_CYAN, 10),
+         text_color=VQ_DARK, text_size=size.small, text_halign=text.align_center)
+
+    // Row helper colors
+    rowBg  = color.new(VQ_GREY, 20)
+    rowBg2 = color.new(VQ_DARK, 30)
+    lblCol = color.new(VQ_WHITE, 25)
+
+    t.cell(0,  1, "Signal",        bgcolor=rowBg,  text_color=lblCol, text_size=size.small)
+    t.cell(1,  1, sigText,         bgcolor=color.new(sigCol, 75), text_color=sigCol, text_size=size.small, text_halign=text.align_center)
+
+    t.cell(0,  2, "Value",         bgcolor=rowBg2, text_color=lblCol, text_size=size.small)
+    t.cell(1,  2, str.tostring(finalTom, "#.####"),
+         bgcolor=rowBg2, text_color=VQ_WHITE, text_size=size.small, text_halign=text.align_center)
+
+    t.cell(0,  3, "ML Confidence", bgcolor=rowBg,  text_color=lblCol, text_size=size.small)
+    t.cell(1,  3, str.tostring(confPct, "#.1") + "%",
+         bgcolor=rowBg, text_color=confCol, text_size=size.small, text_halign=text.align_center)
+
+    t.cell(0,  4, "Win Rate",      bgcolor=rowBg2, text_color=lblCol, text_size=size.small)
+    t.cell(1,  4, str.tostring(winRate, "#.1") + "%",
+         bgcolor=rowBg2, text_color=wrCol, text_size=size.small, text_halign=text.align_center)
+
+    t.cell(0,  5, "Optimized K",   bgcolor=rowBg,  text_color=lblCol, text_size=size.small)
+    t.cell(1,  5, str.tostring(final_k),
+         bgcolor=rowBg, text_color=VQ_CYAN, text_size=size.small, text_halign=text.align_center)
+
+    t.cell(0,  6, "Stability",     bgcolor=rowBg2, text_color=lblCol, text_size=size.small)
+    t.cell(1,  6, str.tostring(stability_score * 100.0, "#") + "%",
+         bgcolor=rowBg2, text_color=stabCol, text_size=size.small, text_halign=text.align_center)
+
+    t.cell(0,  7, "Vol Regime",    bgcolor=rowBg,  text_color=lblCol, text_size=size.small)
+    t.cell(1,  7, str.tostring(volatility_regime, "#.##"),
+         bgcolor=rowBg, text_color=VQ_WHITE, text_size=size.small, text_halign=text.align_center)
+
+    t.cell(0,  8, "Adaptive OB",   bgcolor=rowBg2, text_color=lblCol, text_size=size.small)
+    t.cell(1,  8, str.tostring(adaptive_upper, "#.##"),
+         bgcolor=rowBg2, text_color=VQ_MAG, text_size=size.small, text_halign=text.align_center)
+
+    t.cell(0,  9, "Adaptive OS",   bgcolor=rowBg,  text_color=lblCol, text_size=size.small)
+    t.cell(1,  9, str.tostring(adaptive_lower, "#.##"),
+         bgcolor=rowBg, text_color=VQ_CYAN, text_size=size.small, text_halign=text.align_center)
+
+    t.cell(0, 10, "VZO",           bgcolor=rowBg2, text_color=lblCol, text_size=size.small)
+    t.cell(1, 10, str.tostring(vzo, "#.###"),
+         bgcolor=rowBg2, text_color=VQ_WHITE, text_size=size.small, text_halign=text.align_center)
+
+    t.cell(0, 11, "Overfitting",   bgcolor=rowBg,  text_color=lblCol, text_size=size.small)
+    t.cell(1, 11, is_overfitting ? "YES" : "NO",
+         bgcolor=color.new(ovfCol, 80), text_color=ovfCol, text_size=size.small, text_halign=text.align_center)
+
+    t.cell(0, 12, "Early Entry",   bgcolor=rowBg2, text_color=lblCol, text_size=size.small)
+    t.cell(1, 12, isEarlyEntry ? "ACTIVE" : "—",
+         bgcolor=rowBg2, text_color=earlyCol, text_size=size.small, text_halign=text.align_center)
+
+    t.cell(0, 13, "Total Signals", bgcolor=rowBg,  text_color=lblCol, text_size=size.small)
+    t.cell(1, 13, str.tostring(sigCount),
+         bgcolor=rowBg, text_color=VQ_WHITE, text_size=size.small, text_halign=text.align_center)
+
+
+// ══════════════════════════════════════════════════════════════════
+// ALERTS
+// ══════════════════════════════════════════════════════════════════
+alertcondition(ta.crossover(finalTom,  adaptive_upper), "Adaptive OB",  "ML Tomahawk [VQ]: Adaptive overbought {{ticker}}")
+alertcondition(ta.crossunder(finalTom, adaptive_lower), "Adaptive OS",  "ML Tomahawk [VQ]: Adaptive oversold {{ticker}}")
+alertcondition(ta.crossover(finalTom,  extremeOB),      "Extreme OB",   "ML Tomahawk [VQ]: Extreme overbought {{ticker}}")
+alertcondition(ta.crossunder(finalTom, extremeOS),      "Extreme OS",   "ML Tomahawk [VQ]: Extreme oversold {{ticker}}")
+alertcondition(ta.cross(finalTom, 0),                   "Zero Cross",   "ML Tomahawk [VQ]: Zero line cross {{ticker}}")
+alertcondition(is_overfitting,                          "Overfitting",  "ML Tomahawk [VQ]: Overfitting detected {{ticker}}")
+alertcondition(earlyOB and earlyConf > 0.7,             "Early Sell",   "ML Tomahawk [VQ]: Early sell {{ticker}}")
+alertcondition(earlyOS and earlyConf > 0.7,             "Early Buy",    "ML Tomahawk [VQ]: Early buy {{ticker}}")

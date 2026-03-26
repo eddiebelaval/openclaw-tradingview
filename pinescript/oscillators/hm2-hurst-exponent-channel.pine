@@ -1,0 +1,373 @@
+//@version=5
+// =====================================================================
+// HURST EXPONENT CHANNEL
+// =====================================================================
+// A fractal-adaptive price channel that uses the Hurst Exponent 
+// (estimated via Rescaled Range analysis) to dynamically adjust 
+// channel width based on the market's memory structure.
+//
+// MATH: The Hurst exponent H measures long-term memory in a time series.
+//   H > 0.5  →  Persistent / Trending     → Channels WIDEN
+//   H = 0.5  →  Random Walk               → Channels at baseline
+//   H < 0.5  →  Anti-persistent / Reverting → Channels TIGHTEN
+//
+// The R/S (Rescaled Range) method divides the lookback into subseries,
+// computes cumulative deviation range / std dev for each, then fits
+// log(R/S) vs log(n) — the slope is H.
+//
+// SIGNALS:
+//   T / M markers  = regime shift (trending / mean-reverting)
+//   ● circles      = band touch during mean-revert regime (fade setup)
+//   ↑↓ arrows      = band breakout during trending regime (momentum)
+//   ★ diamonds     = regime shift + price at extreme (high conviction)
+//
+// USAGE: Works on any asset/timeframe. Recommended: 1H+ charts with
+// lookback 100. For 1-5min charts, increase "Calculate Every N Bars"
+// to 3-5 to stay within Pine execution limits.
+// =====================================================================
+
+indicator("HM2 - Hurst Exponent Channel", overlay=true, max_lines_count=500, max_labels_count=500, max_bars_back=1000)
+
+// ========================================
+// INPUT PARAMETERS
+// ========================================
+// --- Core ---
+i_hurstLen    = input.int(100, "Hurst Lookback Period", minval=20, maxval=500, group="Core", tooltip="Period for R/S analysis. Higher = more stable but laggier.")
+i_channelLen  = input.int(20, "Channel Length", minval=5, maxval=200, group="Core", tooltip="EMA length for channel center line")
+i_multBase    = input.float(2.0, "Band Multiplier", minval=0.5, maxval=5.0, step=0.1, group="Core", tooltip="Base multiplier for channel width at H=0.5")
+i_smoothing   = input.int(5, "Hurst Smoothing", minval=1, maxval=20, group="Core", tooltip="EMA smoothing on raw Hurst to reduce noise")
+i_source      = input.source(close, "Source", group="Core")
+
+// --- Regime ---
+i_trendThresh = input.float(0.55, "Trending Threshold", minval=0.51, maxval=0.70, step=0.01, group="Regime", tooltip="Hurst above this = trending regime")
+i_revertThresh= input.float(0.45, "Mean-Revert Threshold", minval=0.30, maxval=0.49, step=0.01, group="Regime", tooltip="Hurst below this = mean-reverting regime")
+i_cooldown    = input.int(5, "Signal Cooldown (bars)", minval=1, maxval=20, group="Regime", tooltip="Minimum bars between repeated band-touch signals")
+
+// --- Display ---
+i_showFill    = input.bool(true, "Show Channel Fill", group="Display")
+i_showMidline = input.bool(true, "Show Center Line", group="Display")
+i_showHurst   = input.bool(true, "Show Hurst Label", group="Display")
+i_showTable   = input.bool(true, "Show Info Table", group="Display")
+i_barColor    = input.bool(false, "Color Bars by Regime", group="Display")
+i_fillOpacity = input.int(85, "Fill Transparency", minval=50, maxval=95, group="Display")
+
+// --- Colors ---
+i_trendColor  = input.color(color.rgb(0, 150, 136), "Trending (H > thresh)", group="Colors")
+i_neutralColor= input.color(color.rgb(158, 158, 158), "Random Walk", group="Colors")
+i_revertColor = input.color(color.rgb(233, 30, 99), "Mean-Reverting (H < thresh)", group="Colors")
+i_midColor    = input.color(color.rgb(255, 193, 7), "Center Line", group="Colors")
+
+// --- Performance ---
+i_calcEvery   = input.int(1, "Calculate Every N Bars", minval=1, maxval=10, group="Performance", tooltip="Recalculate Hurst every N bars. Use 3-5 on 1min charts.")
+
+// ========================================
+// RESCALED RANGE (R/S) ANALYSIS
+// ========================================
+// Calculate average R/S for non-overlapping subseries of length n
+// Uses sample std dev (n-1 denominator) for small-sample bias correction
+calcRS(src, totalLen, n) =>
+    float sumRS = 0.0
+    int count = 0
+    int numSubs = math.floor(totalLen / n)
+    
+    for s = 0 to numSubs - 1
+        int startIdx = s * n
+        
+        // Calculate mean of this subseries
+        float mean = 0.0
+        for i = 0 to n - 1
+            mean += nz(src[startIdx + i])
+        mean := mean / n
+        
+        // Calculate cumulative deviations and standard deviation
+        float cumDev = 0.0
+        float maxCum = -1e10
+        float minCum = 1e10
+        float sumSq = 0.0
+        
+        for i = 0 to n - 1
+            float val = nz(src[startIdx + i])
+            cumDev += (val - mean)
+            maxCum := math.max(maxCum, cumDev)
+            minCum := math.min(minCum, cumDev)
+            sumSq += math.pow(val - mean, 2)
+        
+        float R = maxCum - minCum
+        // Sample std dev (n-1) for bias correction on small subseries
+        float S = n > 1 ? math.sqrt(sumSq / (n - 1)) : math.sqrt(sumSq)
+        
+        if S > 1e-10  // Tighter zero check to avoid near-zero division
+            sumRS += R / S
+            count += 1
+    
+    count > 0 ? sumRS / count : 0.0
+
+// ========================================
+// HURST EXPONENT CALCULATION
+// ========================================
+calcHurst(src, totalLen) =>
+    // Use 5 well-spaced sub-period sizes to ensure good log-log spread
+    // Spacing: ~N/2, N/4, N/6, N/10, N/20 — gives better regression fit
+    // than powers of 2 which collapse when totalLen is small
+    int n1 = math.max(int(math.floor(totalLen / 2)),  8)
+    int n2 = math.max(int(math.floor(totalLen / 4)),  6)
+    int n3 = math.max(int(math.floor(totalLen / 6)),  5)
+    int n4 = math.max(int(math.floor(totalLen / 10)), 4)
+    int n5 = math.max(int(math.floor(totalLen / 20)), 4)
+    
+    float rs1 = calcRS(src, totalLen, n1)
+    float rs2 = calcRS(src, totalLen, n2)
+    float rs3 = calcRS(src, totalLen, n3)
+    float rs4 = calcRS(src, totalLen, n4)
+    float rs5 = calcRS(src, totalLen, n5)
+    
+    // log-log regression: log(n) as x, log(R/S) as y
+    // Only include points where R/S > 0 (valid data)
+    float sumX  = 0.0
+    float sumY  = 0.0
+    float sumXY = 0.0
+    float sumX2 = 0.0
+    int   pts   = 0
+    
+    // Add each valid point to regression sums
+    if rs1 > 0
+        float lx1 = math.log(n1)
+        float ly1 = math.log(rs1)
+        sumX  += lx1
+        sumY  += ly1
+        sumXY += lx1 * ly1
+        sumX2 += lx1 * lx1
+        pts   += 1
+    if rs2 > 0
+        float lx2 = math.log(n2)
+        float ly2 = math.log(rs2)
+        sumX  += lx2
+        sumY  += ly2
+        sumXY += lx2 * ly2
+        sumX2 += lx2 * lx2
+        pts   += 1
+    if rs3 > 0
+        float lx3 = math.log(n3)
+        float ly3 = math.log(rs3)
+        sumX  += lx3
+        sumY  += ly3
+        sumXY += lx3 * ly3
+        sumX2 += lx3 * lx3
+        pts   += 1
+    if rs4 > 0
+        float lx4 = math.log(n4)
+        float ly4 = math.log(rs4)
+        sumX  += lx4
+        sumY  += ly4
+        sumXY += lx4 * ly4
+        sumX2 += lx4 * lx4
+        pts   += 1
+    if rs5 > 0
+        float lx5 = math.log(n5)
+        float ly5 = math.log(rs5)
+        sumX  += lx5
+        sumY  += ly5
+        sumXY += lx5 * ly5
+        sumX2 += lx5 * lx5
+        pts   += 1
+    
+    // Linear regression slope = H
+    float denom = pts * sumX2 - sumX * sumX
+    float H = (denom != 0 and pts >= 3) ? (pts * sumXY - sumX * sumY) / denom : 0.5
+    
+    // Clamp to valid range [0, 1]
+    math.max(0.01, math.min(0.99, H))
+
+// ========================================
+// CALCULATE LOG RETURNS FOR R/S ANALYSIS
+// ========================================
+float prevSource = nz(i_source[1])
+float logReturn = prevSource > 0 ? math.log(i_source / prevSource) : 0.0
+
+// ========================================
+// COMPUTE HURST EXPONENT (with performance throttle + warmup)
+// ========================================
+var float cachedHurst = 0.5
+bool hasWarmup = bar_index >= i_hurstLen  // Don't calculate until we have enough data
+bool shouldCalc = hasWarmup and ((bar_index % i_calcEvery == 0) or barstate.islast)
+
+if shouldCalc
+    cachedHurst := calcHurst(logReturn, i_hurstLen)
+
+float rawHurst = cachedHurst
+float hurst = ta.ema(rawHurst, i_smoothing)
+
+// ========================================
+// ADAPTIVE CHANNEL CALCULATION
+// ========================================
+// Center line: EMA for smoother tracking in trends
+float basis = ta.ema(i_source, i_channelLen)
+
+// Standard deviation for base channel width
+float dev = ta.stdev(i_source, i_channelLen)
+
+// Minimum band width: 0.1% of price to prevent invisible bands
+float minBand = i_source * 0.001
+
+// Nonlinear adaptive multiplier using power curve:
+// H=0.0 → mult ≈ 0.5x (tight), H=0.5 → mult = 1.0x (base), H=1.0 → mult ≈ 2.0x (wide)
+// The power curve gives more dramatic widening for strong trends
+float hurstNorm = math.max(hurst - 0.5, -0.5)  // Center around 0
+float hurstAdaptive = i_multBase * math.pow(2.0, hurstNorm)
+
+// Calculate bands with minimum width enforcement
+float rawBandWidth = math.max(hurstAdaptive * dev, minBand)
+float upper = basis + rawBandWidth
+float lower = basis - rawBandWidth
+
+// ========================================
+// REGIME DETECTION & COLOR LOGIC
+// ========================================
+bool isTrending    = hurst > i_trendThresh
+bool isReverting   = hurst < i_revertThresh
+bool isRandom      = not isTrending and not isReverting
+
+color regimeColor = isTrending ? i_trendColor : 
+                     isReverting ? i_revertColor : 
+                     i_neutralColor
+
+color fillColor = color.new(regimeColor, i_fillOpacity)
+
+// ========================================
+// PLOTTING
+// ========================================
+// Upper and lower bands
+p_upper = plot(upper, "Upper Band", color=regimeColor, linewidth=2)
+p_lower = plot(lower, "Lower Band", color=regimeColor, linewidth=2)
+
+// Center line
+plot(i_showMidline ? basis : na, "Center Line", color=color.new(i_midColor, 30), linewidth=1, style=plot.style_line)
+
+// Channel fill
+fill(p_upper, p_lower, color=i_showFill ? fillColor : na, title="Channel Fill")
+
+// Bar coloring by regime
+barcolor(i_barColor ? regimeColor : na)
+
+// ========================================
+// HURST VALUE LABEL (non-stacking)
+// ========================================
+var label hurstLabel = na
+
+if barstate.islast and i_showHurst
+    string regime = isTrending ? "TRENDING" : 
+                     isReverting ? "MEAN-REVERTING" : 
+                     "RANDOM WALK"
+    
+    string labelText = "H: " + str.tostring(hurst, "#.###") + " | " + regime
+    
+    // Delete old label before creating new one
+    if not na(hurstLabel)
+        label.delete(hurstLabel)
+    
+    hurstLabel := label.new(bar_index + 3, upper, labelText,
+             style=label.style_none, textcolor=regimeColor,
+             size=size.normal, textalign=text.align_left)
+
+// ========================================
+// SIGNAL MARKERS
+// ========================================
+// --- Regime change signals ---
+bool toTrend  = ta.crossover(hurst, i_trendThresh)
+bool toRevert = ta.crossunder(hurst, i_revertThresh)
+
+plotshape(toTrend, "→ Trending", shape.triangleup, location.belowbar, 
+         i_trendColor, size=size.tiny, text="T")
+plotshape(toRevert, "→ Mean-Reverting", shape.triangledown, location.abovebar, 
+         i_revertColor, size=size.tiny, text="M")
+
+// --- Band touch signals with cooldown ---
+// Track bars since last signal to prevent noise
+var int barsSinceUpperSignal = 999
+var int barsSinceLowerSignal = 999
+barsSinceUpperSignal += 1
+barsSinceLowerSignal += 1
+
+bool touchUpperRaw = isReverting and high >= upper and barsSinceUpperSignal >= i_cooldown
+bool touchLowerRaw = isReverting and low <= lower and barsSinceLowerSignal >= i_cooldown
+
+// Prioritize: don't fire both in same bar
+bool touchUpper = touchUpperRaw and not touchLowerRaw
+bool touchLower = touchLowerRaw and not touchUpperRaw
+
+if touchUpper
+    barsSinceUpperSignal := 0
+if touchLower
+    barsSinceLowerSignal := 0
+
+plotshape(touchUpper, "Revert Short", shape.circle, location.abovebar,
+         color.new(i_revertColor, 30), size=size.tiny)
+plotshape(touchLower, "Revert Long", shape.circle, location.belowbar,
+         color.new(i_revertColor, 30), size=size.tiny)
+
+// --- Trend continuation signals ---
+// Price breaks out of band while in trending regime = momentum continuation
+bool trendBreakUp   = isTrending and ta.crossover(close, upper)
+bool trendBreakDown = isTrending and ta.crossunder(close, lower)
+
+plotshape(trendBreakUp, "Trend Break ↑", shape.arrowup, location.belowbar,
+         i_trendColor, size=size.small)
+plotshape(trendBreakDown, "Trend Break ↓", shape.arrowdown, location.abovebar,
+         i_trendColor, size=size.small)
+
+// --- High conviction confluence signals ---
+// Regime just shifted + price at extreme = strongest setup
+bool confluenceLong  = toRevert and low <= lower    // Just went mean-reverting + at lower band
+bool confluenceShort = toRevert and high >= upper   // Just went mean-reverting + at upper band
+bool confluenceTrendUp   = toTrend and close > upper  // Just went trending + breaking out up
+bool confluenceTrendDown = toTrend and close < lower  // Just went trending + breaking out down
+
+plotshape(confluenceLong, "★ Confluence Long", shape.diamond, location.belowbar,
+         color.rgb(0, 230, 118), size=size.normal, text="★")
+plotshape(confluenceShort, "★ Confluence Short", shape.diamond, location.abovebar,
+         color.rgb(255, 82, 82), size=size.normal, text="★")
+plotshape(confluenceTrendUp, "★ Trend Confluence ↑", shape.diamond, location.belowbar,
+         color.rgb(0, 230, 118), size=size.normal, text="★")
+plotshape(confluenceTrendDown, "★ Trend Confluence ↓", shape.diamond, location.abovebar,
+         color.rgb(255, 82, 82), size=size.normal, text="★")
+
+// ========================================
+// PLOTS FOR ALERTS
+// ========================================
+plot(hurst, "Hurst Value", color=color.new(regimeColor, 100), display=display.none)
+plot(upper, "Upper Alert", color=color.new(regimeColor, 100), display=display.none)
+plot(lower, "Lower Alert", color=color.new(regimeColor, 100), display=display.none)
+
+// ========================================
+// ALERTS
+// ========================================
+alertcondition(toTrend, "Regime → Trending", "Hurst crossed above trending threshold — market entering trending regime")
+alertcondition(toRevert, "Regime → Mean-Reverting", "Hurst crossed below mean-revert threshold — market entering mean-reverting regime")
+alertcondition(touchUpper, "Upper Band Touch (MR)", "Price touched upper band during mean-reverting regime — potential short")
+alertcondition(touchLower, "Lower Band Touch (MR)", "Price touched lower band during mean-reverting regime — potential long")
+alertcondition(trendBreakUp, "Trend Breakout ↑", "Price broke above upper channel during trending regime — momentum continuation")
+alertcondition(trendBreakDown, "Trend Breakout ↓", "Price broke below lower channel during trending regime — momentum continuation")
+alertcondition(confluenceLong or confluenceTrendUp, "★ Confluence Long", "High conviction long — regime shift + price at extreme")
+alertcondition(confluenceShort or confluenceTrendDown, "★ Confluence Short", "High conviction short — regime shift + price at extreme")
+
+// ========================================
+// INFO TABLE
+// ========================================
+if barstate.islast and i_showTable
+    var table infoTable = table.new(position.top_right, 2, 4, bgcolor=color.new(color.black, 80), border_width=1)
+    
+    string regime = isTrending ? "TRENDING ↗" : isReverting ? "REVERTING ↔" : "RANDOM ~"
+    color  rc     = regimeColor
+    float  bwPct  = basis != 0 ? rawBandWidth / basis * 100 : 0.0
+    
+    table.cell(infoTable, 0, 0, "Hurst (H)", text_color=color.gray, text_size=size.tiny)
+    table.cell(infoTable, 1, 0, str.tostring(hurst, "#.###"), text_color=rc, text_size=size.small)
+    
+    table.cell(infoTable, 0, 1, "Regime", text_color=color.gray, text_size=size.tiny)
+    table.cell(infoTable, 1, 1, regime, text_color=rc, text_size=size.small)
+    
+    table.cell(infoTable, 0, 2, "Band Width", text_color=color.gray, text_size=size.tiny)
+    table.cell(infoTable, 1, 2, str.tostring(bwPct, "#.##") + "%", text_color=color.white, text_size=size.small)
+    
+    table.cell(infoTable, 0, 3, "Multiplier", text_color=color.gray, text_size=size.tiny)
+    table.cell(infoTable, 1, 3, str.tostring(hurstAdaptive, "#.##") + "x", text_color=color.white, text_size=size.small)

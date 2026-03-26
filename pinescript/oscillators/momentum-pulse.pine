@@ -1,0 +1,539 @@
+// This Pine Script™ code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © alphachart_tv
+// Momentum Pulse v1.0 [FREE]
+//
+// A next-generation momentum analysis system combining adaptive trend strength,
+// multi-timeframe confluence scoring, and automatic divergence detection
+// into a single, visually compelling non-overlay panel.
+//
+// ══════════════════════════════════════════════════════════════════════════════
+// HOW IT WORKS
+// ══════════════════════════════════════════════════════════════════════════════
+//
+// CORE ENGINE — Adaptive Momentum Composite (AMC)
+//   The AMC blends three orthogonal momentum sources into one normalized score:
+//     1. Rate of Change (ROC) — raw price momentum / velocity
+//     2. RSI deviation     — mean-reversion pressure (RSI distance from 50)
+//     3. MACD histogram    — trend-following acceleration
+//   Each component is Z-score normalized and then combined with configurable
+//   weights. The result is a single oscillator that reads momentum from
+//   multiple angles simultaneously — catching both trend-following and
+//   mean-reversion edges.
+//
+// TREND STRENGTH METER
+//   A real-time gauge that classifies momentum into five regimes:
+//     STRONG BULL > BULL > NEUTRAL > BEAR > STRONG BEAR
+//   Uses adaptive thresholds based on recent volatility of the AMC itself,
+//   so the meter auto-calibrates to each asset and timeframe.
+//
+// MULTI-TIMEFRAME CONFLUENCE
+//   Polls momentum direction from up to 3 higher timeframes and displays
+//   alignment as a confluence score (0–4). Full alignment = high-conviction
+//   setups. Diverging timeframes = caution / chop zone.
+//
+// DIVERGENCE DETECTION
+//   Automatically detects Regular and Hidden divergences between price
+//   and the AMC oscillator:
+//     Regular Bullish  — price makes lower low,  AMC makes higher low  → reversal up
+//     Regular Bearish  — price makes higher high, AMC makes lower high → reversal down
+//     Hidden Bullish   — price makes higher low,  AMC makes lower low  → trend continuation up
+//     Hidden Bearish   — price makes lower high,  AMC makes higher high → trend continuation down
+//   Uses pivot-based detection with configurable lookback.
+//
+// MOMENTUM WAVE VISUALIZATION
+//   The AMC is rendered as a gradient-filled histogram with dynamic coloring
+//   that transitions smoothly from bearish (magenta/red) through neutral (gray)
+//   to bullish (cyan/teal). A signal line (smoothed AMC) provides crossover
+//   signals. Zero-line crosses are highlighted with markers.
+//
+// DISCLAIMER: This indicator is for educational and informational purposes only.
+// It does NOT constitute financial advice. Trading involves substantial risk.
+// Use at your own risk.
+// ══════════════════════════════════════════════════════════════════════════════
+
+//@version=6
+indicator("AlphaChart — Momentum Pulse", shorttitle="MP", overlay=false,
+     max_lines_count=500, max_labels_count=500, max_boxes_count=50,
+     precision=2)
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// 🔧 UTILITY FUNCTIONS
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+f_tfInMinutes() =>
+    mult = timeframe.multiplier
+    switch
+        timeframe.isseconds => mult / 60.0
+        timeframe.isminutes => mult * 1.0
+        timeframe.isdaily   => mult * 1440.0
+        timeframe.isweekly  => mult * 10080.0
+        timeframe.ismonthly => mult * 43200.0
+        => mult * 60.0
+
+// Z-score normalization over a lookback period
+f_zscore(float src, int len) =>
+    float mu = ta.sma(src, len)
+    float sigma = ta.stdev(src, len)
+    sigma > 0 ? (src - mu) / sigma : 0.0
+
+// Clamp value to range
+f_clamp(float val, float lo, float hi) =>
+    math.max(lo, math.min(hi, val))
+
+// Dashboard Position Helper
+f_dashPosition(_s) =>
+    switch _s
+        "Top Right"    => position.top_right
+        "Top Left"     => position.top_left
+        "Bottom Right"  => position.bottom_right
+        "Bottom Left"   => position.bottom_left
+        => position.top_right
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// 📊 INPUTS — Momentum Engine
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+group_engine = "📊 Momentum Engine"
+i_rocLen     = input.int(12, "ROC Length", minval=2, maxval=100, group=group_engine, tooltip="Rate of Change lookback period. Measures raw price velocity over N bars. Default 12 works well across most timeframes.")
+i_rsiLen     = input.int(14, "RSI Length", minval=2, maxval=100, group=group_engine, tooltip="RSI lookback period. Standard Wilder setting = 14.")
+i_macdFast   = input.int(12, "MACD Fast", minval=2, maxval=50, group=group_engine, tooltip="MACD fast EMA period.")
+i_macdSlow   = input.int(26, "MACD Slow", minval=5, maxval=100, group=group_engine, tooltip="MACD slow EMA period.")
+i_macdSig    = input.int(9, "MACD Signal", minval=2, maxval=50, group=group_engine, tooltip="MACD signal line smoothing.")
+i_zLen       = input.int(50, "Z-Score Lookback", minval=20, maxval=200, group=group_engine, tooltip="Period for Z-score normalization. Longer = smoother, more stable readings. Default 50 gives stable normalization.")
+i_signalLen  = input.int(9, "Signal Line Smoothing", minval=2, maxval=30, group=group_engine, tooltip="EMA smoothing applied to the composite to create the signal line for crossovers.")
+
+group_weights = "⚖️ Component Weights"
+i_wROC       = input.float(0.40, "ROC Weight", minval=0.0, maxval=1.0, step=0.05, group=group_weights, tooltip="Weight of Rate of Change in the composite. Higher = more responsive to price velocity.")
+i_wRSI       = input.float(0.30, "RSI Weight", minval=0.0, maxval=1.0, step=0.05, group=group_weights, tooltip="Weight of RSI deviation. Higher = more sensitive to overbought/oversold pressure.")
+i_wMACD      = input.float(0.30, "MACD Weight", minval=0.0, maxval=1.0, step=0.05, group=group_weights, tooltip="Weight of MACD histogram. Higher = more trend-following character.")
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// 🌐 INPUTS — Multi-Timeframe
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+group_mtf = "🌐 Multi-Timeframe Confluence"
+i_showMTF    = input.bool(true, "Enable MTF Confluence", group=group_mtf, tooltip="Polls momentum direction from higher timeframes for confluence scoring.")
+i_mtf1       = input.timeframe("60", "Timeframe 1", group=group_mtf, tooltip="First higher timeframe.")
+i_mtf2       = input.timeframe("240", "Timeframe 2", group=group_mtf, tooltip="Second higher timeframe.")
+i_mtf3       = input.timeframe("D", "Timeframe 3", group=group_mtf, tooltip="Third higher timeframe.")
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// 🔀 INPUTS — Divergence Detection
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+group_div = "🔀 Divergence Detection"
+i_showDiv    = input.bool(true, "Show Divergences", group=group_div, tooltip="Detects and displays regular and hidden divergences between price and momentum.")
+i_divPivotL  = input.int(5, "Pivot Lookback (L)", minval=2, maxval=20, group=group_div, tooltip="Left bars for pivot detection. Higher = fewer but more significant pivots.")
+i_divPivotR  = input.int(3, "Pivot Lookback (R)", minval=1, maxval=10, group=group_div, tooltip="Right bars for pivot confirmation. Higher = more lag but fewer false pivots.")
+i_divMaxBars = input.int(60, "Max Bars Between Pivots", minval=10, maxval=200, group=group_div, tooltip="Maximum distance between two pivots for a valid divergence.")
+i_showHidden = input.bool(true, "Show Hidden Divergences", group=group_div, tooltip="Hidden divergences signal trend continuation rather than reversal.")
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// 📋 INPUTS — Dashboard
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+group_dash = "📋 Dashboard"
+i_showDash   = input.bool(true, "Show Dashboard", group=group_dash)
+i_dashPos    = input.string("Top Right", "Dashboard Position", options=["Top Right", "Top Left", "Bottom Right", "Bottom Left"], group=group_dash)
+i_dashSize   = input.string("Small", "Dashboard Size", options=["Tiny", "Small", "Normal"], group=group_dash)
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// 🎨 INPUTS — Visual Settings
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+group_visual = "🎨 Visual Settings"
+i_bullColor1 = input.color(#00e5ff, "Bullish Primary (Cyan)", group=group_visual)
+i_bullColor2 = input.color(#00bfa5, "Bullish Secondary (Teal)", group=group_visual)
+i_bearColor1 = input.color(#ff1744, "Bearish Primary (Red-Pink)", group=group_visual)
+i_bearColor2 = input.color(#e040fb, "Bearish Secondary (Magenta)", group=group_visual)
+i_neutralClr = input.color(#ffd740, "Neutral / Warning (Amber)", group=group_visual)
+i_showZeroX  = input.bool(true, "Show Zero-Line Crosses", group=group_visual, tooltip="Highlights when the AMC crosses the zero line.")
+i_showSignalX = input.bool(true, "Show Signal Crosses", group=group_visual, tooltip="Highlights when the AMC crosses its signal line.")
+i_showBgZone = input.bool(true, "Show Background Zones", group=group_visual, tooltip="Subtle background coloring indicating the current momentum regime.")
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// 🔔 INPUTS — Alerts
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+group_alerts = "🔔 Alerts"
+i_alertZeroX   = input.bool(true, "Alert on Zero-Line Cross", group=group_alerts)
+i_alertSignalX = input.bool(true, "Alert on Signal Line Cross", group=group_alerts)
+i_alertDiv     = input.bool(true, "Alert on Divergence", group=group_alerts)
+i_alertMTF     = input.bool(true, "Alert on Full MTF Confluence", group=group_alerts)
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// ⚙️ CORE CALCULATIONS — Adaptive Momentum Composite (AMC)
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+// 1. Rate of Change — raw price momentum
+float roc_raw = ta.roc(close, i_rocLen)
+float roc_z   = f_zscore(roc_raw, i_zLen)
+
+// 2. RSI deviation from 50 — mean-reversion pressure
+float rsi_raw = ta.rsi(close, i_rsiLen)
+float rsi_dev = rsi_raw - 50.0
+float rsi_z   = f_zscore(rsi_dev, i_zLen)
+
+// 3. MACD histogram — trend acceleration
+[macd_line, macd_signal, macd_hist] = ta.macd(close, i_macdFast, i_macdSlow, i_macdSig)
+float macd_z = f_zscore(macd_hist, i_zLen)
+
+// Normalize weights so they sum to 1.0
+float w_total = i_wROC + i_wRSI + i_wMACD
+float w_roc   = w_total > 0 ? i_wROC / w_total : 0.333
+float w_rsi   = w_total > 0 ? i_wRSI / w_total : 0.333
+float w_macd  = w_total > 0 ? i_wMACD / w_total : 0.334
+
+// Adaptive Momentum Composite
+float amc_raw = w_roc * roc_z + w_rsi * rsi_z + w_macd * macd_z
+
+// Clamp to prevent extreme outliers
+float amc = f_clamp(amc_raw, -4.0, 4.0)
+
+// Signal line (smoothed AMC)
+float amc_signal = ta.ema(amc, i_signalLen)
+
+// Histogram (difference between AMC and signal)
+float amc_hist = amc - amc_signal
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// 📈 TREND STRENGTH CLASSIFICATION
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+// Adaptive thresholds based on recent AMC volatility (series float)
+float amc_stdev    = ta.stdev(amc, i_zLen)
+float thresh_strong = math.max(1.5, amc_stdev * 1.8)
+float thresh_normal = math.max(0.5, amc_stdev * 0.8)
+
+// Regime classification
+var string regime = "NEUTRAL"
+if amc > thresh_strong
+    regime := "STRONG BULL"
+else if amc > thresh_normal
+    regime := "BULL"
+else if amc < -thresh_strong
+    regime := "STRONG BEAR"
+else if amc < -thresh_normal
+    regime := "BEAR"
+else
+    regime := "NEUTRAL"
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// 🌐 MULTI-TIMEFRAME CONFLUENCE
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+// Function to compute AMC direction on any timeframe
+// Returns: 1 (bullish), -1 (bearish), 0 (neutral)
+f_amcDirection() =>
+    float _roc   = f_zscore(ta.roc(close, i_rocLen), i_zLen)
+    float _rsi_d = ta.rsi(close, i_rsiLen) - 50.0
+    float _rsi_z = f_zscore(_rsi_d, i_zLen)
+    [_ml, _ms, _mh] = ta.macd(close, i_macdFast, i_macdSlow, i_macdSig)
+    float _macd_z = f_zscore(_mh, i_zLen)
+    float _amc = w_roc * _roc + w_rsi * _rsi_z + w_macd * _macd_z
+    _amc > 0.0 ? 1 : _amc < 0.0 ? -1 : 0
+
+// Request MTF data — using simple string timeframes from input.timeframe()
+int mtf1_dir = i_showMTF ? request.security(syminfo.tickerid, i_mtf1, f_amcDirection(), lookahead=barmerge.lookahead_off) : 0
+int mtf2_dir = i_showMTF ? request.security(syminfo.tickerid, i_mtf2, f_amcDirection(), lookahead=barmerge.lookahead_off) : 0
+int mtf3_dir = i_showMTF ? request.security(syminfo.tickerid, i_mtf3, f_amcDirection(), lookahead=barmerge.lookahead_off) : 0
+
+// Current TF direction
+int ctf_dir = amc > 0.0 ? 1 : amc < 0.0 ? -1 : 0
+
+// Confluence score: how many TFs agree
+int confluence_bull = (ctf_dir > 0 ? 1 : 0) + (mtf1_dir > 0 ? 1 : 0) + (mtf2_dir > 0 ? 1 : 0) + (mtf3_dir > 0 ? 1 : 0)
+int confluence_bear = (ctf_dir < 0 ? 1 : 0) + (mtf1_dir < 0 ? 1 : 0) + (mtf2_dir < 0 ? 1 : 0) + (mtf3_dir < 0 ? 1 : 0)
+int confluence_score = math.max(confluence_bull, confluence_bear)
+bool full_bull_confluence = confluence_bull == 4
+bool full_bear_confluence = confluence_bear == 4
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// 🔀 DIVERGENCE DETECTION
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+// Pivot highs/lows on price and AMC
+float price_ph = ta.pivothigh(high, i_divPivotL, i_divPivotR)
+float price_pl = ta.pivotlow(low, i_divPivotL, i_divPivotR)
+float amc_ph   = ta.pivothigh(amc, i_divPivotL, i_divPivotR)
+float amc_pl   = ta.pivotlow(amc, i_divPivotL, i_divPivotR)
+
+// Track previous pivots
+var float prev_price_ph = na
+var float prev_amc_ph   = na
+var int   prev_ph_bar   = na
+var float prev_price_pl = na
+var float prev_amc_pl   = na
+var int   prev_pl_bar   = na
+
+// Current pivot bar index (offset by right lookback)
+int pivot_bar = bar_index - i_divPivotR
+
+// Divergence flags
+bool reg_bull_div  = false
+bool reg_bear_div  = false
+bool hid_bull_div  = false
+bool hid_bear_div  = false
+
+// Check for pivot lows (bullish divergences)
+if not na(price_pl) and not na(amc_pl)
+    if not na(prev_price_pl) and not na(prev_amc_pl) and not na(prev_pl_bar)
+        int bar_dist = pivot_bar - prev_pl_bar
+        if bar_dist > 0 and bar_dist <= i_divMaxBars
+            // Regular Bullish: price lower low, AMC higher low
+            if price_pl < prev_price_pl and amc_pl > prev_amc_pl
+                reg_bull_div := true
+            // Hidden Bullish: price higher low, AMC lower low
+            if i_showHidden and price_pl > prev_price_pl and amc_pl < prev_amc_pl
+                hid_bull_div := true
+    prev_price_pl := price_pl
+    prev_amc_pl   := amc_pl
+    prev_pl_bar   := pivot_bar
+
+// Check for pivot highs (bearish divergences)
+if not na(price_ph) and not na(amc_ph)
+    if not na(prev_price_ph) and not na(prev_amc_ph) and not na(prev_ph_bar)
+        int bar_dist = pivot_bar - prev_ph_bar
+        if bar_dist > 0 and bar_dist <= i_divMaxBars
+            // Regular Bearish: price higher high, AMC lower high
+            if price_ph > prev_price_ph and amc_ph < prev_amc_ph
+                reg_bear_div := true
+            // Hidden Bearish: price lower high, AMC higher high
+            if i_showHidden and price_ph < prev_price_ph and amc_ph > prev_amc_ph
+                hid_bear_div := true
+    prev_price_ph := price_ph
+    prev_amc_ph   := amc_ph
+    prev_ph_bar   := pivot_bar
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// 🎨 VISUALIZATION — Momentum Wave
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+// Normalized AMC for gauge (0-100%)
+float amc_norm = f_clamp(amc / math.max(thresh_strong, 1.0), -1.0, 1.0)
+
+// Histogram rising/falling coloring
+bool hist_rising  = amc_hist > nz(amc_hist[1])
+bool hist_falling = amc_hist < nz(amc_hist[1])
+
+color c_hist = amc > 0.0
+     ? (hist_rising ? i_bullColor1 : i_bullColor2)
+     : (hist_falling ? i_bearColor1 : i_bearColor2)
+
+// AMC line color — gradient from bear to bull
+color c_amc = amc > thresh_strong ? i_bullColor1
+     : amc > thresh_normal ? i_bullColor2
+     : amc < -thresh_strong ? i_bearColor1
+     : amc < -thresh_normal ? i_bearColor2
+     : color.gray
+
+// Signal line color
+color c_signal = color.new(#b0bec5, 30)
+
+// --- Plots ---
+
+// Histogram
+plot(amc_hist, "Momentum Histogram", color=color.new(c_hist, 30), style=plot.style_columns, linewidth=2)
+
+// AMC line
+plot(amc, "AMC", color=c_amc, linewidth=2)
+
+// Signal line
+plot(amc_signal, "Signal", color=c_signal, linewidth=1)
+
+// Zero line — hline works here because 0 is a constant
+hline(0, "Zero", color=color.new(color.white, 70), linestyle=hline.style_dotted)
+
+// Threshold bands — series float, so use plot() instead of hline()
+plot(thresh_strong, "Strong Bull Zone", color=color.new(#00e5ff, 85), linewidth=1, style=plot.style_stepline_diamond, display=display.none)
+plot(thresh_normal, "Bull Zone", color=color.new(#00bfa5, 90), linewidth=1, style=plot.style_stepline_diamond, display=display.none)
+plot(-thresh_normal, "Bear Zone", color=color.new(#e040fb, 90), linewidth=1, style=plot.style_stepline_diamond, display=display.none)
+plot(-thresh_strong, "Strong Bear Zone", color=color.new(#ff1744, 85), linewidth=1, style=plot.style_stepline_diamond, display=display.none)
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// 🎯 CROSSOVER SIGNALS
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+// Zero-line crosses
+bool zero_cross_up   = ta.crossover(amc, 0.0)
+bool zero_cross_down = ta.crossunder(amc, 0.0)
+
+// Signal line crosses
+bool signal_cross_up   = ta.crossover(amc, amc_signal)
+bool signal_cross_down = ta.crossunder(amc, amc_signal)
+
+// Zero-line cross markers — plotted on the AMC value at cross
+float zero_up_val   = i_showZeroX and zero_cross_up ? amc : na
+float zero_down_val = i_showZeroX and zero_cross_down ? amc : na
+plotshape(zero_up_val, "Zero Cross Up", shape.circle, location.absolute, i_bullColor1, size=size.tiny, text="0+", textcolor=i_bullColor1)
+plotshape(zero_down_val, "Zero Cross Down", shape.circle, location.absolute, i_bearColor1, size=size.tiny, text="0-", textcolor=i_bearColor1)
+
+// Signal line cross markers
+float sig_up_val   = i_showSignalX and signal_cross_up and not zero_cross_up ? amc : na
+float sig_down_val = i_showSignalX and signal_cross_down and not zero_cross_down ? amc : na
+plotshape(sig_up_val, "Signal Cross Up", shape.diamond, location.absolute, i_bullColor2, size=size.tiny)
+plotshape(sig_down_val, "Signal Cross Down", shape.diamond, location.absolute, i_bearColor2, size=size.tiny)
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// 🔀 DIVERGENCE VISUALIZATION
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+if i_showDiv and reg_bull_div
+    label.new(pivot_bar, amc_pl, "R.Bull", color=color.new(i_bullColor1, 20), textcolor=color.white, style=label.style_label_up, size=size.tiny)
+
+if i_showDiv and reg_bear_div
+    label.new(pivot_bar, amc_ph, "R.Bear", color=color.new(i_bearColor1, 20), textcolor=color.white, style=label.style_label_down, size=size.tiny)
+
+if i_showDiv and hid_bull_div
+    label.new(pivot_bar, amc_pl, "H.Bull", color=color.new(i_bullColor2, 20), textcolor=color.white, style=label.style_label_up, size=size.tiny)
+
+if i_showDiv and hid_bear_div
+    label.new(pivot_bar, amc_ph, "H.Bear", color=color.new(i_bearColor2, 20), textcolor=color.white, style=label.style_label_down, size=size.tiny)
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// 🌈 BACKGROUND ZONES
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+color bg_color = i_showBgZone
+     ? (amc > thresh_strong ? color.new(i_bullColor1, 93)
+     : amc > thresh_normal ? color.new(i_bullColor2, 95)
+     : amc < -thresh_strong ? color.new(i_bearColor1, 93)
+     : amc < -thresh_normal ? color.new(i_bearColor2, 95)
+     : na)
+     : na
+
+bgcolor(bg_color, title="Momentum Regime Background")
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// 📋 DASHBOARD
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+var string _dPos = f_dashPosition(i_dashPos)
+
+var string _dSize = switch i_dashSize
+    "Tiny"   => size.tiny
+    "Small"  => size.small
+    "Normal" => size.normal
+    => size.small
+
+var table dash = table.new(_dPos, 3, 10, border_width=1)
+
+if barstate.islast and i_showDash
+    // Color palette
+    color hdr_bg  = color.new(#0d1117, 0)
+    color row_bg  = color.new(#161b22, 0)
+    color row_alt = color.new(#0d1117, 20)
+    color txt     = color.white
+    color dim_txt = color.new(color.white, 40)
+
+    // Regime color for reuse
+    color regime_col = regime == "STRONG BULL" ? i_bullColor1
+         : regime == "BULL" ? i_bullColor2
+         : regime == "STRONG BEAR" ? i_bearColor1
+         : regime == "BEAR" ? i_bearColor2
+         : color.gray
+
+    // Row 0: Header
+    table.cell(dash, 0, 0, "Momentum Pulse  v1.0", bgcolor=hdr_bg, text_color=i_bullColor1, text_size=_dSize, text_halign=text.align_left)
+    table.cell(dash, 1, 0, "", bgcolor=hdr_bg, text_color=dim_txt, text_size=_dSize)
+    table.cell(dash, 2, 0, timeframe.period, bgcolor=hdr_bg, text_color=i_neutralClr, text_size=_dSize)
+
+    // Row 1: AMC Value
+    color amc_color = amc > 0.0 ? i_bullColor1 : amc < 0.0 ? i_bearColor1 : color.gray
+    string amc_arrow = amc > nz(amc[1]) ? "▲" : amc < nz(amc[1]) ? "▼" : "▬"
+    table.cell(dash, 0, 1, "AMC", bgcolor=row_bg, text_color=txt, text_size=_dSize)
+    table.cell(dash, 1, 1, str.tostring(amc, "#.##"), bgcolor=row_bg, text_color=amc_color, text_size=_dSize)
+    table.cell(dash, 2, 1, amc_arrow, bgcolor=row_bg, text_color=amc_color, text_size=_dSize)
+
+    // Row 2: Regime
+    table.cell(dash, 0, 2, "Regime", bgcolor=row_alt, text_color=txt, text_size=_dSize)
+    table.cell(dash, 1, 2, regime, bgcolor=row_alt, text_color=regime_col, text_size=_dSize)
+    table.cell(dash, 2, 2, "", bgcolor=row_alt, text_color=regime_col, text_size=_dSize)
+
+    // Row 3: Strength Bar (visual gauge)
+    int gauge_pct = int(math.round(math.abs(amc_norm) * 100))
+    int filled = int(math.round(gauge_pct / 10.0))
+    string gauge_str = ""
+    for i = 0 to 9
+        gauge_str += i < filled ? "█" : "░"
+    gauge_str += " " + str.tostring(gauge_pct) + "%"
+    table.cell(dash, 0, 3, "Strength", bgcolor=row_bg, text_color=txt, text_size=_dSize)
+    table.cell(dash, 1, 3, gauge_str, bgcolor=row_bg, text_color=regime_col, text_size=_dSize)
+    table.cell(dash, 2, 3, "", bgcolor=row_bg, text_color=regime_col, text_size=_dSize)
+
+    // Row 4: Signal Crossover Status
+    string sig_status = amc > amc_signal ? "Above Signal" : amc < amc_signal ? "Below Signal" : "On Signal"
+    color sig_col = amc > amc_signal ? i_bullColor2 : amc < amc_signal ? i_bearColor2 : color.gray
+    table.cell(dash, 0, 4, "Signal", bgcolor=row_alt, text_color=txt, text_size=_dSize)
+    table.cell(dash, 1, 4, sig_status, bgcolor=row_alt, text_color=sig_col, text_size=_dSize)
+    table.cell(dash, 2, 4, "", bgcolor=row_alt, text_color=sig_col, text_size=_dSize)
+
+    // Row 5: MTF Confluence
+    if i_showMTF
+        string d1 = ctf_dir > 0 ? "▲" : ctf_dir < 0 ? "▼" : "—"
+        string d2 = mtf1_dir > 0 ? "▲" : mtf1_dir < 0 ? "▼" : "—"
+        string d3 = mtf2_dir > 0 ? "▲" : mtf2_dir < 0 ? "▼" : "—"
+        string d4 = mtf3_dir > 0 ? "▲" : mtf3_dir < 0 ? "▼" : "—"
+        string mtf_str = d1 + " " + d2 + " " + d3 + " " + d4
+        color conf_col = confluence_score == 4 ? (ctf_dir > 0 ? i_bullColor1 : i_bearColor1)
+             : confluence_score >= 3 ? i_neutralClr
+             : color.gray
+        table.cell(dash, 0, 5, "MTF " + str.tostring(confluence_score) + "/4", bgcolor=row_bg, text_color=txt, text_size=_dSize)
+        table.cell(dash, 1, 5, mtf_str, bgcolor=row_bg, text_color=conf_col, text_size=_dSize)
+        table.cell(dash, 2, 5, "", bgcolor=row_bg, text_color=conf_col, text_size=_dSize)
+
+        // Row 6: TF Labels
+        table.cell(dash, 0, 6, "TFs", bgcolor=row_alt, text_color=dim_txt, text_size=_dSize)
+        table.cell(dash, 1, 6, timeframe.period + " | " + i_mtf1 + " | " + i_mtf2 + " | " + i_mtf3, bgcolor=row_alt, text_color=dim_txt, text_size=_dSize)
+        table.cell(dash, 2, 6, "", bgcolor=row_alt, text_color=dim_txt, text_size=_dSize)
+
+    // Row 7: Components
+    string comp_str = "R:" + str.tostring(roc_z, "#.#") + "  S:" + str.tostring(rsi_z, "#.#") + "  M:" + str.tostring(macd_z, "#.#")
+    int comp_row = i_showMTF ? 7 : 5
+    table.cell(dash, 0, comp_row, "Components", bgcolor=row_bg, text_color=txt, text_size=_dSize)
+    table.cell(dash, 1, comp_row, comp_str, bgcolor=row_bg, text_color=dim_txt, text_size=_dSize)
+    table.cell(dash, 2, comp_row, "", bgcolor=row_bg, text_color=dim_txt, text_size=_dSize)
+
+    // Row 8: RSI raw value
+    int rsi_row = comp_row + 1
+    color rsi_col = rsi_raw > 70 ? i_bearColor2 : rsi_raw < 30 ? i_bullColor2 : color.gray
+    string rsi_zone = rsi_raw > 70 ? "Overbought" : rsi_raw < 30 ? "Oversold" : "Neutral"
+    table.cell(dash, 0, rsi_row, "RSI", bgcolor=row_alt, text_color=txt, text_size=_dSize)
+    table.cell(dash, 1, rsi_row, str.tostring(rsi_raw, "#.#"), bgcolor=row_alt, text_color=rsi_col, text_size=_dSize)
+    table.cell(dash, 2, rsi_row, rsi_zone, bgcolor=row_alt, text_color=rsi_col, text_size=_dSize)
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// 🔔 ALERTS
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+alertcondition(zero_cross_up, title="Zero Cross Bullish",
+     message="Momentum Pulse: AMC crossed ABOVE zero on {{ticker}} ({{interval}}) — momentum turning bullish.")
+
+alertcondition(zero_cross_down, title="Zero Cross Bearish",
+     message="Momentum Pulse: AMC crossed BELOW zero on {{ticker}} ({{interval}}) — momentum turning bearish.")
+
+alertcondition(signal_cross_up, title="Signal Cross Bullish",
+     message="Momentum Pulse: AMC crossed ABOVE signal line on {{ticker}} ({{interval}}) — bullish momentum acceleration.")
+
+alertcondition(signal_cross_down, title="Signal Cross Bearish",
+     message="Momentum Pulse: AMC crossed BELOW signal line on {{ticker}} ({{interval}}) — bearish momentum deceleration.")
+
+alertcondition(reg_bull_div, title="Regular Bullish Divergence",
+     message="Momentum Pulse: Regular BULLISH divergence detected on {{ticker}} ({{interval}}) — potential reversal up!")
+
+alertcondition(reg_bear_div, title="Regular Bearish Divergence",
+     message="Momentum Pulse: Regular BEARISH divergence detected on {{ticker}} ({{interval}}) — potential reversal down!")
+
+alertcondition(hid_bull_div, title="Hidden Bullish Divergence",
+     message="Momentum Pulse: Hidden BULLISH divergence on {{ticker}} ({{interval}}) — trend continuation signal up.")
+
+alertcondition(hid_bear_div, title="Hidden Bearish Divergence",
+     message="Momentum Pulse: Hidden BEARISH divergence on {{ticker}} ({{interval}}) — trend continuation signal down.")
+
+alertcondition(full_bull_confluence, title="Full Bullish MTF Confluence",
+     message="Momentum Pulse: FULL BULLISH confluence across all timeframes on {{ticker}} — high-conviction setup!")
+
+alertcondition(full_bear_confluence, title="Full Bearish MTF Confluence",
+     message="Momentum Pulse: FULL BEARISH confluence across all timeframes on {{ticker}} — high-conviction setup!")
+
+// END OF SCRIPT

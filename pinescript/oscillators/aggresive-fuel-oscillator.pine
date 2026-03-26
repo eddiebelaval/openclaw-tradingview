@@ -1,0 +1,251 @@
+//@version=6
+indicator("CVD 24 Momentum Efficiency (v3)", overlay=false, max_bars_back=4000)
+
+// =========================================================================
+// GLOBAL SETTINGS
+// =========================================================================
+grp_global = "Global Settings"
+src        = input.source(hlc3, title="Price Source", group=grp_global)
+lookback   = input.time(timestamp("21 Mar 2024 00:00 -0400"), title="Maximum Lookback", group=grp_global)
+
+grp_anomaly = "Liquidity Anomaly Triggers (The Anchor)"
+vol_length      = input.int(50, "Volume Baseline Length", minval=10, group=grp_anomaly)
+vol_z_threshold = input.float(2.5, "Anomaly Z-Score Threshold", step=0.1, group=grp_anomaly)
+max_anchors     = 24
+anchor_cooldown = input.int(5, "Anchor Cooldown (Bars)", minval=1, group=grp_anomaly)
+
+grp_osc = "Oscillator Visuals & Scaling"
+z_len           = input.int(50, "Normalization (Z-Score) Length", minval=10, group=grp_osc)
+hist_scale      = input.float(1.0, "Fuel Histogram Scale", step=0.1, minval=0.1, group=grp_osc)
+sig_scale       = input.float(1.5, "Efficiency Signal Scale", step=0.1, minval=0.1, group=grp_osc)
+sig_smooth      = input.int(3, "Efficiency Smoothing", minval=1, group=grp_osc)
+color_smooth    = input.int(1, "Color Momentum Smoothing", minval=1, maxval=10, group=grp_osc)
+show_fan        = input.bool(true, "Show Structural Fan Background", group=grp_osc)
+streak_window   = input.int(14, "Streak Lookback Window", minval=1, group=grp_osc, tooltip="How many bars can pass between consensus events before the streak count resets.")
+
+grp_colors = "Visual Heatmap Colors"
+c_bull_abs = input.color(#FF00FF, "Bullish Absorption (Magenta)", group=grp_colors)
+c_bear_abs = input.color(#FF9800, "Bearish Absorption (Orange)", group=grp_colors)
+c_std_up   = input.color(color.aqua, "Standard Upward Move", group=grp_colors)
+c_std_dn   = input.color(color.red, "Standard Downward Move", group=grp_colors)
+
+// Buffer safety for dynamic lengths
+max_bars_back(src, 4000)
+
+// =========================================================================
+// ANOMALY DETECTION & BUFFER LOGIC
+// =========================================================================
+bool is_within_lookback = time >= lookback
+
+// Global Cumulative Delta Calculation
+float delta = volume * (close > open ? 1 : -1)
+var float cum_delta = 0.0
+cum_delta += delta
+
+// Calculate Volume Z-Score
+float vol_sma = ta.sma(volume, vol_length)
+float vol_sd  = ta.stdev(volume, vol_length)
+float vol_z   = vol_sd > 0 ? (volume - vol_sma) / vol_sd : 0
+
+var int bars_since_last_anchor = anchor_cooldown
+bars_since_last_anchor += 1
+
+bool is_anomaly = (vol_z >= vol_z_threshold) and is_within_lookback and (bars_since_last_anchor >= anchor_cooldown)
+
+// Circular Buffers for Anchor Data
+var int[]   anchor_indices = array.new_int(max_anchors, -1)
+var float[] anchor_cvd_ref = array.new_float(max_anchors, na)
+
+if is_anomaly
+    bars_since_last_anchor := 0
+    array.unshift(anchor_indices, bar_index)
+    array.unshift(anchor_cvd_ref, cum_delta)
+    array.pop(anchor_indices)
+    array.pop(anchor_cvd_ref)
+
+// =========================================================================
+// DYNAMIC CALCULATION PIPELINE (CVD)
+// =========================================================================
+f_calc_cvd(int rank) =>
+    int   idx      = array.get(anchor_indices, rank-1)
+    float start_v  = array.get(anchor_cvd_ref, rank-1)
+    int   count    = idx != -1 ? (bar_index - idx + 1) : 0
+    float current_cvd = (count > 0) ? (cum_delta - start_v) : na
+    current_cvd
+
+// Unroll 24 instances for CVD calculation
+v1  = f_calc_cvd(1),  v2  = f_calc_cvd(2),  v3  = f_calc_cvd(3),  v4  = f_calc_cvd(4)
+v5  = f_calc_cvd(5),  v6  = f_calc_cvd(6),  v7  = f_calc_cvd(7),  v8  = f_calc_cvd(8)
+v9  = f_calc_cvd(9),  v10 = f_calc_cvd(10), v11 = f_calc_cvd(11), v12 = f_calc_cvd(12)
+v13 = f_calc_cvd(13), v14 = f_calc_cvd(14), v15 = f_calc_cvd(15), v16 = f_calc_cvd(16)
+v17 = f_calc_cvd(17), v18 = f_calc_cvd(18), v19 = f_calc_cvd(19), v20 = f_calc_cvd(20)
+v21 = f_calc_cvd(21), v22 = f_calc_cvd(22), v23 = f_calc_cvd(23), v24 = f_calc_cvd(24)
+
+// =========================================================================
+// META-MEAN CONSENSUS & CLUSTER ANALYTICS
+// =========================================================================
+var float[] active_cvds = array.new_float(0)
+array.clear(active_cvds)
+
+f_push(float v) =>
+    if not na(v)
+        array.push(active_cvds, v)
+
+f_push(v1), f_push(v2), f_push(v3), f_push(v4), f_push(v5), f_push(v6), f_push(v7), f_push(v8)
+f_push(v9), f_push(v10), f_push(v11), f_push(v12), f_push(v13), f_push(v14), f_push(v15), f_push(v16)
+f_push(v17), f_push(v18), f_push(v19), f_push(v20), f_push(v21), f_push(v22), f_push(v23), f_push(v24)
+
+int sz = array.size(active_cvds)
+float meta_mean_cvd = sz > 0 ? array.avg(active_cvds) : na
+float max_cvd_raw   = sz > 0 ? array.max(active_cvds) : na
+float min_cvd_raw   = sz > 0 ? array.min(active_cvds) : na
+float cross_sd      = sz > 1 ? array.stdev(active_cvds) : 0
+
+// Z-Score Standardization for CVD
+float meta_cvd_sma = ta.sma(meta_mean_cvd, z_len)
+float meta_cvd_sd  = ta.stdev(meta_mean_cvd, z_len)
+float meta_z_cvd   = meta_cvd_sd > 0 ? (meta_mean_cvd - meta_cvd_sma) / meta_cvd_sd : 0
+
+// =========================================================================
+// THE ENGINE: MOMENTUM EFFICIENCY & ABSORPTION
+// =========================================================================
+float price_hull = ta.hma(src, 24)
+float d_dx_cvd   = meta_z_cvd - nz(meta_z_cvd[1], meta_z_cvd)
+float d_dx_price = price_hull - nz(price_hull[1], price_hull)
+
+float eng_sma = ta.sma(d_dx_cvd, z_len)
+float eng_sd  = ta.stdev(d_dx_cvd, z_len)
+float eng_z   = eng_sd > 0 ? (d_dx_cvd - eng_sma) / eng_sd : 0
+float eng_sig = ta.wma(eng_z, sig_smooth) * sig_scale
+
+// Momentum Logic for Heatmap
+bool is_expanding_up = meta_z_cvd >= 0 and ta.rising(meta_z_cvd, color_smooth)
+bool is_expanding_dn = meta_z_cvd <  0 and ta.falling(meta_z_cvd, color_smooth)
+
+f_apply_momentum(color base_c, bool expanding) =>
+    expanding ? base_c : color.new(base_c, 65)
+
+// Coloring for Signals and Histogram
+color sig_color = na
+if d_dx_price < 0 and d_dx_cvd > 0
+    sig_color := c_bull_abs
+else if d_dx_price > 0 and d_dx_cvd < 0
+    sig_color := c_bear_abs
+else if d_dx_cvd > 0
+    sig_color := c_std_up
+else
+    sig_color := c_std_dn
+
+color hist_base = meta_z_cvd > 0 ? c_std_up : c_std_dn
+color hist_color = f_apply_momentum(hist_base, meta_z_cvd > 0 ? is_expanding_up : is_expanding_dn)
+
+// Cloud Transparency Logic
+float sd_baseline = ta.sma(cross_sd, z_len)
+float concentration_ratio = sd_baseline > 0 ? math.min(cross_sd / sd_baseline, 2.0) : 1.0
+int cloud_transp = int(math.max(60, math.min(95, 60 + (concentration_ratio * 20))))
+color cloud_color = color.new(hist_color, cloud_transp)
+
+// =========================================================================
+// EXTREME FUEL CONSENSUS BACKGROUND SIGNALS
+// =========================================================================
+// Consensus: All 24 anchors must be active and agree on direction relative to zero
+bool all_below_zero = sz == 24 and max_cvd_raw < 0
+bool all_above_zero = sz == 24 and min_cvd_raw > 0
+
+// Persistent Streak Accumulator for Background Intensity
+var int bg_streak_count = 0
+var int last_consensus_bar = -100
+
+if all_below_zero or all_above_zero
+    if bar_index - last_consensus_bar <= streak_window
+        bg_streak_count += 1
+    else
+        bg_streak_count := 1
+    last_consensus_bar := bar_index
+else
+    if bar_index - last_consensus_bar > streak_window
+        bg_streak_count := 0
+
+// REVERSED Brightness logic: 
+// First bar (count 1) is brightest (transp 70) 
+// Last bar (count 50) is dimmest (transp 95)
+float intensity_ratio = math.min(bg_streak_count, 50) / 50.0
+int dynamic_transp = int(70 + (intensity_ratio * 25))
+
+// Apply Background Signal
+bgcolor(all_below_zero ? color.new(color.lime, dynamic_transp) : all_above_zero ? color.new(color.red, dynamic_transp) : na)
+
+// =========================================================================
+// RENDERING (VISUAL HIERARCHY)
+// =========================================================================
+hline(0, "Equilibrium", color=color.new(color.gray, 50), linestyle=hline.style_solid)
+
+// 1. Structural Cloud (Back Layer)
+float f_sc = meta_cvd_sd > 0 ? meta_cvd_sd : 1.0
+float f_sm = meta_cvd_sma
+
+p_cloud_max = plot(show_fan ? (max_cvd_raw - f_sm) / f_sc : na, "Cloud Max", color=color.new(color.white, 100))
+p_cloud_min = plot(show_fan ? (min_cvd_raw - f_sm) / f_sc : na, "Cloud Min", color=color.new(color.white, 100))
+fill(p_cloud_max, p_cloud_min, cloud_color, title="Consensus Fuel Cloud")
+
+// 2. Agreed Fuel Histogram (Middle Layer)
+plot(meta_z_cvd * hist_scale, "Agreed Fuel Histogram", color=hist_color, style=plot.style_columns)
+
+// 3. Efficiency Signal Line (Top Layer)
+plot(eng_sig, "Momentum Efficiency Signal", color=sig_color, linewidth=3)
+
+// 4. Structural Fan Ribbons (Recency Palette)
+int fan_transp = 75
+color c1  = sz > 0  ? color.new(#F48FB1, fan_transp) : na 
+color c2  = sz > 1  ? color.new(#EF5350, fan_transp) : na
+color c3  = sz > 2  ? color.new(#E53935, fan_transp) : na
+color c4  = sz > 3  ? color.new(#FFCC80, fan_transp) : na 
+color c5  = sz > 4  ? color.new(#FFB74D, fan_transp) : na
+color c6  = sz > 5  ? color.new(#FF9800, fan_transp) : na
+color c7  = sz > 6  ? color.new(#FFF59D, fan_transp) : na 
+color c8  = sz > 7  ? color.new(#FFF176, fan_transp) : na
+color c9  = sz > 8  ? color.new(#FFEB3B, fan_transp) : na
+color c10 = sz > 9  ? color.new(#A5D6A7, fan_transp) : na 
+color c11 = sz > 10 ? color.new(#81C784, fan_transp) : na
+color c12 = sz > 11 ? color.new(#66BB6A, fan_transp) : na
+color c13 = sz > 12 ? color.new(#80CBC4, fan_transp) : na 
+color c14 = sz > 13 ? color.new(#4DB6AC, fan_transp) : na
+color c15 = sz > 14 ? color.new(#26A69A, fan_transp) : na
+color c16 = sz > 15 ? color.new(#81D4FA, fan_transp) : na 
+color c17 = sz > 16 ? color.new(#4FC3F7, fan_transp) : na
+color c18 = sz > 17 ? color.new(#29B6F6, fan_transp) : na
+color c19 = sz > 18 ? color.new(#90CAF9, fan_transp) : na 
+color c20 = sz > 19 ? color.new(#64B5F6, fan_transp) : na
+color c21 = sz > 20 ? color.new(#42A5F5, fan_transp) : na
+color c22 = sz > 21 ? color.new(#B39DDB, fan_transp) : na 
+color c23 = sz > 22 ? color.new(#9575CD, fan_transp) : na
+color c24 = sz > 23 ? color.new(#7E57C2, fan_transp) : na
+
+plot(show_fan ? (v1  - f_sm) / f_sc : na, "V1",  color=c1)
+plot(show_fan ? (v2  - f_sm) / f_sc : na, "V2",  color=c2)
+plot(show_fan ? (v3  - f_sm) / f_sc : na, "V3",  color=c3)
+plot(show_fan ? (v4  - f_sm) / f_sc : na, "V4",  color=c4)
+plot(show_fan ? (v5  - f_sm) / f_sc : na, "V5",  color=c5)
+plot(show_fan ? (v6  - f_sm) / f_sc : na, "V6",  color=c6)
+plot(show_fan ? (v7  - f_sm) / f_sc : na, "V7",  color=c7)
+plot(show_fan ? (v8  - f_sm) / f_sc : na, "V8",  color=c8)
+plot(show_fan ? (v9  - f_sm) / f_sc : na, "V9",  color=c9)
+plot(show_fan ? (v10 - f_sm) / f_sc : na, "V10", color=c10)
+plot(show_fan ? (v11 - f_sm) / f_sc : na, "V11", color=c11)
+plot(show_fan ? (v12 - f_sm) / f_sc : na, "V12", color=c12)
+plot(show_fan ? (v13 - f_sm) / f_sc : na, "V13", color=c13)
+plot(show_fan ? (v14 - f_sm) / f_sc : na, "V14", color=c14)
+plot(show_fan ? (v15 - f_sm) / f_sc : na, "V15", color=c15)
+plot(show_fan ? (v16 - f_sm) / f_sc : na, "V16", color=c16)
+plot(show_fan ? (v17 - f_sm) / f_sc : na, "V17", color=c17)
+plot(show_fan ? (v18 - f_sm) / f_sc : na, "V18", color=c18)
+plot(show_fan ? (v19 - f_sm) / f_sc : na, "V19", color=c19)
+plot(show_fan ? (v20 - f_sm) / f_sc : na, "V20", color=c20)
+plot(show_fan ? (v21 - f_sm) / f_sc : na, "V21", color=c21)
+plot(show_fan ? (v22 - f_sm) / f_sc : na, "V22", color=c22)
+plot(show_fan ? (v23 - f_sm) / f_sc : na, "V23", color=c23)
+plot(show_fan ? (v24 - f_sm) / f_sc : na, "V24", color=c24)
+
+// 5. Anomaly Triggers
+color trigger_color = is_anomaly ? (close >= open ? color.blue : color.yellow) : na
+plotchar(is_anomaly ? 0 : na, "Liquidity Event", char="▲", location=location.absolute, color=trigger_color, size=size.tiny)

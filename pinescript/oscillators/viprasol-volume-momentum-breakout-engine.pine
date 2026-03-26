@@ -1,0 +1,632 @@
+// This Pine Script(TM) v6 indicator is subject to the terms of the Mozilla Public License 2.0
+// https://mozilla.org/MPL/2.0/
+// (c) Viprasol
+
+//@version=6
+indicator("[Viprasol] Volume Momentum Breakout Engine", overlay=false,
+     max_lines_count=500, max_labels_count=500, max_boxes_count=500, max_bars_back=1000)
+
+// ──────────────────────────────────────────────────────────────────────────────
+// CONSTANTS
+// ──────────────────────────────────────────────────────────────────────────────
+const string MODE_PIVOT    = "Pivot Breakout"
+const string MODE_EXTREMES = "OB/OS Continuation"
+const color  COLOR_BULL    = #26A69A
+const color  COLOR_BEAR    = #EF5350
+const color  COLOR_NEUTRAL = #9E9E9E
+const color  COLOR_SURGE   = #FFAB00
+const color  COLOR_PANEL_BG  = #1A1A2E
+const color  COLOR_PANEL_HDR = #0F3460
+const string VP_LABEL      = "VIPRASOL"
+
+// ──────────────────────────────────────────────────────────────────────────────
+// INPUTS
+// ──────────────────────────────────────────────────────────────────────────────
+// --- Core Settings ---
+string GRP_CORE = "Core Settings"
+string signalModeInput = input.string(MODE_PIVOT, "Signal Mode",
+     options=[MODE_PIVOT, MODE_EXTREMES], group=GRP_CORE,
+     tooltip="Pivot Breakout: signals fire when the oscillator breaks above/below its own pivot levels. OB/OS Continuation: signals fire on crossover/crossunder of the OB/OS thresholds.")
+int volumeWindowInput = input.int(20, "Volume Lookback Window", minval=1, maxval=200, group=GRP_CORE,
+     tooltip="Number of bars used to calculate average volume and standard deviation for the oscillator normalization.")
+float overboughtInput = input.float(15.0, "Overbought Level", step=0.5, group=GRP_CORE,
+     tooltip="Upper threshold for the oscillator. Pivot lines are created above this level; OB/OS mode triggers buys on crossover.")
+float oversoldInput = input.float(-15.0, "Oversold Level", step=0.5, group=GRP_CORE,
+     tooltip="Lower threshold for the oscillator. Pivot lines are created below this level; OB/OS mode triggers sells on crossunder.")
+
+// --- Pivot Settings ---
+string GRP_PIVOT = "Pivot Settings"
+int pivotLookLeftInput = input.int(2, "Pivot Left Bars", minval=1, maxval=20, group=GRP_PIVOT,
+     tooltip="Number of bars to the left of a pivot point for confirmation. Higher = more significant pivots, fewer signals.")
+int pivotLookRightInput = input.int(2, "Pivot Right Bars", minval=1, maxval=20, group=GRP_PIVOT,
+     tooltip="Number of bars to the right of a pivot point for confirmation. Higher = more lag but more reliable pivots.")
+bool priceDirectionFilterInput = input.bool(false, "Price Direction Filter", group=GRP_PIVOT,
+     tooltip="When enabled, new pivot lines only form if the closing price at the pivot also confirms direction (higher close for bull, lower for bear).")
+int maxPivotLineBarsInput = input.int(200, "Max Pivot Line Length (bars)", minval=0, group=GRP_PIVOT,
+     tooltip="Maximum number of bars a pivot line can extend before auto-expiring. 0 = no limit.")
+
+// --- Signal Filters ---
+string GRP_FILTER = "Signal Filters"
+bool barCloseConfirmInput = input.bool(true, "Bar-Close Confirmation", group=GRP_FILTER,
+     tooltip="When enabled, box breakout signals only fire on confirmed (closed) bars, reducing false signals from wicks.")
+int signalCooldownInput = input.int(5, "Signal Cooldown (bars)", minval=0, maxval=100, group=GRP_FILTER,
+     tooltip="Minimum bars between signals. Prevents signal clustering in volatile conditions. 0 = no cooldown.")
+bool useTrendFilterInput = input.bool(false, "Use Trend Filter (EMA)", group=GRP_FILTER,
+     tooltip="When enabled, long signals require price above EMA and short signals require price below EMA.")
+int trendFilterPeriodInput = input.int(50, "Trend Filter EMA Period", minval=5, maxval=500, group=GRP_FILTER,
+     tooltip="Period for the trend filter EMA. Only used when Trend Filter is enabled.")
+
+// --- Risk Management ---
+string GRP_RISK = "Risk Management"
+bool showTradeOverlayInput = input.bool(true, "Show TP/SL on Chart", group=GRP_RISK,
+     tooltip="Display entry, stop-loss, and take-profit lines with shaded risk/reward zones on the price chart.")
+bool atrBasedSlInput = input.bool(true, "ATR-Based Stop Loss", group=GRP_RISK,
+     tooltip="When enabled, stop-loss distance is calculated from ATR. When disabled, uses a fixed percentage.")
+int atrCalcPeriodInput = input.int(14, "ATR Period", minval=1, maxval=50, group=GRP_RISK,
+     tooltip="Lookback period for ATR calculation. Only used when ATR-Based SL is enabled.")
+float slAtrFactorInput = input.float(1.5, "SL ATR Multiplier", step=0.1, group=GRP_RISK,
+     tooltip="Multiplier applied to ATR for stop-loss distance. Higher = wider stop.")
+float slPercentInput = input.float(1.0, "SL Percentage", step=0.1, group=GRP_RISK,
+     tooltip="Fixed percentage from entry for stop-loss. Only used when ATR-Based SL is disabled.")
+float tp1RatioInput = input.float(1.0, "TP1 Risk:Reward", step=0.1, group=GRP_RISK,
+     tooltip="Risk-to-reward ratio for first take-profit level. 1.0 = same distance as SL.")
+float tp2RatioInput = input.float(2.0, "TP2 Risk:Reward", step=0.1, group=GRP_RISK,
+     tooltip="Risk-to-reward ratio for second take-profit level.")
+float tp3RatioInput = input.float(3.0, "TP3 Risk:Reward", step=0.1, group=GRP_RISK,
+     tooltip="Risk-to-reward ratio for third take-profit level.")
+
+// --- TP/SL Display ---
+string GRP_TPSL_VIS = "TP/SL Display"
+bool showSlLineInput = input.bool(true, "Show SL", group=GRP_TPSL_VIS,
+     tooltip="Display stop-loss line and label on the price chart.")
+bool showTp1LineInput = input.bool(true, "Show TP1", group=GRP_TPSL_VIS,
+     tooltip="Display TP1 line and label on the price chart.")
+bool showTp2LineInput = input.bool(true, "Show TP2", group=GRP_TPSL_VIS,
+     tooltip="Display TP2 line and label on the price chart.")
+bool showTp3LineInput = input.bool(true, "Show TP3", group=GRP_TPSL_VIS,
+     tooltip="Display TP3 line and label on the price chart.")
+
+// --- Visuals ---
+string GRP_VIS = "Visuals"
+color oscillatorColorInput = input.color(#B0BEC5, "Oscillator Line", group=GRP_VIS,
+     tooltip="Color of the main oscillator line.")
+color zeroLineColorInput = input.color(color.gray, "Zero Line", group=GRP_VIS,
+     tooltip="Color of the horizontal zero line.")
+color obBandColorInput = input.color(color.gray, "OB Band", group=GRP_VIS,
+     tooltip="Color of the overbought threshold line.")
+color osBandColorInput = input.color(color.gray, "OS Band", group=GRP_VIS,
+     tooltip="Color of the oversold threshold line.")
+color zoneGradientColorInput = input.color(color.new(color.gray, 85), "OB/OS Zone Fill", group=GRP_VIS,
+     tooltip="Fill color between the OB and OS threshold lines.")
+color bullSignalColorInput = input.color(COLOR_BULL, "Bull Color", inline="sigcol", group=GRP_VIS,
+     tooltip="Color for bullish signals, lines, boxes, and backgrounds.")
+color bearSignalColorInput = input.color(COLOR_BEAR, "Bear Color", inline="sigcol", group=GRP_VIS,
+     tooltip="Color for bearish signals, lines, boxes, and backgrounds.")
+bool showVolumeSurgeInput = input.bool(true, "Highlight Volume Surges", group=GRP_VIS,
+     tooltip="Highlight the oscillator background when volume exceeds 2x the average, indicating unusual activity.")
+float volumeSurgeThresholdInput = input.float(2.0, "Volume Surge Multiplier", minval=1.1, step=0.1, group=GRP_VIS,
+     tooltip="Volume must exceed this multiple of the average to trigger a surge highlight.")
+
+// --- Dashboard ---
+string GRP_DASH = "Dashboard"
+bool showDashboardInput = input.bool(true, "Show Dashboard", group=GRP_DASH,
+     tooltip="Toggle the information dashboard on/off.")
+string dashFontSizeInput = input.string("small", "Dashboard Font Size",
+     options=["tiny", "small", "normal", "large", "huge"], group=GRP_DASH,
+     tooltip="Font size for all dashboard text.")
+
+// ──────────────────────────────────────────────────────────────────────────────
+// FUNCTIONS
+// ──────────────────────────────────────────────────────────────────────────────
+getFontSize(string sz) =>
+    switch sz
+        "tiny"   => size.tiny
+        "small"  => size.small
+        "normal" => size.normal
+        "large"  => size.large
+        "huge"   => size.huge
+
+addPanelRow(table tbl, int rowIdx, string title, string val, color valColor, string fontSize) =>
+    table.cell(tbl, 0, rowIdx, title, text_color=color.new(color.white, 20), text_halign=text.align_left,
+         text_size=getFontSize(fontSize), bgcolor=COLOR_PANEL_BG)
+    table.cell(tbl, 1, rowIdx, val, text_color=valColor, text_size=getFontSize(fontSize),
+         text_halign=text.align_right, bgcolor=COLOR_PANEL_BG)
+
+// ──────────────────────────────────────────────────────────────────────────────
+// CALCULATIONS — Volume Momentum Oscillator
+// ──────────────────────────────────────────────────────────────────────────────
+float volMean       = ta.sma(volume, volumeWindowInput)
+float volStdDev     = ta.stdev(volume, volumeWindowInput)
+float volNormalized = math.max((volume - volMean) / volStdDev, 0)
+
+float priceMovement     = close - close[1]
+float rawMomentum       = priceMovement * volNormalized
+
+float momentumMean      = ta.sma(rawMomentum, volumeWindowInput)
+float momentumStdDev    = ta.stdev(rawMomentum, volumeWindowInput)
+float oscillatorValue   = (rawMomentum - momentumMean) / momentumStdDev * 10
+
+float atrValue          = ta.atr(atrCalcPeriodInput)
+float trendFilterEma    = ta.ema(close, trendFilterPeriodInput)
+
+// Volume surge detection
+bool isVolumeSurge = volume > volMean * volumeSurgeThresholdInput
+
+// ──────────────────────────────────────────────────────────────────────────────
+// CALCULATIONS — Derived Colors
+// ──────────────────────────────────────────────────────────────────────────────
+color bullLightColor = color.new(bullSignalColorInput, 40)
+color bearLightColor = color.new(bearSignalColorInput, 40)
+color bullFillColor  = color.new(bullSignalColorInput, 85)
+color bearFillColor  = color.new(bearSignalColorInput, 85)
+
+// ──────────────────────────────────────────────────────────────────────────────
+// CALCULATIONS — Pivot Mode State
+// ──────────────────────────────────────────────────────────────────────────────
+bool isPivotMode = signalModeInput == MODE_PIVOT
+
+float pivotHigh = na
+float pivotLow  = na
+
+var float prevHighPivotLevel = na
+var float prevHighPivotClose = na
+var float prevLowPivotLevel  = na
+var float prevLowPivotClose  = na
+
+var array<line>  upperPivotLines   = array.new<line>()
+var array<float> upperPivotLevels  = array.new<float>()
+var array<bool>  upperPivotActive  = array.new<bool>()
+
+var array<line>  lowerPivotLines   = array.new<line>()
+var array<float> lowerPivotLevels  = array.new<float>()
+var array<bool>  lowerPivotActive  = array.new<bool>()
+
+var array<box>   signalBoxes       = array.new<box>()
+var array<float> signalBoxTopEdge  = array.new<float>()
+var array<float> signalBoxBotEdge  = array.new<float>()
+
+// Signal cooldown tracking
+var int lastSignalBar = 0
+
+// ──────────────────────────────────────────────────────────────────────────────
+// CALCULATIONS — Trade State
+// ──────────────────────────────────────────────────────────────────────────────
+var int   tradeDirection   = 0
+var int   tradeEntryBar    = na
+var float tradeSlLevel     = na
+var float tradeExtremeTP   = na
+
+var line     tradeEntryLine    = na
+var label    tradeEntryLabel   = na
+var line     tradeSlLine       = na
+var label    tradeSlLabel      = na
+var line     tradeTp1Line      = na
+var label    tradeTp1Label     = na
+var line     tradeTp2Line      = na
+var label    tradeTp2Label     = na
+var line     tradeTp3Line      = na
+var label    tradeTp3Label     = na
+var line     tradeExtremeLine  = na
+var linefill tradeRiskFill     = na
+var linefill tradeRewardFill   = na
+
+// Signal counters for dashboard
+var int totalBullSignals = 0
+var int totalBearSignals = 0
+
+// ──────────────────────────────────────────────────────────────────────────────
+// CALCULATIONS — Creating Pivot Lines
+// ──────────────────────────────────────────────────────────────────────────────
+if isPivotMode
+    pivotHigh := ta.pivothigh(oscillatorValue, pivotLookLeftInput, pivotLookRightInput)
+    pivotLow  := ta.pivotlow(oscillatorValue, pivotLookLeftInput, pivotLookRightInput)
+
+    if not na(pivotHigh) and pivotHigh > overboughtInput
+        int   pivotBar   = bar_index - pivotLookRightInput
+        float pivotClose = close[pivotLookRightInput]
+        bool shouldCreate = na(prevHighPivotLevel) or
+             (pivotHigh > prevHighPivotLevel and (not priceDirectionFilterInput or pivotClose > prevHighPivotClose))
+        if shouldCreate
+            line pivotLine = line.new(pivotBar, pivotHigh, pivotBar + 1, pivotHigh,
+                 extend=extend.right, color=bullSignalColorInput, width=2)
+            array.push(upperPivotLines, pivotLine)
+            array.push(upperPivotLevels, pivotHigh)
+            array.push(upperPivotActive, true)
+        prevHighPivotLevel := pivotHigh
+        prevHighPivotClose := pivotClose
+
+    if not na(pivotLow) and pivotLow < oversoldInput
+        int   pivotBar   = bar_index - pivotLookRightInput
+        float pivotClose = close[pivotLookRightInput]
+        bool shouldCreate = na(prevLowPivotLevel) or
+             (pivotLow < prevLowPivotLevel and (not priceDirectionFilterInput or pivotClose < prevLowPivotClose))
+        if shouldCreate
+            line pivotLine = line.new(pivotBar, pivotLow, pivotBar + 1, pivotLow,
+                 extend=extend.right, color=bearSignalColorInput, width=2)
+            array.push(lowerPivotLines, pivotLine)
+            array.push(lowerPivotLevels, pivotLow)
+            array.push(lowerPivotActive, true)
+        prevLowPivotLevel := pivotLow
+        prevLowPivotClose := pivotClose
+
+// ──────────────────────────────────────────────────────────────────────────────
+// CALCULATIONS — Signal Logic + Box Creation
+// ──────────────────────────────────────────────────────────────────────────────
+bool rawBullSignal    = false
+bool rawBearSignal    = false
+bool bullBoxPlaced    = false
+bool bearBoxPlaced    = false
+
+if isPivotMode
+    // Check upper pivot breakouts
+    int upperCount = array.size(upperPivotLines)
+    if upperCount > 0
+        for j = 0 to upperCount - 1
+            int idx = upperCount - 1 - j
+            if array.get(upperPivotActive, idx)
+                float level     = array.get(upperPivotLevels, idx)
+                line  pivotLine = array.get(upperPivotLines, idx)
+                int   startBar  = line.get_x1(pivotLine)
+                bool  broken    = oscillatorValue > level
+                bool  expired   = maxPivotLineBarsInput > 0 and (bar_index - startBar >= maxPivotLineBarsInput)
+                if broken or expired
+                    int endBar = broken ? bar_index : startBar + maxPivotLineBarsInput
+                    line.set_x2(pivotLine, endBar)
+                    line.set_extend(pivotLine, extend.none)
+                    array.set(upperPivotActive, idx, false)
+                    if broken
+                        rawBullSignal := true
+                        if not bullBoxPlaced
+                            box signalBox = box.new(bar_index, high, bar_index, low,
+                                 border_color=bullSignalColorInput,
+                                 bgcolor=color.new(bullSignalColorInput, 85), force_overlay=true)
+                            array.push(signalBoxes, signalBox)
+                            array.push(signalBoxTopEdge, high)
+                            array.push(signalBoxBotEdge, low)
+                            bullBoxPlaced := true
+
+    // Check lower pivot breakdowns
+    int lowerCount = array.size(lowerPivotLines)
+    if lowerCount > 0
+        for j = 0 to lowerCount - 1
+            int idx = lowerCount - 1 - j
+            if array.get(lowerPivotActive, idx)
+                float level     = array.get(lowerPivotLevels, idx)
+                line  pivotLine = array.get(lowerPivotLines, idx)
+                int   startBar  = line.get_x1(pivotLine)
+                bool  broken    = oscillatorValue < level
+                bool  expired   = maxPivotLineBarsInput > 0 and (bar_index - startBar >= maxPivotLineBarsInput)
+                if broken or expired
+                    int endBar = broken ? bar_index : startBar + maxPivotLineBarsInput
+                    line.set_x2(pivotLine, endBar)
+                    line.set_extend(pivotLine, extend.none)
+                    array.set(lowerPivotActive, idx, false)
+                    if broken
+                        rawBearSignal := true
+                        if not bearBoxPlaced
+                            box signalBox = box.new(bar_index, high, bar_index, low,
+                                 border_color=bearSignalColorInput,
+                                 bgcolor=color.new(bearSignalColorInput, 85), force_overlay=true)
+                            array.push(signalBoxes, signalBox)
+                            array.push(signalBoxTopEdge, high)
+                            array.push(signalBoxBotEdge, low)
+                            bearBoxPlaced := true
+
+else
+    // OB/OS Continuation mode
+    bool bullCrossed = ta.crossover(oscillatorValue, overboughtInput)
+    bool bearCrossed = ta.crossunder(oscillatorValue, oversoldInput)
+
+    if bullCrossed
+        rawBullSignal := true
+        if not bullBoxPlaced
+            box signalBox = box.new(bar_index, high, bar_index, low,
+                 border_color=bullSignalColorInput,
+                 bgcolor=color.new(bullSignalColorInput, 85), force_overlay=true)
+            array.push(signalBoxes, signalBox)
+            array.push(signalBoxTopEdge, high)
+            array.push(signalBoxBotEdge, low)
+            bullBoxPlaced := true
+
+    if bearCrossed
+        rawBearSignal := true
+        if not bearBoxPlaced
+            box signalBox = box.new(bar_index, high, bar_index, low,
+                 border_color=bearSignalColorInput,
+                 bgcolor=color.new(bearSignalColorInput, 85), force_overlay=true)
+            array.push(signalBoxes, signalBox)
+            array.push(signalBoxTopEdge, high)
+            array.push(signalBoxBotEdge, low)
+            bearBoxPlaced := true
+
+// ──────────────────────────────────────────────────────────────────────────────
+// CALCULATIONS — Box Extension + Breakout Detection
+// ──────────────────────────────────────────────────────────────────────────────
+bool boxBreakoutBull = false
+bool boxBreakoutBear = false
+
+int boxCount = array.size(signalBoxes)
+if boxCount > 0
+    for j = 0 to boxCount - 1
+        int idx = boxCount - 1 - j
+        box  currentBox = array.get(signalBoxes, idx)
+        float topEdge   = array.get(signalBoxTopEdge, idx)
+        float botEdge   = array.get(signalBoxBotEdge, idx)
+
+        box.set_right(currentBox, bar_index)
+
+        bool pierced = close > topEdge or close < botEdge
+        if pierced
+            if close > topEdge
+                boxBreakoutBull := true
+            else
+                boxBreakoutBear := true
+            array.remove(signalBoxes, idx)
+            array.remove(signalBoxTopEdge, idx)
+            array.remove(signalBoxBotEdge, idx)
+
+// ──────────────────────────────────────────────────────────────────────────────
+// CALCULATIONS — Apply Filters to Box Breakout Signals
+// ──────────────────────────────────────────────────────────────────────────────
+bool cooldownClear = (bar_index - lastSignalBar) >= signalCooldownInput
+bool trendBullOk   = useTrendFilterInput ? close > trendFilterEma : true
+bool trendBearOk   = useTrendFilterInput ? close < trendFilterEma : true
+bool barConfirmed  = barCloseConfirmInput ? barstate.isconfirmed : true
+
+bool confirmedBullBreakout = boxBreakoutBull and cooldownClear and trendBullOk and barConfirmed
+bool confirmedBearBreakout = boxBreakoutBear and cooldownClear and trendBearOk and barConfirmed
+
+if confirmedBullBreakout
+    lastSignalBar    := bar_index
+    totalBullSignals += 1
+if confirmedBearBreakout
+    lastSignalBar    := bar_index
+    totalBearSignals += 1
+
+// ──────────────────────────────────────────────────────────────────────────────
+// CALCULATIONS — TP/SL Trade Overlay
+// ──────────────────────────────────────────────────────────────────────────────
+if (confirmedBullBreakout or confirmedBearBreakout) and showTradeOverlayInput
+    line.delete(tradeEntryLine),   label.delete(tradeEntryLabel)
+    line.delete(tradeSlLine),      label.delete(tradeSlLabel)
+    line.delete(tradeTp1Line),     label.delete(tradeTp1Label)
+    line.delete(tradeTp2Line),     label.delete(tradeTp2Label)
+    line.delete(tradeTp3Line),     label.delete(tradeTp3Label)
+    line.delete(tradeExtremeLine)
+    linefill.delete(tradeRiskFill), linefill.delete(tradeRewardFill)
+
+    int   dir        = confirmedBullBreakout ? 1 : -1
+    tradeDirection  := dir
+    tradeEntryBar   := bar_index
+    float entryPx    = close
+    float riskDist   = atrBasedSlInput ? atrValue * slAtrFactorInput : entryPx * (slPercentInput / 100)
+
+    float slPx  = dir == 1 ? entryPx - riskDist : entryPx + riskDist
+    float tp1Px = dir == 1 ? entryPx + riskDist * tp1RatioInput : entryPx - riskDist * tp1RatioInput
+    float tp2Px = dir == 1 ? entryPx + riskDist * tp2RatioInput : entryPx - riskDist * tp2RatioInput
+    float tp3Px = dir == 1 ? entryPx + riskDist * tp3RatioInput : entryPx - riskDist * tp3RatioInput
+
+    // Determine extreme TP for fill zone
+    float extremePx = na
+    if showTp3LineInput
+        extremePx := tp3Px
+    if showTp2LineInput
+        extremePx := na(extremePx) ? tp2Px : dir == 1 ? math.max(extremePx, tp2Px) : math.min(extremePx, tp2Px)
+    if showTp1LineInput
+        extremePx := na(extremePx) ? tp1Px : dir == 1 ? math.max(extremePx, tp1Px) : math.min(extremePx, tp1Px)
+
+    color dirColor = dir == 1 ? bullSignalColorInput : bearSignalColorInput
+    tradeEntryLine  := line.new(bar_index, entryPx, bar_index + 1, entryPx,
+         color=dirColor, width=2, extend=extend.right, force_overlay=true)
+    tradeEntryLabel := label.new(bar_index, entryPx,
+         (dir == 1 ? "LONG " : "SHORT ") + str.tostring(entryPx, format.mintick),
+         style=label.style_label_left, color=dirColor, textcolor=color.white,
+         size=size.small, force_overlay=true)
+
+    if showSlLineInput
+        tradeSlLine  := line.new(bar_index, slPx, bar_index + 1, slPx,
+             color=bearLightColor, width=1, style=line.style_dashed, extend=extend.right, force_overlay=true)
+        tradeSlLabel := label.new(bar_index, slPx,
+             "SL " + str.tostring(slPx, format.mintick),
+             style=label.style_label_left, color=bearLightColor, textcolor=color.white,
+             size=size.small, force_overlay=true)
+
+    if showTp1LineInput
+        tradeTp1Line  := line.new(bar_index, tp1Px, bar_index + 1, tp1Px,
+             color=bullLightColor, width=1, extend=extend.right, force_overlay=true)
+        tradeTp1Label := label.new(bar_index, tp1Px,
+             "TP1 " + str.tostring(tp1Px, format.mintick),
+             style=label.style_label_left, color=bullLightColor, textcolor=color.white,
+             size=size.small, force_overlay=true)
+
+    if showTp2LineInput
+        tradeTp2Line  := line.new(bar_index, tp2Px, bar_index + 1, tp2Px,
+             color=bullLightColor, width=1, extend=extend.right, force_overlay=true)
+        tradeTp2Label := label.new(bar_index, tp2Px,
+             "TP2 " + str.tostring(tp2Px, format.mintick),
+             style=label.style_label_left, color=bullLightColor, textcolor=color.white,
+             size=size.small, force_overlay=true)
+
+    if showTp3LineInput
+        tradeTp3Line  := line.new(bar_index, tp3Px, bar_index + 1, tp3Px,
+             color=bullLightColor, width=1, style=line.style_dotted, extend=extend.right, force_overlay=true)
+        tradeTp3Label := label.new(bar_index, tp3Px,
+             "TP3 " + str.tostring(tp3Px, format.mintick),
+             style=label.style_label_left, color=bullLightColor, textcolor=color.white,
+             size=size.small, force_overlay=true)
+
+    // Risk/reward fills
+    if showSlLineInput
+        tradeRiskFill := linefill.new(tradeEntryLine, tradeSlLine, bearFillColor)
+
+    float fillExtreme = entryPx
+    if showTp1LineInput
+        fillExtreme := dir == 1 ? math.max(fillExtreme, tp1Px) : math.min(fillExtreme, tp1Px)
+    if showTp2LineInput
+        fillExtreme := dir == 1 ? math.max(fillExtreme, tp2Px) : math.min(fillExtreme, tp2Px)
+    if showTp3LineInput
+        fillExtreme := dir == 1 ? math.max(fillExtreme, tp3Px) : math.min(fillExtreme, tp3Px)
+
+    if (dir == 1 and fillExtreme > entryPx) or (dir == -1 and fillExtreme < entryPx)
+        tradeExtremeLine := line.new(bar_index, fillExtreme, bar_index + 1, fillExtreme,
+             color=na, extend=extend.right, force_overlay=true)
+        tradeRewardFill  := linefill.new(tradeEntryLine, tradeExtremeLine, bullFillColor)
+
+    tradeSlLevel   := slPx
+    tradeExtremeTP := extremePx
+
+// ──────────────────────────────────────────────────────────────────────────────
+// VISUALS — Oscillator Plot
+// ──────────────────────────────────────────────────────────────────────────────
+plot(oscillatorValue, color=oscillatorColorInput, linewidth=2, title="Volume Momentum Oscillator")
+hline(0, color=zeroLineColorInput, title="Zero Line")
+hline(overboughtInput, color=obBandColorInput, linestyle=hline.style_dashed, title="OB Level")
+hline(oversoldInput, color=osBandColorInput, linestyle=hline.style_dashed, title="OS Level")
+
+obPlotLine = plot(overboughtInput, color=na, display=display.none)
+osPlotLine = plot(oversoldInput, color=na, display=display.none)
+fill(obPlotLine, osPlotLine, color=zoneGradientColorInput, title="OB/OS Zone")
+
+// ──────────────────────────────────────────────────────────────────────────────
+// VISUALS — Signal Highlights & Triangles
+// ──────────────────────────────────────────────────────────────────────────────
+bgcolor(rawBullSignal ? color.new(bullSignalColorInput, 70) : na, title="Bull Signal BG")
+bgcolor(rawBearSignal ? color.new(bearSignalColorInput, 70) : na, title="Bear Signal BG")
+
+// Volume surge highlight
+bgcolor(showVolumeSurgeInput and isVolumeSurge ? color.new(COLOR_SURGE, 88) : na, title="Volume Surge BG")
+
+plotshape(confirmedBullBreakout, title="Bull Breakout", location=location.belowbar,
+     color=bullSignalColorInput, style=shape.triangleup, size=size.small, force_overlay=true)
+plotshape(confirmedBearBreakout, title="Bear Breakout", location=location.abovebar,
+     color=bearSignalColorInput, style=shape.triangledown, size=size.small, force_overlay=true)
+
+// ──────────────────────────────────────────────────────────────────────────────
+// VISUALS — Moving Labels & Trade Closure
+// ──────────────────────────────────────────────────────────────────────────────
+if tradeDirection != 0
+    label.set_x(tradeEntryLabel, bar_index)
+    if not na(tradeSlLabel)
+        label.set_x(tradeSlLabel, bar_index)
+    if not na(tradeTp1Label)
+        label.set_x(tradeTp1Label, bar_index)
+    if not na(tradeTp2Label)
+        label.set_x(tradeTp2Label, bar_index)
+    if not na(tradeTp3Label)
+        label.set_x(tradeTp3Label, bar_index)
+
+    bool slTriggered = tradeDirection == 1 ? low <= tradeSlLevel : high >= tradeSlLevel
+    bool tpTriggered = not na(tradeExtremeTP) and
+         (tradeDirection == 1 ? high >= tradeExtremeTP : low <= tradeExtremeTP)
+
+    if bar_index > tradeEntryBar and (slTriggered or tpTriggered)
+        line.set_extend(tradeEntryLine, extend.none)
+        line.set_x2(tradeEntryLine, bar_index)
+        if not na(tradeSlLine)
+            line.set_extend(tradeSlLine, extend.none)
+            line.set_x2(tradeSlLine, bar_index)
+        if not na(tradeTp1Line)
+            line.set_extend(tradeTp1Line, extend.none)
+            line.set_x2(tradeTp1Line, bar_index)
+        if not na(tradeTp2Line)
+            line.set_extend(tradeTp2Line, extend.none)
+            line.set_x2(tradeTp2Line, bar_index)
+        if not na(tradeTp3Line)
+            line.set_extend(tradeTp3Line, extend.none)
+            line.set_x2(tradeTp3Line, bar_index)
+        if not na(tradeExtremeLine)
+            line.set_extend(tradeExtremeLine, extend.none)
+            line.set_x2(tradeExtremeLine, bar_index)
+        tradeDirection := 0
+
+// ──────────────────────────────────────────────────────────────────────────────
+// VISUALS — Dashboard
+// ──────────────────────────────────────────────────────────────────────────────
+var table infoPanel = table.new(position.top_right, 2, 12,
+     bgcolor=COLOR_PANEL_BG, border_width=1, border_color=color.new(color.gray, 60))
+
+if barstate.islast and showDashboardInput
+    table.cell(infoPanel, 0, 0, VP_LABEL, text_color=color.white, bgcolor=COLOR_PANEL_HDR,
+         text_size=getFontSize(dashFontSizeInput), text_halign=text.align_center)
+    table.cell(infoPanel, 1, 0, "VOL-MOM", text_color=color.white, bgcolor=COLOR_PANEL_HDR,
+         text_size=getFontSize(dashFontSizeInput), text_halign=text.align_center)
+
+    addPanelRow(infoPanel, 1, "Mode", signalModeInput == MODE_PIVOT ? "PIVOT" : "OB/OS",
+         color.white, dashFontSizeInput)
+    addPanelRow(infoPanel, 2, "Oscillator", str.tostring(oscillatorValue, "#.#"),
+         oscillatorValue > overboughtInput ? COLOR_BULL : oscillatorValue < oversoldInput ? COLOR_BEAR : COLOR_NEUTRAL,
+         dashFontSizeInput)
+    addPanelRow(infoPanel, 3, "Volume", volume > volMean ? "ABOVE AVG" : "BELOW AVG",
+         volume > volMean ? COLOR_BULL : COLOR_NEUTRAL, dashFontSizeInput)
+    addPanelRow(infoPanel, 4, "Vol Surge",
+         isVolumeSurge ? str.tostring(volume / volMean, "#.#") + "x" : "---",
+         isVolumeSurge ? COLOR_SURGE : COLOR_NEUTRAL, dashFontSizeInput)
+    addPanelRow(infoPanel, 5, "ATR (" + str.tostring(atrCalcPeriodInput) + ")",
+         str.tostring(atrValue, "#.##"), color.white, dashFontSizeInput)
+
+    // Active boxes
+    addPanelRow(infoPanel, 6, "Active Boxes", str.tostring(array.size(signalBoxes)),
+         array.size(signalBoxes) > 0 ? COLOR_SURGE : COLOR_NEUTRAL, dashFontSizeInput)
+
+    // Trade info
+    string posText = tradeDirection == 1 ? "LONG" : tradeDirection == -1 ? "SHORT" : "FLAT"
+    color posColor = tradeDirection == 1 ? COLOR_BULL : tradeDirection == -1 ? COLOR_BEAR : COLOR_NEUTRAL
+    addPanelRow(infoPanel, 7, "Position", posText, posColor, dashFontSizeInput)
+
+    // Signal counts
+    addPanelRow(infoPanel, 8, "Bull Signals", str.tostring(totalBullSignals), COLOR_BULL, dashFontSizeInput)
+    addPanelRow(infoPanel, 9, "Bear Signals", str.tostring(totalBearSignals), COLOR_BEAR, dashFontSizeInput)
+
+    // Trend filter status
+    string trendText = useTrendFilterInput ? (close > trendFilterEma ? "BULLISH" : "BEARISH") : "OFF"
+    color trendColor = useTrendFilterInput ? (close > trendFilterEma ? COLOR_BULL : COLOR_BEAR) : COLOR_NEUTRAL
+    addPanelRow(infoPanel, 10, "Trend Filter", trendText, trendColor, dashFontSizeInput)
+
+    addPanelRow(infoPanel, 11, "Cooldown",
+         signalCooldownInput > 0 ? str.tostring(signalCooldownInput) + " bars" : "OFF",
+         COLOR_NEUTRAL, dashFontSizeInput)
+
+// ──────────────────────────────────────────────────────────────────────────────
+// CLEANUP — Prevent Array Overflow
+// ──────────────────────────────────────────────────────────────────────────────
+while array.size(upperPivotLines) > 250
+    line.delete(array.shift(upperPivotLines))
+    array.shift(upperPivotLevels)
+    array.shift(upperPivotActive)
+
+while array.size(lowerPivotLines) > 250
+    line.delete(array.shift(lowerPivotLines))
+    array.shift(lowerPivotLevels)
+    array.shift(lowerPivotActive)
+
+while array.size(signalBoxes) > 100
+    box.delete(array.shift(signalBoxes))
+    array.shift(signalBoxTopEdge)
+    array.shift(signalBoxBotEdge)
+
+// ──────────────────────────────────────────────────────────────────────────────
+// ALERTS
+// ──────────────────────────────────────────────────────────────────────────────
+alertcondition(confirmedBullBreakout,
+     title="Bullish Box Breakout",
+     message="[Viprasol Vol-Mom] LONG breakout on {{ticker}} at {{close}} | TF: {{interval}}")
+
+alertcondition(confirmedBearBreakout,
+     title="Bearish Box Breakout",
+     message="[Viprasol Vol-Mom] SHORT breakout on {{ticker}} at {{close}} | TF: {{interval}}")
+
+alertcondition(confirmedBullBreakout or confirmedBearBreakout,
+     title="Any Box Breakout",
+     message="[Viprasol Vol-Mom] Breakout signal on {{ticker}} at {{close}} | TF: {{interval}}")
+
+alertcondition(rawBullSignal,
+     title="Bullish Oscillator Signal",
+     message="[Viprasol Vol-Mom] Bullish oscillator trigger on {{ticker}} | TF: {{interval}}")
+
+alertcondition(rawBearSignal,
+     title="Bearish Oscillator Signal",
+     message="[Viprasol Vol-Mom] Bearish oscillator trigger on {{ticker}} | TF: {{interval}}")
+
+alertcondition(isVolumeSurge,
+     title="Volume Surge Detected",
+     message="[Viprasol Vol-Mom] Volume surge on {{ticker}} at {{close}} | TF: {{interval}}")

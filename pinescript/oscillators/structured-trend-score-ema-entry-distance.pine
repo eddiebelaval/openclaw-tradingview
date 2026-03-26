@@ -1,0 +1,245 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © Naixis
+//@version=6
+indicator("Damian's Indicator Updated - Structured + Dist% Entry", overlay=false, max_labels_count=50, max_lines_count=50)
+
+//=============================================================================
+// 1) INPUTS
+//=============================================================================
+groupData = "Données"
+srcType   = input.string("close", "Type de prix", options=["close", "hl2", "ohlc4"], group=groupData)
+lenFastIn = input.int(20, "Longueur rapide", minval=1, group=groupData)
+lenSlowIn = input.int(50, "Longueur lente", minval=2, group=groupData)
+
+groupEMA  = "EMA Entry/TP (Distance %)"
+useHTF    = input.bool(true, "Utiliser EMA en HTF (ex: Weekly)", group=groupEMA)
+htfTf     = input.timeframe("W", "Timeframe HTF", group=groupEMA)
+emaLength = input.int(100, "Longueur EMA Principale", group=groupEMA, minval=1)
+multTP    = input.float(1.7, "Multiplicateur TP (EMA*1.7)", group=groupEMA, step=0.05, minval=1.0)
+multEntry = input.float(0.7, "Multiplicateur Entrée (EMA*0.7)", group=groupEMA, step=0.05, minval=0.1)
+
+nearZonePct = input.float(2.0, "Proche si distance <= (%)", group=groupEMA, step=0.1, minval=0.0)
+midZonePct  = input.float(5.0, "Moyen si distance <= (%)", group=groupEMA, step=0.1, minval=0.0)
+
+groupUI   = "Affichage"
+showTable = input.bool(true, "Afficher table", group=groupUI)
+showDisc  = input.bool(true, "Afficher disclaimer", group=groupUI)
+showBands = input.bool(true, "Afficher bandes de couleur (score)", group=groupUI, tooltip="Rouge: <=35 | Vert: >=65")
+showEntryDistPlot = input.bool(true, "Afficher courbe distance % -> Entry", group=groupUI)
+
+groupAl   = "Alertes"
+hiThresh  = input.float(62, "Seuil haussier", minval=0, maxval=100, group=groupAl)
+loThresh  = input.float(38, "Seuil baissier", minval=0, maxval=100, group=groupAl)
+
+//=============================================================================
+// 2) CONSTANTS / STATE
+//=============================================================================
+string DISCLAIMER = "Cet indicateur montre des régularités historiques, pas des probabilités futures. Les performances passées ne préjugent pas des résultats futurs."
+
+var table t = table.new(position.bottom_center, 6, 2, border_width=1)
+var label discLbl = na
+
+//=============================================================================
+// 3) SOURCE
+//=============================================================================
+float src = switch srcType
+    "hl2"   => hl2
+    "ohlc4" => ohlc4
+    => close
+
+//=============================================================================
+// 4) HELPERS
+//=============================================================================
+f_clamp(float x, float lo, float hi) =>
+    math.max(lo, math.min(hi, x))
+
+f_luma(color c) =>
+    float r = color.r(c), g = color.g(c), b = color.b(c)
+    (0.299 * r + 0.587 * g + 0.114 * b) / 255.0
+
+f_txtColor(color bg) =>
+    f_luma(bg) > 0.60 ? color.black : color.white
+
+f_heat(float v) =>
+    float x = f_clamp(v, 0, 100)
+    color c = color.new(color.red, 0)
+    if x >= 70
+        c := color.new(color.green, 0)
+    else if x >= 60
+        c := color.new(color.lime, 0)
+    else if x >= 50
+        c := color.new(color.yellow, 0)
+    else if x >= 40
+        c := color.new(color.orange, 0)
+    else
+        c := color.new(color.red, 0)
+    c
+
+f_fmt1(float v) =>
+    na(v) ? "na" : str.tostring(v, "#.0")
+
+f_fmt2(float v) =>
+    na(v) ? "na" : str.tostring(v, "#.##")
+
+f_fmtPct(float v) =>
+    na(v) ? "na" : str.tostring(v, "#.##") + "%"
+
+f_cell(table tbl, int col, int row, string txt, color bg, string tip="") =>
+    table.cell(tbl, col, row, txt, text_color=f_txtColor(bg), bgcolor=bg, tooltip=tip)
+
+// Score de tendance (0..100)
+f_trendScore(float fastMA, float slowMA, float rsiVal, float atrVal, float price) =>
+    float maScore    = fastMA > slowMA ? 40 : 10
+    float rsiScore   = f_clamp(rsiVal, 0, 100) * 0.4
+    float priceScore = (price > fastMA ? 10 : 0) + (price > slowMA ? 10 : 0)
+    float denom      = math.max(price, syminfo.mintick)
+    float atrScore   = f_clamp((atrVal / denom) * 1000.0, 0, 10)
+    f_clamp(maScore + rsiScore + priceScore + atrScore, 0, 100)
+
+//=============================================================================
+// 5) CORE CALCULATIONS
+//=============================================================================
+int lenSlow = math.max(2, lenSlowIn)
+int lenFast = math.max(1, math.min(lenFastIn, lenSlow - 1))
+
+float smaFast = ta.sma(src, lenFast)
+float smaSlow = ta.sma(src, lenSlow)
+float rsi14   = ta.rsi(src, 14)
+float atr14   = ta.atr(14)
+
+bool ready = not na(smaFast) and not na(smaSlow) and not na(rsi14) and not na(atr14)
+
+float trendScore = ready ? f_trendScore(smaFast, smaSlow, rsi14, atr14, src) : na
+float scoreSma   = ta.sma(trendScore, 20)
+
+//=============================================================================
+// 5bis) EMA Entry/TP + distance % (vs close TF courant)
+//=============================================================================
+float emaBase = useHTF
+     ? request.security(
+            syminfo.tickerid,
+            htfTf,
+            ta.ema(close, emaLength),
+            gaps=barmerge.gaps_off,
+            lookahead=barmerge.lookahead_off
+       )
+     : ta.ema(close, emaLength)
+
+float entryLevelLong = emaBase * multEntry
+float tpLevelLong    = emaBase * multTP
+
+float denomClose = math.max(close, syminfo.mintick)
+
+float distPctToEntry = ready ? 100.0 * math.abs(entryLevelLong - close) / denomClose : na
+float pctToTP        = ready ? 100.0 * (tpLevelLong - close) / denomClose : na
+
+string zoneTag = na(distPctToEntry) ? "na" :
+                 distPctToEntry <= nearZonePct ? "PROCHE" :
+                 distPctToEntry <= midZonePct  ? "MOYEN"  : "LOIN"
+
+color zoneColor = na(distPctToEntry) ? color.new(color.gray, 60) :
+                  distPctToEntry <= nearZonePct ? color.new(color.green, 0) :
+                  distPctToEntry <= midZonePct  ? color.new(color.orange, 0) :
+                                                  color.new(color.red, 0)
+
+//=============================================================================
+// 6) SIGNALS + ALERT LOGIC
+// IMPORTANT: crossover/crossunder doivent être appelés sur chaque bar
+//=============================================================================
+float tsSafe  = na(trendScore) ? 0.0 : trendScore
+float smaSafe = na(scoreSma)   ? 0.0 : scoreSma
+
+bool bullCrossRaw = ta.crossover(tsSafe, hiThresh)
+bool bearCrossRaw = ta.crossunder(tsSafe, loThresh)
+bool crossUpRaw   = ta.crossover(tsSafe, smaSafe)
+bool crossDownRaw = ta.crossunder(tsSafe, smaSafe)
+
+// Signaux filtrés (évite les alertes sur périodes non initialisées)
+bool bullCross = ready and bullCrossRaw
+bool bearCross = ready and bearCrossRaw
+bool crossUp   = ready and not na(scoreSma) and crossUpRaw
+bool crossDown = ready and not na(scoreSma) and crossDownRaw
+
+bool nearEntry = ready and (distPctToEntry <= nearZonePct)
+
+// Alertes TradingView
+alertcondition(bullCross, "Bull signal", "Score > bullish threshold")
+alertcondition(bearCross, "Bear signal", "Score < bearish threshold")
+alertcondition(crossUp, "Bullish cross", "Trend score crossed above its SMA(20)")
+alertcondition(crossDown, "Bearish cross", "Trend score crossed below its SMA(20)")
+alertcondition(nearEntry, "Near Entry zone", "Price is near the EMA-based Entry zone (distance <= threshold)")
+
+//=============================================================================
+// 7) PLOTTING
+//=============================================================================
+color bg = na
+if showBands and ready and not na(trendScore)
+    bg := trendScore <= 35 ? color.new(color.red, 85) :
+          trendScore >= 65 ? color.new(color.green, 85) : na
+bgcolor(bg, title="Bandes Score")
+
+plot(trendScore, title="Score de Tendance", color=color.black, linewidth=2)
+plot(scoreSma,   title="SMA(20) Score",     color=color.aqua,  linewidth=1)
+
+plotshape(series=crossUp ? trendScore : na,   title="Croisement Haussier", style=shape.triangleup,
+     location=location.absolute, color=color.green, size=size.small)
+plotshape(series=crossDown ? trendScore : na, title="Croisement Baissier", style=shape.triangledown,
+     location=location.absolute, color=color.red, size=size.small)
+
+hline(0,           "0% (sur Entry)", color=color.new(color.gray, 70))
+hline(nearZonePct, "Seuil PROCHE",   color=color.new(color.green, 75))
+hline(midZonePct,  "Seuil MOYEN",    color=color.new(color.orange, 80))
+
+plot(showEntryDistPlot ? distPctToEntry : na, title="Distance % -> Entry (abs)", color=zoneColor, linewidth=2)
+
+//=============================================================================
+// 8) UI / TABLE / DISCLAIMER
+//=============================================================================
+if barstate.islast
+    if showTable
+        // Table horizontale: 2 lignes x 6 colonnes (compact en bas à gauche)
+        table.clear(t, 0, 0, 5, 1)
+
+        // LIGNE 0 = libellés
+        f_cell(t, 0, 0, "Score",         color.new(color.gray, 85))
+        f_cell(t, 1, 0, "RSI(14)",       color.new(color.gray, 85))
+        f_cell(t, 2, 0, "MA Fast",       color.new(color.gray, 85))
+        f_cell(t, 3, 0, "MA Slow",       color.new(color.gray, 85))
+        f_cell(t, 4, 0, "ATR(14)",       color.new(color.gray, 85))
+        f_cell(t, 5, 0, "Dist->Entry",   color.new(color.gray, 85), "100*abs(Entry - Close)/Close")
+
+        // LIGNE 1 = valeurs
+        f_cell(t, 0, 1, na(trendScore) ? "na" : (f_fmt1(trendScore) + "%"),
+              na(trendScore) ? color.new(color.gray, 70) : f_heat(trendScore))
+        f_cell(t, 1, 1, f_fmt1(rsi14), f_heat(rsi14))
+        f_cell(t, 2, 1, f_fmt1(smaFast), color.new(color.green, 20))
+        f_cell(t, 3, 1, f_fmt1(smaSlow), color.new(color.blue, 20))
+        f_cell(t, 4, 1, f_fmt2(atr14), color.new(color.purple, 20))
+        f_cell(t, 5, 1, f_fmtPct(distPctToEntry) + " (" + zoneTag + ")", color.new(zoneColor, 70))
+        
+    else
+        table.clear(t, 0, 0, 5, 1)
+
+    if showDisc and not na(trendScore)
+        int labelX = bar_index - math.min(bar_index, 20)
+        if na(discLbl)
+            discLbl := label.new(
+                x=labelX,
+                y=trendScore,
+                text=DISCLAIMER,
+                style=label.style_label_left,
+                textcolor=color.new(color.white, 30),
+                color=color.new(color.black, 90),
+                textalign=text.align_left,
+                size=size.small,
+                tooltip="Information importante"
+            )
+        else
+            label.set_x(discLbl, labelX)
+            label.set_y(discLbl, trendScore)
+            label.set_text(discLbl, DISCLAIMER)
+            label.set_tooltip(discLbl, "Information importante")
+    else
+        if not na(discLbl)
+            label.delete(discLbl)
+            discLbl := na

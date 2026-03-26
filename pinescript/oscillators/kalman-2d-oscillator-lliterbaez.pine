@@ -1,0 +1,212 @@
+// ╔══════════════════════════════════════════════════════════════════════════════╗
+// ║   KKalman 2D Oscillator [LliterBaez]                                         ║
+// ║   Author  : @LliterBaez                                                      ║
+// ║   Version : 1.0 — Open Source                                                ║
+// ║                                                                              ║
+// ║   Works well on XAU/USD and major indices.                                   ║
+// ║   Test it on your favorite instrument and timeframe.                         ║
+// ║                                                                              ║
+// ║   HOW THE MATH WORKS                                                         ║
+// ║   ─────────────────────────────────────────────────────────────────────      ║
+// ║   State vector  : x = [price, velocity]ᵀ  (2D)                               ║
+// ║   Transition    : F = [[1,1],[0,1]]  (constant velocity model)               ║
+// ║   Observation   : H = [1, 0]  (we only observe price)                        ║
+// ║   Adaptive Q/R  : Q and R scale with rolling price volatility                ║
+// ║                                                                              ║
+// ║   OSCILLATOR OUTPUT                                                          ║
+// ║   ─────────────────────────────────────────────────────────────────────      ║
+// ║   Z-score histogram : ỹₖ / sqrt(Sₖ)  — innovation normalized by its std       ║
+// ║     |Z| > 2 sigma  →  price is statistically far from Kalman prediction      ║
+// ║     |Z| > 3 sigma  →  extreme anomaly — high-probability reversion zone      ║
+// ║   Velocity line     : internal momentum of the filter (x1 component)         ║
+// ║     Positive  →  underlying trend is UP                                      ║
+// ║     Negative  →  underlying trend is DOWN                                    ║
+// ║                                                                              ║
+// ║   ENTRY LOGIC (combine both signals)                                         ║
+// ║   ─────────────────────────────────────────────────────────────────────      ║
+// ║   LONG  : Z-score below -2 AND velocity turning UP   (pullback in uptrend)   ║
+// ║   SHORT : Z-score above +2 AND velocity turning DOWN (pullback in downtrend) ║
+// ║   AVOID : Z and velocity pointing same direction = momentum, not anomaly.    ║
+// ╚══════════════════════════════════════════════════════════════════════════════╝
+
+//@version=5
+indicator("Kalman 2D Oscillator [LliterBaez]",
+     shorttitle  = "KF2D-OSC",
+     overlay     = false,
+     max_bars_back = 500)
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  INPUTS
+// ─────────────────────────────────────────────────────────────────────────────
+var string GRP_CORE  = "Core Settings"
+var string GRP_STYLE = "Visual Style"
+var string GRP_ALERT = "Alerts"
+
+src      = input.source(close,  "Price Source",
+     group   = GRP_CORE)
+
+vol_len  = input.int(20, "Volatility Window (bars)",
+     minval  = 5,
+     maxval  = 200,
+     step    = 1,
+     tooltip = "Number of bars used to compute the adaptive R (measurement noise).\n" +
+               "Higher = smoother but slower to react to regime changes.\n" +
+               "Start with 20 and adjust to your instrument and timeframe.",
+     group   = GRP_CORE)
+
+q_scale  = input.float(0.01, "Q Scale (process noise ratio)",
+     minval  = 0.0001,
+     maxval  = 1.0,
+     step    = 0.001,
+     tooltip = "Controls how much the filter trusts its own prediction vs the market.\n" +
+               "Low  (0.003–0.008) → smoother line, more lag.\n" +
+               "High (0.02–0.08)   → reactive, more noise.\n" +
+               "Start at 0.01 and adjust based on your instrument's volatility.",
+     group   = GRP_CORE)
+
+ob_level = input.float(2.0, "Overbought / Oversold Level (σ)",
+     minval  = 1.0,
+     maxval  = 4.0,
+     step    = 0.1,
+     tooltip = "Z-score threshold to define extreme zones.\n" +
+               "2.0σ covers ~95% of observations statistically.\n" +
+               "2.5σ gives fewer but higher-quality signals.",
+     group   = GRP_CORE)
+
+col_pos  = input.color(#26A69A, "Z > 0 Color",  group = GRP_STYLE)
+col_neg  = input.color(#EF5350, "Z < 0 Color",  group = GRP_STYLE)
+col_vel  = input.color(#FFA726, "Velocity Color", group = GRP_STYLE)
+show_vel = input.bool(true, "Show Velocity Line",
+     tooltip = "Displays the normalized internal velocity (x₁) of the Kalman state.\n" +
+               "Use it to confirm trend direction before acting on Z-score extremes.",
+     group   = GRP_STYLE)
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  ADAPTIVE NOISE PARAMETERS
+//  R (measurement noise covariance) = rolling variance of price
+//  Q (process noise covariance)     = q_scale × R
+//  When volatility rises → R grows → filter trusts individual prices less
+// ─────────────────────────────────────────────────────────────────────────────
+float price_std = ta.stdev(src, vol_len)
+float R_k       = math.pow(price_std, 2)
+float Q_k       = q_scale * R_k
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  KALMAN FILTER STATE  (persistent across bars)
+//  x = [x0 (price estimate), x1 (velocity estimate)]ᵀ
+//  P = 2×2 error covariance matrix  [[P00, P01], [P10, P11]]
+// ─────────────────────────────────────────────────────────────────────────────
+var float x0  = na
+var float x1  = na
+var float P00 = na
+var float P01 = na
+var float P10 = na
+var float P11 = na
+
+if na(x0)
+    x0  := src
+    x1  := 0.0
+    P00 := 1.0
+    P01 := 0.0
+    P10 := 0.0
+    P11 := 1.0
+
+// ── 1. PREDICTION STEP ───────────────────────────────────────────────────────
+//  x_pred = F · x     where F = [[1,1],[0,1]]
+//  P_pred = F · P · Fᵀ + Q·I₂   (expanded analytically)
+float xp0  = x0 + x1
+float xp1  = x1
+float Pp00 = P00 + P01 + P10 + P11 + Q_k
+float Pp01 = P01 + P11
+float Pp10 = P10 + P11
+float Pp11 = P11 + Q_k
+
+// ── 2. INNOVATION ────────────────────────────────────────────────────────────
+//  ỹₖ = zₖ − H · x_pred    where H = [1, 0]
+//  Sₖ = H · P_pred · Hᵀ + R   (innovation covariance, scalar)
+float innov = src - xp0
+float S_k   = Pp00 + R_k
+
+// ── 3. KALMAN GAIN ───────────────────────────────────────────────────────────
+//  Kₖ = P_pred · Hᵀ · Sₖ⁻¹
+float K0 = Pp00 / S_k
+float K1 = Pp10 / S_k
+
+// ── 4. UPDATE STEP ───────────────────────────────────────────────────────────
+//  x̂ₖ = x_pred + K · ỹₖ
+//  Pₖ  = (I − K·H) · P_pred
+x0  := xp0 + K0 * innov
+x1  := xp1 + K1 * innov
+P00 := (1.0 - K0) * Pp00
+P01 := (1.0 - K0) * Pp01
+P10 := Pp10 - K1 * Pp00
+P11 := Pp11 - K1 * Pp01
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  OSCILLATOR OUTPUTS
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Z-score of the innovation  (how many σ away from prediction)
+float zscore   = S_k > 0 ? innov / math.sqrt(S_k) : 0.0
+
+// Velocity normalized by price std dev  (trend direction signal)
+float vel_norm = x1 / math.max(price_std, 0.0001)
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  PLOTS
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Z-score histogram
+plot(zscore,   "Z-Score (Innovation)",
+     color     = zscore >= 0 ? col_pos : col_neg,
+     style     = plot.style_histogram,
+     linewidth = 2)
+
+// Velocity line
+plot(show_vel ? vel_norm : na, "Kalman Velocity (norm.)",
+     color     = col_vel,
+     linewidth = 1,
+     style     = plot.style_line)
+
+// Reference levels
+hline( 0,         "Zero",          color = color.gray,
+       linestyle  = hline.style_solid,  linewidth = 1)
+hline( ob_level,  "+Threshold",    color = color.new(color.red,   40),
+       linestyle  = hline.style_dashed, linewidth = 1)
+hline(-ob_level,  "-Threshold",    color = color.new(color.red,   40),
+       linestyle  = hline.style_dashed, linewidth = 1)
+hline( 1,         "+1σ",           color = color.new(color.teal,  60),
+       linestyle  = hline.style_dotted, linewidth = 1)
+hline(-1,         "-1σ",           color = color.new(color.teal,  60),
+       linestyle  = hline.style_dotted, linewidth = 1)
+
+// Background zones
+bgcolor(zscore >  ob_level ? color.new(color.red,   92) : na, title = "Overbought Zone")
+bgcolor(zscore < -ob_level ? color.new(color.teal,  92) : na, title = "Oversold Zone")
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  ALERTS
+// ─────────────────────────────────────────────────────────────────────────────
+alertcondition(zscore >  ob_level,
+     title   = "Z-Score Overbought",
+     message = "Kalman 2D [LliterBaez] — Z-Score above +{{plot_0}} σ on {{ticker}} {{interval}}")
+
+alertcondition(zscore < -ob_level,
+     title   = "Z-Score Oversold",
+     message = "Kalman 2D [LliterBaez] — Z-Score below -{{plot_0}} σ on {{ticker}} {{interval}}")
+
+alertcondition(ta.crossover(zscore, 0),
+     title   = "Z-Score Crosses Zero Up",
+     message = "Kalman 2D [LliterBaez] — Momentum shift UP on {{ticker}} {{interval}}")
+
+alertcondition(ta.crossunder(zscore, 0),
+     title   = "Z-Score Crosses Zero Down",
+     message = "Kalman 2D [LliterBaez] — Momentum shift DOWN on {{ticker}} {{interval}}")
+
+alertcondition(ta.crossunder(zscore,  ob_level) and zscore > 0,
+     title   = "Overbought Exit",
+     message = "Kalman 2D [LliterBaez] — Z-Score exiting overbought on {{ticker}} {{interval}}")
+
+alertcondition(ta.crossover(zscore, -ob_level) and zscore < 0,
+     title   = "Oversold Exit",
+     message = "Kalman 2D [LliterBaez] — Z-Score exiting oversold on {{ticker}} {{interval}}")

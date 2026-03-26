@@ -1,0 +1,149 @@
+//@version=6
+// -----------------------------------------------------------------------------
+// | Indicator: Quantum Adaptive HMM Oscillator v2 (Custom Visuals)            |
+// -----------------------------------------------------------------------------
+indicator("Quantum Adaptive HMM Oscillator", shorttitle="Quant_HMM_Adapt", overlay=false)
+
+// ==========================================
+// --- 1. SETTINGS ---
+// ==========================================
+group_obs = "HMM Core Engine"
+length    = input.int(20, "Lookback Period", minval=5, group=group_obs)
+
+group_adapt = "Adaptive Engine (ER)"
+use_adapt = input.bool(true, "Use Adaptive Probabilities", group=group_adapt)
+base_bull = input.float(0.70, "Base P(Bull | Bull)", step=0.05, maxval=0.95, group=group_adapt)
+base_bear = input.float(0.70, "Base P(Bear | Bear)", step=0.05, maxval=0.95, group=group_adapt)
+base_chop = input.float(0.50, "Base P(Chop | Chop)", step=0.05, maxval=0.95, group=group_adapt)
+
+group_sig = "Signal Line & BBs"
+sig_len = input.int(9, "Signal Line EMA", group=group_sig)
+bb_len  = input.int(20, "BB Length", group=group_sig)
+bb_mult = input.float(2.0, "BB StdDev", step=0.1, group=group_sig)
+show_div = input.bool(true, "Show Divergences", group=group_sig)
+
+group_vis = "Visual Theme & Colors"
+c_bull    = input.color(#00FFFF, "Bullish (Cyan)", group=group_vis)
+c_bear    = input.color(#FF00FF, "Bearish (Fuchsia)", group=group_vis)
+c_chop    = input.color(color.gray, "Neutral/Chop", group=group_vis)
+c_sig     = input.color(color.white, "Signal Line", group=group_vis)
+
+// --- NEW BB VISUAL CONTROLS ---
+c_bb_line = input.color(color.new(color.gray, 50), "BB Line Color", group=group_vis)
+c_bb_fill = input.color(color.new(color.gray, 90), "BB Background Fill", group=group_vis)
+
+// ==========================================
+// --- 2. ADAPTIVE LOGIC (Kaufman's ER) ---
+// ==========================================
+float change = math.abs(close - close[length])
+float volatility = math.sum(math.abs(close - close[1]), length)
+float er = volatility != 0 ? change / volatility : 0.0
+
+float dyn_p_stay_bull = use_adapt ? math.min(0.99, base_bull + (er * 0.25)) : base_bull
+float dyn_p_stay_bear = use_adapt ? math.min(0.99, base_bear + (er * 0.25)) : base_bear
+float dyn_p_stay_chop = use_adapt ? math.min(0.99, base_chop + ((1.0 - er) * 0.35)) : base_chop
+
+// ==========================================
+// --- 3. HMM BAYESIAN MATH ENGINE ---
+// ==========================================
+mom_raw = ta.roc(close, 1)
+mom_smooth = ta.ema(mom_raw, length)
+mom_std = ta.stdev(mom_smooth, length)
+obs_mom = mom_std != 0 ? (mom_smooth - ta.sma(mom_smooth, length)) / mom_std : 0.0
+
+vol_raw = ta.atr(length)
+vol_std = ta.stdev(vol_raw, length)
+obs_vol = vol_std != 0 ? (vol_raw - ta.sma(vol_raw, length)) / vol_std : 0.0
+
+f_pdf(_x, _mu, _sigma) =>
+    _var = _sigma * _sigma
+    (1.0 / math.sqrt(2.0 * math.pi * _var)) * math.exp(-math.pow(_x - _mu, 2) / (2.0 * _var))
+
+like_bull = f_pdf(obs_mom, 1.0, 1.0) * f_pdf(obs_vol, -0.5, 1.0)
+like_bear = f_pdf(obs_mom, -1.0, 1.0) * f_pdf(obs_vol, 1.0, 1.0)
+like_chop = f_pdf(obs_mom, 0.0, 0.5) * f_pdf(obs_vol, 1.5, 1.0)
+
+var float prob_bull = 1/3.0
+var float prob_bear = 1/3.0
+var float prob_chop = 1/3.0
+
+trans_bull_bear = (1.0 - dyn_p_stay_bull) * 0.2
+trans_bull_chop = (1.0 - dyn_p_stay_bull) * 0.8
+trans_bear_bull = (1.0 - dyn_p_stay_bear) * 0.2
+trans_bear_chop = (1.0 - dyn_p_stay_bear) * 0.8
+trans_chop_bull = (1.0 - dyn_p_stay_chop) * 0.5
+trans_chop_bear = (1.0 - dyn_p_stay_chop) * 0.5
+
+prior_bull = (prob_bull * dyn_p_stay_bull) + (prob_bear * trans_bear_bull) + (prob_chop * trans_chop_bull)
+prior_bear = (prob_bull * trans_bull_bear) + (prob_bear * dyn_p_stay_bear) + (prob_chop * trans_chop_bear)
+prior_chop = (prob_bull * trans_bull_chop) + (prob_bear * trans_bear_chop) + (prob_chop * dyn_p_stay_chop)
+
+post_bull = prior_bull * like_bull
+post_bear = prior_bear * like_bear
+post_chop = prior_chop * like_chop
+
+total_post = post_bull + post_bear + post_chop
+
+if total_post > 0
+    prob_bull := post_bull / total_post
+    prob_bear := post_bear / total_post
+    prob_chop := post_chop / total_post
+
+pct_bull = prob_bull * 100
+pct_bear = prob_bear * 100
+pct_chop = prob_chop * 100
+
+// ==========================================
+// --- 4. THE NET REGIME OSCILLATOR ---
+// ==========================================
+float net_regime = pct_bull - pct_bear
+float sig_line   = ta.ema(net_regime, sig_len)
+
+color osc_color = color.from_gradient(net_regime, -50, 50, c_bear, c_bull)
+if pct_chop > 50
+    osc_color := c_chop 
+
+// ==========================================
+// --- 5. BOLLINGER BANDS & BOTTLENECKS ---
+// ==========================================
+float bb_basis = ta.sma(net_regime, bb_len)
+float bb_dev   = bb_mult * ta.stdev(net_regime, bb_len)
+float bb_upper = bb_basis + bb_dev
+float bb_lower = bb_basis - bb_dev
+
+float bb_width = bb_upper - bb_lower
+bool is_squeeze = bb_width < ta.percentile_linear_interpolation(bb_width, 50, 20) 
+
+// ==========================================
+// --- 6. DIVERGENCE ENGINE ---
+// ==========================================
+int piv_len = 5
+float ph = ta.pivothigh(net_regime, piv_len, piv_len)
+float pl = ta.pivotlow(net_regime, piv_len, piv_len)
+
+bool bear_div = show_div and not na(ph) and close[piv_len] > ta.valuewhen(not na(ph), close[piv_len], 1) and ph < ta.valuewhen(not na(ph), ph, 1)
+bool bull_div = show_div and not na(pl) and close[piv_len] < ta.valuewhen(not na(pl), close[piv_len], 1) and pl > ta.valuewhen(not na(pl), pl, 1)
+
+// ==========================================
+// --- 7. PLOTTING ---
+// ==========================================
+bgcolor(is_squeeze ? color.new(color.yellow, 90) : na, title="Squeeze Bottleneck")
+
+hline(0, "Zero Line", color=color.new(color.white, 50), linestyle=hline.style_dotted)
+
+// Updated BB Visuals using the new color pickers
+p_upper = plot(bb_upper, "BB Upper", color=c_bb_line)
+p_lower = plot(bb_lower, "BB Lower", color=c_bb_line)
+fill(p_upper, p_lower, color=c_bb_fill, title="BB Background")
+
+plot(sig_line, "Signal Line", color=color.new(c_sig, 30), linewidth=1)
+plot(net_regime, "Net Regime Oscillator", color=osc_color, linewidth=2)
+
+plotshape(bull_div, "Bull Div", shape.labelup, location.bottom, color=color.new(c_bull, 20), text="DIV", textcolor=color.white, offset=-piv_len)
+plotshape(bear_div, "Bear Div", shape.labeldown, location.top, color=color.new(c_bear, 20), text="DIV", textcolor=color.white, offset=-piv_len)
+
+bool long_sig = ta.crossover(net_regime, sig_line) and net_regime < 0
+bool short_sig = ta.crossunder(net_regime, sig_line) and net_regime > 0
+
+plotshape(long_sig, "Signal Cross Up", shape.triangleup, location.bottom, color=c_bull, size=size.tiny)
+plotshape(short_sig, "Signal Cross Down", shape.triangledown, location.top, color=c_bear, size=size.tiny)

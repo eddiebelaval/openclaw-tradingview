@@ -1,0 +1,144 @@
+//@version=6
+indicator("HARSI + Liquidation Bubbles Clean", overlay=true, max_labels_count=500)
+
+//══════════════════════════════════════════════════════════════════════════════
+// INPUTS
+//══════════════════════════════════════════════════════════════════════════════
+
+// ── Liquidation bubbles
+groupB = "Liquidation Bubbles"
+lnt             = input.int(21, "Parameters", group=groupB)
+sens            = input.float(2.5, "Sensitivity", step=0.25, group=groupB)
+comb            = input.bool(false, "Combined Score", group=groupB)
+customasset     = input.symbol("ES1!", "Custom Asset Volume", group=groupB)
+customassetinp  = input.bool(false, "Use Custom Asset Volume", group=groupB)
+upc             = input.color(#2962ff, "Bull Bubble", group=groupB)
+dnc             = input.color(#e91e63, "Bear Bubble", group=groupB)
+
+// ── HARSI
+groupH = "HARSI"
+harsiLen        = input.int(14, "HARSI Length", minval=1, group=groupH)
+harsiSmooth     = input.int(1, "Open Smoothing", minval=1, maxval=100, group=groupH)
+showFlipArrows  = input.bool(true, "Show HARSI Flip Arrows", group=groupH)
+paintBars       = input.bool(true, "Color Bars By HARSI Bias", group=groupH)
+showBiasBand    = input.bool(false, "Show Background Bias", group=groupH)
+
+//══════════════════════════════════════════════════════════════════════════════
+// LIQUIDATION BUBBLES
+//══════════════════════════════════════════════════════════════════════════════
+
+volumex = customassetinp ? request.security(customasset, timeframe.period, volume) : volume
+
+advancedvwma(float src, int len = 21, series float volSeries = volume, float alpha = 1.0, bool inverted = false, bool whenCond = true) =>
+    w = inverted ? 1.0 / math.pow(volSeries, alpha) : math.pow(volSeries, alpha)
+    var numarr = array.new_float()
+    var denarr = array.new_float()
+    if whenCond
+        array.push(numarr, src * w)
+        array.push(denarr, w)
+    if array.size(numarr) > len
+        array.remove(numarr, 0)
+        array.remove(denarr, 0)
+    num = array.avg(numarr)
+    den = array.avg(denarr)
+    num / den
+
+liquidationbubble(int len, float thres, series float volSeries = volume, bool combined = true) =>
+    pricemean   = advancedvwma(close, len, volSeries, 1.0, true, true)
+    pricedev    = math.max(math.abs(high - pricemean), math.abs(pricemean - low))
+    pricedevavg = ta.sma(pricedev, len * 2)
+    pricez      = pricedevavg == 0 ? 0 : (pricedev * (high - pricemean > pricemean - low ? 1 : -1)) / pricedevavg
+
+    volumemean   = advancedvwma(volSeries, len, volSeries, 1.0, true, true)
+    volumedev    = volSeries - volumemean
+    volumedevavg = ta.sma(math.abs(volumedev), len * 2)
+    volumez      = volumedevavg == 0 ? 0 : volumedev / volumedevavg
+
+    combined
+         ? ((math.avg(math.abs(pricez), volumez) > thres) ? math.sign(pricez) * -1 : 0)
+         : ((volumez > thres and math.abs(pricez) > thres) ? math.sign(pricez) * -1 : 0)
+
+bubbleSmall = liquidationbubble(lnt, sens - 0.5, volumex, comb)
+bubbleBig   = liquidationbubble(lnt, sens + 0.5, volumex, comb)
+
+atrPad = ta.atr(100) * 0.25
+
+smallBullY = bubbleSmall > 0 and not (bubbleBig > 0) ? low - atrPad : na
+smallBearY = bubbleSmall < 0 and not (bubbleBig < 0) ? high + atrPad : na
+bigBullY   = bubbleBig > 0 ? low - atrPad : na
+bigBearY   = bubbleBig < 0 ? high + atrPad : na
+
+plot(smallBullY, "Small Bull Bubble", color.new(upc, 50), style=plot.style_circles, linewidth=3)
+plot(smallBearY, "Small Bear Bubble", color.new(dnc, 50), style=plot.style_circles, linewidth=3)
+plot(bigBullY,   "Big Bull Bubble",   color.new(upc, 0),  style=plot.style_circles, linewidth=5)
+plot(bigBearY,   "Big Bear Bubble",   color.new(dnc, 0),  style=plot.style_circles, linewidth=5)
+
+//══════════════════════════════════════════════════════════════════════════════
+// HARSI CORE
+//══════════════════════════════════════════════════════════════════════════════
+
+f_zrsi(float src, int len) =>
+    ta.rsi(src, len) - 50.0
+
+f_rsiHeikinAshi(int len, int smoothing) =>
+    closeRSI = f_zrsi(close, len)
+    openRSI  = nz(closeRSI[1], closeRSI)
+
+    highRSI_raw = f_zrsi(high, len)
+    lowRSI_raw  = f_zrsi(low, len)
+
+    highRSI = math.max(highRSI_raw, lowRSI_raw)
+    lowRSI  = math.min(highRSI_raw, lowRSI_raw)
+
+    haClose = (openRSI + highRSI + lowRSI + closeRSI) / 4.0
+
+    var float haOpen = na
+    haOpen := na(haOpen[smoothing]) ? (openRSI + closeRSI) / 2.0 : ((haOpen[1] * smoothing) + haClose[1]) / (smoothing + 1.0)
+
+    haHigh = math.max(highRSI, math.max(haOpen, haClose))
+    haLow  = math.min(lowRSI, math.min(haOpen, haClose))
+
+    [haOpen, haHigh, haLow, haClose]
+
+[ho, hh, hl, hc] = f_rsiHeikinAshi(harsiLen, harsiSmooth)
+
+harsiBull = hc > ho
+harsiBear = hc < ho
+harsiFlipUp = ta.crossover(hc, ho)
+harsiFlipDn = ta.crossunder(hc, ho)
+
+// Strength proxy from HARSI candle body
+harsiBody = math.abs(hc - ho)
+
+//══════════════════════════════════════════════════════════════════════════════
+// CLEAN VISUALS
+//══════════════════════════════════════════════════════════════════════════════
+
+// Light bar coloring by HARSI bias
+barcolor(paintBars ? (harsiBull ? color.new(color.teal, 65) : color.new(color.red, 65)) : na)
+
+// Optional subtle background
+bgcolor(showBiasBand ? (harsiBull ? color.new(color.teal, 92) : color.new(color.red, 92)) : na)
+
+// HARSI flip arrows
+plotshape(showFlipArrows and harsiFlipUp, title="HARSI Bull Flip", style=shape.triangleup, location=location.belowbar, color=color.teal, size=size.tiny, text="HARSI")
+plotshape(showFlipArrows and harsiFlipDn, title="HARSI Bear Flip", style=shape.triangledown, location=location.abovebar, color=color.red, size=size.tiny, text="HARSI")
+
+//══════════════════════════════════════════════════════════════════════════════
+// OPTIONAL CONFLUENCE MARKERS
+//══════════════════════════════════════════════════════════════════════════════
+
+bullConfluence = (bubbleSmall > 0 or bubbleBig > 0) and harsiBull
+bearConfluence = (bubbleSmall < 0 or bubbleBig < 0) and harsiBear
+
+plotshape(bullConfluence, title="Bull Confluence", style=shape.circle, location=location.belowbar, color=color.new(upc, 0), size=size.tiny, text="C")
+plotshape(bearConfluence, title="Bear Confluence", style=shape.circle, location=location.abovebar, color=color.new(dnc, 0), size=size.tiny, text="C")
+
+//══════════════════════════════════════════════════════════════════════════════
+// ALERTS
+//══════════════════════════════════════════════════════════════════════════════
+
+alertcondition(harsiFlipUp, "HARSI Bull Flip", "HARSI flipped bullish")
+alertcondition(harsiFlipDn, "HARSI Bear Flip", "HARSI flipped bearish")
+alertcondition(bullConfluence, "Bull Confluence", "Bull liquidation bubble with bullish HARSI bias")
+alertcondition(bearConfluence, "Bear Confluence", "Bear liquidation bubble with bearish HARSI bias")

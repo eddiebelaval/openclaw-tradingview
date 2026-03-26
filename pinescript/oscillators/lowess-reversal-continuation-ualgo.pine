@@ -1,0 +1,266 @@
+// This work is licensed under Creative Commons Attribution-NonCommercial-ShareAlike 4.0 International  
+// https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © UAlgo
+
+//@version=6
+indicator("LOWESS Reversal & Continuation [UAlgo]", overlay = true, max_labels_count = 500)
+
+// -----------------------------------------------------------------------------
+// Inputs
+// -----------------------------------------------------------------------------
+GROUP_LOWESS = "LOWESS Core"
+GROUP_SIGNAL = "Signal Logic"
+GROUP_VISUAL = "Visual Design"
+
+src         = input.source(close, "Source Price", group = GROUP_LOWESS)
+length      = input.int(100, "Lookback Bars", minval = 20, maxval = 300, group = GROUP_LOWESS)
+spanFrac    = input.float(0.35, "Span Ratio", minval = 0.10, maxval = 1.00, step = 0.01, group = GROUP_LOWESS)
+robustIters = input.int(1, "Robust Passes", minval = 0, maxval = 3, group = GROUP_LOWESS)
+
+atrLen          = input.int(14, "ATR Length", minval = 1, group = GROUP_SIGNAL)
+slopeThreshold  = input.float(0.02, "Slope Filter (ATR)", minval = 0.0, step = 0.001, group = GROUP_SIGNAL)
+pullbackLookback = input.int(8, "Pullback Window (bars)", minval = 1, maxval = 50, group = GROUP_SIGNAL)
+cooldownBars    = input.int(5, "Signal Cooldown", minval = 0, maxval = 100, group = GROUP_SIGNAL)
+confirmClose    = input.bool(true, "Confirm On Bar Close", group = GROUP_SIGNAL)
+
+showBand    = input.bool(true, "Show Adaptive Band", group = GROUP_VISUAL)
+bandAtrMult = input.float(0.8, "Band Width (ATR)", minval = 0.1, step = 0.1, group = GROUP_VISUAL)
+showLabels  = input.bool(true, "Show Signal Labels", group = GROUP_VISUAL)
+maxLabels   = input.int(150, "Max Labels", minval = 20, maxval = 400, group = GROUP_VISUAL)
+
+// -----------------------------------------------------------------------------
+// Types
+// -----------------------------------------------------------------------------
+type LowessEngine
+    array<float> x
+    array<float> y
+    array<float> baseW
+    array<float> robustW
+    array<float> finalW
+    array<float> residualAbs
+    int length
+    float yhat
+    float slope
+    float intercept
+
+type SignalState
+    int lastBullRev
+    int lastBearRev
+    int lastBullCont
+    int lastBearCont
+
+type SignalBook
+    label[] items
+    int maxKeep
+
+// -----------------------------------------------------------------------------
+// Methods
+// -----------------------------------------------------------------------------
+method median(array<float> this) =>
+    array<float> tmp = array.copy(this)
+    array.sort(tmp, order.ascending)
+    int n = array.size(tmp)
+    float result = na
+    if n > 0
+        int mid = n / 2
+        result := n % 2 == 1 ? array.get(tmp, mid) : (array.get(tmp, mid - 1) + array.get(tmp, mid)) * 0.5
+    result
+
+method resize(LowessEngine this, int len) =>
+    if this.length != len
+        this.length := len
+        this.x := array.new_float(len, na)
+        this.y := array.new_float(len, na)
+        this.baseW := array.new_float(len, na)
+        this.robustW := array.new_float(len, 1.0)
+        this.finalW := array.new_float(len, na)
+        this.residualAbs := array.new_float(len, na)
+        for i = 0 to len - 1
+            array.set(this.x, i, i)
+
+method loadWindow(LowessEngine this, float seriesValue) =>
+    for i = 0 to this.length - 1
+        array.set(this.y, i, seriesValue[this.length - 1 - i])
+
+method buildDistanceWeights(LowessEngine this, int spanBars) =>
+    int x0 = this.length - 1
+    float bandwidth = math.max(spanBars, 1)
+    for i = 0 to this.length - 1
+        float u = math.abs(i - x0) / bandwidth
+        float w = u < 1 ? math.pow(1 - math.pow(u, 3), 3) : 0.0
+        array.set(this.baseW, i, w)
+
+method solveWeightedLinear(LowessEngine this, array<float> weights) =>
+    float s0 = 0.0
+    float s1 = 0.0
+    float s2 = 0.0
+    float t0 = 0.0
+    float t1 = 0.0
+
+    for i = 0 to this.length - 1
+        float w = array.get(weights, i)
+        float x = array.get(this.x, i)
+        float y = array.get(this.y, i)
+        s0 += w
+        s1 += w * x
+        s2 += w * x * x
+        t0 += w * y
+        t1 += w * x * y
+
+    float den = s0 * s2 - s1 * s1
+    if s0 <= 1e-10 or math.abs(den) <= 1e-10
+        this.slope := 0.0
+        this.intercept := array.get(this.y, this.length - 1)
+    else
+        this.slope := (s0 * t1 - s1 * t0) / den
+        this.intercept := (t0 - this.slope * s1) / s0
+
+    float x0 = this.length - 1
+    this.yhat := this.intercept + this.slope * x0
+
+method updateRobustWeights(LowessEngine this) =>
+    for i = 0 to this.length - 1
+        float xi = array.get(this.x, i)
+        float yi = array.get(this.y, i)
+        float fit = this.intercept + this.slope * xi
+        array.set(this.residualAbs, i, math.abs(yi - fit))
+
+    float med = this.residualAbs.median()
+    float scale = med * 6.0
+
+    if na(scale) or scale <= 1e-10
+        for i = 0 to this.length - 1
+            array.set(this.robustW, i, 1.0)
+    else
+        for i = 0 to this.length - 1
+            float u = array.get(this.residualAbs, i) / scale
+            float rw = u < 1 ? math.pow(1 - math.pow(u, 2), 2) : 0.0
+            array.set(this.robustW, i, rw)
+
+method fit(LowessEngine this, float seriesValue, float span, int robustSteps) =>
+    this.loadWindow(seriesValue)
+    int spanBars = math.max(2, math.min(this.length, int(math.round(this.length * span))))
+    this.buildDistanceWeights(spanBars)
+
+    for i = 0 to this.length - 1
+        array.set(this.robustW, i, 1.0)
+
+    int steps = math.max(0, robustSteps)
+    for iter = 0 to steps
+        for i = 0 to this.length - 1
+            float w = array.get(this.baseW, i) * array.get(this.robustW, i)
+            array.set(this.finalW, i, w)
+
+        this.solveWeightedLinear(this.finalW)
+
+        if iter < steps
+            this.updateRobustWeights()
+
+canBullRev(SignalState state, int cooldown) =>
+    na(state.lastBullRev) or bar_index - state.lastBullRev > cooldown
+
+canBearRev(SignalState state, int cooldown) =>
+    na(state.lastBearRev) or bar_index - state.lastBearRev > cooldown
+
+canBullCont(SignalState state, int cooldown) =>
+    na(state.lastBullCont) or bar_index - state.lastBullCont > cooldown
+
+canBearCont(SignalState state, int cooldown) =>
+    na(state.lastBearCont) or bar_index - state.lastBearCont > cooldown
+
+method add(SignalBook this, int x, float y, string txt, color bgColor, color txtColor, bool above) =>
+    label lb = label.new(x = x, y = y, text = txt, xloc = xloc.bar_index, yloc = above ? yloc.abovebar : yloc.belowbar, style = label.style_label_center, color = bgColor, textcolor = txtColor, size = size.tiny)
+    array.push(this.items, lb)
+    if array.size(this.items) > this.maxKeep
+        label old = array.shift(this.items)
+        label.delete(old)
+
+// -----------------------------------------------------------------------------
+// Engine Execution
+// -----------------------------------------------------------------------------
+var LowessEngine engine = LowessEngine.new(array.new_float(), array.new_float(), array.new_float(), array.new_float(), array.new_float(), array.new_float(), 0, na, na, na)
+var SignalState signalState = SignalState.new(int(na), int(na), int(na), int(na))
+var SignalBook signalBook = SignalBook.new(array.new_label(), maxLabels)
+
+signalBook.maxKeep := maxLabels
+
+bool enoughBars = bar_index >= length - 1
+engine.resize(length)
+engine.fit(src, spanFrac, robustIters)
+
+float lowess = enoughBars ? engine.yhat : na
+float slope = enoughBars ? engine.slope : na
+float atr = ta.atr(atrLen)
+
+float slopeAtr = not na(slope) and atr > 0 ? slope / atr : na
+float accelAtr = slopeAtr - nz(slopeAtr[1])
+
+bool upRegime = not na(slopeAtr) and slopeAtr > slopeThreshold
+bool downRegime = not na(slopeAtr) and slopeAtr < -slopeThreshold
+
+int bullPbBars = int(nz(ta.barssince(low < lowess), 100000))
+int bearPbBars = int(nz(ta.barssince(high > lowess), 100000))
+bool bullPullbackRecent = bullPbBars <= pullbackLookback
+bool bearPullbackRecent = bearPbBars <= pullbackLookback
+
+bool slopeCrossUp = ta.crossover(slopeAtr, 0)
+bool slopeCrossDown = ta.crossunder(slopeAtr, 0)
+bool priceCrossUp = ta.crossover(close, lowess)
+bool priceCrossDown = ta.crossunder(close, lowess)
+
+bool bullRevRaw = enoughBars and slopeCrossUp and accelAtr > 0 and close > lowess
+bool bearRevRaw = enoughBars and slopeCrossDown and accelAtr < 0 and close < lowess
+
+bool bullContRaw = enoughBars and upRegime and bullPullbackRecent and priceCrossUp and accelAtr > 0 and not bullRevRaw
+bool bearContRaw = enoughBars and downRegime and bearPullbackRecent and priceCrossDown and accelAtr < 0 and not bearRevRaw
+
+bool gate = confirmClose ? barstate.isconfirmed : true
+
+bool bullRev = gate and bullRevRaw and canBullRev(signalState, cooldownBars)
+bool bearRev = gate and bearRevRaw and canBearRev(signalState, cooldownBars)
+bool bullCont = gate and bullContRaw and canBullCont(signalState, cooldownBars)
+bool bearCont = gate and bearContRaw and canBearCont(signalState, cooldownBars)
+
+if bullRev
+    signalState.lastBullRev := bar_index
+if bearRev
+    signalState.lastBearRev := bar_index
+if bullCont
+    signalState.lastBullCont := bar_index
+if bearCont
+    signalState.lastBearCont := bar_index
+
+// -----------------------------------------------------------------------------
+// Visuals
+// -----------------------------------------------------------------------------
+color upColor = color.rgb(16, 185, 129)
+color dnColor = color.rgb(239, 83, 80)
+color labelTextColor = color.rgb(248, 250, 252)
+
+color lowessColor = na(slopeAtr) ? color.rgb(148, 163, 184) : slopeAtr >= 0 ? upColor : dnColor
+lowessPlot = plot(lowess, "LOWESS", color = lowessColor, linewidth = 2)
+
+float upperBand = showBand and not na(lowess) ? lowess + atr * bandAtrMult : na
+float lowerBand = showBand and not na(lowess) ? lowess - atr * bandAtrMult : na
+upBandPlot = plot(upperBand, "Upper Band", color = color.new(lowessColor, 78))
+dnBandPlot = plot(lowerBand, "Lower Band", color = color.new(lowessColor, 78))
+fill(upBandPlot, dnBandPlot, color = color.new(lowessColor, 90), title = "LOWESS Band Fill")
+
+if showLabels and bullRev
+    signalBook.add(bar_index, low, "▲", upColor, labelTextColor, false)
+if showLabels and bearRev
+    signalBook.add(bar_index, high, "▼", dnColor, labelTextColor, true)
+if showLabels and bullCont
+    signalBook.add(bar_index, low, "•", upColor, labelTextColor, false)
+if showLabels and bearCont
+    signalBook.add(bar_index, high, "•", dnColor, labelTextColor, true)
+
+plot(slopeAtr, "LOWESS Slope (ATR-normalized)", color = color.new(color.white, 100), display = display.none)
+
+// -----------------------------------------------------------------------------
+// Alerts
+// -----------------------------------------------------------------------------
+alertcondition(bullRev, "Bullish LOWESS Reversal", "Bullish LOWESS reversal on {{ticker}}")
+alertcondition(bearRev, "Bearish LOWESS Reversal", "Bearish LOWESS reversal on {{ticker}}")
+alertcondition(bullCont, "Bullish LOWESS Continuation", "Bullish LOWESS continuation on {{ticker}}")
+alertcondition(bearCont, "Bearish LOWESS Continuation", "Bearish LOWESS continuation on {{ticker}}")

@@ -1,0 +1,553 @@
+//@version=6
+indicator("Multi Divergence Indicator", overlay=true, shorttitle="Multi Div")
+
+// Inputs - General
+maxDist = input.int(50, "Max Bar Distance", group="General Settings")
+lbL = input.int(5, "Pivot Lookback Left", group="General Settings")
+lbR = input.int(5, "Pivot Lookback Right", group="General Settings")
+offset_mult = input.float(0.5, "Label Offset Multiplier", group="General Settings", step=0.1)
+repaint = input.bool(true, "Allow Repaint for Last Bar Detection", group="General Settings", tooltip="Enables potential divergence detection on the last bar (may repaint)")
+
+// Inputs - Trend Filter
+trendMethod = input.string("None", "Trend Detection Method", ["None", "Zigzag", "MA Difference"], group="Trend Filter", tooltip="Strict filter: regular in opposite trend only, hidden in matching only")
+maType = input.string("SMA", "MA Type", ["SMA", "EMA", "WMA", "HMA"], group="Trend Filter")
+maLength = input.int(200, "MA Length", minval=1, group="Trend Filter")
+
+// Inputs - Label Colors
+bull_reg_bg = input.color(color.green, "Bullish Regular Label Background", group="Label Colors")
+bull_reg_text = input.color(color.white, "Bullish Regular Label Text", group="Label Colors")
+bull_hid_bg = input.color(color.lime, "Bullish Hidden Label Background", group="Label Colors")
+bull_hid_text = input.color(color.white, "Bullish Hidden Label Text", group="Label Colors")
+bear_reg_bg = input.color(color.red, "Bearish Regular Label Background", group="Label Colors")
+bear_reg_text = input.color(color.white, "Bearish Regular Label Text", group="Label Colors")
+bear_hid_bg = input.color(color.orange, "Bearish Hidden Label Background", group="Label Colors")
+bear_hid_text = input.color(color.white, "Bearish Hidden Label Text", group="Label Colors")
+
+// Moving Average for trend filter
+ma = switch maType
+    "SMA" => ta.sma(close, maLength)
+    "EMA" => ta.ema(close, maLength)
+    "WMA" => ta.wma(close, maLength)
+    "HMA" => ta.hma(close, maLength)
+
+// RSI
+rsi_len = input.int(14, "RSI Length", group="RSI Settings")
+rsi_src = input.source(close, "Source", group="RSI Settings")
+rsi_div = input.bool(true, "Calculate Divergence", group="RSI Settings")
+
+// MACD
+macd_fast = input.int(12, "Fast Length", group="MACD Settings")
+macd_slow = input.int(26, "Slow Length", group="MACD Settings")
+macd_sig = input.int(9, "Signal Smoothing", group="MACD Settings")
+macd_src = input.source(close, "Source", group="MACD Settings")
+macd_div = input.bool(true, "Calculate Divergence", group="MACD Settings")
+
+// Stochastic
+stoch_k_len = input.int(14, "%K Length", group="Stochastic Settings")
+stoch_src = input.source(close, "Source", group="Stochastic Settings")
+stoch_smoothK = input.int(3, "Smooth K", group="Stochastic Settings")
+stoch_smoothD = input.int(3, "Smooth D", group="Stochastic Settings")
+stoch_div = input.bool(true, "Calculate Divergence", group="Stochastic Settings")
+
+// CCI
+cci_len = input.int(20, "Length", group="CCI Settings")
+cci_src = input.source(close, "Source", group="CCI Settings")
+cci_div = input.bool(true, "Calculate Divergence", group="CCI Settings")
+
+// Momentum
+mom_len = input.int(10, "Length", group="Momentum Settings")
+mom_src = input.source(close, "Source", group="Momentum Settings")
+mom_div = input.bool(true, "Calculate Divergence", group="Momentum Settings")
+
+// Williams %R
+willr_len = input.int(14, "Length", group="Williams %R Settings")
+willr_div = input.bool(true, "Calculate Divergence", group="Williams %R Settings")
+
+// Awesome Oscillator
+ao_fast = input.int(5, "Fast Length", group="Awesome Oscillator Settings")
+ao_slow = input.int(34, "Slow Length", group="Awesome Oscillator Settings")
+ao_div = input.bool(true, "Calculate Divergence", group="Awesome Oscillator Settings")
+
+// OBV
+obv_div = input.bool(true, "Calculate Divergence", group="OBV Settings")
+
+// ATR for offset
+atr = ta.atr(14)
+
+// Oscillators
+rsi = ta.rsi(rsi_src, rsi_len)
+[macdLine, signal, macdHist] = ta.macd(macd_src, macd_fast, macd_slow, macd_sig)
+stochK = ta.stoch(stoch_src, high, low, stoch_k_len)
+stoch_smooth = ta.sma(stochK, stoch_smoothK)
+stochD = ta.sma(stoch_smooth, stoch_smoothD)
+cci = ta.cci(cci_src, cci_len)
+mom = ta.mom(mom_src, mom_len)
+willr = ta.wpr(willr_len)
+ao = ta.sma(hl2, ao_fast) - ta.sma(hl2, ao_slow)
+obv_val = ta.obv
+
+// Vars for lows
+var float prevLowPrice = na
+var int prevLowBar = na
+var int prevLowTime = na
+var float prevLowMA = na
+var float rsi_prevLow = na
+var float macd_prevLow = na
+var float stoch_prevLow = na
+var float cci_prevLow = na
+var float mom_prevLow = na
+var float willr_prevLow = na
+var float ao_prevLow = na
+var float obv_prevLow = na
+
+// Vars for highs
+var float prevHighPrice = na
+var int prevHighBar = na
+var int prevHighTime = na
+var float prevHighMA = na
+var float rsi_prevHigh = na
+var float macd_prevHigh = na
+var float stoch_prevHigh = na
+var float cci_prevHigh = na
+var float mom_prevHigh = na
+var float willr_prevHigh = na
+var float ao_prevHigh = na
+var float obv_prevHigh = na
+
+// Arrays to track labels for live color updates
+var array<label> bull_reg_labels = array.new<label>()
+var array<label> bull_hid_labels = array.new<label>()
+var array<label> bear_reg_labels = array.new<label>()
+var array<label> bear_hid_labels = array.new<label>()
+
+// Signal variables for plots (reset each bar)
+bull_reg_count_plot = 0
+bull_hid_count_plot = 0
+bear_reg_count_plot = 0
+bear_hid_count_plot = 0
+
+// Extract ta.lowest/ta.highest outside if for consistency
+float lowestLeft = ta.lowest(low[1], lbL)
+float highestLeft = ta.highest(high[1], lbL)
+
+// Detect confirmed low pivots
+float priceLowPivot = ta.pivotlow(low, lbL, lbR)
+if not na(priceLowPivot)
+    int pivotBar = bar_index - lbR
+    int currTime = time[lbR]
+    float currLowPrice = low[lbR]
+    float curr_rsi = rsi[lbR]
+    float curr_macd = macdHist[lbR]
+    float curr_stoch = stochD[lbR]
+    float curr_cci = cci[lbR]
+    float curr_mom = mom[lbR]
+    float curr_willr = willr[lbR]
+    float curr_ao = ao[lbR]
+    float curr_obv = obv_val[lbR]
+    float atr_val = atr[lbR]
+    float currMA = ma[lbR]
+    
+    int bull_reg_count = 0
+    int bull_hid_count = 0
+    string bull_reg_tooltip = ""
+    string bull_hid_tooltip = ""
+    if not na(prevLowBar) and pivotBar - prevLowBar <= maxDist
+        float trend = 0
+        if trendMethod == "Zigzag"
+            trend = math.sign(currLowPrice - prevLowPrice)
+        if trendMethod == "MA Difference" and not na(prevLowMA)
+            trend = math.sign(currMA - prevLowMA)
+        
+        bool regularOK = trendMethod == "None" or trend < 0
+        bool hiddenOK = trendMethod == "None" or trend > 0
+        
+        if rsi_div and currLowPrice < prevLowPrice and curr_rsi > rsi_prevLow and regularOK
+            bull_reg_count += 1
+            bull_reg_tooltip += "RSI\n"
+        if rsi_div and currLowPrice > prevLowPrice and curr_rsi < rsi_prevLow and hiddenOK
+            bull_hid_count += 1
+            bull_hid_tooltip += "RSI\n"
+        if macd_div and currLowPrice < prevLowPrice and curr_macd > macd_prevLow and regularOK
+            bull_reg_count += 1
+            bull_reg_tooltip += "MACD\n"
+        if macd_div and currLowPrice > prevLowPrice and curr_macd < macd_prevLow and hiddenOK
+            bull_hid_count += 1
+            bull_hid_tooltip += "MACD\n"
+        if stoch_div and currLowPrice < prevLowPrice and curr_stoch > stoch_prevLow and regularOK
+            bull_reg_count += 1
+            bull_reg_tooltip += "Stoch\n"
+        if stoch_div and currLowPrice > prevLowPrice and curr_stoch < stoch_prevLow and hiddenOK
+            bull_hid_count += 1
+            bull_hid_tooltip += "Stoch\n"
+        if cci_div and currLowPrice < prevLowPrice and curr_cci > cci_prevLow and regularOK
+            bull_reg_count += 1
+            bull_reg_tooltip += "CCI\n"
+        if cci_div and currLowPrice > prevLowPrice and curr_cci < cci_prevLow and hiddenOK
+            bull_hid_count += 1
+            bull_hid_tooltip += "CCI\n"
+        if mom_div and currLowPrice < prevLowPrice and curr_mom > mom_prevLow and regularOK
+            bull_reg_count += 1
+            bull_reg_tooltip += "Mom\n"
+        if mom_div and currLowPrice > prevLowPrice and curr_mom < mom_prevLow and hiddenOK
+            bull_hid_count += 1
+            bull_hid_tooltip += "Mom\n"
+        if willr_div and currLowPrice < prevLowPrice and curr_willr > willr_prevLow and regularOK
+            bull_reg_count += 1
+            bull_reg_tooltip += "W%R\n"
+        if willr_div and currLowPrice > prevLowPrice and curr_willr < willr_prevLow and hiddenOK
+            bull_hid_count += 1
+            bull_hid_tooltip += "W%R\n"
+        if ao_div and currLowPrice < prevLowPrice and curr_ao > ao_prevLow and regularOK
+            bull_reg_count += 1
+            bull_reg_tooltip += "AO\n"
+        if ao_div and currLowPrice > prevLowPrice and curr_ao < ao_prevLow and hiddenOK
+            bull_hid_count += 1
+            bull_hid_tooltip += "AO\n"
+        if obv_div and currLowPrice < prevLowPrice and curr_obv > obv_prevLow and regularOK
+            bull_reg_count += 1
+            bull_reg_tooltip += "OBV\n"
+        if obv_div and currLowPrice > prevLowPrice and curr_obv < obv_prevLow and hiddenOK
+            bull_hid_count += 1
+            bull_hid_tooltip += "OBV\n"
+    
+    if bull_reg_count > 0
+        line.new(prevLowTime, prevLowPrice, currTime, currLowPrice, xloc=xloc.bar_time, extend=extend.none, color=color.green, width=1)
+        label myLabel = label.new(currTime, currLowPrice - (atr_val * offset_mult), str.tostring(bull_reg_count), xloc=xloc.bar_time, yloc=yloc.price, color=bull_reg_bg, style=label.style_label_up, textcolor=bull_reg_text, tooltip=bull_reg_tooltip)
+        array.push(bull_reg_labels, myLabel)
+        alert("Bullish Regular Divergence detected\n" + bull_reg_tooltip, alert.freq_once_per_bar_close)
+        bull_reg_count_plot := bull_reg_count
+    
+    if bull_hid_count > 0
+        line.new(prevLowTime, prevLowPrice, currTime, currLowPrice, xloc=xloc.bar_time, extend=extend.none, color=color.lime, width=1)
+        label myLabel = label.new(currTime, currLowPrice - (atr_val * offset_mult), str.tostring(bull_hid_count), xloc=xloc.bar_time, yloc=yloc.price, color=bull_hid_bg, style=label.style_label_up, textcolor=bull_hid_text, tooltip=bull_hid_tooltip)
+        array.push(bull_hid_labels, myLabel)
+        alert("Bullish Hidden Divergence detected\n" + bull_hid_tooltip, alert.freq_once_per_bar_close)
+        bull_hid_count_plot := bull_hid_count
+    
+    prevLowPrice := currLowPrice
+    prevLowBar := pivotBar
+    prevLowTime := currTime
+    prevLowMA := currMA
+    rsi_prevLow := curr_rsi
+    macd_prevLow := curr_macd
+    stoch_prevLow := curr_stoch
+    cci_prevLow := curr_cci
+    mom_prevLow := curr_mom
+    willr_prevLow := curr_willr
+    ao_prevLow := curr_ao
+    obv_prevLow := curr_obv
+
+// Potential low pivot on last bar if repaint enabled
+if repaint and barstate.islast and not na(prevLowBar) and bar_index - prevLowBar <= maxDist
+    bool potentialLow = low < lowestLeft
+    if potentialLow
+        int pivotBar = bar_index
+        int currTime = time
+        float currLowPrice = low
+        float curr_rsi = rsi
+        float curr_macd = macdHist
+        float curr_stoch = stochD
+        float curr_cci = cci
+        float curr_mom = mom
+        float curr_willr = willr
+        float curr_ao = ao
+        float curr_obv = obv_val
+        float atr_val = atr
+        float currMA = ma
+        
+        int bull_reg_count = 0
+        int bull_hid_count = 0
+        string bull_reg_tooltip = ""
+        string bull_hid_tooltip = ""
+        float trend = 0
+        if trendMethod == "Zigzag"
+            trend = math.sign(currLowPrice - prevLowPrice)
+        if trendMethod == "MA Difference" and not na(prevLowMA)
+            trend = math.sign(currMA - prevLowMA)
+        
+        bool regularOK = trendMethod == "None" or trend < 0
+        bool hiddenOK = trendMethod == "None" or trend > 0
+        
+        if rsi_div and currLowPrice < prevLowPrice and curr_rsi > rsi_prevLow and regularOK
+            bull_reg_count += 1
+            bull_reg_tooltip += "RSI\n"
+        if rsi_div and currLowPrice > prevLowPrice and curr_rsi < rsi_prevLow and hiddenOK
+            bull_hid_count += 1
+            bull_hid_tooltip += "RSI\n"
+        if macd_div and currLowPrice < prevLowPrice and curr_macd > macd_prevLow and regularOK
+            bull_reg_count += 1
+            bull_reg_tooltip += "MACD\n"
+        if macd_div and currLowPrice > prevLowPrice and curr_macd < macd_prevLow and hiddenOK
+            bull_hid_count += 1
+            bull_hid_tooltip += "MACD\n"
+        if stoch_div and currLowPrice < prevLowPrice and curr_stoch > stoch_prevLow and regularOK
+            bull_reg_count += 1
+            bull_reg_tooltip += "Stoch\n"
+        if stoch_div and currLowPrice > prevLowPrice and curr_stoch < stoch_prevLow and hiddenOK
+            bull_hid_count += 1
+            bull_hid_tooltip += "Stoch\n"
+        if cci_div and currLowPrice < prevLowPrice and curr_cci > cci_prevLow and regularOK
+            bull_reg_count += 1
+            bull_reg_tooltip += "CCI\n"
+        if cci_div and currLowPrice > prevLowPrice and curr_cci < cci_prevLow and hiddenOK
+            bull_hid_count += 1
+            bull_hid_tooltip += "CCI\n"
+        if mom_div and currLowPrice < prevLowPrice and curr_mom > mom_prevLow and regularOK
+            bull_reg_count += 1
+            bull_reg_tooltip += "Mom\n"
+        if mom_div and currLowPrice > prevLowPrice and curr_mom < mom_prevLow and hiddenOK
+            bull_hid_count += 1
+            bull_hid_tooltip += "Mom\n"
+        if willr_div and currLowPrice < prevLowPrice and curr_willr > willr_prevLow and regularOK
+            bull_reg_count += 1
+            bull_reg_tooltip += "W%R\n"
+        if willr_div and currLowPrice > prevLowPrice and curr_willr < willr_prevLow and hiddenOK
+            bull_hid_count += 1
+            bull_hid_tooltip += "W%R\n"
+        if ao_div and currLowPrice < prevLowPrice and curr_ao > ao_prevLow and regularOK
+            bull_reg_count += 1
+            bull_reg_tooltip += "AO\n"
+        if ao_div and currLowPrice > prevLowPrice and curr_ao < ao_prevLow and hiddenOK
+            bull_hid_count += 1
+            bull_hid_tooltip += "AO\n"
+        if obv_div and currLowPrice < prevLowPrice and curr_obv > obv_prevLow and regularOK
+            bull_reg_count += 1
+            bull_reg_tooltip += "OBV\n"
+        if obv_div and currLowPrice > prevLowPrice and curr_obv < obv_prevLow and hiddenOK
+            bull_hid_count += 1
+            bull_hid_tooltip += "OBV\n"
+        
+        if bull_reg_count > 0
+            line.new(prevLowTime, prevLowPrice, currTime, currLowPrice, xloc=xloc.bar_time, extend=extend.none, color=color.green, width=1, style=line.style_dashed)
+            label myLabel = label.new(currTime, currLowPrice - (atr_val * offset_mult), str.tostring(bull_reg_count) + " (pot)", xloc=xloc.bar_time, yloc=yloc.price, color=bull_reg_bg, style=label.style_label_up, textcolor=bull_reg_text, tooltip=bull_reg_tooltip)
+            array.push(bull_reg_labels, myLabel)
+            alert("Potential Bullish Regular Divergence detected\n" + bull_reg_tooltip, alert.freq_once_per_bar_close)
+            bull_reg_count_plot := bull_reg_count
+        
+        if bull_hid_count > 0
+            line.new(prevLowTime, prevLowPrice, currTime, currLowPrice, xloc=xloc.bar_time, extend=extend.none, color=color.lime, width=1, style=line.style_dashed)
+            label myLabel = label.new(currTime, currLowPrice - (atr_val * offset_mult), str.tostring(bull_hid_count) + " (pot)", xloc=xloc.bar_time, yloc=yloc.price, color=bull_hid_bg, style=label.style_label_up, textcolor=bull_hid_text, tooltip=bull_hid_tooltip)
+            array.push(bull_hid_labels, myLabel)
+            alert("Potential Bullish Hidden Divergence detected\n" + bull_hid_tooltip, alert.freq_once_per_bar_close)
+            bull_hid_count_plot := bull_hid_count
+
+// Detect confirmed high pivots
+float priceHighPivot = ta.pivothigh(high, lbL, lbR)
+if not na(priceHighPivot)
+    int pivotBar = bar_index - lbR
+    int currTime = time[lbR]
+    float currHighPrice = high[lbR]
+    float curr_rsi = rsi[lbR]
+    float curr_macd = macdHist[lbR]
+    float curr_stoch = stochD[lbR]
+    float curr_cci = cci[lbR]
+    float curr_mom = mom[lbR]
+    float curr_willr = willr[lbR]
+    float curr_ao = ao[lbR]
+    float curr_obv = obv_val[lbR]
+    float atr_val = atr[lbR]
+    float currMA = ma[lbR]
+    
+    int bear_reg_count = 0
+    int bear_hid_count = 0
+    string bear_reg_tooltip = ""
+    string bear_hid_tooltip = ""
+    if not na(prevHighBar) and pivotBar - prevHighBar <= maxDist
+        float trend = 0
+        if trendMethod == "Zigzag"
+            trend = math.sign(currHighPrice - prevHighPrice)
+        if trendMethod == "MA Difference" and not na(prevHighMA)
+            trend = math.sign(currMA - prevHighMA)
+        
+        bool regularOK = trendMethod == "None" or trend > 0
+        bool hiddenOK = trendMethod == "None" or trend < 0
+        
+        if rsi_div and currHighPrice > prevHighPrice and curr_rsi < rsi_prevHigh and regularOK
+            bear_reg_count += 1
+            bear_reg_tooltip += "RSI\n"
+        if rsi_div and currHighPrice < prevHighPrice and curr_rsi > rsi_prevHigh and hiddenOK
+            bear_hid_count += 1
+            bear_hid_tooltip += "RSI\n"
+        if macd_div and currHighPrice > prevHighPrice and curr_macd < macd_prevHigh and regularOK
+            bear_reg_count += 1
+            bear_reg_tooltip += "MACD\n"
+        if macd_div and currHighPrice < prevHighPrice and curr_macd > macd_prevHigh and hiddenOK
+            bear_hid_count += 1
+            bear_hid_tooltip += "MACD\n"
+        if stoch_div and currHighPrice > prevHighPrice and curr_stoch < stoch_prevHigh and regularOK
+            bear_reg_count += 1
+            bear_reg_tooltip += "Stoch\n"
+        if stoch_div and currHighPrice < prevHighPrice and curr_stoch > stoch_prevHigh and hiddenOK
+            bear_hid_count += 1
+            bear_hid_tooltip += "Stoch\n"
+        if cci_div and currHighPrice > prevHighPrice and curr_cci < cci_prevHigh and regularOK
+            bear_reg_count += 1
+            bear_reg_tooltip += "CCI\n"
+        if cci_div and currHighPrice < prevHighPrice and curr_cci > cci_prevHigh and hiddenOK
+            bear_hid_count += 1
+            bear_hid_tooltip += "CCI\n"
+        if mom_div and currHighPrice > prevHighPrice and curr_mom < mom_prevHigh and regularOK
+            bear_reg_count += 1
+            bear_reg_tooltip += "Mom\n"
+        if mom_div and currHighPrice < prevHighPrice and curr_mom > mom_prevHigh and hiddenOK
+            bear_hid_count += 1
+            bear_hid_tooltip += "Mom\n"
+        if willr_div and currHighPrice > prevHighPrice and curr_willr < willr_prevHigh and regularOK
+            bear_reg_count += 1
+            bear_reg_tooltip += "W%R\n"
+        if willr_div and currHighPrice < prevHighPrice and curr_willr > willr_prevHigh and hiddenOK
+            bear_hid_count += 1
+            bear_hid_tooltip += "W%R\n"
+        if ao_div and currHighPrice > prevHighPrice and curr_ao < ao_prevHigh and regularOK
+            bear_reg_count += 1
+            bear_reg_tooltip += "AO\n"
+        if ao_div and currHighPrice < prevHighPrice and curr_ao > ao_prevHigh and hiddenOK
+            bear_hid_count += 1
+            bear_hid_tooltip += "AO\n"
+        if obv_div and currHighPrice > prevHighPrice and curr_obv < obv_prevHigh and regularOK
+            bear_reg_count += 1
+            bear_reg_tooltip += "OBV\n"
+        if obv_div and currHighPrice < prevHighPrice and curr_obv > obv_prevHigh and hiddenOK
+            bear_hid_count += 1
+            bear_hid_tooltip += "OBV\n"
+    
+    if bear_reg_count > 0
+        line.new(prevHighTime, prevHighPrice, currTime, currHighPrice, xloc=xloc.bar_time, extend=extend.none, color=color.red, width=1)
+        label myLabel = label.new(currTime, currHighPrice + (atr_val * offset_mult), str.tostring(bear_reg_count), xloc=xloc.bar_time, yloc=yloc.price, color=bear_reg_bg, style=label.style_label_down, textcolor=bear_reg_text, tooltip=bear_reg_tooltip)
+        array.push(bear_reg_labels, myLabel)
+        alert("Bearish Regular Divergence detected\n" + bear_reg_tooltip, alert.freq_once_per_bar_close)
+        bear_reg_count_plot := bear_reg_count
+    
+    if bear_hid_count > 0
+        line.new(prevHighTime, prevHighPrice, currTime, currHighPrice, xloc=xloc.bar_time, extend=extend.none, color=color.orange, width=1)
+        label myLabel = label.new(currTime, currHighPrice + (atr_val * offset_mult), str.tostring(bear_hid_count), xloc=xloc.bar_time, yloc=yloc.price, color=bear_hid_bg, style=label.style_label_down, textcolor=bear_hid_text, tooltip=bear_hid_tooltip)
+        array.push(bear_hid_labels, myLabel)
+        alert("Bearish Hidden Divergence detected\n" + bear_hid_tooltip, alert.freq_once_per_bar_close)
+        bear_hid_count_plot := bear_hid_count
+    
+    prevHighPrice := currHighPrice
+    prevHighBar := pivotBar
+    prevHighTime := currTime
+    prevHighMA := currMA
+    rsi_prevHigh := curr_rsi
+    macd_prevHigh := curr_macd
+    stoch_prevHigh := curr_stoch
+    cci_prevHigh := curr_cci
+    mom_prevHigh := curr_mom
+    willr_prevHigh := curr_willr
+    ao_prevHigh := curr_ao
+    obv_prevHigh := curr_obv
+
+// Potential high pivot on last bar if repaint enabled
+if repaint and barstate.islast and not na(prevHighBar) and bar_index - prevHighBar <= maxDist
+    bool potentialHigh = high > highestLeft
+    if potentialHigh
+        int pivotBar = bar_index
+        int currTime = time
+        float currHighPrice = high
+        float curr_rsi = rsi
+        float curr_macd = macdHist
+        float curr_stoch = stochD
+        float curr_cci = cci
+        float curr_mom = mom
+        float curr_willr = willr
+        float curr_ao = ao
+        float curr_obv = obv_val
+        float atr_val = atr
+        float currMA = ma
+        
+        int bear_reg_count = 0
+        int bear_hid_count = 0
+        string bear_reg_tooltip = ""
+        string bear_hid_tooltip = ""
+        float trend = 0
+        if trendMethod == "Zigzag"
+            trend = math.sign(currHighPrice - prevHighPrice)
+        if trendMethod == "MA Difference" and not na(prevHighMA)
+            trend = math.sign(currMA - prevHighMA)
+        
+        bool regularOK = trendMethod == "None" or trend > 0
+        bool hiddenOK = trendMethod == "None" or trend < 0
+        
+        if rsi_div and currHighPrice > prevHighPrice and curr_rsi < rsi_prevHigh and regularOK
+            bear_reg_count += 1
+            bear_reg_tooltip += "RSI\n"
+        if rsi_div and currHighPrice < prevHighPrice and curr_rsi > rsi_prevHigh and hiddenOK
+            bear_hid_count += 1
+            bear_hid_tooltip += "RSI\n"
+        if macd_div and currHighPrice > prevHighPrice and curr_macd < macd_prevHigh and regularOK
+            bear_reg_count += 1
+            bear_reg_tooltip += "MACD\n"
+        if macd_div and currHighPrice < prevHighPrice and curr_macd > macd_prevHigh and hiddenOK
+            bear_hid_count += 1
+            bear_hid_tooltip += "MACD\n"
+        if stoch_div and currHighPrice > prevHighPrice and curr_stoch < stoch_prevHigh and regularOK
+            bear_reg_count += 1
+            bear_reg_tooltip += "Stoch\n"
+        if stoch_div and currHighPrice < prevHighPrice and curr_stoch > stoch_prevHigh and hiddenOK
+            bear_hid_count += 1
+            bear_hid_tooltip += "Stoch\n"
+        if cci_div and currHighPrice > prevHighPrice and curr_cci < cci_prevHigh and regularOK
+            bear_reg_count += 1
+            bear_reg_tooltip += "CCI\n"
+        if cci_div and currHighPrice < prevHighPrice and curr_cci > cci_prevHigh and hiddenOK
+            bear_hid_count += 1
+            bear_hid_tooltip += "CCI\n"
+        if mom_div and currHighPrice > prevHighPrice and curr_mom < mom_prevHigh and regularOK
+            bear_reg_count += 1
+            bear_reg_tooltip += "Mom\n"
+        if mom_div and currHighPrice < prevHighPrice and curr_mom > mom_prevHigh and hiddenOK
+            bear_hid_count += 1
+            bear_hid_tooltip += "Mom\n"
+        if willr_div and currHighPrice > prevHighPrice and curr_willr < willr_prevHigh and regularOK
+            bear_reg_count += 1
+            bear_reg_tooltip += "W%R\n"
+        if willr_div and currHighPrice < prevHighPrice and curr_willr > willr_prevHigh and hiddenOK
+            bear_hid_count += 1
+            bear_hid_tooltip += "W%R\n"
+        if ao_div and currHighPrice > prevHighPrice and curr_ao < ao_prevHigh and regularOK
+            bear_reg_count += 1
+            bear_reg_tooltip += "AO\n"
+        if ao_div and currHighPrice < prevHighPrice and curr_ao > ao_prevHigh and hiddenOK
+            bear_hid_count += 1
+            bear_hid_tooltip += "AO\n"
+        if obv_div and currHighPrice > prevHighPrice and curr_obv < obv_prevHigh and regularOK
+            bear_reg_count += 1
+            bear_reg_tooltip += "OBV\n"
+        if obv_div and currHighPrice < prevHighPrice and curr_obv > obv_prevHigh and hiddenOK
+            bear_hid_count += 1
+            bear_hid_tooltip += "OBV\n"
+        
+        if bear_reg_count > 0
+            line.new(prevHighTime, prevHighPrice, currTime, currHighPrice, xloc=xloc.bar_time, extend=extend.none, color=color.red, width=1, style=line.style_dashed)
+            label myLabel = label.new(currTime, currHighPrice + (atr_val * offset_mult), str.tostring(bear_reg_count) + " (pot)", xloc=xloc.bar_time, yloc=yloc.price, color=bear_reg_bg, style=label.style_label_down, textcolor=bear_reg_text, tooltip=bear_reg_tooltip)
+            array.push(bear_reg_labels, myLabel)
+            alert("Potential Bearish Regular Divergence detected\n" + bear_reg_tooltip, alert.freq_once_per_bar_close)
+            bear_reg_count_plot := bear_reg_count
+        
+        if bear_hid_count > 0
+            line.new(prevHighTime, prevHighPrice, currTime, currHighPrice, xloc=xloc.bar_time, extend=extend.none, color=color.orange, width=1, style=line.style_dashed)
+            label myLabel = label.new(currTime, currHighPrice + (atr_val * offset_mult), str.tostring(bear_hid_count) + " (pot)", xloc=xloc.bar_time, yloc=yloc.price, color=bear_hid_bg, style=label.style_label_down, textcolor=bear_hid_text, tooltip=bear_hid_tooltip)
+            array.push(bear_hid_labels, myLabel)
+            alert("Potential Bearish Hidden Divergence detected\n" + bear_hid_tooltip, alert.freq_once_per_bar_close)
+            bear_hid_count_plot := bear_hid_count
+
+// Live color update for all existing labels
+for lbl in bull_reg_labels
+    label.set_color(lbl, bull_reg_bg)
+    label.set_textcolor(lbl, bull_reg_text)
+for lbl in bull_hid_labels
+    label.set_color(lbl, bull_hid_bg)
+    label.set_textcolor(lbl, bull_hid_text)
+for lbl in bear_reg_labels
+    label.set_color(lbl, bear_reg_bg)
+    label.set_textcolor(lbl, bear_reg_text)
+for lbl in bear_hid_labels
+    label.set_color(lbl, bear_hid_bg)
+    label.set_textcolor(lbl, bear_hid_text)
+
+// Plots for screener compatibility (hidden on chart)
+plot(bull_reg_count_plot, "Bullish Regular Divergence Count", color.green, display = display.data_window)
+plot(bull_hid_count_plot, "Bullish Hidden Divergence Count", color.lime, display = display.data_window)
+plot(bear_reg_count_plot, "Bearish Regular Divergence Count", color.red, display = display.data_window)
+plot(bear_hid_count_plot, "Bearish Hidden Divergence Count", color.orange, display = display.data_window)

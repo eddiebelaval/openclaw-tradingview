@@ -1,0 +1,136 @@
+// -----------------------------------------------------------------------------
+// | © AlgoPoint                                                               |
+// | Indicator: VWAP Z-Score & Exhaustion Matrix [AlgoPoint]                   |
+// | Developer: Harmony Algo & AlgoPoint Collaboration                         |
+// -----------------------------------------------------------------------------
+//@version=5
+indicator("VWAP Z-Score & Exhaustion Matrix [AlgoPoint]", shorttitle="VWAP Z-Score [AlgoPoint]", overlay=false)
+
+// =============================================================================
+// 1. INPUTS & SETTINGS (UI/UX)
+// =============================================================================
+grp_calc = "1. Quantitative Core Settings"
+src = input.source(hlc3, "Source (Typical Price)", group=grp_calc, inline="c1")
+length = input.int(50, "Rolling Window", minval=10, maxval=500, group=grp_calc, inline="c1")
+z_threshold = input.float(2.5, "Signal Z-Score Threshold", step=0.1, group=grp_calc, inline="c2")
+vol_len = input.int(20, "Volume Exhaustion Length", minval=5, maxval=100, group=grp_calc, inline="c2")
+
+grp_of = "2. Order Flow (Microstructure) Settings"
+use_delta = input.bool(true, "Require Delta Confirmation?", group=grp_of, tooltip="Requires selling pressure (Negative Delta) at tops and buying pressure (Positive Delta) at bottoms to fire a signal.")
+
+grp_ui = "3. UI & Dashboard Settings"
+show_dashboard = input.bool(true, "Show Quant Dashboard?", group=grp_ui)
+dash_pos = input.string("Bottom Right", "Position", options=["Top Right", "Bottom Right", "Bottom Left"], group=grp_ui)
+show_barcolor = input.bool(true, "Dynamic Gradient Bar Colors?", group=grp_ui)
+
+// AlgoPoint Brand Colors
+color_bull = color.new(#2ee319, 0)
+color_bear = color.new(#f31623, 0)
+color_neut = color.new(#7f49de, 0)
+color_gray = color.new(#808080, 50)
+
+// =============================================================================
+// 2. MATHEMATICAL CORE: ROLLING VWAP & VW-STDEV
+// =============================================================================
+float rolling_vwap = ta.vwma(src, length)
+
+float sq_diff = math.pow(src - rolling_vwap, 2) * volume
+float sum_sq_diff = math.sum(sq_diff, length)
+float sum_vol = math.sum(volume, length)
+
+float vw_variance = sum_vol > 0 ? (sum_sq_diff / sum_vol) : 0
+float vw_stdev = math.sqrt(vw_variance)
+float z_score = vw_stdev > 0 ? ((src - rolling_vwap) / vw_stdev) : 0
+
+// =============================================================================
+// 3. MATHEMATICAL CORE: EXHAUSTION & VOLUME DELTA PROXY
+// =============================================================================
+// 3.1 Exhaustion
+float avg_vol = ta.sma(volume, vol_len)
+bool is_exhausted = volume < avg_vol
+
+// 3.2 Volume Delta Proxy (Order Flow Estimation)
+float bar_range = high - low
+float buy_pressure = close - low
+float sell_pressure = high - close
+
+float up_vol = bar_range > 0 ? (buy_pressure / bar_range) * volume : (close >= open ? volume : 0)
+float dn_vol = bar_range > 0 ? (sell_pressure / bar_range) * volume : (close < open ? volume : 0)
+float vol_delta = up_vol - dn_vol
+
+// =============================================================================
+// 4. VISUALS (UI/UX) & GRADIENT BAR COLORING
+// =============================================================================
+hline(z_threshold, "Upper Threshold (+Z)", color=color.new(color_bear, 50), linestyle=hline.style_dashed)
+hline(0, "Mean (0)", color=color.new(color_neut, 50), linestyle=hline.style_dotted)
+hline(-z_threshold, "Lower Threshold (-Z)", color=color.new(color_bull, 50), linestyle=hline.style_dashed)
+
+color dynamic_grad = z_score > 0 ? color.from_gradient(z_score, 0, z_threshold, color_gray, color_bear) : color.from_gradient(z_score, -z_threshold, 0, color_bull, color_gray)
+
+plot(z_score, title="VWAP Z-Score", color=dynamic_grad, linewidth=2, style=plot.style_line)
+
+p_z = plot(z_score, color=na, editable=false)
+p_upper = plot(z_threshold, color=na, editable=false)
+p_lower = plot(-z_threshold, color=na, editable=false)
+
+fill(p_z, p_upper, z_score > z_threshold ? color.new(color_bear, 80) : na, title="Overbought Fill")
+fill(p_z, p_lower, z_score < -z_threshold ? color.new(color_bull, 80) : na, title="Oversold Fill")
+
+plotshape(is_exhausted and math.abs(z_score) >= z_threshold ? z_score : na, title="Exhaustion Node", style=shape.circle, location=location.absolute, color=color.new(color_neut, 0), size=size.tiny)
+
+barcolor(show_barcolor ? dynamic_grad : na, title="Gradient Bar Colors")
+
+// =============================================================================
+// 5. SIGNAL GENERATION (Strictly No Repaint)
+// =============================================================================
+// Order Flow Checks
+bool delta_short_ok = use_delta ? (vol_delta < 0) : true // Sellers taking control
+bool delta_long_ok = use_delta ? (vol_delta > 0) : true  // Buyers taking control
+
+bool fade_short = (z_score >= z_threshold) and is_exhausted and delta_short_ok and barstate.isconfirmed
+bool fade_long = (z_score <= -z_threshold) and is_exhausted and delta_long_ok and barstate.isconfirmed
+
+if (fade_long)
+    label.new(bar_index, z_score - 0.5, "Fade\nLong", color=#018208, style=label.style_label_up, textcolor=color.white, size=size.small)
+
+if (fade_short)
+    label.new(bar_index, z_score + 0.5, "Fade\nShort", color=#d12208, style=label.style_label_down, textcolor=color.white, size=size.small)
+
+// =============================================================================
+// 6. ALERTS (Webhook & JSON Ready)
+// =============================================================================
+alertcondition(fade_long, title="Z-Score: FADE LONG", message="AlgoPoint: Extreme Z-Score + Exhaustion + Positive Delta (Buyers active). Fade Long.")
+alertcondition(fade_short, title="Z-Score: FADE SHORT", message="AlgoPoint: Extreme Z-Score + Exhaustion + Negative Delta (Sellers active). Fade Short.")
+
+if fade_long
+    alert('{"action": "buy", "asset": "' + syminfo.ticker + '", "price": ' + str.tostring(close) + ', "z_score": ' + str.tostring(z_score, "#.##") + ', "delta": ' + str.tostring(vol_delta, "#.##") + '}', alert.freq_once_per_bar_close)
+
+if fade_short
+    alert('{"action": "sell", "asset": "' + syminfo.ticker + '", "price": ' + str.tostring(close) + ', "z_score": ' + str.tostring(z_score, "#.##") + ', "delta": ' + str.tostring(vol_delta, "#.##") + '}', alert.freq_once_per_bar_close)
+
+// =============================================================================
+// 7. QUANT DASHBOARD
+// =============================================================================
+var table dash = table.new(dash_pos == "Top Right" ? position.top_right : dash_pos == "Bottom Left" ? position.bottom_left : position.bottom_right, 2, 5, border_width=1, border_color=color.gray, frame_color=color.black, frame_width=2)
+
+if barstate.islast and show_dashboard
+    table.cell(dash, 0, 0, "AlgoPoint HFT Core", text_color=color.white, bgcolor=color_neut, text_size=size.small, width=15)
+    table.cell(dash, 1, 0, "Metrics", text_color=color.white, bgcolor=color_neut, text_size=size.small, width=10)
+    
+    z_col = z_score > z_threshold ? color_bear : z_score < -z_threshold ? color_bull : color.gray
+    table.cell(dash, 0, 1, "Current Z-Score", text_color=color.white, bgcolor=color.new(color.gray, 80), text_size=size.small)
+    table.cell(dash, 1, 1, str.tostring(z_score, "#.##"), text_color=color.white, bgcolor=color.new(z_col, 50), text_size=size.small)
+    
+    exh_txt = is_exhausted ? "Exhausted (Drying)" : "Active (Pushing)"
+    exh_col = is_exhausted ? color_neut : color.gray
+    table.cell(dash, 0, 2, "Volume Status", text_color=color.white, bgcolor=color.new(color.gray, 80), text_size=size.small)
+    table.cell(dash, 1, 2, exh_txt, text_color=color.white, bgcolor=color.new(exh_col, 50), text_size=size.small)
+    
+    // Order Flow Delta Dashboard Row
+    delta_txt = vol_delta > 0 ? "Buyers (+" + str.tostring(vol_delta, format.volume) + ")" : "Sellers (" + str.tostring(vol_delta, format.volume) + ")"
+    delta_col = vol_delta > 0 ? color_bull : color_bear
+    table.cell(dash, 0, 3, "Order Flow Delta", text_color=color.white, bgcolor=color.new(color.gray, 80), text_size=size.small)
+    table.cell(dash, 1, 3, delta_txt, text_color=color.white, bgcolor=color.new(delta_col, 50), text_size=size.small)
+
+    table.cell(dash, 0, 4, "Rolling VWAP", text_color=color.white, bgcolor=color.new(color.gray, 80), text_size=size.small)
+    table.cell(dash, 1, 4, str.tostring(rolling_vwap, "#.##"), text_color=color.white, bgcolor=color.new(color.gray, 80), text_size=size.small)

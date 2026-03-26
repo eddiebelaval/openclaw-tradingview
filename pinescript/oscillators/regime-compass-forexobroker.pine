@@ -1,0 +1,353 @@
+//@version=6
+indicator("Regime Compass [forexobroker]",
+     shorttitle="Regime",
+     overlay=true)
+
+// ══════════════════════════════════════════════════════════════════════════════
+// Regime Compass [forexobroker]
+// Version 1.0
+//
+// Market regime detection combining ADX, Bollinger Band Width, ATR Percentile,
+// and Hurst Exponent into a voting system that classifies the market as Strong
+// Trend, Weak Trend, Ranging, or Volatile/Choppy. Dashboard shows all measure
+// values, the current regime, strategy recommendation, and regime history.
+//
+// (c) forexobroker | Open-source | Educational use
+// ══════════════════════════════════════════════════════════════════════════════
+
+// ┌──────────────────────────────────────────────────────────────────────────┐
+// │ INPUTS                                                                  │
+// └──────────────────────────────────────────────────────────────────────────┘
+
+// Detection
+adxLen     = input.int(14,    "ADX DI Length",       minval=2,  maxval=50,  group="Detection", tooltip="Directional Movement Index lookback for DI+/DI-")
+adxSmooth  = input.int(14,    "ADX Smoothing",       minval=2,  maxval=50,  group="Detection", tooltip="ADX smoothing length")
+bbLen      = input.int(20,    "BB Width Length",      minval=5,  maxval=100, group="Detection", tooltip="Bollinger Band lookback for width calculation")
+bbMult     = input.float(2.0, "BB Multiplier",        minval=0.5, maxval=5.0, step=0.1, group="Detection", tooltip="Bollinger Band standard deviation multiplier")
+atrLen     = input.int(14,    "ATR Length",           minval=2,  maxval=50,  group="Detection", tooltip="Average True Range lookback period")
+hurstLen   = input.int(100,   "Hurst Length",         minval=20, maxval=500, group="Detection", tooltip="Lookback for Hurst Exponent R/S calculation")
+
+// Thresholds
+strongTrendAdx = input.float(30.0, "Strong Trend ADX",   minval=15, maxval=60, group="Thresholds", tooltip="ADX above this = strong trend signal")
+weakTrendAdx   = input.float(20.0, "Weak Trend ADX",     minval=10, maxval=40, group="Thresholds", tooltip="ADX above this = weak trend signal")
+highVolBbw     = input.int(75,     "High Vol BB Width %", minval=50, maxval=95, group="Thresholds", tooltip="BB Width percentrank above this = high volatility")
+lowVolBbw      = input.int(25,     "Low Vol BB Width %",  minval=5,  maxval=50, group="Thresholds", tooltip="BB Width percentrank below this = low volatility (ranging)")
+highVolAtr     = input.int(75,     "High Vol ATR %",      minval=50, maxval=95, group="Thresholds", tooltip="ATR percentrank above this = high volatility")
+hurstTrend     = input.float(0.55, "Hurst Trend Thresh",  minval=0.5, maxval=0.8, step=0.01, group="Thresholds", tooltip="Hurst above this = trending character")
+hurstMeanRev   = input.float(0.45, "Hurst MR Thresh",     minval=0.2, maxval=0.5, step=0.01, group="Thresholds", tooltip="Hurst below this = mean-reverting character")
+
+// Display
+tablePosition  = input.string("top_right", "Table Position", options=["top_left","top_center","top_right","middle_left","middle_center","middle_right","bottom_left","bottom_center","bottom_right"], group="Display")
+textSize       = input.string("small", "Text Size", options=["tiny","small","normal"], group="Display")
+historyLen     = input.int(100,  "Regime History Bars",  minval=20, maxval=500, group="Display", tooltip="Number of bars to track for regime history percentages")
+showBgColor    = input.bool(true, "Show Regime Background", group="Display", tooltip="Tint chart background with regime color")
+bgTransparency = input.int(92,   "Background Transparency", minval=80, maxval=97, group="Display", tooltip="Higher = more subtle background tint")
+
+// Colors
+strongTrendCol = input.color(#00C853, "Strong Trend Color", group="Colors")
+weakTrendCol   = input.color(#69F0AE, "Weak Trend Color",   group="Colors")
+rangingCol     = input.color(#FFD54F, "Ranging Color",       group="Colors")
+choppyCol      = input.color(#FF5252, "Volatile Color",      group="Colors")
+
+// ┌──────────────────────────────────────────────────────────────────────────┐
+// │ THEME-AWARE COLORS                                                      │
+// └──────────────────────────────────────────────────────────────────────────┘
+
+bool isDark    = chart.bg_color == #000000 or chart.bg_color == #131722 or chart.bg_color == #1E222D or chart.bg_color == #2A2E39
+headerBg       = isDark ? #2A2E39 : #E8E8E8
+headerText     = isDark ? #D1D4DC : #333333
+cellBg         = isDark ? #1E222D : #F5F5F5
+borderCol      = isDark ? #363A45 : #D0D0D0
+mutedText      = isDark ? #787B86 : #999999
+titleBg        = #6A1B9A
+titleText      = color.white
+
+// ┌──────────────────────────────────────────────────────────────────────────┐
+// │ HELPER FUNCTIONS                                                        │
+// └──────────────────────────────────────────────────────────────────────────┘
+
+getTablePos() =>
+    switch tablePosition
+        "top_left"      => position.top_left
+        "top_center"    => position.top_center
+        "top_right"     => position.top_right
+        "middle_left"   => position.middle_left
+        "middle_center" => position.middle_center
+        "middle_right"  => position.middle_right
+        "bottom_left"   => position.bottom_left
+        "bottom_center" => position.bottom_center
+        "bottom_right"  => position.bottom_right
+
+getTextSize() =>
+    switch textSize
+        "tiny"   => size.tiny
+        "small"  => size.small
+        "normal" => size.normal
+
+getRegimeColor(int r) =>
+    switch r
+        0 => strongTrendCol
+        1 => weakTrendCol
+        2 => rangingCol
+        3 => choppyCol
+        => mutedText
+
+getRegimeName(int r) =>
+    switch r
+        0 => "STRONG TREND"
+        1 => "WEAK TREND"
+        2 => "RANGING"
+        3 => "VOLATILE"
+        => "UNKNOWN"
+
+getRecommendation(int r) =>
+    switch r
+        0 => "Use Trend-Following"
+        1 => "Use Breakout / Trend"
+        2 => "Use Mean-Reversion"
+        3 => "Reduce Size / Stay Flat"
+        => "—"
+
+// ┌──────────────────────────────────────────────────────────────────────────┐
+// │ CORE CALCULATIONS                                                       │
+// └──────────────────────────────────────────────────────────────────────────┘
+
+// ADX — Directional Movement Index
+[diPlus, diMinus, adxVal] = ta.dmi(adxLen, adxSmooth)
+
+// Bollinger Band Width — percentrank for scale-free comparison
+bbw     = ta.bbw(close, bbLen, bbMult)
+bbwRank = ta.percentrank(bbw, 100)
+
+// ATR Percentile
+atrVal  = ta.atr(atrLen)
+atrRank = ta.percentrank(atrVal, 100)
+
+// Hurst Exponent — R/S (Rescaled Range) approximation
+logReturns = nz(math.log(close / close[1]))
+meanReturn = ta.sma(logReturns, hurstLen)
+deviations = logReturns - meanReturn
+cumDev     = math.sum(deviations, hurstLen)
+rangeVal   = ta.highest(cumDev, hurstLen) - ta.lowest(cumDev, hurstLen)
+stdDev     = ta.stdev(logReturns, hurstLen)
+rsRatio    = nz(rangeVal / stdDev, 1.0)
+hurst      = math.max(0.0, math.min(1.0, nz(math.log(rsRatio) / math.log(hurstLen), 0.5)))
+
+// ┌──────────────────────────────────────────────────────────────────────────┐
+// │ VOTING SYSTEM                                                           │
+// └──────────────────────────────────────────────────────────────────────────┘
+
+int trendVotes    = 0
+int rangeVotes    = 0
+int volatileVotes = 0
+
+// ADX voting
+if adxVal > strongTrendAdx
+    trendVotes += 2
+else if adxVal > weakTrendAdx
+    trendVotes += 1
+else
+    rangeVotes += 1
+
+// BB Width voting
+if bbwRank > highVolBbw
+    trendVotes    += 1
+    volatileVotes += 1
+else if bbwRank < lowVolBbw
+    rangeVotes += 2
+else
+    // moderate BB width — no strong signal
+    trendVotes += 0
+
+// ATR voting
+if atrRank > highVolAtr
+    volatileVotes += 2
+else if atrRank < lowVolBbw
+    rangeVotes += 1
+
+// Hurst voting
+if hurst > hurstTrend
+    trendVotes += 2
+else if hurst < hurstMeanRev
+    rangeVotes += 2
+else
+    volatileVotes += 1
+
+// Classification — highest vote wins with tiebreakers
+int classifiedRegime = 1
+if volatileVotes >= 4
+    classifiedRegime := 3
+else if trendVotes > rangeVotes and trendVotes > volatileVotes
+    classifiedRegime := adxVal > strongTrendAdx ? 0 : 1
+else if rangeVotes >= trendVotes
+    classifiedRegime := 2
+else
+    classifiedRegime := 1
+
+// ┌──────────────────────────────────────────────────────────────────────────┐
+// │ REGIME STATE + HISTORY                                                  │
+// └──────────────────────────────────────────────────────────────────────────┘
+
+var int regime     = 1
+var int prevRegime = 1
+
+if barstate.isconfirmed
+    prevRegime := regime
+    regime     := classifiedRegime
+
+// History tracking
+var regimeHistory = array.new_int(0)
+if barstate.isconfirmed
+    array.push(regimeHistory, regime)
+    if array.size(regimeHistory) > historyLen
+        array.shift(regimeHistory)
+
+// Count percentages
+int countST = 0
+int countWT = 0
+int countRG = 0
+int countVL = 0
+int histSize = array.size(regimeHistory)
+
+if histSize > 0
+    for i = 0 to histSize - 1
+        int val = array.get(regimeHistory, i)
+        if val == 0
+            countST += 1
+        else if val == 1
+            countWT += 1
+        else if val == 2
+            countRG += 1
+        else
+            countVL += 1
+
+float pctST = histSize > 0 ? math.round(countST / histSize * 100, 0) : 0
+float pctWT = histSize > 0 ? math.round(countWT / histSize * 100, 0) : 0
+float pctRG = histSize > 0 ? math.round(countRG / histSize * 100, 0) : 0
+float pctVL = histSize > 0 ? math.round(countVL / histSize * 100, 0) : 0
+
+// ┌──────────────────────────────────────────────────────────────────────────┐
+// │ COMPASS NEEDLE                                                          │
+// └──────────────────────────────────────────────────────────────────────────┘
+
+compassRaw = (nz(adxVal) / 100 * 25) + (nz(bbwRank) / 100 * 25) + (nz(atrRank) / 100 * 25) + (nz(hurst) * 25)
+compass    = ta.ema(compassRaw, 5)
+
+// ┌──────────────────────────────────────────────────────────────────────────┐
+// │ BACKGROUND COLOR                                                        │
+// └──────────────────────────────────────────────────────────────────────────┘
+
+regimeCol = getRegimeColor(regime)
+bgcolor(showBgColor ? color.new(regimeCol, bgTransparency) : na, title="Regime Background")
+
+// ┌──────────────────────────────────────────────────────────────────────────┐
+// │ DASHBOARD TABLE                                                         │
+// └──────────────────────────────────────────────────────────────────────────┘
+
+if barstate.islast
+    var tbl = table.new(getTablePos(), 4, 11, border_color=borderCol, border_width=1)
+    sz = getTextSize()
+
+    // Row 0 — Title bar
+    table.cell(tbl, 0, 0, "REGIME COMPASS", text_color=titleText, bgcolor=titleBg, text_size=sz, text_halign=text.align_left)
+    table.cell(tbl, 1, 0, "",               text_color=titleText, bgcolor=titleBg, text_size=sz)
+    table.cell(tbl, 2, 0, "",               text_color=titleText, bgcolor=titleBg, text_size=sz)
+    table.cell(tbl, 3, 0, "forexobroker",   text_color=color.new(titleText, 40), bgcolor=titleBg, text_size=sz, text_halign=text.align_right)
+
+    // Row 1 — Column headers
+    table.cell(tbl, 0, 1, "MEASURE", text_color=headerText, bgcolor=headerBg, text_size=sz, text_halign=text.align_left)
+    table.cell(tbl, 1, 1, "VALUE",   text_color=headerText, bgcolor=headerBg, text_size=sz, text_halign=text.align_right)
+    table.cell(tbl, 2, 1, "RANK",    text_color=headerText, bgcolor=headerBg, text_size=sz, text_halign=text.align_right)
+    table.cell(tbl, 3, 1, "SIGNAL",  text_color=headerText, bgcolor=headerBg, text_size=sz, text_halign=text.align_left)
+
+    // Row 2 — ADX
+    adxSignal    = adxVal > strongTrendAdx ? "▲ Strong" : adxVal > weakTrendAdx ? "▲ Trending" : "▼ Weak"
+    adxSigCol    = adxVal > strongTrendAdx ? strongTrendCol : adxVal > weakTrendAdx ? weakTrendCol : rangingCol
+    table.cell(tbl, 0, 2, "ADX",                                      text_color=headerText, bgcolor=cellBg, text_size=sz, text_halign=text.align_left)
+    table.cell(tbl, 1, 2, str.tostring(math.round(nz(adxVal), 1)),    text_color=headerText, bgcolor=cellBg, text_size=sz, text_halign=text.align_right)
+    table.cell(tbl, 2, 2, "—",                                        text_color=mutedText,  bgcolor=cellBg, text_size=sz, text_halign=text.align_right)
+    table.cell(tbl, 3, 2, adxSignal,                                   text_color=adxSigCol,  bgcolor=cellBg, text_size=sz, text_halign=text.align_left)
+
+    // Row 3 — BB Width
+    bbwSignal    = bbwRank > highVolBbw ? "▲ Expanding" : bbwRank < lowVolBbw ? "▼ Narrow" : "● Normal"
+    bbwSigCol    = bbwRank > highVolBbw ? strongTrendCol : bbwRank < lowVolBbw ? rangingCol : mutedText
+    table.cell(tbl, 0, 3, "BB Width",                                  text_color=headerText, bgcolor=cellBg, text_size=sz, text_halign=text.align_left)
+    table.cell(tbl, 1, 3, str.tostring(math.round(nz(bbw), 4)),       text_color=headerText, bgcolor=cellBg, text_size=sz, text_halign=text.align_right)
+    table.cell(tbl, 2, 3, str.tostring(math.round(nz(bbwRank), 0)),   text_color=headerText, bgcolor=cellBg, text_size=sz, text_halign=text.align_right)
+    table.cell(tbl, 3, 3, bbwSignal,                                    text_color=bbwSigCol,  bgcolor=cellBg, text_size=sz, text_halign=text.align_left)
+
+    // Row 4 — ATR
+    atrSignal    = atrRank > highVolAtr ? "⚡ High Vol" : atrRank < lowVolBbw ? "▼ Low Vol" : "● Normal"
+    atrSigCol    = atrRank > highVolAtr ? choppyCol : atrRank < lowVolBbw ? rangingCol : mutedText
+    table.cell(tbl, 0, 4, "ATR",                                      text_color=headerText, bgcolor=cellBg, text_size=sz, text_halign=text.align_left)
+    table.cell(tbl, 1, 4, str.tostring(math.round(nz(atrVal), 5)),    text_color=headerText, bgcolor=cellBg, text_size=sz, text_halign=text.align_right)
+    table.cell(tbl, 2, 4, str.tostring(math.round(nz(atrRank), 0)),   text_color=headerText, bgcolor=cellBg, text_size=sz, text_halign=text.align_right)
+    table.cell(tbl, 3, 4, atrSignal,                                   text_color=atrSigCol,  bgcolor=cellBg, text_size=sz, text_halign=text.align_left)
+
+    // Row 5 — Hurst
+    hurstSignal  = hurst > hurstTrend ? "▲ Trending" : hurst < hurstMeanRev ? "▼ MeanRev" : "● Random"
+    hurstSigCol  = hurst > hurstTrend ? strongTrendCol : hurst < hurstMeanRev ? rangingCol : mutedText
+    table.cell(tbl, 0, 5, "Hurst",                                    text_color=headerText, bgcolor=cellBg, text_size=sz, text_halign=text.align_left)
+    table.cell(tbl, 1, 5, str.tostring(math.round(nz(hurst), 3)),     text_color=headerText, bgcolor=cellBg, text_size=sz, text_halign=text.align_right)
+    table.cell(tbl, 2, 5, "—",                                        text_color=mutedText,  bgcolor=cellBg, text_size=sz, text_halign=text.align_right)
+    table.cell(tbl, 3, 5, hurstSignal,                                  text_color=hurstSigCol, bgcolor=cellBg, text_size=sz, text_halign=text.align_left)
+
+    // Row 6 — Separator
+    table.cell(tbl, 0, 6, "─────",  text_color=borderCol, bgcolor=headerBg, text_size=sz)
+    table.cell(tbl, 1, 6, "─────",  text_color=borderCol, bgcolor=headerBg, text_size=sz)
+    table.cell(tbl, 2, 6, "─────",  text_color=borderCol, bgcolor=headerBg, text_size=sz)
+    table.cell(tbl, 3, 6, "─────",  text_color=borderCol, bgcolor=headerBg, text_size=sz)
+
+    // Row 7 — Regime
+    rCol = getRegimeColor(regime)
+    table.cell(tbl, 0, 7, "REGIME",                text_color=headerText, bgcolor=headerBg, text_size=sz, text_halign=text.align_left)
+    table.cell(tbl, 1, 7, getRegimeName(regime),   text_color=rCol,       bgcolor=headerBg, text_size=sz, text_halign=text.align_right)
+    table.cell(tbl, 2, 7, "",                       text_color=headerText, bgcolor=headerBg, text_size=sz)
+    table.cell(tbl, 3, 7, "",                       text_color=headerText, bgcolor=headerBg, text_size=sz)
+
+    // Row 8 — Recommendation
+    table.cell(tbl, 0, 8, "RECOMMEND",                   text_color=headerText, bgcolor=headerBg, text_size=sz, text_halign=text.align_left)
+    table.cell(tbl, 1, 8, getRecommendation(regime),     text_color=rCol,       bgcolor=headerBg, text_size=sz, text_halign=text.align_right)
+    table.cell(tbl, 2, 8, "",                             text_color=headerText, bgcolor=headerBg, text_size=sz)
+    table.cell(tbl, 3, 8, "",                             text_color=headerText, bgcolor=headerBg, text_size=sz)
+
+    // Row 9 — Compass
+    compassCol = compass > 60 ? strongTrendCol : compass < 40 ? rangingCol : mutedText
+    table.cell(tbl, 0, 9, "COMPASS",                                      text_color=headerText, bgcolor=headerBg, text_size=sz, text_halign=text.align_left)
+    table.cell(tbl, 1, 9, str.tostring(math.round(nz(compass), 1)),       text_color=compassCol, bgcolor=headerBg, text_size=sz, text_halign=text.align_right)
+    table.cell(tbl, 2, 9, compass > 60 ? "Active" : compass < 40 ? "Quiet" : "Normal", text_color=compassCol, bgcolor=headerBg, text_size=sz, text_halign=text.align_right)
+    table.cell(tbl, 3, 9, "",                                              text_color=headerText, bgcolor=headerBg, text_size=sz)
+
+    // Row 10 — History
+    histStr = "ST:" + str.tostring(pctST, "#") + "% WT:" + str.tostring(pctWT, "#") + "% RG:" + str.tostring(pctRG, "#") + "% V:" + str.tostring(pctVL, "#") + "%"
+    table.cell(tbl, 0, 10, "HISTORY",  text_color=headerText, bgcolor=cellBg, text_size=sz, text_halign=text.align_left)
+    table.cell(tbl, 1, 10, histStr,    text_color=headerText, bgcolor=cellBg, text_size=sz, text_halign=text.align_right)
+    table.cell(tbl, 2, 10, "",         text_color=headerText, bgcolor=cellBg, text_size=sz)
+    table.cell(tbl, 3, 10, "",         text_color=headerText, bgcolor=cellBg, text_size=sz)
+
+// ┌──────────────────────────────────────────────────────────────────────────┐
+// │ DATA WINDOW                                                             │
+// └──────────────────────────────────────────────────────────────────────────┘
+
+plot(adxVal,  "ADX",          display=display.data_window)
+plot(bbwRank, "BBW Rank",     display=display.data_window)
+plot(atrRank, "ATR Rank",     display=display.data_window)
+plot(hurst,   "Hurst",        display=display.data_window)
+plot(compass, "Compass",      display=display.data_window)
+plot(regime,  "Regime (0-3)", display=display.data_window)
+
+// ┌──────────────────────────────────────────────────────────────────────────┐
+// │ ALERT CONDITIONS                                                        │
+// └──────────────────────────────────────────────────────────────────────────┘
+
+regimeChanged    = barstate.isconfirmed and regime != prevRegime
+toStrongTrend    = regimeChanged and regime == 0
+toRanging        = regimeChanged and regime == 2
+toVolatile       = regimeChanged and regime == 3
+
+alertcondition(toStrongTrend,    "Regime → Strong Trend",  "Regime Compass: Market shifted to STRONG TREND — use trend-following strategies")
+alertcondition(toRanging,        "Regime → Ranging",       "Regime Compass: Market shifted to RANGING — use mean-reversion strategies")
+alertcondition(toVolatile,       "Regime → Volatile",      "Regime Compass: Market shifted to VOLATILE — reduce position size or stay flat")
+alertcondition(regimeChanged,    "Any Regime Change",      "Regime Compass: Market regime has changed — review your strategy")
+alertcondition(ta.crossover(compass, 70.0),  "Compass Above 70",  "Regime Compass: Compass above 70 — high market activity")
+alertcondition(ta.crossunder(compass, 30.0), "Compass Below 30",  "Regime Compass: Compass below 30 — low market activity")

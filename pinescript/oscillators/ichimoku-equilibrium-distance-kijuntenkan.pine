@@ -1,0 +1,297 @@
+//@version=6
+indicator("Ichimoku Equilibrium Distance (Kijun/Tenkan)", overlay = false, shorttitle = "KijunDist")
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Inputs
+// ─────────────────────────────────────────────────────────────────────────────
+grpInfo     = "Info"
+showInfo    = input.bool(false, "General description", group = grpInfo,
+     tooltip = "Shows a compact on-chart help table with the indicator logic.\n• Method stays purely Ichimoku-based.\n• Distances, confluence, and regime bias are derived only from Ichimoku components (no ATR/RSI filters).")
+
+grpPlots      = "Plots"
+plotKj        = input.bool(true,  "Plot Kijun-price distance", group = grpPlots, tooltip = "Shows Close minus Kijun.\n• Positive = price above Kijun.\n• Negative = price below Kijun.")
+plotTk        = input.bool(false, "Plot Tenkan-price distance", group = grpPlots, tooltip = "Shows Close minus Tenkan.\n• Reacts faster than Kijun distance.")
+plotTkKj      = input.bool(false, "Plot Tenkan-Kijun distance", group = grpPlots, tooltip = "Shows Tenkan minus Kijun.\n• Positive = Tenkan above Kijun (bullish bias).")
+mode          = input.string("Raw", "Distance mode", options = ["Raw", "% of Price", "% of Ichimoku Range"], group = grpPlots,
+              tooltip = "Distance value normalization.\n• Raw\n• % of Price\n• % of Ichimoku Range\nIchimoku Range uses Highest-Lowest of the same window (no ATR/RSI).")
+
+grpSignals    = "Signals & Alerts"
+showShapes    = input.bool(true, "Show signal markers", group = grpSignals, tooltip = "Shows markers for enabled crossover signals.\nSignals are based only on Ichimoku relationships.")
+sigPxKijun    = input.bool(false, "Price crosses Kijun (Dist crosses 0)", group = grpSignals, tooltip = "Signal when the Price-vs-Kijun distance crosses the zero line.\nEquivalent to a price/Kijun crossover.")
+sigPxTenkan   = input.bool(false, "Price crosses Tenkan (Dist crosses 0)", group = grpSignals, tooltip = "Signal when the Price-vs-Tenkan distance crosses the zero line.\nFaster than price/Kijun.")
+sigTkxKj      = input.bool(false, "Tenkan crosses Kijun (TK-KJ crosses 0)", group = grpSignals, tooltip = "Signal when Tenkan crosses Kijun (TK-KJ crosses 0).\nImportant Ichimoku bias/regime shift.")
+
+enableAlerts  = input.bool(false, "Enable alertconditions", group = grpSignals, tooltip = "Registers alertcondition rules for enabled Ichimoku signals.\nAllows TradingView alerts without external filters.")
+
+grpBG         = "Background"
+bgEnabled     = input.bool(true, "Enable background", group = grpBG, tooltip = "Enables background as a regime/bias overlay.\nCalculated exclusively from Ichimoku distances.")
+bgTfMode      = input.string("Current", "Background timeframe", options = ["Current", "Higher TF"], group = grpBG, tooltip = "Selects Current or Higher TF for background calculation.\nLets you combine local context with HTF Ichimoku bias.")
+bgSource      = input.string("Confluence", "Background source", options = ["None", "Kijun Dist", "Tenkan Dist", "Tenkan-Kijun Dist", "Confluence"], group = grpBG,
+              tooltip = "Source for background color: a single Ichimoku signal or confluence.\nConfluence uses majority logic over enabled Ichimoku sources.")
+bgBaseTransp  = input.int(90, "Base transparency (0=opaque)", minval = 0, maxval = 100, group = grpBG, tooltip = "Base background transparency (0 opaque, 100 invisible).\nAdjusted dynamically in Confluence mode.")
+bgStep        = input.int(10, "Confluence opacity step", minval = 0, maxval = 30, group = grpBG, tooltip = "Transparency step for Confluence mode.\nEach additional agreement reduces transparency by this value.")
+confUseKj     = input.bool(true, "Confluence uses Kijun Dist", group = grpBG, tooltip = "Controls whether Kijun distance is included in background confluence.\nIndependent from line plotting.")
+confUseTk     = input.bool(false, "Confluence uses Tenkan Dist", group = grpBG, tooltip = "Controls whether Tenkan distance is included in background confluence.\nIndependent from line plotting.")
+confUseTkKj   = input.bool(false, "Confluence uses Tenkan-Kijun Dist", group = grpBG, tooltip = "Controls whether Tenkan-Kijun distance is included in background confluence.\nIndependent from line plotting.")
+
+grpCore = "Ichimoku Core"
+kjLen   = input.int(26, minval = 1, title = "Kijun-Sen Length", group = grpCore, tooltip = "Period for Kijun-Sen (average of Highest/Lowest).\nLarger = slower and smoother, smaller = more reactive.")
+tkLen   = input.int(9,  minval = 1, title = "Tenkan-Sen Length", group = grpCore, tooltip = "Period for Tenkan-Sen (average of Highest/Lowest).\nTypically faster than Kijun and useful for short-term Ichimoku bias.")
+
+grpHist       = "MTF Histogram (Current Close vs HTF Kijun)"
+histEnable    = input.bool(true, "Enable MTF histogram", group = grpHist, tooltip = "Enables histograms: current Close minus HTF Kijun.\nHelps visualize stretch relative to HTF Ichimoku.")
+histMode      = input.string("% of Price", "Histogram mode", options = ["Raw", "% of Price", "% of Ichimoku Range"], group = grpHist,
+     tooltip = "Scaling for histogram values.\nCan match line mode or be configured separately.")
+// keep UI lean: fixed defaults for histogram scaling
+histFitLookbk = 200
+histFitRatio  = 0.8
+hist4H        = input.bool(true,  "Show 4H", group = grpHist, inline = "h", tooltip = "")
+histD         = input.bool(true,  "Show D",  group = grpHist, inline = "h", tooltip = "")
+histW         = input.bool(true,  "Show W",  group = grpHist, inline = "h", tooltip = "")
+histM         = input.bool(true,  "Show M",  group = grpHist, inline = "h", tooltip = "Shows enabled MTF histograms as Close minus HTF Kijun (4H, D, W, M).")
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Helpers
+// ─────────────────────────────────────────────────────────────────────────────
+f_mid(_len) =>
+    math.avg(ta.lowest(_len), ta.highest(_len))
+
+f_range(_len) =>
+    math.max(ta.highest(_len) - ta.lowest(_len), syminfo.mintick)
+
+f_norm(_val, _len) =>
+    switch mode
+        "Raw"               => _val
+        "% of Price"        => (_val / math.max(math.abs(close), syminfo.mintick)) * 100.0
+        "% of Ichimoku Range" => (_val / f_range(_len)) * 100.0
+
+f_histNorm(_val) =>
+    switch histMode
+        "Raw"                 => _val
+        "% of Price"          => (_val / math.max(math.abs(close), syminfo.mintick)) * 100.0
+        "% of Ichimoku Range" => (_val / f_range(kjLen)) * 100.0
+
+f_histLabelY(_barVal, _pad) =>
+    // Keep a consistent visual gap above the *top* of the histogram bar.
+    // For negative bars, the top is the zero-line; for positive bars, it is the bar value.
+    math.max(_barVal, 0) + _pad
+
+f_nextHTF() =>
+    // Safe mapping: always returns a valid timeframe string (no `na`)
+    if timeframe.isintraday
+        timeframe.multiplier <= 15 ? "60" :
+         timeframe.multiplier <= 120 ? "240" : "D"
+    else if timeframe.period == "D"
+        "3D"
+    else if timeframe.period == "3D"
+        "W"
+    else if timeframe.isdaily
+        "W"
+    else if timeframe.isweekly
+        "M"
+    else
+        // monthly + fallback
+        "M"
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Core series (current TF)
+// ─────────────────────────────────────────────────────────────────────────────
+kijun      = f_mid(kjLen)
+tenkan     = f_mid(tkLen)
+
+kjDistRaw  = close - kijun
+tkDistRaw  = close - tenkan
+tkKjRaw    = tenkan - kijun
+
+kjDist     = f_norm(kjDistRaw, kjLen)
+tkDist     = f_norm(tkDistRaw, tkLen)
+tkKjDist   = f_norm(tkKjRaw,   kjLen)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// HTF series (computed only if needed)
+// ─────────────────────────────────────────────────────────────────────────────
+htf      = f_nextHTF()
+useHTF   = bgEnabled and bgTfMode == "Higher TF" and (bgSource != "None")
+needConfluence = bgSource == "Confluence"
+
+bool needKj   = useHTF and (bgSource == "Kijun Dist" or (needConfluence and confUseKj))
+bool needTk   = useHTF and (bgSource == "Tenkan Dist" or (needConfluence and confUseTk))
+bool needTkKj = useHTF and (bgSource == "Tenkan-Kijun Dist" or (needConfluence and confUseTkKj))
+
+float kjDistHTF   = na
+float tkDistHTF   = na
+float tkKjDistHTF = na
+
+if needKj
+    kjDistHTF   := request.security(syminfo.tickerid, htf, f_norm(close - f_mid(kjLen), kjLen))
+if needTk
+    tkDistHTF   := request.security(syminfo.tickerid, htf, f_norm(close - f_mid(tkLen), tkLen))
+if needTkKj
+    tkKjDistHTF := request.security(syminfo.tickerid, htf, f_norm(f_mid(tkLen) - f_mid(kjLen), kjLen))
+
+srcKj   = (bgTfMode == "Higher TF") ? kjDistHTF   : kjDist
+srcTk   = (bgTfMode == "Higher TF") ? tkDistHTF   : tkDist
+srcTkKj = (bgTfMode == "Higher TF") ? tkKjDistHTF : tkKjDist
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Plots
+// ─────────────────────────────────────────────────────────────────────────────
+plot(0, "Equilibrium Line", color = color.new(color.white, 50))
+plot(plotKj   ? kjDist   : na, "Kijun Dist",   color = (kjDist   > 0 ? color.green : color.red))
+plot(plotTk   ? tkDist   : na, "Tenkan Dist",  color = (tkDist   > 0 ? color.blue  : color.red))
+plot(plotTkKj ? tkKjDist : na, "TK-KJ Dist",   color = (tkKjDist > 0 ? color.blue  : color.orange))
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Background (single call, with confluence opacity)
+// ─────────────────────────────────────────────────────────────────────────────
+color bgCol = na
+
+if bgEnabled and bgSource != "None"
+    if bgSource == "Confluence"
+        int bull = 0
+        int bear = 0
+
+        if confUseKj
+            bull += srcKj > 0 ? 1 : 0
+            bear += srcKj < 0 ? 1 : 0
+        if confUseTk
+            bull += srcTk > 0 ? 1 : 0
+            bear += srcTk < 0 ? 1 : 0
+        if confUseTkKj
+            bull += srcTkKj > 0 ? 1 : 0
+            bear += srcTkKj < 0 ? 1 : 0
+
+        int dir = bull > bear ? 1 : bull < bear ? -1 : 0
+        int strength = math.abs(bull - bear)  // 0..3
+        int transp = math.min(math.max(bgBaseTransp - math.max(strength - 1, 0) * bgStep, 0), 100)
+
+        bgCol := dir == 1 ? color.new(color.green, transp) :
+                 dir == -1 ? color.new(color.red, transp) : na
+    else
+        float s = bgSource == "Kijun Dist" ? srcKj : bgSource == "Tenkan Dist" ? srcTk : srcTkKj
+        bgCol := bgSource == "Tenkan-Kijun Dist" ? (s > 0 ? color.new(color.blue, bgBaseTransp) : color.new(color.orange, bgBaseTransp)) : (s > 0 ? color.new(color.green, bgBaseTransp) : color.new(color.red, bgBaseTransp))
+
+bgcolor(bgCol, title = "Background")
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Signals (conservative, explicit Ichimoku meanings)
+// ─────────────────────────────────────────────────────────────────────────────
+pxCrossKijunUp   = ta.crossover(kjDistRaw, 0)
+pxCrossKijunDn   = ta.crossunder(kjDistRaw, 0)
+pxCrossTenkanUp  = ta.crossover(tkDistRaw, 0)
+pxCrossTenkanDn  = ta.crossunder(tkDistRaw, 0)
+tkCrossKjUp      = ta.crossover(tkKjRaw, 0)
+tkCrossKjDn      = ta.crossunder(tkKjRaw, 0)
+
+plotshape(showShapes and sigPxKijun  and pxCrossKijunUp,  title="Price x Kijun Up",   style=shape.triangleup,   location=location.bottom, color=color.new(color.green, 0), size=size.tiny)
+plotshape(showShapes and sigPxKijun  and pxCrossKijunDn,  title="Price x Kijun Down", style=shape.triangledown, location=location.top,    color=color.new(color.red,   0), size=size.tiny)
+
+plotshape(showShapes and sigPxTenkan and pxCrossTenkanUp, title="Price x Tenkan Up",   style=shape.triangleup,   location=location.bottom, color=color.new(color.green, 0), size=size.tiny)
+plotshape(showShapes and sigPxTenkan and pxCrossTenkanDn, title="Price x Tenkan Down", style=shape.triangledown, location=location.top,    color=color.new(color.red,   0), size=size.tiny)
+
+plotshape(showShapes and sigTkxKj    and tkCrossKjUp,    title="Tenkan x Kijun Up",   style=shape.triangleup,   location=location.bottom, color=color.new(color.green, 0), size=size.tiny)
+plotshape(showShapes and sigTkxKj    and tkCrossKjDn,    title="Tenkan x Kijun Down", style=shape.triangledown, location=location.top,    color=color.new(color.red,   0), size=size.tiny)
+
+alertcondition(enableAlerts and sigPxKijun  and pxCrossKijunUp,  "Price crossed above Kijun",  "Price crossed above Kijun")
+alertcondition(enableAlerts and sigPxKijun  and pxCrossKijunDn,  "Price crossed below Kijun",  "Price crossed below Kijun")
+alertcondition(enableAlerts and sigPxTenkan and pxCrossTenkanUp, "Price crossed above Tenkan", "Price crossed above Tenkan")
+alertcondition(enableAlerts and sigPxTenkan and pxCrossTenkanDn, "Price crossed below Tenkan", "Price crossed below Tenkan")
+alertcondition(enableAlerts and sigTkxKj    and tkCrossKjUp,     "Tenkan crossed above Kijun", "Tenkan crossed above Kijun")
+alertcondition(enableAlerts and sigTkxKj    and tkCrossKjDn,     "Tenkan crossed below Kijun", "Tenkan crossed below Kijun")
+
+// ─────────────────────────────────────────────────────────────────────────────
+// MTF Histogram (Current close vs HTF Kijun) — gated for performance
+// ─────────────────────────────────────────────────────────────────────────────
+float kj4h = na
+float kjD  = na
+float kjW  = na
+float kjM  = na
+
+if histEnable
+    if hist4H
+        kj4h := request.security(syminfo.tickerid, "240", f_mid(kjLen))
+    if histD
+        kjD  := request.security(syminfo.tickerid, "D",   f_mid(kjLen))
+    if histW
+        kjW  := request.security(syminfo.tickerid, "W",   f_mid(kjLen))
+    if histM
+        kjM  := request.security(syminfo.tickerid, "M",   f_mid(kjLen))
+
+kj_d_4h = f_histNorm(close - kj4h)
+kj_d_d  = f_histNorm(close - kjD)
+kj_d_w  = f_histNorm(close - kjW)
+kj_d_m  = f_histNorm(close - kjM)
+
+histAbsNow  = math.max(math.max(math.abs(nz(kj_d_4h, 0.0)), math.abs(nz(kj_d_d, 0.0))), math.max(math.abs(nz(kj_d_w, 0.0)), math.abs(nz(kj_d_m, 0.0))))
+mainAbsNow  = math.max(plotKj ? math.abs(kjDist) : 0.0, math.max(plotTk ? math.abs(tkDist) : 0.0, plotTkKj ? math.abs(tkKjDist) : 0.0))
+histAbsPeak = ta.highest(histAbsNow, histFitLookbk)
+mainAbsPeak = ta.highest(mainAbsNow, histFitLookbk)
+fitDen      = math.max(histAbsPeak, syminfo.mintick)
+fitNum      = math.max(mainAbsPeak * histFitRatio, syminfo.mintick)
+histFitMul  = fitNum / fitDen
+labelPad   = math.max(mainAbsPeak * 0.06, syminfo.mintick * 20)
+
+histPlot4H  = kj_d_4h * histFitMul
+histPlotD   = kj_d_d * histFitMul
+histPlotW   = kj_d_w * histFitMul
+histPlotM   = kj_d_m * histFitMul
+
+plot(histEnable and hist4H and timeframe.isintraday ? histPlot4H : na,
+     "Hist 4H", color = (histPlot4H > 0 ? color.new(color.blue, 40) : color.new(color.red, 40)),
+     style = plot.style_histogram, offset = 2, show_last = 1, linewidth = 4)
+
+plot(histEnable and histD and (timeframe.isintraday or timeframe.isdaily) ? histPlotD : na,
+     "Hist D", color = (histPlotD > 0 ? color.new(color.blue, 40) : color.new(color.red, 40)),
+     style = plot.style_histogram, offset = 4, show_last = 1, linewidth = 4)
+
+plot(histEnable and histW and (timeframe.isintraday or timeframe.isdaily or timeframe.isweekly) ? histPlotW : na,
+     "Hist W", color = (histPlotW > 0 ? color.new(color.blue, 40) : color.new(color.red, 40)),
+     style = plot.style_histogram, offset = 6, show_last = 1, linewidth = 4)
+
+plot(histEnable and histM and (timeframe.isintraday or timeframe.isdaily or timeframe.isweekly or timeframe.ismonthly) ? histPlotM : na,
+     "Hist M", color = (histPlotM > 0 ? color.new(color.blue, 40) : color.new(color.red, 40)),
+     style = plot.style_histogram, offset = 8, show_last = 1, linewidth = 4)
+
+// Tiny TF tags on histogram bars (latest visible bars only)
+var label lbl4H = na
+var label lblD  = na
+var label lblW  = na
+var label lblM  = na
+
+if barstate.islast
+    if not na(lbl4H)
+        label.delete(lbl4H)
+    if not na(lblD)
+        label.delete(lblD)
+    if not na(lblW)
+        label.delete(lblW)
+    if not na(lblM)
+        label.delete(lblM)
+
+    if histEnable and hist4H and timeframe.isintraday and not na(histPlot4H)
+        lbl4H := label.new(bar_index + 2, f_histLabelY(histPlot4H, labelPad), "4H", xloc = xloc.bar_index, yloc = yloc.price, style = label.style_none, textcolor = color.new(color.white, 0), size = size.tiny)
+    if histEnable and histD and (timeframe.isintraday or timeframe.isdaily) and not na(histPlotD)
+        lblD := label.new(bar_index + 4, f_histLabelY(histPlotD, labelPad), "D", xloc = xloc.bar_index, yloc = yloc.price, style = label.style_none, textcolor = color.new(color.white, 0), size = size.tiny)
+    if histEnable and histW and (timeframe.isintraday or timeframe.isdaily or timeframe.isweekly) and not na(histPlotW)
+        lblW := label.new(bar_index + 6, f_histLabelY(histPlotW, labelPad), "W", xloc = xloc.bar_index, yloc = yloc.price, style = label.style_none, textcolor = color.new(color.white, 0), size = size.tiny)
+    if histEnable and histM and (timeframe.isintraday or timeframe.isdaily or timeframe.isweekly or timeframe.ismonthly) and not na(histPlotM)
+        lblM := label.new(bar_index + 8, f_histLabelY(histPlotM, labelPad), "M", xloc = xloc.bar_index, yloc = yloc.price, style = label.style_none, textcolor = color.new(color.white, 0), size = size.tiny)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Info table (optional)
+// ─────────────────────────────────────────────────────────────────────────────
+var table tInfo = table.new(position.top_right, 1, 1)
+
+if barstate.islast
+    if showInfo
+        string txt =
+             "Kijun-Price Distance\n" +
+             "• Measures deviation of price from Kijun / Tenkan\n" +
+             "• Large distance = extended (not automatically a reversal)\n" +
+             "• Confluence BG = agreement of selected sources\n" +
+             "• Higher TF BG uses next mapped timeframe: " + htf + "\n\n" +
+             "Conservative tip:\n" +
+             "Use '% of Ichimoku Range' to compare across symbols."
+        table.cell(tInfo, 0, 0, txt, text_size = size.small, text_color = color.rgb(102, 98, 98))
+    else
+        table.clear(tInfo, 0, 0, 0, 0)

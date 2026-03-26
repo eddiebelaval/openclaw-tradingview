@@ -1,0 +1,591 @@
+//@version=6
+indicator(title = "MACD & DMI/ADX Context (MTF)", shorttitle = "MACD/DMI", timeframe = "", dynamic_requests = true)
+
+// Changelog v2.0: Refactor non-repaint mode, MTF security wrappers, unified background engine, event-based alerts, histogram alert package, divergence module, bugfixes.
+
+//------------------------------------------------------------------------------
+// General
+//------------------------------------------------------------------------------
+info                    = input.bool(false, "General Description", tooltip = "• Combines MACD and DMI/ADX\n⠀in one multi-purpose script.\n• Includes mode switching for\n⠀MACD or DMI/ADX analysis.\n• Supports MTF context,\n⠀trend/consolidation BG, and\n⠀state markers.\n• Provides divergence detection\n⠀(classic + hidden, depending\n⠀on settings) including preview.\n• Includes a comprehensive\n⠀alert package for MACD lines,\n⠀histogram, and DMI/ADX states.")
+mode                    = input.string("MACD", "Mode", options = ["MACD", "DMI/ADX"], tooltip = "• Selects the active analysis mode.\n⠀Only the active mode drives\n⠀core plots and events.\n• MACD: line, signal, histogram,\n⠀and MACD alerts.\n• DMI/ADX: +DI/-DI/ADX context\n⠀and DMI/ADX alerts.")
+execMode                = input.string("Realtime Visuals + Confirmed Alerts", "Execution Mode", options = ["Confirmed Only (Non-Repaint)", "Realtime Visuals + Confirmed Alerts", "Realtime Visuals + Realtime Alerts (May Repaint)"], tooltip = "• Confirmed only: visuals and alerts only on bar ⠀close.\n• Realtime Visuals + Confirmed Alerts: visuals ⠀update intrabar, alerts only on close.\n• Realtime Visuals + Realtime Alerts: both update ⠀intrabar (may repaint).")
+stateMarkersContinuous  = input.bool(true, "State Markers Continuous", tooltip = "• ON: marker on every bar\n⠀while the state stays valid.\n• OFF: marker only on the first\n⠀bar of a new state.")
+
+okAlert = execMode == "Realtime Visuals + Realtime Alerts (May Repaint)" ? true : barstate.isconfirmed
+okVisual = execMode == "Confirmed Only (Non-Repaint)" ? barstate.isconfirmed : true
+
+// Background transparency constants
+bgSoft      = 88
+bgMedium    = 82
+bgStrong    = 74
+
+f_nextHTF() =>
+    timeframe.period == "1" or timeframe.period == "5" or timeframe.period == "15" ? "60" :
+     timeframe.period == "60" or timeframe.period == "120" ? "240" :
+     timeframe.isintraday ? "D" :
+     timeframe.period == "D" ? "3D" :
+     timeframe.period == "3D" ? "W" :
+     timeframe.isweekly ? "M" : na
+
+f_sec(_tf, _expr) =>
+    request.security(syminfo.tickerid, _tf, _expr, barmerge.gaps_off, barmerge.lookahead_off)
+
+f_stateMarker(_state, _continuous) =>
+    _continuous ? _state : (_state and not _state[1])
+
+f_adx(_len, _lensig) =>
+    [_, __, _adx] = ta.dmi(_len, _lensig)
+    _adx
+
+//------------------------------------------------------------------------------
+// MACD
+//------------------------------------------------------------------------------
+macdGroup           = "Moving Average Convergence Divergence (MACD)"
+macd_plot_htf       = input.bool(false, "Plot MACD Higher Timeframe BG", group = macdGroup, tooltip = "• Colors bg by MACD vs signal\n⠀on the next higher timeframe.\n• Mapping: 5m→60m, 60m→240m,\n⠀intraday→D.\n• Useful for top-down bias.")
+macd_plot_ctf       = input.bool(true, "Plot MACD Cross Current Timeframe BG", group = macdGroup, tooltip = "• Colors bg from current-TF\n⠀MACD regime.\n• Green/red is based on MACD\n⠀above/below signal line.\n• Base context in MACD mode.")
+macd_plot_s         = input.bool(false, "Plot MACD Signal Line >/< 0 BG", group = macdGroup, tooltip = "• Colors bg by signal-line\n⠀zero-line regime.\n• Above 0 = bullish context.\n• Below 0 = bearish context.")
+macd_plot_m         = input.bool(false, "Plot MACD Line >/< 0 BG", group = macdGroup, tooltip = "• Colors bg by MACD-line\n⠀zero-line regime.\n• Reacts faster than\n⠀signal-line filtering.")
+signal_l_slo        = input.bool(false, "Plot MACD Signal Line Slope BG", group = macdGroup, tooltip = "• Colors bg by the slope\n⠀of the signal line.\n• Uses the configured\n⠀slope length.\n• Helps detect momentum shifts early.")
+macd_l_slo          = input.bool(false, "Plot MACD Line Slope BG", group = macdGroup, tooltip = "• Colors bg by the slope\n⠀of the MACD line.\n• Usually faster than\n⠀signal-line slope.")
+slope_len           = input.int(1, minval = 1, title = "MACD Signal/MACD Slope Length", group = macdGroup, tooltip = "• Number of bars for slope\n⠀detection via ta.rising/\n⠀ta.falling logic.\n• Higher values smooth flips\n⠀but react later.")
+macd_consol         = input.bool(false, "Plot MACD Trend/Consolidation Filter BG", group = macdGroup, tooltip = "• Uses stronger bg with\n⠀combined MACD filters.\n• Considers zero-line regime,\n⠀slope, and histogram progress.\n• Green/red = trend,\n⠀gray = consolidation.")
+plot_hist_sig_1     = input.bool(false, "Plot MACD Histogram Counter-Trend Signal", group = macdGroup, tooltip = "• Plots counter-trend histogram\n⠀pattern triangles.\n• Intended for pullback/reversal\n⠀style reads.\n• Best used with broader\n⠀context filters.")
+plot_hist_sig_2     = input.bool(false, "Plot MACD Histogram Trend Signal", group = macdGroup, tooltip = "• Plots trend-following\n⠀histogram pattern triangles.\n• Intended for continuation\n⠀entries with momentum.\n• Best used in directional\n⠀trend context.")
+fast_length         = input.int(12, "Fast Length", group = macdGroup, tooltip = "• Fast EMA length used in\n⠀MACD calculation.\n• Lower = faster and noisier.\n• Higher = smoother and slower.")
+slow_length         = input.int(26, "Slow Length", group = macdGroup, tooltip = "• Slow EMA length used in\n⠀MACD calculation.\n• Usually kept above Fast\n⠀Length for standard behavior.")
+signal_length       = input.int(9, "Signal Smoothing", minval = 1, maxval = 50, group = macdGroup, tooltip = "• Smoothing length of MACD\n⠀signal line.\n• Larger values reduce whipsaws\n⠀but delay crosses.")
+src                 = input.source(close, "Source", group = macdGroup, tooltip = "• Price source used by MACD\n⠀(e.g., close, hl2, ohlc4).")
+
+//------------------------------------------------------------------------------
+// Divergence (Pivot-Based): Compact Markers On Histogram / MACD Line
+//------------------------------------------------------------------------------
+divGroup = "MACD Divergence (Pivot-Based)"
+divMode                     = input.string("Off", "Divergence Mode", options = ["Off", "Histogram Divergence", "MACD Line Divergence"], group = divGroup, tooltip = "• Off: disables divergence.\n• Histogram Divergence: price\n⠀pivots vs MACD histogram.\n• MACD Line Divergence: price\n⠀pivots vs MACD line.")
+divType                     = input.string("Classic", "Divergence Type", options = ["Classic", "Hidden", "Both"], group = divGroup, tooltip = "• Classic: regular divergence\n⠀(reversal style).\n• Hidden: continuation-style\n⠀divergence.\n• Both: evaluates and plots\n⠀both types.")
+divPreview                  = input.bool(true, "Show Divergence Preview (Faster, No Alerts)", group = divGroup, tooltip = "• Shows early preview signals\n⠀using a smaller right pivot.\n• Faster visual hint.\n• No alerts for preview.\n• May differ from confirmed\n⠀divergence.")
+div_preview_right           = input.int(2, "Preview Pivot Right", minval = 1, group = divGroup, tooltip = "• Right bars needed for\n⠀preview pivot confirmation.\n• Smaller value = earlier\n⠀preview.\n• Typical: 2 or 3.")
+// ONE unified distance control
+div_marker_distance         = input.float(1.0, "Marker Distance", minval = 0.0, step = 0.1, group = divGroup, tooltip = "• Single control for marker\n⠀spacing.\n• Higher = more distance from\n⠀baseline.\n• Built-in floor prevents dots\n⠀from touching the line.")
+div_left                    = input.int(5, "Pivot Left",  minval = 1, group = divGroup, tooltip = "• Left bars required before\n⠀the pivot bar.\n• Higher value = stronger pivot\n⠀structure, but fewer signals.")
+div_right                   = input.int(5, "Pivot Right", minval = 1, group = divGroup, tooltip = "• Right bars required after\n⠀the pivot bar.\n• Higher value = slower but\n⠀more confirmed divergence.")
+
+// Internal constants (no UI)
+int   _DIV_RANGE_LEN = 200
+float _DIV_FLOOR_PCT = 0.03   // 3% of oscillator range as minimum distance
+
+//------------------------------------------------------------------------------
+// DMI / ADX
+//------------------------------------------------------------------------------
+dmiGroup        = "Directional Movement Index (DMI) and Average Directional Index (ADX)"
+dmi_plot        = input.bool(true, "Plot DMI Current Timeframe BG", group = dmiGroup, tooltip = "• Colors bg from DI dominance\n⠀on the current timeframe.\n• +DI above -DI (or reverse)\n⠀defines directional context.\n• Base context in DMI/ADX mode.")
+dmi_plot_htf    = input.bool(false, "Plot DMI Higher Timeframe BG", group = dmiGroup, tooltip = "• Colors bg from DI dominance\n⠀on the next higher timeframe.\n• Helps align LTF decisions\n⠀with HTF direction.")
+adx_range       = input.bool(false, "Plot DMI/ADX Consolidation Filter BG", group = dmiGroup, tooltip = "• Uses stronger trend/\n⠀consolidation bg via ADX/DI.\n• Green/red = directional\n⠀trend context.\n• Gray = weak/ranging.")
+adx_plot        = input.bool(false, "Plot ADX", group = dmiGroup, tooltip = "• Shows ADX and threshold level lines in DMI/ADX mode for direct trend-strength reading.")
+adx_slo         = input.bool(false, "Plot EMA/DMI Filtered ADX Slope BG", group = dmiGroup, tooltip = "• Colors bg when ADX rises\n⠀and filter conditions are met.\n• Filter source: DI-based\n⠀or EMA-price-based.")
+tog_dmi_ema     = input.bool(false, "Toggle EMA Filter For ADX Slope BG", group = dmiGroup, tooltip = "• Switches filter source\n⠀for ADX-slope bg.\n• OFF = DI-dominance filter.\n• ON = price relative to EMA.")
+slope_len_dmi   = input.int(1, minval = 1, title = "ADX Slope Length", group = dmiGroup, tooltip = "• Number of bars used to determine whether ADX is rising. Higher values reduce noise but can react later.")
+ema_p           = input.int(20, minval = 1, title = "EMA Period", group = dmiGroup, tooltip = "• EMA Period for the\n⠀ADX-slope EMA filter.")
+adx_hist_plot   = input.bool(false, "Plot MTF ADX Histogram", group = dmiGroup, tooltip = "• Shows compact ADX histogram snapshots from higher timeframes (4H, D, W, M) as right-shifted bars for quick strength overview.")
+len             = input.int(7, minval = 1, title = "DI Length", group = dmiGroup, tooltip = "• Lookback length for +DI/-DI computation. Lower values react faster but are noisier.")
+lensig          = input.int(7, "ADX Smoothing", minval = 1, maxval = 50, group = dmiGroup, tooltip = "• Smoothing length for ADX. Larger values produce steadier trend-strength readings.")
+adx_thres       = input.int(25, "ADX Threshold", minval = 1, group = dmiGroup, tooltip = "• Trend-strength threshold used by DMI/ADX state logic and related alerts.")
+sig_plot_1      = input.bool(false, "Plot DMI/ADX Signal 1", tooltip = "• Plots triangles for Signal 1: directional condition where DI relationship is active while ADX is positioned between +DI and -DI. Intended as a contextual/structure signal rather than a standalone entry trigger.", group = dmiGroup)
+sig_plot_2      = input.bool(false, "Plot DMI/ADX Signal 2", tooltip = "• Plots triangles for Signal 2: DI directional state with ADX at or above the configured threshold, emphasizing stronger-trend participation compared with Signal 1.", group = dmiGroup)
+
+//------------------------------------------------------------------------------
+// Alerts
+//------------------------------------------------------------------------------
+macdLinesAlertGroup         = "Alerts: MACD Lines"
+macdL_alert_cross           = input.bool(true, "Alert: MACD↔Signal Cross", group = macdLinesAlertGroup, tooltip = "• Enables alerts on MACD line crossing above/below signal line.")
+macdL_alert_regime          = input.bool(false, "Alert: Regime Start/End", group = macdLinesAlertGroup, tooltip = "• Enables event alerts when MACD-vs-signal bull/bear regime starts or ends.")
+macdL_alert_macd0           = input.bool(false, "Alert: MACD Zero Cross", group = macdLinesAlertGroup, tooltip = "• Enables alerts when MACD line crosses above/below zero.")
+macdL_alert_sig0            = input.bool(false, "Alert: Signal Zero Cross", group = macdLinesAlertGroup, tooltip = "• Enables alerts when signal line crosses above/below zero.")
+macdL_alert_near0_cross     = input.bool(false, "Alert: Cross Near Zero", group = macdLinesAlertGroup, tooltip = "• Enables MACD↔signal cross alerts with optional near-zero filter.")
+macdL_near0_abs             = input.float(0.0, "Near Zero Abs", minval = 0.0, step = 0.01, group = macdLinesAlertGroup, tooltip = "• Absolute near-zero threshold for MACD and signal lines. 0 disables strict near-zero filtering.")
+macdL_alert_slopeflip       = input.bool(false, "Alert: MACD Slope Flip", group = macdLinesAlertGroup, tooltip = "• Enables alerts when MACD line delta flips sign.")
+macdL_alert_sig_slopeflip   = input.bool(false, "Alert: Signal Slope Flip", group = macdLinesAlertGroup, tooltip = "• Enables alerts when signal line delta flips sign.")
+macdL_alert_proximity       = input.bool(false, "Alert: MACD/Signal Proximity", group = macdLinesAlertGroup, tooltip = "• Enables early-warning alerts when |MACD-signal| enters configured proximity threshold.")
+macdL_prox_abs              = input.float(0.05, "Proximity Abs", minval = 0.0, step = 0.01, group = macdLinesAlertGroup, tooltip = "• Proximity threshold: |MACD-signal| <= threshold. 0 disables proximity condition.")
+
+// Histogram alert package
+histAlertGroup = "Alerts: MACD Histogram"
+hist_alert_zero         = input.bool(true, "Alert: Zero Cross", group = histAlertGroup, tooltip = "• Enables alerts when MACD histogram crosses above or below zero.")
+hist_alert_slopeflip    = input.bool(true, "Alert: Slope Flip", group = histAlertGroup, tooltip = "• Enables alerts when histogram slope changes sign (from falling to rising or vice versa).")
+hist_alert_growfall     = input.bool(false, "Alert: Grow/Fall Color Flip", group = histAlertGroup, tooltip = "• Enables alerts when histogram color regime flips between growth/fall states.")
+hist_alert_pivot        = input.bool(false, "Alert: Pivot Peaks/Troughs", group = histAlertGroup, tooltip = "• Enables alerts for confirmed histogram pivot highs/lows using left/right pivot parameters.")
+hist_alert_ignite       = input.bool(false, "Alert: Compression To Expansion (Ignition)", group = histAlertGroup, tooltip = "• Enables alerts when low-volatility histogram compression transitions into expansion beyond ignition threshold.")
+hist_pivot_left         = input.int(3, "Pivot Left", minval = 1, group = histAlertGroup, tooltip = "• Number of bars to the left required to confirm a histogram pivot.")
+hist_pivot_right        = input.int(3, "Pivot Right", minval = 1, group = histAlertGroup, tooltip = "• Number of bars to the right required to confirm a histogram pivot. Higher values increase confirmation delay.")
+ignite_len              = input.int(8, "Compression Length", minval = 2, group = histAlertGroup, tooltip = "• Lookback window used to evaluate whether histogram stayed compressed before ignition.")
+ignite_max_abs          = input.float(0.05, "Compression Max Abs", minval = 0.0, step = 0.01, group = histAlertGroup, tooltip = "• Maximum allowed absolute histogram value during compression phase.")
+ignite_abs              = input.float(0.15, "Ignition Abs", minval = 0.0, step = 0.01, group = histAlertGroup, tooltip = "• Absolute histogram level that must be exceeded after compression to trigger ignition event.")
+
+dmiAlertGroup = "Alerts: DMI/ADX"
+dmi_alert_di_cross              = input.bool(true, "Alert: +DI↔-DI Cross", group = dmiAlertGroup, tooltip = "• Enables alerts on +DI/-DI cross events.")
+dmi_alert_di_regime             = input.bool(false, "Alert: DI Regime Start/End", group = dmiAlertGroup, tooltip = "• Enables event alerts when +DI or -DI dominance starts/ends.")
+dmi_alert_adx_thres             = input.bool(false, "Alert: ADX Threshold Cross", group = dmiAlertGroup, tooltip = "• Enables alerts when ADX crosses above/below ADX threshold.")
+dmi_alert_adx_slopeflip         = input.bool(false, "Alert: ADX Slope Flip", group = dmiAlertGroup, tooltip = "• Enables alerts when ADX delta flips sign.")
+dmi_alert_strong_rising         = input.bool(true, "Alert: ADX Strong+Rising Start", group = dmiAlertGroup, tooltip = "• Enables alert when ADX enters strong+rising state.")
+dmi_alert_strong_rising_end     = input.bool(false, "Alert: ADX Strong+Rising End", group = dmiAlertGroup, tooltip = "• Enables alert when ADX exits strong+rising state.")
+dmi_alert_state_longshort       = input.bool(true, "Alert: State Long_2/Short_2 Start-End", group = dmiAlertGroup, tooltip = "• Enables alerts for Long_2/Short_2 state start and end events.")
+
+
+[macdRaw, signalRaw, histRaw] = ta.macd(src, fast_length, slow_length, signal_length)
+macdLine = macdRaw
+signalLine = signalRaw
+histLine = histRaw
+
+col_grow_above = color.new(color.green, 75)
+col_grow_below = color.new(color.red, 75)
+col_fall_above = color.new(color.green, 75)
+col_fall_below = color.new(color.red, 75)
+col_macd = #0094ff
+col_signal = #ff6a00
+
+isMACDMode = mode == "MACD"
+
+plot(isMACDMode ? macdLine : na, "MACD line", col_macd)
+plot(isMACDMode ? signalLine : na, "Signal line", col_signal)
+plot(isMACDMode ? histLine : na, "MACD histogram", style = plot.style_columns, color = histLine >= 0 ? histLine[1] < histLine ? col_grow_above : col_fall_above : histLine[1] < histLine ? col_grow_below : col_fall_below)
+
+// MACD MTF tuple request (only when needed)
+tfHTF = f_nextHTF()
+needMacdHTF = isMACDMode and macd_plot_htf and not na(tfHTF)
+float macdHTF = na
+float signalHTF = na
+float histHTF = na
+if needMacdHTF
+    [macdHTF_tmp, signalHTF_tmp, histHTF_tmp] = request.security(syminfo.tickerid, tfHTF, [macdLine, signalLine, histLine], barmerge.gaps_off, barmerge.lookahead_off)
+    macdHTF := macdHTF_tmp
+    signalHTF := signalHTF_tmp
+    histHTF := histHTF_tmp
+
+signal_l_slope_up = ta.rising(signalLine, slope_len)
+macd_l_slope_up = ta.rising(macdLine, slope_len)
+
+trend_up = macdLine > 0 and macd_l_slope_up and histLine > histLine[1] and histLine > 0
+trend_dn = macdLine < 0 and not macd_l_slope_up and histLine < histLine[1] and histLine < 0
+
+hist_sig1_short = histLine > 0 and histLine < histLine[1] and histLine[1] < histLine[2] and histLine[2] > histLine[3]
+hist_sig1_long = histLine < 0 and histLine > histLine[1] and histLine[1] > histLine[2] and histLine[2] < histLine[3]
+hist_sig2_short = histLine < 0 and histLine < histLine[1] and histLine[1] > histLine[2]
+hist_sig2_long = histLine > 0 and histLine > histLine[1] and histLine[1] < histLine[2]
+
+macd_marker_sig1_short = f_stateMarker(hist_sig1_short, stateMarkersContinuous)
+macd_marker_sig1_long = f_stateMarker(hist_sig1_long, stateMarkersContinuous)
+macd_marker_sig2_short = f_stateMarker(hist_sig2_short, stateMarkersContinuous)
+macd_marker_sig2_long = f_stateMarker(hist_sig2_long, stateMarkersContinuous)
+
+plotshape(isMACDMode and plot_hist_sig_1 and okVisual and macd_marker_sig1_short, title = "MACD Signal 1 short", style = shape.triangledown, location = location.top, color = color.red, size = size.tiny)
+plotshape(isMACDMode and plot_hist_sig_1 and okVisual and macd_marker_sig1_long, title = "MACD Signal 1 long", style = shape.triangleup, location = location.bottom, color = color.green, size = size.tiny)
+plotshape(isMACDMode and plot_hist_sig_2 and okVisual and macd_marker_sig2_short, title = "MACD Signal 2 short", style = shape.triangledown, location = location.top, color = color.red, size = size.tiny)
+plotshape(isMACDMode and plot_hist_sig_2 and okVisual and macd_marker_sig2_long, title = "MACD Signal 2 long", style = shape.triangleup, location = location.bottom, color = color.green, size = size.tiny)
+
+
+[diPRaw, diMRaw, adxRaw] = ta.dmi(len, lensig)
+diplus = diPRaw
+diminus = diMRaw
+adx = adxRaw
+
+isDMIMode = mode == "DMI/ADX"
+plot(isDMIMode and adx_plot ? adx : na, "ADX", color.new(color.blue, 30))
+plot(isDMIMode and adx_plot ? adx_thres : na, "ADX Threshold Level", color.gray, trackprice = true)
+plot(isDMIMode ? diplus : na, "+DI", color.green)
+plot(isDMIMode ? diminus : na, "-DI", color.red)
+
+needDmiHTF = isDMIMode and dmi_plot_htf and not na(tfHTF)
+float diP_HTF = na
+float diM_HTF = na
+float adxHTF = na
+if needDmiHTF
+    [diP_HTF_tmp, diM_HTF_tmp, adxHTF_tmp] = request.security(syminfo.tickerid, tfHTF, [diplus, diminus, adx], barmerge.gaps_off, barmerge.lookahead_off)
+    diP_HTF := diP_HTF_tmp
+    diM_HTF := diM_HTF_tmp
+    adxHTF := adxHTF_tmp
+
+adx_slope_up = ta.rising(adx, slope_len_dmi)
+ema = ta.ema(close, ema_p)
+slo_sig_g = not tog_dmi_ema ? adx_slope_up and diplus > diminus : adx_slope_up and close > ema
+slo_sig_r = not tog_dmi_ema ? adx_slope_up and diplus < diminus : adx_slope_up and close < ema
+
+long_1 = diplus > diminus and adx < diplus and adx > diminus
+short_1 = diplus < diminus and adx > diplus and adx < diminus
+long_2 = diplus > diminus and adx >= adx_thres
+short_2 = diplus < diminus and adx >= adx_thres
+
+dmi_marker_long_1 = f_stateMarker(long_1, stateMarkersContinuous)
+dmi_marker_short_1 = f_stateMarker(short_1, stateMarkersContinuous)
+dmi_marker_long_2 = f_stateMarker(long_2, stateMarkersContinuous)
+dmi_marker_short_2 = f_stateMarker(short_2, stateMarkersContinuous)
+
+plotshape(isDMIMode and sig_plot_1 and okVisual and dmi_marker_long_1, title = "ADX Signal 1 long", style = shape.triangleup, location = location.bottom, color = color.green, size = size.tiny)
+plotshape(isDMIMode and sig_plot_1 and okVisual and dmi_marker_short_1, title = "ADX Signal 1 short", style = shape.triangledown, location = location.top, color = color.red, size = size.tiny)
+plotshape(isDMIMode and sig_plot_2 and okVisual and dmi_marker_long_2, title = "ADX Signal 2 long", style = shape.triangleup, location = location.bottom, color = color.green, size = size.tiny)
+plotshape(isDMIMode and sig_plot_2 and okVisual and dmi_marker_short_2, title = "ADX Signal 2 short", style = shape.triangledown, location = location.top, color = color.red, size = size.tiny)
+
+trend_up_c = adx_slope_up and diplus > diminus
+trend_dn_c = adx_slope_up and diplus < diminus
+
+// MTF ADX histogram (request only if enabled)
+float adx_4h = na
+float adx_d = na
+float adx_w = na
+float adx_m = na
+if isDMIMode and adx_hist_plot
+    adx_4h := f_sec("240", f_adx(len, lensig))
+    adx_d := f_sec("D", f_adx(len, lensig))
+    adx_w := f_sec("W", f_adx(len, lensig))
+    adx_m := f_sec("M", f_adx(len, lensig))
+
+plot(isDMIMode and adx_hist_plot and timeframe.isintraday ? adx_4h : na, color = color.new(color.blue, 40), style = plot.style_histogram, offset = 2, show_last = 1, linewidth = 4, title = "ADX 4H")
+plot(isDMIMode and adx_hist_plot and (timeframe.isintraday or timeframe.isdaily) ? adx_d : na, color = color.new(color.blue, 40), style = plot.style_histogram, offset = 4, show_last = 1, linewidth = 4, title = "ADX D")
+plot(isDMIMode and adx_hist_plot and (timeframe.isintraday or timeframe.isdaily or timeframe.isweekly) ? adx_w : na, color = color.new(color.blue, 40), style = plot.style_histogram, offset = 6, show_last = 1, linewidth = 4, title = "ADX W")
+plot(isDMIMode and adx_hist_plot and (timeframe.isintraday or timeframe.isdaily or timeframe.isweekly or timeframe.ismonthly) ? adx_m : na, color = color.new(color.blue, 40), style = plot.style_histogram, offset = 8, show_last = 1, linewidth = 4, title = "ADX M")
+
+//------------------------------------------------------------------------------
+// Unified background engine (single bgcolor)
+//------------------------------------------------------------------------------
+color bg = na
+
+if isMACDMode
+    if macd_consol
+        bg := trend_up ? color.new(color.green, bgStrong) : trend_dn ? color.new(color.red, bgStrong) : color.new(color.gray, 100)
+    else if signal_l_slo
+        bg := signal_l_slope_up ? color.new(color.green, bgMedium) : color.new(color.red, bgMedium)
+    else if macd_l_slo
+        bg := macd_l_slope_up ? color.new(color.green, bgMedium) : color.new(color.red, bgMedium)
+    else if macd_plot_s
+        bg := signalLine > 0 ? color.new(color.green, bgSoft) : signalLine < 0 ? color.new(color.red, bgSoft) : na
+    else if macd_plot_m
+        bg := macdLine > 0 ? color.new(color.green, bgSoft) : macdLine < 0 ? color.new(color.red, bgSoft) : na
+    else if macd_plot_ctf
+        bg := macdLine > signalLine ? color.new(color.green, bgSoft) : macdLine < signalLine ? color.new(color.red, bgSoft) : na
+    else if macd_plot_htf
+        bg := macdHTF > signalHTF ? color.new(color.green, bgSoft) : macdHTF < signalHTF ? color.new(color.red, bgSoft) : na
+
+if isDMIMode
+    if adx_range
+        bg := trend_up_c ? color.new(color.green, bgStrong) : trend_dn_c ? color.new(color.red, bgStrong) : color.new(color.gray, 100)
+    else if adx_slo
+        bg := slo_sig_g ? color.new(color.green, bgMedium) : slo_sig_r ? color.new(color.red, bgMedium) : na
+    else if dmi_plot
+        bg := diplus > diminus ? color.new(color.green, bgSoft) : color.new(color.red, bgSoft)
+    else if dmi_plot_htf
+        bg := diP_HTF > diM_HTF ? color.new(color.green, bgSoft) : color.new(color.red, bgSoft)
+
+var color bgHold = na
+if okVisual and not na(bg)
+    bgHold := bg
+bgcolor(bgHold, title = "Context Bg")
+
+//------------------------------------------------------------------------------
+// Alerts (event-based)
+//------------------------------------------------------------------------------
+state_long0 = long_2
+state_short0 = short_2
+start_long = okAlert and isDMIMode and state_long0 and not state_long0[1]
+end_long = okAlert and isDMIMode and not state_long0 and state_long0[1]
+start_short = okAlert and isDMIMode and state_short0 and not state_short0[1]
+end_short = okAlert and isDMIMode and not state_short0 and state_short0[1]
+
+macd_cross_up_raw = ta.crossover(macdLine, signalLine)
+macd_cross_down_raw = ta.crossunder(macdLine, signalLine)
+macd_zero_up_raw = ta.crossover(macdLine, 0)
+macd_zero_down_raw = ta.crossunder(macdLine, 0)
+sig_zero_up_raw = ta.crossover(signalLine, 0)
+sig_zero_down_raw = ta.crossunder(signalLine, 0)
+dmi_cross_up_raw = ta.crossover(diplus, diminus)
+dmi_cross_down_raw = ta.crossunder(diplus, diminus)
+
+macdBullState0 = macdLine > signalLine
+macdBearState0 = macdLine < signalLine
+macdBullStart = okAlert and isMACDMode and macdBullState0 and not macdBullState0[1]
+macdBullEnd = okAlert and isMACDMode and not macdBullState0 and macdBullState0[1]
+macdBearStart = okAlert and isMACDMode and macdBearState0 and not macdBearState0[1]
+macdBearEnd = okAlert and isMACDMode and not macdBearState0 and macdBearState0[1]
+
+near0 = macdL_near0_abs > 0 and math.abs(macdLine) <= macdL_near0_abs and math.abs(signalLine) <= macdL_near0_abs
+
+macdDelta = macdLine - macdLine[1]
+sigDelta = signalLine - signalLine[1]
+macdSlopeFlipUp = okAlert and isMACDMode and macdDelta > 0 and macdDelta[1] <= 0
+macdSlopeFlipDown = okAlert and isMACDMode and macdDelta < 0 and macdDelta[1] >= 0
+sigSlopeFlipUp = okAlert and isMACDMode and sigDelta > 0 and sigDelta[1] <= 0
+sigSlopeFlipDown = okAlert and isMACDMode and sigDelta < 0 and sigDelta[1] >= 0
+
+macdDiff = math.abs(macdLine - signalLine)
+prox = macdL_prox_abs > 0 and macdDiff <= macdL_prox_abs
+proxEnter = okAlert and isMACDMode and prox and not prox[1]
+
+diBullState0 = diplus > diminus
+diBearState0 = diplus < diminus
+diBullStart = okAlert and isDMIMode and diBullState0 and not diBullState0[1]
+diBullEnd = okAlert and isDMIMode and not diBullState0 and diBullState0[1]
+diBearStart = okAlert and isDMIMode and diBearState0 and not diBearState0[1]
+diBearEnd = okAlert and isDMIMode and not diBearState0 and diBearState0[1]
+
+adxThresUpRaw = ta.crossover(adx, adx_thres)
+adxThresDownRaw = ta.crossunder(adx, adx_thres)
+adxThresUp = okAlert and isDMIMode and adxThresUpRaw
+adxThresDown = okAlert and isDMIMode and adxThresDownRaw
+adxDelta = adx - adx[1]
+adxSlopeFlipUp = okAlert and isDMIMode and adxDelta > 0 and adxDelta[1] <= 0
+adxSlopeFlipDown = okAlert and isDMIMode and adxDelta < 0 and adxDelta[1] >= 0
+
+macd_cross_up = okAlert and isMACDMode and macd_cross_up_raw
+macd_cross_down = okAlert and isMACDMode and macd_cross_down_raw
+macd_zero_up = okAlert and isMACDMode and macd_zero_up_raw
+macd_zero_down = okAlert and isMACDMode and macd_zero_down_raw
+sig_zero_up = okAlert and isMACDMode and sig_zero_up_raw
+sig_zero_down = okAlert and isMACDMode and sig_zero_down_raw
+macd_cross_up_near0 = okAlert and isMACDMode and macd_cross_up_raw and (macdL_near0_abs <= 0 ? true : near0)
+macd_cross_down_near0 = okAlert and isMACDMode and macd_cross_down_raw and (macdL_near0_abs <= 0 ? true : near0)
+dmi_cross_up = okAlert and isDMIMode and dmi_cross_up_raw
+dmi_cross_down = okAlert and isDMIMode and dmi_cross_down_raw
+adxStrongRisingState0 = adx >= adx_thres and adx_slope_up
+adx_strong_rising = okAlert and isDMIMode and adxStrongRisingState0 and not adxStrongRisingState0[1]
+adx_strong_rising_end = okAlert and isDMIMode and not adxStrongRisingState0 and adxStrongRisingState0[1]
+
+
+hist_delta = histLine - histLine[1]
+hist_zero_up_raw = ta.crossover(histLine, 0)
+hist_zero_down_raw = ta.crossunder(histLine, 0)
+
+hist_slope_flip_up = okAlert and isMACDMode and hist_delta > 0 and hist_delta[1] <= 0
+hist_slope_flip_down = okAlert and isMACDMode and hist_delta < 0 and hist_delta[1] >= 0
+hist_zero_up = okAlert and isMACDMode and hist_zero_up_raw
+hist_zero_down = okAlert and isMACDMode and hist_zero_down_raw
+
+growAbove = histLine >= 0 and histLine > histLine[1]
+fallAbove = histLine >= 0 and histLine < histLine[1]
+growBelow = histLine < 0 and histLine > histLine[1]
+fallBelow = histLine < 0 and histLine < histLine[1]
+
+growAboveOn = okAlert and isMACDMode and growAbove and not growAbove[1]
+fallAboveOn = okAlert and isMACDMode and fallAbove and not fallAbove[1]
+growBelowOn = okAlert and isMACDMode and growBelow and not growBelow[1]
+fallBelowOn = okAlert and isMACDMode and fallBelow and not fallBelow[1]
+
+hist_piv_hi = ta.pivothigh(histLine, hist_pivot_left, hist_pivot_right)
+hist_piv_lo = ta.pivotlow(histLine, hist_pivot_left, hist_pivot_right)
+hist_piv_hi_vis = okVisual and isMACDMode and not na(hist_piv_hi)
+hist_piv_lo_vis = okVisual and isMACDMode and not na(hist_piv_lo)
+hist_piv_hi_al = okAlert and isMACDMode and not na(hist_piv_hi)
+hist_piv_lo_al = okAlert and isMACDMode and not na(hist_piv_lo)
+
+hist_compressed = ta.highest(math.abs(histLine), ignite_len) <= ignite_max_abs
+hist_ignite_up = okAlert and isMACDMode and hist_compressed[1] and histLine >= ignite_abs
+hist_ignite_down = okAlert and isMACDMode and hist_compressed[1] and histLine <= -ignite_abs
+
+alertcondition(dmi_alert_state_longshort and (start_long or end_long), "DMI/ADX: State Long Start/End", "{{ticker}} {{interval}} DMI/ADX Long_2 state changed")
+alertcondition(dmi_alert_state_longshort and (start_short or end_short), "DMI/ADX: State Short Start/End", "{{ticker}} {{interval}} DMI/ADX Short_2 state changed")
+
+alertcondition(macdL_alert_cross and (macd_cross_up or macd_cross_down), "MACD Lines: Cross Up/Down", "{{ticker}} {{interval}} MACD line crossed signal")
+alertcondition(macdL_alert_regime and (macdBullStart or macdBullEnd or macdBearStart or macdBearEnd), "MACD Lines: Regime Bull/Bear Start/End", "{{ticker}} {{interval}} MACD bull/bear regime changed")
+alertcondition(macdL_alert_macd0 and (macd_zero_up or macd_zero_down), "MACD Lines: MACD Zero Up/Down", "{{ticker}} {{interval}} MACD line crossed zero")
+alertcondition(macdL_alert_sig0 and (sig_zero_up or sig_zero_down), "MACD Lines: Signal Zero Up/Down", "{{ticker}} {{interval}} signal line crossed zero")
+alertcondition(macdL_alert_near0_cross and (macd_cross_up_near0 or macd_cross_down_near0), "MACD Lines: Cross Near Zero Up/Down", "{{ticker}} {{interval}} MACD/signal crossed near zero")
+alertcondition(macdL_alert_slopeflip and (macdSlopeFlipUp or macdSlopeFlipDown), "MACD Lines: MACD Slope Flip Up/Down", "{{ticker}} {{interval}} MACD slope flipped")
+alertcondition(macdL_alert_sig_slopeflip and (sigSlopeFlipUp or sigSlopeFlipDown), "MACD Lines: Signal Slope Flip Up/Down", "{{ticker}} {{interval}} signal slope flipped")
+alertcondition(macdL_alert_proximity and proxEnter, "MACD Lines: Proximity Enter", "{{ticker}} {{interval}} MACD/signal entered proximity threshold")
+
+alertcondition(dmi_alert_di_cross and (dmi_cross_up or dmi_cross_down), "DMI/ADX: DI Cross Up/Down", "{{ticker}} {{interval}} +DI/-DI cross")
+alertcondition(dmi_alert_di_regime and (diBullStart or diBullEnd or diBearStart or diBearEnd), "DMI/ADX: DI Regime Start/End", "{{ticker}} {{interval}} DI dominance regime changed")
+alertcondition(dmi_alert_adx_thres and (adxThresUp or adxThresDown), "DMI/ADX: ADX Threshold Up/Down", "{{ticker}} {{interval}} ADX crossed threshold")
+alertcondition(dmi_alert_adx_slopeflip and (adxSlopeFlipUp or adxSlopeFlipDown), "DMI/ADX: ADX Slope Flip Up/Down", "{{ticker}} {{interval}} ADX slope flipped")
+alertcondition((dmi_alert_strong_rising and adx_strong_rising) or (dmi_alert_strong_rising_end and adx_strong_rising_end), "DMI/ADX: ADX Strong+Rising Start/End", "{{ticker}} {{interval}} ADX strong+rising state changed")
+
+alertcondition(hist_alert_zero and hist_zero_up, "Histogram zero cross up", "MACD histogram crossed above zero")
+alertcondition(hist_alert_zero and hist_zero_down, "Histogram zero cross down", "MACD histogram crossed below zero")
+alertcondition(hist_alert_slopeflip and hist_slope_flip_up, "Histogram slope flip up", "MACD histogram slope flipped up")
+alertcondition(hist_alert_slopeflip and hist_slope_flip_down, "Histogram slope flip down", "MACD histogram slope flipped down")
+alertcondition(hist_alert_growfall and growAboveOn, "Histogram grow above 0", "MACD histogram started growing above 0")
+alertcondition(hist_alert_growfall and fallAboveOn, "Histogram fall above 0", "MACD histogram started falling above 0")
+alertcondition(hist_alert_growfall and growBelowOn, "Histogram grow below 0", "MACD histogram started growing below 0")
+alertcondition(hist_alert_growfall and fallBelowOn, "Histogram fall below 0", "MACD histogram started falling below 0")
+alertcondition(hist_alert_pivot and hist_piv_hi_al, "Histogram pivot peak", "MACD histogram pivot peak confirmed")
+alertcondition(hist_alert_pivot and hist_piv_lo_al, "Histogram pivot trough", "MACD histogram pivot trough confirmed")
+alertcondition(hist_alert_ignite and hist_ignite_up, "Histogram ignition up", "MACD histogram ignited up after compression")
+alertcondition(hist_alert_ignite and hist_ignite_down, "Histogram ignition down", "MACD histogram ignited down after compression")
+
+plotshape(isMACDMode and hist_alert_pivot and hist_piv_hi_vis, title = "Hist Pivot Peak", style = shape.circle, location = location.top, color = color.orange, size = size.tiny, offset = -hist_pivot_right)
+plotshape(isMACDMode and hist_alert_pivot and hist_piv_lo_vis, title = "Hist Pivot Trough", style = shape.circle, location = location.bottom, color = color.aqua, size = size.tiny, offset = -hist_pivot_right)
+
+
+//------------------------------------------------------------------------------
+// Divergence (Pivot-Based): Preview + Confirm
+//  - MACD only (auto-off in DMI/ADX)
+//  - Preview: faster pivots, visuals only
+//  - Confirm: your pivots, visuals + alerts
+//  - MACD Line mode: anchor dots to SIGNAL line (constant baseline)
+//  - Marker spacing: ONE user control + internal robust floor (no "touching")
+//------------------------------------------------------------------------------
+
+//------------------------------------------------------------------------------
+// Helpers
+//------------------------------------------------------------------------------
+f_atPivot(_piv, _series, _right, _occ) =>
+    ta.valuewhen(not na(_piv), _series[_right], _occ)
+
+//------------------------------------------------------------------------------
+// Enable flags
+//------------------------------------------------------------------------------
+divEnabled = divMode != "Off"
+divAllowed = divEnabled and isMACDMode
+previewAllowed = divAllowed and divPreview and execMode != "Confirmed Only (Non-Repaint)"
+showClassicDiv = divType == "Classic" or divType == "Both"
+showHiddenDiv = divType == "Hidden" or divType == "Both"
+
+// Oscillator selection
+float osc = na
+if divAllowed
+    osc := divMode == "Histogram Divergence" ? histLine :
+           divMode == "MACD Line Divergence" ? macdLine : na
+
+// Range source for the floor:
+// - In MACD Line mode we anchor to SIGNAL => use SIGNAL range for more consistent spacing to signal line
+// - Otherwise use osc range
+float rangeSrc = na
+if divAllowed
+    rangeSrc := divMode == "MACD Line Divergence" ? signalLine : osc
+
+// Dynamic basis (kept, but no extra knobs):
+// - MACD Line mode: |MACD - Signal| EMA (good proxy for local separation)
+// - Histogram mode: |osc| EMA
+float dynBasis = na
+if divAllowed
+    dynBasis := divMode == "MACD Line Divergence" ? ta.ema(math.abs(macdLine - signalLine), 50) : ta.ema(math.abs(osc), 50)
+
+// Range basis for the minimum floor
+float rangeBasis = na
+if divAllowed
+    rangeBasis := (ta.highest(rangeSrc, _DIV_RANGE_LEN) - ta.lowest(rangeSrc, _DIV_RANGE_LEN))
+
+//------------------------------------------------------------------------------
+// CONFIRMED divergence (div_left/div_right)
+//------------------------------------------------------------------------------
+float plC = na
+float phC = na
+if divAllowed
+    plC := ta.pivotlow(low,  div_left, div_right)
+    phC := ta.pivothigh(high, div_left, div_right)
+
+// Sample at pivot bar
+pricePL_C      = f_atPivot(plC, low,  div_right, 0)
+pricePL_C_prev = f_atPivot(plC, low,  div_right, 1)
+oscAtPL_C      = f_atPivot(plC, osc,  div_right, 0)
+oscAtPL_C_prev = f_atPivot(plC, osc,  div_right, 1)
+
+pricePH_C      = f_atPivot(phC, high, div_right, 0)
+pricePH_C_prev = f_atPivot(phC, high, div_right, 1)
+oscAtPH_C      = f_atPivot(phC, osc,  div_right, 0)
+oscAtPH_C_prev = f_atPivot(phC, osc,  div_right, 1)
+
+// Signal at pivot (for MACD Line mode baseline)
+sigAtPL_C      = f_atPivot(plC, signalLine, div_right, 0)
+sigAtPH_C      = f_atPivot(phC, signalLine, div_right, 0)
+
+// Bases at pivot
+dynAtPL_C      = f_atPivot(plC, dynBasis,   div_right, 0)
+dynAtPH_C      = f_atPivot(phC, dynBasis,   div_right, 0)
+rangeAtPL_C    = f_atPivot(plC, rangeBasis, div_right, 0)
+rangeAtPH_C    = f_atPivot(phC, rangeBasis, div_right, 0)
+
+// Divergence conditions
+divBullClassic_C = divAllowed and showClassicDiv and not na(plC) and pricePL_C < pricePL_C_prev and oscAtPL_C > oscAtPL_C_prev
+divBearClassic_C = divAllowed and showClassicDiv and not na(phC) and pricePH_C > pricePH_C_prev and oscAtPH_C < oscAtPH_C_prev
+divBullHidden_C = divAllowed and showHiddenDiv and not na(plC) and pricePL_C > pricePL_C_prev and oscAtPL_C < oscAtPL_C_prev
+divBearHidden_C = divAllowed and showHiddenDiv and not na(phC) and pricePH_C < pricePH_C_prev and oscAtPH_C > oscAtPH_C_prev
+
+divBull_C = divBullClassic_C or divBullHidden_C
+divBear_C = divBearClassic_C or divBearHidden_C
+
+divBull_C_vis = okVisual and divBull_C
+divBear_C_vis = okVisual and divBear_C
+divBull_C_al  = okAlert  and divBull_C
+divBear_C_al  = okAlert  and divBear_C
+
+// Unified spacing:
+// - dynamic component (scaled by distance)
+// - minimum floor based on range (also scaled by distance), prevents "touching"
+dynOffPL_C = nz(dynAtPL_C, 0.0) * div_marker_distance
+dynOffPH_C = nz(dynAtPH_C, 0.0) * div_marker_distance
+
+floorOffPL_C = nz(rangeAtPL_C, 0.0) * _DIV_FLOOR_PCT * div_marker_distance
+floorOffPH_C = nz(rangeAtPH_C, 0.0) * _DIV_FLOOR_PCT * div_marker_distance
+
+markerOffsetPL_C = math.max(dynOffPL_C, floorOffPL_C)
+markerOffsetPH_C = math.max(dynOffPH_C, floorOffPH_C)
+
+// Baseline anchoring
+baseBull_C = divMode == "MACD Line Divergence" ? sigAtPL_C : oscAtPL_C
+baseBear_C = divMode == "MACD Line Divergence" ? sigAtPH_C : oscAtPH_C
+
+bullY_C = baseBull_C - markerOffsetPL_C
+bearY_C = baseBear_C + markerOffsetPH_C
+
+plot(divBull_C_vis ? bullY_C : na, title="Bull Div (CONF)", style=plot.style_circles, linewidth=2, offset=-div_right, color=color.new(color.green, 0))
+plot(divBear_C_vis ? bearY_C : na, title="Bear Div (CONF)", style=plot.style_circles, linewidth=2, offset=-div_right, color=color.new(color.red,   0))
+
+alertcondition(okAlert and divBullClassic_C, "Bullish divergence (Classic)", "Classic bullish divergence confirmed")
+alertcondition(okAlert and divBearClassic_C, "Bearish divergence (Classic)", "Classic bearish divergence confirmed")
+alertcondition(okAlert and divBullHidden_C, "Bullish divergence (Hidden)", "Hidden bullish divergence confirmed")
+alertcondition(okAlert and divBearHidden_C, "Bearish divergence (Hidden)", "Hidden bearish divergence confirmed")
+alertcondition(divBull_C_al, "Bullish divergence", "Bullish divergence confirmed")
+alertcondition(divBear_C_al, "Bearish divergence", "Bearish divergence confirmed")
+
+//------------------------------------------------------------------------------
+// PREVIEW divergence (right=div_preview_right) — visuals only
+//------------------------------------------------------------------------------
+float plP = na
+float phP = na
+if previewAllowed
+    plP := ta.pivotlow(low,  div_left, div_preview_right)
+    phP := ta.pivothigh(high, div_left, div_preview_right)
+
+pricePL_P      = f_atPivot(plP, low,  div_preview_right, 0)
+pricePL_P_prev = f_atPivot(plP, low,  div_preview_right, 1)
+oscAtPL_P      = f_atPivot(plP, osc,  div_preview_right, 0)
+oscAtPL_P_prev = f_atPivot(plP, osc,  div_preview_right, 1)
+
+pricePH_P      = f_atPivot(phP, high, div_preview_right, 0)
+pricePH_P_prev = f_atPivot(phP, high, div_preview_right, 1)
+oscAtPH_P      = f_atPivot(phP, osc,  div_preview_right, 0)
+oscAtPH_P_prev = f_atPivot(phP, osc,  div_preview_right, 1)
+
+sigAtPL_P      = f_atPivot(plP, signalLine, div_preview_right, 0)
+sigAtPH_P      = f_atPivot(phP, signalLine, div_preview_right, 0)
+
+dynAtPL_P      = f_atPivot(plP, dynBasis,   div_preview_right, 0)
+dynAtPH_P      = f_atPivot(phP, dynBasis,   div_preview_right, 0)
+rangeAtPL_P    = f_atPivot(plP, rangeBasis, div_preview_right, 0)
+rangeAtPH_P    = f_atPivot(phP, rangeBasis, div_preview_right, 0)
+
+divBullClassic_P = previewAllowed and showClassicDiv and not na(plP) and pricePL_P < pricePL_P_prev and oscAtPL_P > oscAtPL_P_prev
+divBearClassic_P = previewAllowed and showClassicDiv and not na(phP) and pricePH_P > pricePH_P_prev and oscAtPH_P < oscAtPH_P_prev
+divBullHidden_P = previewAllowed and showHiddenDiv and not na(plP) and pricePL_P > pricePL_P_prev and oscAtPL_P < oscAtPL_P_prev
+divBearHidden_P = previewAllowed and showHiddenDiv and not na(phP) and pricePH_P < pricePH_P_prev and oscAtPH_P > oscAtPH_P_prev
+
+divBull_P = divBullClassic_P or divBullHidden_P
+divBear_P = divBearClassic_P or divBearHidden_P
+
+divBull_P_vis = okVisual and divBull_P
+divBear_P_vis = okVisual and divBear_P
+
+dynOffPL_P = nz(dynAtPL_P, 0.0) * div_marker_distance
+dynOffPH_P = nz(dynAtPH_P, 0.0) * div_marker_distance
+
+floorOffPL_P = nz(rangeAtPL_P, 0.0) * _DIV_FLOOR_PCT * div_marker_distance
+floorOffPH_P = nz(rangeAtPH_P, 0.0) * _DIV_FLOOR_PCT * div_marker_distance
+
+markerOffsetPL_P = math.max(dynOffPL_P, floorOffPL_P)
+markerOffsetPH_P = math.max(dynOffPH_P, floorOffPH_P)
+
+baseBull_P = divMode == "MACD Line Divergence" ? sigAtPL_P : oscAtPL_P
+baseBear_P = divMode == "MACD Line Divergence" ? sigAtPH_P : oscAtPH_P
+
+bullY_P = baseBull_P - markerOffsetPL_P
+bearY_P = baseBear_P + markerOffsetPH_P
+
+plot(divBull_P_vis ? bullY_P : na, title="Bull Div (PREVIEW)", style=plot.style_circles, linewidth=1, offset=-div_preview_right, color=color.new(color.green, 70))
+plot(divBear_P_vis ? bearY_P : na, title="Bear Div (PREVIEW)", style=plot.style_circles, linewidth=1, offset=-div_preview_right, color=color.new(color.red,   70))

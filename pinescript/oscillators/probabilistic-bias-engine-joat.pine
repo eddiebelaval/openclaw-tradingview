@@ -1,0 +1,507 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © officialjackofalltrades
+//@version=6
+indicator("Probabilistic Bias Engine [JOAT]", shorttitle="PBE [JOAT]", overlay=false, max_bars_back=500)
+
+// ─────────────────────────────────────────────────────────────────────────────────
+// CONFIGURATION
+// ─────────────────────────────────────────────────────────────────────────────────
+
+g_bayesian = "Bayesian Parameters"
+g_loop = "Historical Analysis"
+g_confluence = "Multi-Timeframe Confluence"
+g_visual = "Visualization"
+
+// Bayesian Settings
+source = input.source(hlc3, "Price Source", group=g_bayesian)
+bayesian_length = input.int(14, "Bayesian Period", minval=5, maxval=50, group=g_bayesian)
+smoothing_period = input.int(2, "Signal Smoothing", minval=1, maxval=10, group=g_bayesian)
+
+// For-Loop Analysis (from Bayesian & Zero Lag knowledge)
+loop_start = input.int(1, "Loop Start", minval=1, group=g_loop)
+loop_lookback = input.int(70, "Loop Lookback", minval=10, maxval=200, group=g_loop)
+
+// Multi-Timeframe Confluence
+enable_mtf = input.bool(true, "Enable MTF Confluence", group=g_confluence)
+tf_short = input.timeframe("5", "Short Timeframe", group=g_confluence)
+tf_medium = input.timeframe("15", "Medium Timeframe", group=g_confluence)
+tf_long = input.timeframe("60", "Long Timeframe", group=g_confluence)
+confluence_threshold = input.int(2, "Confluence Requirement", minval=1, maxval=3, group=g_confluence)
+
+// Visual
+show_probability_bands = input.bool(true, "Show Probability Bands", group=g_visual)
+show_bias_zones = input.bool(true, "Show Bias Zones", group=g_visual)
+show_histogram = input.bool(true, "Show Histogram", group=g_visual)
+
+// ─────────────────────────────────────────────────────────────────────────────────
+// COLOR SYSTEM - GREEN/ORANGE PROBABILITY GRADIENT (Bayesian Theme)
+// ─────────────────────────────────────────────────────────────────────────────────
+
+color c_bullish_strong = #00ff41       // Matrix green (high probability)
+color c_bullish_weak = #39ff14         // Neon green
+color c_bearish_strong = #8B0000       // Dark red (low probability)
+color c_bearish_weak = #DC143C         // Crimson red
+color c_neutral = #1a1a2e              // Deep space blue
+color c_band_upper = #00ff41           // Matrix green
+color c_band_lower = #8B0000           // Dark red
+color c_background = #0d0d0d           // Almost black
+color c_text = #ffffff                 // Pure white
+color c_dashboard_bg = #0a0a0f         // Almost black
+color c_dashboard_border = #00ff41     // Matrix green border
+
+// ─────────────────────────────────────────────────────────────────────────────────
+// CORE FUNCTIONS
+// ─────────────────────────────────────────────────────────────────────────────────
+
+// For-Loop Historical Analysis (from Bayesian Indicator knowledge)
+f_forloop_analysis(float src, int start, int lookback) =>
+    float sum = 0.0
+    for i = start to lookback
+        sum += src > src[i] ? 1 : -1
+    float normalized = sum / (lookback - start + 1)
+    normalized
+
+// Bayesian Probability Calculation (from Bayesian Indicator knowledge)
+f_bayesian_probability(float loop_value) =>
+    float evidence = loop_value > 0 ? 0.7 : 0.3
+    float prior = 0.5
+    float posterior = (prior * evidence) / (prior * evidence + (1 - prior) * (1 - evidence))
+    posterior
+
+// Multi-Timeframe Bias Detection
+f_get_timeframe_bias(string tf) =>
+    [src_tf, loop_score_tf] = request.security(syminfo.tickerid, tf,
+         [source, f_forloop_analysis(source, loop_start, loop_lookback)],
+         lookahead=barmerge.lookahead_off)
+    
+    float prob_tf = f_bayesian_probability(loop_score_tf)
+    int bias_tf = prob_tf > 0.5 ? 1 : -1
+    [prob_tf, bias_tf]
+
+// ─────────────────────────────────────────────────────────────────────────────────
+// CALCULATIONS
+// ─────────────────────────────────────────────────────────────────────────────────
+
+// Current timeframe analysis
+float loop_score = f_forloop_analysis(source, loop_start, loop_lookback)
+float short_term_prob = f_bayesian_probability(loop_score)
+float long_term_prob = f_bayesian_probability(ta.sma(loop_score, bayesian_length))
+
+// Combined probability (0-100 scale)
+float combined_probability = (short_term_prob * 100 + long_term_prob * 100) / 2
+float smoothed_probability = ta.ema(combined_probability, smoothing_period)
+
+// Binary bias signal
+int bias_signal = smoothed_probability > 50 ? 1 : -1
+
+// Multi-Timeframe Confluence
+var float prob_short = 0.0
+var float prob_medium = 0.0
+var float prob_long = 0.0
+var int bias_short = 0
+var int bias_medium = 0
+var int bias_long = 0
+
+if enable_mtf
+    [prob_short_temp, bias_short_temp] = f_get_timeframe_bias(tf_short)
+    [prob_medium_temp, bias_medium_temp] = f_get_timeframe_bias(tf_medium)
+    [prob_long_temp, bias_long_temp] = f_get_timeframe_bias(tf_long)
+    
+    prob_short := prob_short_temp * 100
+    prob_medium := prob_medium_temp * 100
+    prob_long := prob_long_temp * 100
+    bias_short := bias_short_temp
+    bias_medium := bias_medium_temp
+    bias_long := bias_long_temp
+
+// Confluence count
+int bullish_confluence = (bias_signal > 0 ? 1 : 0) + (bias_short > 0 ? 1 : 0) + (bias_medium > 0 ? 1 : 0) + (bias_long > 0 ? 1 : 0)
+int bearish_confluence = (bias_signal < 0 ? 1 : 0) + (bias_short < 0 ? 1 : 0) + (bias_medium < 0 ? 1 : 0) + (bias_long < 0 ? 1 : 0)
+
+bool strong_bullish = bullish_confluence >= confluence_threshold
+bool strong_bearish = bearish_confluence >= confluence_threshold
+
+// Probability strength (distance from 50)
+float probability_strength = math.abs(smoothed_probability - 50)
+
+// ─────────────────────────────────────────────────────────────────────────────────
+// VISUALIZATION
+// ─────────────────────────────────────────────────────────────────────────────────
+
+// Reference lines
+hline(50, "Neutral", color=color.new(c_neutral, 50), linestyle=hline.style_solid, linewidth=1)
+hline(70, "Strong Bullish", color=color.new(c_bullish_weak, 70), linestyle=hline.style_dotted)
+hline(30, "Strong Bearish", color=color.new(c_bearish_weak, 70), linestyle=hline.style_dotted)
+
+// Probability bands
+band_upper = plot(show_probability_bands ? 70 : na, "Upper Band", color=color.new(c_band_upper, 80), linewidth=1)
+band_lower = plot(show_probability_bands ? 30 : na, "Lower Band", color=color.new(c_band_lower, 80), linewidth=1)
+fill(band_upper, band_lower, color=color.new(c_background, 95), title="Neutral Zone")
+
+// Main probability line
+color prob_color = color.gray
+if smoothed_probability > 50
+    prob_color := strong_bullish ? c_bullish_strong : c_bullish_weak
+else
+    prob_color := strong_bearish ? c_bearish_strong : c_bearish_weak
+
+plot(smoothed_probability, "Probability", color=prob_color, linewidth=3, style=plot.style_line)
+
+// Histogram with basic gradient (confidence score calculated later)
+color hist_color = color.gray
+if smoothed_probability > 50
+    // Bullish: brighter green as probability increases
+    float bull_intensity = math.min(100, probability_strength * 2)
+    hist_color := color.from_gradient(bull_intensity, 0, 100, color.new(c_bullish_weak, 70), color.new(c_bullish_strong, 10))
+else
+    // Bearish: brighter orange/red as probability increases
+    float bear_intensity = math.min(100, probability_strength * 2)
+    hist_color := color.from_gradient(bear_intensity, 0, 100, color.new(c_bearish_weak, 70), color.new(c_bearish_strong, 10))
+
+plot(show_histogram ? smoothed_probability - 50 : na, "Histogram", 
+     color=hist_color, style=plot.style_histogram, linewidth=4, histbase=0)
+
+// Background zones for strong bias
+bgcolor(show_bias_zones and strong_bullish ? color.new(c_bullish_strong, 95) : na, title="Strong Bullish Zone")
+bgcolor(show_bias_zones and strong_bearish ? color.new(c_bearish_strong, 95) : na, title="Strong Bearish Zone")
+
+// ─────────────────────────────────────────────────────────────────────────────────
+// DASHBOARD
+// ─────────────────────────────────────────────────────────────────────────────────
+
+var table dashboard = table.new(position.bottom_right, 3, 10, bgcolor=color.new(c_dashboard_bg, 5), border_width=2, border_color=color.new(c_dashboard_border, 30))
+
+if barstate.islast
+    // Header
+    table.cell(dashboard, 0, 0, "PBE [JOAT]", text_color=c_bullish_strong, text_size=size.normal, bgcolor=color.new(c_dashboard_bg, 0))
+    table.merge_cells(dashboard, 0, 0, 2, 0)
+    
+    // Current probability
+    table.cell(dashboard, 0, 1, "Current", text_color=c_text, text_size=size.tiny)
+    table.cell(dashboard, 1, 1, str.tostring(smoothed_probability, "#.#") + "%", text_color=prob_color, text_size=size.small)
+    table.cell(dashboard, 2, 1, bias_signal > 0 ? "BULL" : "BEAR", text_color=prob_color, text_size=size.tiny)
+    
+    // Strength
+    table.cell(dashboard, 0, 2, "Strength", text_color=c_text, text_size=size.tiny)
+    table.cell(dashboard, 1, 2, str.tostring(probability_strength, "#.#"), text_color=c_text, text_size=size.tiny)
+    table.merge_cells(dashboard, 1, 2, 2, 2)
+    
+    // MTF Confluence
+    if enable_mtf
+        table.cell(dashboard, 0, 3, tf_short, text_color=c_text, text_size=size.tiny)
+        table.cell(dashboard, 1, 3, str.tostring(prob_short, "#.#") + "%", 
+             text_color=bias_short > 0 ? c_bullish_weak : c_bearish_weak, text_size=size.tiny)
+        table.cell(dashboard, 2, 3, bias_short > 0 ? "UP" : "DN", 
+             text_color=bias_short > 0 ? c_bullish_strong : c_bearish_strong, text_size=size.small)
+        
+        table.cell(dashboard, 0, 4, tf_medium, text_color=c_text, text_size=size.tiny)
+        table.cell(dashboard, 1, 4, str.tostring(prob_medium, "#.#") + "%", 
+             text_color=bias_medium > 0 ? c_bullish_weak : c_bearish_weak, text_size=size.tiny)
+        table.cell(dashboard, 2, 4, bias_medium > 0 ? "UP" : "DN", 
+             text_color=bias_medium > 0 ? c_bullish_strong : c_bearish_strong, text_size=size.small)
+        
+        table.cell(dashboard, 0, 5, tf_long, text_color=c_text, text_size=size.tiny)
+        table.cell(dashboard, 1, 5, str.tostring(prob_long, "#.#") + "%", 
+             text_color=bias_long > 0 ? c_bullish_weak : c_bearish_weak, text_size=size.tiny)
+        table.cell(dashboard, 2, 5, bias_long > 0 ? "UP" : "DN", 
+             text_color=bias_long > 0 ? c_bullish_strong : c_bearish_strong, text_size=size.small)
+
+// ─────────────────────────────────────────────────────────────────────────────────
+// ADVANCED FEATURES - ENSEMBLE FOR-LOOP ANALYSIS
+// ─────────────────────────────────────────────────────────────────────────────────
+
+// Multiple lookback periods for ensemble analysis (from Zero Lag knowledge)
+f_forloop_ensemble(float src, int start, int end1, int end2, int end3) =>
+    float sum1 = 0.0, float sum2 = 0.0, float sum3 = 0.0
+    
+    for i = start to end1
+        sum1 += src > src[i] ? 1 : -1
+    
+    for i = start to end2
+        sum2 += src > src[i] ? 1 : -1
+    
+    for i = start to end3
+        sum3 += src > src[i] ? 1 : -1
+    
+    float norm1 = sum1 / (end1 - start + 1)
+    float norm2 = sum2 / (end2 - start + 1)
+    float norm3 = sum3 / (end3 - start + 1)
+    
+    // Weighted ensemble (shorter periods get more weight)
+    float ensemble = (norm1 * 0.5) + (norm2 * 0.3) + (norm3 * 0.2)
+    [ensemble, norm1, norm2, norm3]
+
+[ensemble_score, short_loop, medium_loop, long_loop] = f_forloop_ensemble(source, loop_start, 30, 70, 150)
+
+// Ensemble probability
+float ensemble_prob = f_bayesian_probability(ensemble_score) * 100
+
+// ─────────────────────────────────────────────────────────────────────────────────
+// ADVANCED FEATURES - VOLATILITY REGIME SCALING
+// ─────────────────────────────────────────────────────────────────────────────────
+
+// ATR-based volatility regime (from VRC knowledge)
+float atr_val = ta.atr(14)
+float natr = close > 0 ? (atr_val / close) * 100 : 0.0
+float vol_percentile = ta.percentrank(natr, 100)
+
+// Regime classification
+string vol_regime = 
+     vol_percentile >= 80 ? "High Vol" :
+     vol_percentile >= 60 ? "Elevated" :
+     vol_percentile >= 40 ? "Normal" :
+     vol_percentile >= 20 ? "Low Vol" :
+     "Very Low"
+
+// Regime-adjusted probability (scale down in high volatility)
+float regime_multiplier = 
+     vol_percentile >= 80 ? 0.85 :
+     vol_percentile >= 60 ? 0.92 :
+     vol_percentile >= 40 ? 1.0 :
+     vol_percentile >= 20 ? 1.05 :
+     1.1
+
+float regime_adjusted_prob = smoothed_probability * regime_multiplier
+
+// ─────────────────────────────────────────────────────────────────────────────────
+// ADVANCED FEATURES - DIVERGENCE CONFIRMATION LAYER
+// ─────────────────────────────────────────────────────────────────────────────────
+
+// RSI divergence detection (from DCS knowledge)
+float rsi = ta.rsi(close, 14)
+float rsi_high = ta.pivothigh(rsi, 5, 2)
+float rsi_low = ta.pivotlow(rsi, 5, 2)
+
+var float last_rsi_high = na
+var float last_rsi_high_price = na
+var float last_rsi_low = na
+var float last_rsi_low_price = na
+
+if not na(rsi_high)
+    last_rsi_high := rsi_high
+    last_rsi_high_price := high[2]
+
+if not na(rsi_low)
+    last_rsi_low := rsi_low
+    last_rsi_low_price := low[2]
+
+// Bullish divergence: price lower low, RSI higher low
+bool bull_divergence = not na(last_rsi_low) and low < last_rsi_low_price and rsi > last_rsi_low
+
+// Bearish divergence: price higher high, RSI lower high
+bool bear_divergence = not na(last_rsi_high) and high > last_rsi_high_price and rsi < last_rsi_high
+
+// Divergence-enhanced signals
+bool enhanced_bullish = smoothed_probability > 50 and (bull_divergence or strong_bullish)
+bool enhanced_bearish = smoothed_probability < 50 and (bear_divergence or strong_bearish)
+
+// ─────────────────────────────────────────────────────────────────────────────────
+// ADVANCED FEATURES - CONFIDENCE HEATMAP VISUALIZATION
+// ─────────────────────────────────────────────────────────────────────────────────
+
+// Confidence score based on multiple factors
+float confidence_score = 0.0
+
+// Factor 1: Probability strength (0-40 points)
+confidence_score += math.abs(smoothed_probability - 50) * 0.8
+
+// Factor 2: MTF confluence (0-30 points)
+int mtf_alignment = (bias_signal > 0 and bias_short > 0 and bias_medium > 0 and bias_long > 0) ? 30 : (bias_signal < 0 and bias_short < 0 and bias_medium < 0 and bias_long < 0) ? 30 : (bullish_confluence >= 3 or bearish_confluence >= 3) ? 20 : (bullish_confluence >= 2 or bearish_confluence >= 2) ? 10 : 0
+confidence_score += mtf_alignment
+
+// Factor 3: Divergence confirmation (0-20 points)
+confidence_score += (bull_divergence or bear_divergence) ? 20 : 0
+
+// Factor 4: Regime favorability (0-10 points)
+confidence_score += (vol_regime == "Normal" or vol_regime == "Low Vol") ? 10 : vol_regime == "Very Low" ? 5 : 0
+
+// Normalize to 0-100
+confidence_score := math.min(confidence_score, 100)
+
+// Heatmap color based on confidence
+color heatmap_color = 
+     confidence_score >= 80 ? color.new(smoothed_probability > 50 ? c_bullish_strong : c_bearish_strong, 10) :
+     confidence_score >= 60 ? color.new(smoothed_probability > 50 ? c_bullish_weak : c_bearish_weak, 30) :
+     confidence_score >= 40 ? color.new(c_neutral, 50) :
+     color.new(c_neutral, 70)
+
+// Background heatmap
+bgcolor(show_bias_zones ? heatmap_color : na, title="Confidence Heatmap")
+
+// ─────────────────────────────────────────────────────────────────────────────────
+// ADVANCED FEATURES - ZERO-LAG SIGNAL OVERLAY
+// ─────────────────────────────────────────────────────────────────────────────────
+
+// Zero-lag calculation (from Zero Lag knowledge)
+int zl_length = 20
+int lag = math.floor((zl_length - 1) / 2)
+float zl_basis = ta.ema(smoothed_probability + (smoothed_probability - smoothed_probability[lag]), zl_length)
+
+// Plot zero-lag line
+plot(zl_basis, "Zero-Lag Probability", color=color.new(c_band_upper, 50), linewidth=2, style=plot.style_circles)
+
+// ─────────────────────────────────────────────────────────────────────────────────
+// ENHANCED DASHBOARD WITH ADVANCED METRICS
+// ─────────────────────────────────────────────────────────────────────────────────
+
+if barstate.islast
+    // Ensemble scores
+    table.cell(dashboard, 0, 6, "Ensemble", text_color=c_text, text_size=size.tiny)
+    table.cell(dashboard, 1, 6, str.tostring(ensemble_prob, "#.#") + "%", 
+               text_color=ensemble_prob > 50 ? c_bullish_weak : c_bearish_weak, text_size=size.tiny)
+    table.merge_cells(dashboard, 1, 6, 2, 6)
+    
+    // Volatility regime
+    table.cell(dashboard, 0, 7, "Vol Regime", text_color=c_text, text_size=size.tiny)
+    table.cell(dashboard, 1, 7, vol_regime, text_color=c_text, text_size=size.tiny)
+    table.merge_cells(dashboard, 1, 7, 2, 7)
+    
+    // Confidence score
+    table.cell(dashboard, 0, 8, "Confidence", text_color=c_text, text_size=size.tiny)
+    table.cell(dashboard, 1, 8, str.tostring(confidence_score, "#") + "%", 
+               text_color=confidence_score >= 70 ? c_bullish_strong : c_text, text_size=size.tiny)
+    table.merge_cells(dashboard, 1, 8, 2, 8)
+    
+    // Divergence status
+    if bull_divergence or bear_divergence
+        table.cell(dashboard, 0, 9, "Divergence", text_color=c_text, text_size=size.tiny)
+        table.cell(dashboard, 1, 9, bull_divergence ? "BULL" : "BEAR", 
+                   text_color=bull_divergence ? c_bullish_strong : c_bearish_strong, text_size=size.tiny)
+        table.merge_cells(dashboard, 1, 9, 2, 9)
+
+// ─────────────────────────────────────────────────────────────────────────────────
+// ENHANCED ALERTS
+// ─────────────────────────────────────────────────────────────────────────────────
+
+alertcondition(ta.crossover(smoothed_probability, 70), "Strong Bullish Bias", "PBE: Strong bullish probability detected")
+alertcondition(ta.crossunder(smoothed_probability, 30), "Strong Bearish Bias", "PBE: Strong bearish probability detected")
+alertcondition(strong_bullish and not strong_bullish[1], "Bullish Confluence", "PBE: Multi-timeframe bullish confluence")
+alertcondition(strong_bearish and not strong_bearish[1], "Bearish Confluence", "PBE: Multi-timeframe bearish confluence")
+alertcondition(confidence_score >= 80 and confidence_score[1] < 80, "High Confidence Signal", "PBE: High confidence setup detected (80%+)")
+alertcondition(bull_divergence, "Bullish Divergence", "PBE: Bullish divergence detected - reversal potential")
+alertcondition(bear_divergence, "Bearish Divergence", "PBE: Bearish divergence detected - reversal potential")
+alertcondition(enhanced_bullish and not enhanced_bullish[1], "Enhanced Bullish", "PBE: Enhanced bullish signal with divergence confirmation")
+alertcondition(enhanced_bearish and not enhanced_bearish[1], "Enhanced Bearish", "PBE: Enhanced bearish signal with divergence confirmation")
+
+// ─────────────────────────────────────────────────────────────────────────────────
+// INSTITUTIONAL-GRADE SIGNALS (High Accuracy, No Overlapping)
+// ─────────────────────────────────────────────────────────────────────────────────
+
+// Signal cooldown system (minimum 12 bars between signals)
+var int last_signal_bar = -999
+int bars_since_signal = bar_index - last_signal_bar
+bool cooldown_passed = bars_since_signal >= 12
+
+// HIGH CONVICTION BULLISH SIGNAL
+// Requirements: 
+// 1. Probability > 65% (strong bullish bias)
+// 2. Confidence score >= 70% (high conviction)
+// 3. MTF alignment (at least 3/4 timeframes bullish)
+// 4. Cooldown passed
+var bool prev_high_conviction_bull = false
+bool high_conviction_bull = smoothed_probability > 65 and 
+     confidence_score >= 70 and 
+     bullish_confluence >= 3 and 
+     cooldown_passed and
+     not prev_high_conviction_bull
+
+// HIGH CONVICTION BEARISH SIGNAL
+// Requirements:
+// 1. Probability < 35% (strong bearish bias)
+// 2. Confidence score >= 70% (high conviction)
+// 3. MTF alignment (at least 3/4 timeframes bearish)
+// 4. Cooldown passed
+var bool prev_high_conviction_bear = false
+bool high_conviction_bear = smoothed_probability < 35 and 
+     confidence_score >= 70 and 
+     bearish_confluence >= 3 and 
+     cooldown_passed and
+     not prev_high_conviction_bear
+
+// REGIME SHIFT SIGNALS
+// Detect when probability crosses 50 with strong momentum
+bool regime_shift_bullish = ta.crossover(smoothed_probability, 50) and 
+     probability_strength > 10 and 
+     bullish_confluence >= 2 and
+     cooldown_passed
+
+bool regime_shift_bearish = ta.crossunder(smoothed_probability, 50) and 
+     probability_strength > 10 and 
+     bearish_confluence >= 2 and
+     cooldown_passed
+
+// DIVERGENCE CONFIRMATION SIGNALS
+// Only show when divergence + probability alignment
+bool divergence_bull_signal = bull_divergence and 
+     smoothed_probability > 45 and 
+     not bull_divergence[1] and
+     cooldown_passed
+
+bool divergence_bear_signal = bear_divergence and 
+     smoothed_probability < 55 and 
+     not bear_divergence[1] and
+     cooldown_passed
+
+// Update last signal bar and previous signal states
+if high_conviction_bull or high_conviction_bear or regime_shift_bullish or regime_shift_bearish or divergence_bull_signal or divergence_bear_signal
+    last_signal_bar := bar_index
+
+// Update previous signal states
+prev_high_conviction_bull := high_conviction_bull
+prev_high_conviction_bear := high_conviction_bear
+
+// Calculate signal positions (no overlapping)
+float atr_value = ta.atr(14)
+float signal_offset = atr_value * 2.5
+
+// Plot HIGH CONVICTION signals (primary signals)
+plotshape(
+     high_conviction_bull,
+     title="HIGH CONVICTION BULL",
+     style=shape.labelup,
+     location=location.bottom,
+     color=color.new(c_bullish_strong, 0),
+     textcolor=color.black,
+     text="BULL SETUP",
+     size=size.small
+)
+
+plotshape(
+     high_conviction_bear,
+     title="HIGH CONVICTION BEAR",
+     style=shape.labeldown,
+     location=location.top,
+     color=color.new(c_bearish_strong, 0),
+     textcolor=color.white,
+     text="BEAR SETUP",
+     size=size.small
+)
+
+// Plot REGIME SHIFT markers (secondary signals)
+plotshape(
+     regime_shift_bullish,
+     title="REGIME SHIFT BULL",
+     style=shape.triangleup,
+     location=location.bottom,
+     color=color.new(c_bullish_weak, 20),
+     textcolor=color.white,
+     text="SHIFT",
+     size=size.tiny
+)
+
+plotshape(
+     regime_shift_bearish,
+     title="REGIME SHIFT BEAR",
+     style=shape.triangledown,
+     location=location.top,
+     color=color.new(c_bearish_weak, 20),
+     textcolor=color.white,
+     text="SHIFT",
+     size=size.tiny
+)
+
+// Divergence signals removed to prevent overlapping text
+
+// ═══════════════════════════════════════════════════════════════════════════════════
+// END OF PROBABILISTIC BIAS ENGINE
+// ═══════════════════════════════════════════════════════════════════════════════════

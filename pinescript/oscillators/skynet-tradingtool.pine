@@ -1,0 +1,342 @@
+//@version=6
+indicator("SkyNet TradingTool", shorttitle="SkyNet-TT", overlay=false,
+     format=format.price, precision=2, max_bars_back=1000, scale=scale.right)
+
+// ╔══════════════════════════════════════════════════════════════╗
+// ║  DESIGN RATIONALE                                            ║
+// ║  Optimised for the 10-minute timeframe                      ║
+// ║  Intraday (1-8 hours) + Multi-day (1-3 days)                ║
+// ║  7 indicators → each normalised [-1..+1]                    ║
+// ║  Weighted composite → [-100..+100]                          ║
+// ║                                                              ║
+// ║  Parameters adapted for 10m:                                ║
+// ║  · Short periods for sensitivity to 10m movement            ║
+// ║  · Lower ADX threshold (trends weaker on 10m)               ║
+// ║  · Smaller flat threshold (smaller SMA deviations)          ║
+// ║  · Composite smooth=3 (filters noise without large lag)     ║
+// ╚══════════════════════════════════════════════════════════════╝
+
+// ╔══════════════════════════════════════════════════════════════╗
+// ║  TIMEFRAME                                                   ║
+// ╚══════════════════════════════════════════════════════════════╝
+string gTF     = "═══ Timeframe ═══"
+bool   useTF   = input.bool(false,     "Use Custom Timeframe?", group=gTF, inline="tf")
+string tfSel   = input.timeframe("1D", "",                      group=gTF, inline="tf")
+bool   repaint = input.bool(false,     "Allow Repainting?",     group=gTF)
+
+// ╔══════════════════════════════════════════════════════════════╗
+// ║  VZO                                                         ║
+// ╚══════════════════════════════════════════════════════════════╝
+string gVZO    = "═══ VZO ═══"
+bool   vzoOn   = input.bool(true,  "Enable",  group=gVZO)
+int    vzoLen  = input.int(14,     "Length",  group=gVZO, minval=2, inline="v1")
+bool   vzoSm   = input.bool(true,  "Smooth",  group=gVZO, inline="v1")
+int    vzoSmN  = input.int(4,      "EMA",     group=gVZO, minval=1, inline="v1")
+float  vzoZone = input.float(55.0, "Zone ±", group=gVZO, minval=1.0, maxval=120.0,
+     tooltip="VZO above/below this level = full signal strength")
+float  vzoW    = input.float(2.0,  "Weight", group=gVZO, minval=0.0, maxval=3.0, step=0.1,
+     tooltip="VZO has the highest weight — volume leads price")
+
+// ╔══════════════════════════════════════════════════════════════╗
+// ║  Z-SCORE                                                     ║
+// ╚══════════════════════════════════════════════════════════════╝
+string gZS     = "═══ Z-Score ═══"
+bool   zsOn    = input.bool(true,     "Enable",  group=gZS)
+int    zsLen   = input.int(24,        "Length",  group=gZS, minval=2)
+string zsSrc   = input.string("close","Source",  group=gZS,
+     options=["close","hl2","Returns","open","high","low"])
+float  zsW     = input.float(1.5,     "Weight", group=gZS, minval=0.0, maxval=3.0, step=0.1,
+     tooltip="Z-Score: statistical mean-reversion and momentum")
+
+// ╔══════════════════════════════════════════════════════════════╗
+// ║  CTO (Composite Trend Oscillator)                            ║
+// ╚══════════════════════════════════════════════════════════════╝
+string gCTO    = "═══ CTO ═══"
+bool   ctoOn   = input.bool(true, "Enable",      group=gCTO)
+int    ctoSpc  = input.int(1,     "Dispersion",  group=gCTO, minval=1, maxval=8,
+     tooltip="Distance between MAs in cluster. Lower = more sensitive")
+int    ctoPsL  = input.int(2,     "Post Smooth", group=gCTO, minval=1)
+float  ctoW    = input.float(1.4, "Weight",      group=gCTO, minval=0.0, maxval=3.0, step=0.1,
+     tooltip="CTO: 33-MA cluster — most accurate for trend")
+
+// ╔══════════════════════════════════════════════════════════════╗
+// ║  DMI                                                         ║
+// ╚══════════════════════════════════════════════════════════════╝
+string gDMI    = "═══ DMI ═══"
+bool   dmiOn   = input.bool(true, "Enable",      group=gDMI)
+int    dmiLen  = input.int(10,    "Length",      group=gDMI, minval=1, inline="dm")
+int    dmiNL   = input.int(100,   "Norm Period", group=gDMI, minval=10, inline="dm")
+float  dmiW    = input.float(1.0, "Weight",      group=gDMI, minval=0.0, maxval=3.0, step=0.1)
+
+// ╔══════════════════════════════════════════════════════════════╗
+// ║  ADX                                                         ║
+// ╚══════════════════════════════════════════════════════════════╝
+string gADX    = "═══ ADX ═══"
+bool   adxOn   = input.bool(true,  "Enable",          group=gADX)
+int    adxLen  = input.int(10,     "Length",          group=gADX, minval=1, inline="ax")
+float  adxMid  = input.float(18.0, "Trend Threshold", group=gADX, minval=5.0, maxval=50.0, inline="ax",
+     tooltip="ADX above threshold = trend confirmed. Below = flat (ADX reduces weight)")
+float  adxW    = input.float(1.0,  "Weight",          group=gADX, minval=0.0, maxval=3.0, step=0.1)
+
+// ╔══════════════════════════════════════════════════════════════╗
+// ║  AROON                                                       ║
+// ╚══════════════════════════════════════════════════════════════╝
+string gARN    = "═══ Aroon ═══"
+bool   arnOn   = input.bool(true, "Enable",    group=gARN)
+int    arnLen  = input.int(20,    "Length",    group=gARN, minval=2, inline="ar")
+int    arnSm   = input.int(5,     "ZL Smooth", group=gARN, minval=1, inline="ar")
+float  arnW    = input.float(1.0, "Weight",    group=gARN, minval=0.0, maxval=3.0, step=0.1)
+
+// ╔══════════════════════════════════════════════════════════════╗
+// ║  RSI                                                         ║
+// ╚══════════════════════════════════════════════════════════════╝
+string gRSI    = "═══ RSI ═══"
+bool   rsiOn   = input.bool(true, "Enable", group=gRSI)
+int    rsiLen  = input.int(10,    "Length", group=gRSI, minval=2)
+float  rsiW    = input.float(1.0, "Weight", group=gRSI, minval=0.0, maxval=3.0, step=0.1)
+
+// ╔══════════════════════════════════════════════════════════════╗
+// ║  COMPOSITE SETTINGS                                          ║
+// ╚══════════════════════════════════════════════════════════════╝
+string gComp   = "═══ Composite ═══"
+bool   useFlat = input.bool(true,  "Flat Market Filter", group=gComp,
+     tooltip="Reduces weight of trend indicators (VZO, CTO, DMI) in flat markets")
+float  flatThr = input.float(0.001,"Flat Threshold",     group=gComp, minval=0.001, step=0.001,
+     tooltip="|SMA20-SMA50|/SMA50 below this = flat market")
+int    compSm  = input.int(3,      "Composite Smooth",   group=gComp, minval=1,
+     tooltip="EMA smoothing of the final composite")
+
+// ╔══════════════════════════════════════════════════════════════╗
+// ║  VISUAL                                                      ║
+// ╚══════════════════════════════════════════════════════════════╝
+string gVis    = "═══ Visual ═══"
+color  cBullS  = input.color(#00E676,                    "Bull Strong", group=gVis, inline="v1")
+color  cBullW  = input.color(color.new(#00E676, 55),     "Bull Weak",   group=gVis, inline="v1")
+color  cBearS  = input.color(#FF1744,                    "Bear Strong", group=gVis, inline="v2")
+color  cBearW  = input.color(color.new(#FF1744, 55),     "Bear Weak",   group=gVis, inline="v2")
+color  cNeut   = input.color(color.new(#607D8B, 40),     "Neutral",     group=gVis)
+bool   showFill= input.bool(true,                        "Fill",        group=gVis, inline="vf")
+int    fillAlp = input.int(85,                           "Alpha",       group=gVis, inline="vf", minval=0, maxval=100)
+bool   showInd = input.bool(false,                       "Show Individual Lines", group=gVis)
+bool   showBarC= input.bool(true,                        "Barcolor",    group=gVis)
+
+// ╔══════════════════════════════════════════════════════════════╗
+// ║  FUNCTIONS                                                   ║
+// ╚══════════════════════════════════════════════════════════════╝
+
+// Clamp value to [-1, +1]
+f_clamp(series float v) => math.max(-1.0, math.min(1.0, v))
+
+// Security wrapper — handles repainting setting
+f_sec(series float src) =>
+    string tf = useTF ? tfSel : timeframe.period
+    request.security(syminfo.tickerid, tf,
+         src[repaint ? 0 : barstate.isrealtime ? 1 : 0],
+         barmerge.gaps_off, barmerge.lookahead_off)
+         [repaint ? 0 : barstate.isrealtime ? 0 : 1]
+
+// VZO → [-120..+120] then zone-normalised → [-1..+1]
+f_vzo(simple int len, simple bool sm, simple int sn) =>
+    float dir     = close > close[3] ? volume : -volume
+    float rawVol  = math.max(ta.linreg(volume, len, 0), 1e-6)
+    float raw     = 100.0 * ta.linreg(dir, len, 0) / rawVol
+    float clamped = math.max(-120.0, math.min(120.0, raw))
+    float v       = sm ? ta.ema(clamped, sn) : clamped
+    f_clamp(v / 60.0)
+
+// Z-Score → [-4..+4] then /4 → [-1..+1]
+f_zscore(simple int len, simple string srcStr) =>
+    float s = switch srcStr
+        "Returns" => (close - open) / close * 100
+        "open"    => open
+        "high"    => high
+        "low"     => low
+        "hl2"     => hl2
+        =>           close
+    int   L = srcStr == "Returns" ? 500 : len
+    float z = (s - ta.sma(s, L)) / math.max(ta.stdev(s, L), 1e-10)
+    f_clamp(math.max(-4.0, math.min(4.0, z)) / 4.0)
+
+// CTO: 33-MA cluster score → [-1..+1]
+f_cto(simple int sp, simple int psLen) =>
+    float s = close
+    float c01 = ta.ema(s, 1 *sp), float c02 = ta.ema(s, 2 *sp)
+    float c03 = ta.ema(s, 3 *sp), float c04 = ta.ema(s, 4 *sp)
+    float c05 = ta.ema(s, 5 *sp), float c06 = ta.ema(s, 6 *sp)
+    float c07 = ta.ema(s, 7 *sp), float c08 = ta.ema(s, 8 *sp)
+    float c09 = ta.ema(s, 9 *sp), float c10 = ta.ema(s,10 *sp)
+    float c11 = ta.ema(s,11 *sp), float c12 = ta.ema(s,12 *sp)
+    float c13 = ta.ema(s,13 *sp), float c14 = ta.ema(s,14 *sp)
+    float c15 = ta.ema(s,15 *sp), float c16 = ta.ema(s,16 *sp)
+    float c17 = ta.ema(s,17 *sp), float c18 = ta.ema(s,18 *sp)
+    float c19 = ta.ema(s,19 *sp), float c20 = ta.ema(s,20 *sp)
+    float c21 = ta.ema(s,21 *sp), float c22 = ta.ema(s,22 *sp)
+    float c23 = ta.ema(s,23 *sp), float c24 = ta.ema(s,24 *sp)
+    float c25 = ta.ema(s,25 *sp), float c26 = ta.ema(s,26 *sp)
+    float c27 = ta.ema(s,27 *sp), float c28 = ta.ema(s,28 *sp)
+    float c29 = ta.ema(s,29 *sp), float c30 = ta.ema(s,30 *sp)
+    float c31 = ta.ema(s,31 *sp), float c32 = ta.ema(s,32 *sp)
+    float c33 = ta.ema(s,33 *sp)
+    int sc =
+         (s>c01?1:-1)+(c01>c02?1:-1)+(c02>c03?1:-1)+(c03>c04?1:-1)+(c04>c05?1:-1)+
+         (c05>c06?1:-1)+(c06>c07?1:-1)+(c07>c08?1:-1)+(c08>c09?1:-1)+(c09>c10?1:-1)+
+         (c10>c11?1:-1)+(c11>c12?1:-1)+(c12>c13?1:-1)+(c13>c14?1:-1)+(c14>c15?1:-1)+
+         (c15>c16?1:-1)+(c16>c17?1:-1)+(c17>c18?1:-1)+(c18>c19?1:-1)+(c19>c20?1:-1)+
+         (c20>c21?1:-1)+(c21>c22?1:-1)+(c22>c23?1:-1)+(c23>c24?1:-1)+(c24>c25?1:-1)+
+         (c25>c26?1:-1)+(c26>c27?1:-1)+(c27>c28?1:-1)+(c28>c29?1:-1)+(c29>c30?1:-1)+
+         (c30>c31?1:-1)+(c31>c32?1:-1)+(c32>c33?1:-1)
+    float raw = float(sc) / 33.0
+    float sm  = psLen > 1 ? ta.ema(raw, psLen) : raw
+    f_clamp(sm)
+
+// DMI: signed |DI+−DI-|, rolling-max normalised → [-1..+1]
+f_dmi(simple int len, simple int normLen) =>
+    float hiD = high - high[1]
+    float loD = low[1] - low
+    float pDM = hiD > loD and hiD > 0 ? hiD : 0.0
+    float mDM = loD > hiD and loD > 0 ? loD : 0.0
+    float tr  = math.max(high - low, math.max(math.abs(high - close[1]), math.abs(low - close[1])))
+    float atr = ta.rma(tr, len)
+    float diP = 100.0 * ta.rma(pDM, len) / math.max(atr, 1e-6)
+    float diM = 100.0 * ta.rma(mDM, len) / math.max(atr, 1e-6)
+    float raw = math.abs(diP - diM) * (diP >= diM ? 1.0 : -1.0)
+    float mx  = ta.highest(math.abs(raw), normLen)
+    f_clamp(raw / math.max(mx, 1e-6))
+
+// ADX: (ADX−threshold)/threshold → [-1..+1]
+f_adx(simple int len, simple float mid) =>
+    [_, _, adxV] = ta.dmi(len, len)
+    f_clamp((adxV - mid) / math.max(mid, 1e-6))
+
+// Aroon Zero-Lag: (AroonUp − AroonDn) / 100 → [-1..+1]
+f_aroon(simple int len, simple int sm) =>
+    float aU  = 100.0 * (ta.highestbars(high, len + 1) + len) / len
+    float aD  = 100.0 * (ta.lowestbars(low,  len + 1) + len) / len
+    float raw = (aU - aD) / 100.0
+    float e1  = ta.ema(raw, sm)
+    f_clamp(e1 + (e1 - ta.ema(e1, sm)))
+
+// RSI centred: (RSI−50)/50 → [-1..+1]
+f_rsi(simple int len) =>
+    f_clamp((ta.rsi(close, len) - 50.0) / 50.0)
+
+// ╔══════════════════════════════════════════════════════════════╗
+// ║  COMPUTE — all indicators via security wrapper               ║
+// ╚══════════════════════════════════════════════════════════════╝
+
+float nVZO = vzoOn ? f_sec(f_vzo(vzoLen, vzoSm, vzoSmN))  : 0.0
+float nZS  = zsOn  ? f_sec(f_zscore(zsLen, zsSrc))         : 0.0
+float nCTO = ctoOn ? f_sec(f_cto(ctoSpc, ctoPsL))          : 0.0
+float nDMI = dmiOn ? f_sec(f_dmi(dmiLen, dmiNL))           : 0.0
+float nADX = adxOn ? f_sec(f_adx(adxLen, adxMid))          : 0.0
+float nARN = arnOn ? f_sec(f_aroon(arnLen, arnSm))          : 0.0
+float nRSI = rsiOn ? f_sec(f_rsi(rsiLen))                  : 0.0
+
+// ╔══════════════════════════════════════════════════════════════╗
+// ║  FLAT MARKET DETECTION                                       ║
+// ╚══════════════════════════════════════════════════════════════╝
+
+float sma20   = ta.sma(close, 20)
+float sma50   = ta.sma(close, 50)
+float tDiff   = math.abs(sma20 - sma50) / math.max(sma50, 1e-6)
+bool  isTrend = tDiff > flatThr
+float flatK   = useFlat ? (isTrend ? 1.0 : 0.5) : 1.0
+
+// ╔══════════════════════════════════════════════════════════════╗
+// ║  ADAPTIVE WEIGHTS                                            ║
+// ╚══════════════════════════════════════════════════════════════╝
+
+float wVZO = vzoOn ? vzoW * flatK : 0.0
+float wZS  = zsOn  ? zsW          : 0.0
+float wCTO = ctoOn ? ctoW * flatK : 0.0
+float wDMI = dmiOn ? dmiW * flatK : 0.0
+float wADX = adxOn ? adxW         : 0.0
+float wARN = arnOn ? arnW         : 0.0
+float wRSI = rsiOn ? rsiW         : 0.0
+float wTot = math.max(wVZO + wZS + wCTO + wDMI + wADX + wARN + wRSI, 1e-6)
+
+// ╔══════════════════════════════════════════════════════════════╗
+// ║  COMPOSITE SCORE [-100..+100]                                ║
+// ╚══════════════════════════════════════════════════════════════╝
+
+float rawComp = (nVZO*wVZO + nZS*wZS + nCTO*wCTO +
+                 nDMI*wDMI + nADX*wADX + nARN*wARN + nRSI*wRSI) / wTot * 100.0
+float comp     = compSm > 1 ? ta.ema(rawComp, compSm) : rawComp
+float strength = math.abs(comp) / 100.0
+
+// ╔══════════════════════════════════════════════════════════════╗
+// ║  COMPOSITE COLOR                                             ║
+// ╚══════════════════════════════════════════════════════════════╝
+
+color compCol = comp >= 0.0
+     ? color.from_gradient(strength, 0.0, 1.0, cBullW, cBullS)
+     : color.from_gradient(strength, 0.0, 1.0, cBearW, cBearS)
+
+// Individual line colors (muted)
+color vzoCol = nVZO > 0 ? color.new(#00BCD4, 50) : color.new(#FF6D00, 50)
+color zsCol  = color.from_gradient(nZS, -1.0, 1.0,
+     color.new(#0044FF, 40), color.new(color.lime, 40))
+color ctoCol = nCTO > 0 ? color.new(#FFD600, 55) : color.new(#9C27B0, 55)
+color dmiCol = nDMI > 0 ? color.new(#1C3BFB, 55) : color.new(#FF0000, 55)
+color arnCol = color.new(#80CBC4, 60)
+color rsiCol = color.new(#CE93D8, 60)
+
+// ╔══════════════════════════════════════════════════════════════╗
+// ║  SCALE LOCKS                                                 ║
+// ╚══════════════════════════════════════════════════════════════╝
+
+plot( 100.0, color=color.new(color.white, 99), display=display.price_scale)
+plot(-100.0, color=color.new(color.white, 99), display=display.price_scale)
+
+// ╔══════════════════════════════════════════════════════════════╗
+// ║  ZONE LINES                                                  ║
+// ╚══════════════════════════════════════════════════════════════╝
+
+h_ob  = hline( 30.0,   "OB",   color=color.new(#00E676, 40), linestyle=hline.style_dotted)
+h_os  = hline(-30.0,   "OS",   color=color.new(#FF1744, 40), linestyle=hline.style_dotted)
+h_ob2 = hline( 100.0,  "+100", color=color.new(color.gray, 70), linestyle=hline.style_solid)
+h_os2 = hline(-100.0,  "-100", color=color.new(color.gray, 70), linestyle=hline.style_solid)
+hline(0.0, "Zero", color=color.new(color.gray, 50), linestyle=hline.style_dashed)
+fill(h_ob,  h_ob2, color=color.new(#00E676, 92), title="Bull Zone")
+fill(h_os,  h_os2, color=color.new(#FF1744, 92), title="Bear Zone")
+
+// ╔══════════════════════════════════════════════════════════════╗
+// ║  INDIVIDUAL INDICATOR LINES                                  ║
+// ║  VZO always visible (controlled by vzoOn toggle)            ║
+// ║  ZScore / CTO / DMI / Aroon / RSI hidden by default         ║
+// ╚══════════════════════════════════════════════════════════════╝
+
+plot(vzoOn ? nVZO * 100 : na, "VZO",
+     color=vzoCol, linewidth=1)
+plot(showInd and zsOn  ? nZS  * 100 : na, "ZScore",
+     color=zsCol,  linewidth=1, display=display.none)
+plot(showInd and ctoOn ? nCTO * 100 : na, "CTO",
+     color=ctoCol, linewidth=1, display=display.none)
+plot(showInd and dmiOn ? nDMI * 100 : na, "DMI",
+     color=dmiCol, linewidth=1, display=display.none)
+plot(showInd and arnOn ? nARN * 100 : na, "Aroon",
+     color=arnCol, linewidth=1, display=display.none)
+plot(showInd and rsiOn ? nRSI * 100 : na, "RSI",
+     color=rsiCol, linewidth=1, display=display.none)
+
+// ╔══════════════════════════════════════════════════════════════╗
+// ║  COMPOSITE LINE + FILL                                       ║
+// ╚══════════════════════════════════════════════════════════════╝
+
+p_comp = plot(comp, "Composite", color=compCol, linewidth=3)
+p_zero = plot(0.0,  "Zero",      color=color.new(color.gray, 80))
+
+fill(p_comp, p_zero,
+     comp, 0.0,
+     showFill and comp > 0.0 ? color.new(cBullS, fillAlp) : color.new(cBullS, 100),
+     showFill and comp > 0.0 ? color.new(cBullS, 100)     : color.new(cBullS, 100))
+fill(p_comp, p_zero,
+     0.0, comp,
+     showFill and comp < 0.0 ? color.new(cBearS, 100)     : color.new(cBearS, 100),
+     showFill and comp < 0.0 ? color.new(cBearS, fillAlp) : color.new(cBearS, 100))
+
+// ╔══════════════════════════════════════════════════════════════╗
+// ║  BAR COLOR                                                   ║
+// ╚══════════════════════════════════════════════════════════════╝
+
+barcolor(showBarC ? compCol : na, title="Barcolor")

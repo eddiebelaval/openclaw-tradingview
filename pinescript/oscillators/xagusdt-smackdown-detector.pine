@@ -1,0 +1,116 @@
+//@version=6
+indicator("XAGUSDT Smackdown Detector + Predictor [5m Early Warning]", overlay=true, max_labels_count=500)
+
+// ── Inputs ────────────────────────────────────────────────────────────────
+drop_window_minutes          = input.int(15,    "Drop Window (minutes)", minval=5, maxval=60)
+drop_threshold_percent       = input.float(1.0, "Drop Threshold (%)", minval=0.1, step=0.1)
+post_drop_hours              = input.float(2.0, "Post-Drop Hours", minval=0.5, step=0.5)
+flattening_threshold_percent = input.float(0.5, "Flattening Range (%)", minval=0.1, step=0.1)
+use_time_filter              = input.bool(false, "Filter by Session (for reactive part)")
+session_times                = input.session("0100-0200,1200-1300", "Session Times")
+
+// Predictor inputs (tuned for 5-minute early warnings)
+rsi_length                   = input.int(14,     "RSI Length (Predictor)", minval=5)
+rsi_overbought               = input.int(68,     "RSI Overbought Level (lower = more signals)", minval=60, maxval=85)
+
+// ── Calculations ──────────────────────────────────────────────────────────
+chart_time_sec = timeframe.in_seconds(timeframe.period)
+drop_bars      = math.ceil(drop_window_minutes * 60.0 / chart_time_sec)
+post_drop_bars = math.ceil(post_drop_hours   * 3600.0 / chart_time_sec)
+
+// ── Persistent variables ──────────────────────────────────────────────────
+var int   last_start_bar   = na
+var float last_start_high  = na
+var int   last_start_index = na
+
+// ──────────────────────────────────────────────────────────────────────────
+// PART 1: REACTIVE SMACKDOWN DETECTOR (RED) – unchanged, you said you're fine with it
+// ──────────────────────────────────────────────────────────────────────────
+highest_offset = ta.highestbars(high, drop_bars)
+
+float highest_high   = na
+float drop_pct       = na
+bool  enough_history = false
+bool  in_session     = not use_time_filter
+
+if not na(highest_offset)
+    int lookback = math.max(1, math.abs(highest_offset))
+    enough_history := bar_index >= lookback
+    if enough_history
+        highest_high := high[lookback]
+        drop_pct     := (highest_high - low) / highest_high * 100
+        if use_time_filter and lookback <= 5000
+            int t = time[lookback]
+            if not na(t)
+                in_session := not na(time(timeframe.period, session_times, t))
+
+bool crossed     = not na(drop_pct) and drop_pct >= drop_threshold_percent
+bool first_cross = crossed and not crossed[1]
+bool start_condition = first_cross and enough_history and in_session
+
+if start_condition
+    int start_bar_index = bar_index - math.abs(highest_offset)
+    label.new(x = start_bar_index, y = highest_high, text = "Smackdown Start", color = color.new(color.red, 15), textcolor = color.white, style = label.style_label_down, size = size.small)
+    last_start_bar   := bar_index
+    last_start_high  := highest_high
+    last_start_index := start_bar_index
+
+// Confirmation logic (fixed for Pine consistency)
+int   bars_since = not na(last_start_bar) ? math.max(1, bar_index - last_start_index + 1) : 0
+float range_low  = na
+float range_high = na
+float range_pct  = na
+
+if bars_since > 0
+    range_low  := ta.lowest(low,  bars_since)
+    range_high := ta.highest(high, bars_since)
+    range_pct  := range_low != 0 ? (range_high - range_low) / range_low * 100 : na
+
+bool confirmed = false
+if not na(last_start_bar) and bar_index >= last_start_bar + post_drop_bars
+    confirmed := range_pct <= flattening_threshold_percent
+    if confirmed
+        label.new(x = last_start_index, y = range_high, text = "Smackdown Confirmed", color = color.new(color.green, 15), textcolor = color.white, style = label.style_label_up, size = size.small)
+    last_start_bar   := na
+    last_start_high  := na
+    last_start_index := na
+
+plotshape(series = start_condition, title = "Start Signal", style = shape.triangledown, location = location.abovebar, color = color.red, size = size.small)
+
+// ──────────────────────────────────────────────────────────────────────────
+// PART 2: PURPLE PREDICTOR – Early Warning (NOW WORKING on 5m)
+// ──────────────────────────────────────────────────────────────────────────
+rsi = ta.rsi(close, rsi_length)
+
+overbought   = rsi > rsi_overbought
+rsi_rollover = rsi < rsi[1] and rsi[1] >= rsi_overbought - 3
+near_high    = high >= ta.highest(high, 20) * 0.997
+
+bool raw_condition = overbought and rsi_rollover and near_high
+bool potential_drop = raw_condition and not raw_condition[1]
+
+// Purple label + shape
+if potential_drop
+    label.new(
+         x        = bar_index,
+         y        = high,
+         text     = "🚨 POTENTIAL DROP?",
+         color    = color.new(color.purple, 10),
+         textcolor = color.white,
+         style    = label.style_label_down,
+         size     = size.normal
+         )
+
+plotshape(
+    series   = potential_drop,
+    title    = "Potential Drop Warning",
+    style    = shape.triangleup,
+    location = location.belowbar,
+    color    = color.purple,
+    size     = size.normal
+)
+
+// ── Alerts (set these!) ───────────────────────────────────────────────────
+alertcondition(potential_drop,  title="🚨 POTENTIAL DROP WARNING",     message="Early warning: Potential smackdown coming - GET OUT OF THE WAY!")
+alertcondition(start_condition, title="Smackdown START (reactive)",    message="Smackdown START detected in XAGUSDT")
+alertcondition(confirmed,       title="Smackdown CONFIRMED",           message="Smackdown flattening confirmed")

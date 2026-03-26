@@ -1,0 +1,209 @@
+// This source code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © Pineify
+
+//======================================================================//
+//                    ____  _            _  __                          //
+//                   |  _ \(_)_ __   ___(_)/ _|_   _                    //
+//                   | |_) | | '_ \ / _ \ | |_| | | |                   //
+//                   |  __/| | | | |  __/ |  _| |_| |                   //
+//                   |_|   |_|_| |_|\___|_|_|  \__, |                   //
+//                                             |___/                    //
+//======================================================================//
+
+//@version=6
+// Indicator declaration:
+//   - "Alpha Relative Strength & Performance" is the full name shown in the indicator list
+//   - "Alpha RSP" is the short name displayed on the chart pane
+//   - overlay=false places the indicator in a separate sub-panel below the price chart
+//   - max_lines_count=500 allows up to 500 line objects for potential future extensions
+indicator("Alpha Relative Strength & Performance [Pineify]", "Alpha RSP [Pineify]", overlay=false, max_lines_count=500)
+
+// =========================================================================
+// INPUTS
+// =========================================================================
+// Benchmark symbol: the reference index that the current asset is compared against.
+// Common choices: SPY (S&P 500 ETF), QQQ (Nasdaq 100), BTCUSD (Bitcoin), etc.
+benchmark = input.symbol("SPY", "Benchmark Symbol", tooltip="Index to compare against (e.g., SPY, BTCUSD)")
+
+// Calculation window: the lookback period used for WMA smoothing of the RS ratio and momentum.
+// Shorter values (e.g., 7) react faster but are noisier; longer values (e.g., 50) are smoother but lag more.
+length = input.int(14, "Calculation Window", minval=2, maxval=200)
+
+// Colors - Four-Quadrant System
+// Each color corresponds to one of the four relative strength quadrants:
+//   Green  = Strong (Leading)   — asset outperforms benchmark with rising momentum
+//   Blue   = Improving          — asset underperforms but momentum is turning positive
+//   Yellow = Weakening          — asset outperforms but momentum is fading
+//   Red    = Weak (Lagging)     — asset underperforms with falling momentum
+colorStrong = input.color(#089981, "Strong (Leading)", inline="col1")
+colorImprove = input.color(#2962ff, "Improving", inline="col1")
+colorWeakening = input.color(color.yellow, "Weakening", inline="col2")
+colorWeak = input.color(#F23645, "Weak (Lagging)", inline="col2")
+
+// =========================================================================
+// DATA FETCHING & CALCULATIONS
+// =========================================================================
+// Fetch the benchmark's closing price from the previous bar.
+// Using close[1] with lookahead_on avoids repainting by ensuring we only use
+// confirmed (already closed) benchmark data — never the current in-progress bar.
+benchClose = request.security(benchmark, timeframe.period, close[1], lookahead=barmerge.lookahead_on)
+
+// Guard against missing benchmark data (e.g., symbol not found, no data on this bar).
+// All subsequent calculations check this flag and fall back to neutral values if false.
+validData = not na(benchClose)
+
+// --- 1. Relative Strength Ratio & Momentum Calculation ---
+
+// RS (Relative Strength) = current asset price / benchmark price.
+// A rising RS means the asset is gaining value faster (or losing slower) than the benchmark.
+// Falls back to 1.0 (neutral) when benchmark data is unavailable.
+rs = validData ? close / benchClose : 1.0
+
+// Smooth the raw RS with a Weighted Moving Average (WMA).
+// WMA gives more weight to recent bars, providing a responsive yet stable trend line of RS.
+wma_rs = ta.wma(rs, length)
+
+// RS Ratio: measures where the current RS sits relative to its own smoothed trend.
+// Formula: WMA(RS / WMA_RS) * 100
+//   - Values > 100 → asset is outperforming its own recent average (leading the benchmark)
+//   - Values < 100 → asset is underperforming its own recent average (lagging the benchmark)
+// The double WMA smoothing (first on RS, then on the ratio) reduces noise significantly.
+rsRatioRaw = ta.wma(rs / wma_rs, length) * 100
+rs_ratio = validData ? rsRatioRaw : 100.0
+
+// RS Momentum: measures the rate of change of the RS Ratio itself.
+// Formula: RS_Ratio / WMA(RS_Ratio) * 100
+//   - Values > 100 → the RS Ratio is accelerating (momentum is positive / improving)
+//   - Values < 100 → the RS Ratio is decelerating (momentum is negative / deteriorating)
+// This is the "second derivative" of relative strength — it tells you whether
+// outperformance/underperformance is getting better or worse.
+rsMomRaw = rs_ratio / ta.wma(rs_ratio, length) * 100
+rs_mom = validData ? rsMomRaw : 100.0
+
+// --- 2. Relative Performance (Net Returns Delta) ---
+
+// Calculate single-bar percentage returns for both the asset and the benchmark.
+// These are simple arithmetic returns: (current - previous) / previous.
+assetReturn = validData ? (close - close[1]) / close[1] : 0.0
+benchReturn = validData ? (benchClose - benchClose[1]) / benchClose[1] : 0.0
+
+// Net Performance = Asset Return - Benchmark Return, expressed in percentage points.
+// Positive → asset outperformed the benchmark on this bar.
+// Negative → asset underperformed the benchmark on this bar.
+// This provides a bar-by-bar "alpha" reading independent of the smoothed RS calculations.
+netPerformance = (assetReturn - benchReturn) * 100
+
+// =========================================================================
+// STATE DETERMINATION & COLORING
+// =========================================================================
+// Classify the asset into one of four quadrants based on RS Ratio and RS Momentum.
+// The 100 level is the equilibrium line for both metrics:
+//   RS Ratio > 100  → "Leading"  (asset outperforms benchmark trend)
+//   RS Ratio < 100  → "Lagging"  (asset underperforms benchmark trend)
+//   RS Mom   > 100  → "Positive Momentum" (relative strength is improving)
+//   RS Mom   < 100  → "Negative Momentum" (relative strength is deteriorating)
+isLeading = rs_ratio > 100
+isPositiveMom = rs_mom > 100
+
+// Four-quadrant state assignment (inspired by RRG — Relative Rotation Graphs):
+//   Strong (Green)     = Leading + Positive Momentum  → best quadrant, full outperformance
+//   Weakening (Yellow) = Leading + Negative Momentum  → still ahead but losing steam
+//   Improving (Blue)   = Lagging + Positive Momentum  → behind but catching up
+//   Weak (Red)         = Lagging + Negative Momentum  → worst quadrant, full underperformance
+// Assets typically rotate clockwise through these quadrants over time.
+stateColor = isLeading and isPositiveMom ? colorStrong :
+             isLeading and not isPositiveMom ? colorWeakening :
+             not isLeading and isPositiveMom ? colorImprove :
+             colorWeak
+
+// Human-readable state label used in the info table display.
+stateText = isLeading and isPositiveMom ? "Strong (Leading)" : isLeading and not isPositiveMom ? "Weakening" : not isLeading and isPositiveMom ? "Improving" : "Weak (Lagging)"
+
+// =========================================================================
+// BEAUTIFUL PLOTTING
+// =========================================================================
+// Dashed horizontal line at 100 — the equilibrium baseline.
+// RS Ratio above this line = outperforming; below = underperforming.
+hline(100, "Equilibrium Baseline", color=color.new(color.gray, 50), linestyle=hline.style_dashed)
+
+// Plot the RS Ratio as a thick line colored by the current quadrant state.
+// This is the primary visual element of the indicator.
+rsPlot = plot(rs_ratio, "RS-Ratio", color=stateColor, linewidth=3)
+
+// Invisible baseline plot at 100 — used solely as an anchor for the fill below.
+basePlot = plot(100, "Base", display=display.none)
+
+// Semi-transparent fill between the RS Ratio line and the 100 baseline.
+// Visually highlights the magnitude of outperformance (above 100) or underperformance (below 100).
+fill(rsPlot, basePlot, color=color.new(stateColor, 85), title="Performance Area")
+
+// (Commented out) Histogram showing bar-by-bar net performance delta.
+// Uncomment to add a column-style overlay showing single-bar alpha.
+// perfPlot = plot(netPerformance + 100, "Net Performance Delta %", style=plot.style_columns, color=netPerformance > 0 ? color.new(colorStrong, 60) : color.new(colorWeak, 60))
+
+// =========================================================================
+// CROSS SIGNALS
+// =========================================================================
+// Bullish Entry Signal:
+//   Triggers when RS Ratio crosses ABOVE 100 (asset begins outperforming)
+//   AND the previous bar had positive momentum (RS Mom > 100).
+//   This combination ensures we enter only when the asset is transitioning
+//   into the "Strong" quadrant with momentum already confirmed.
+strongCross = ta.crossover(rs_ratio, 100) and isPositiveMom[1]
+
+// Bearish Exit Signal:
+//   Triggers when RS Ratio crosses BELOW 100 (asset begins underperforming)
+//   AND the previous bar had negative momentum (RS Mom < 100).
+//   This combination ensures we exit only when the asset is transitioning
+//   into the "Weak" quadrant with deteriorating momentum already confirmed.
+weakCross = ta.crossunder(rs_ratio, 100) and not isPositiveMom[1]
+
+// Plot small circles at the RS Ratio level where crossover signals occur.
+// Green circle = Bullish Entry, Red circle = Bearish Exit.
+plotshape(strongCross ? rs_ratio : na, title="Bullish Entry", style=shape.circle, location=location.absolute, color=color.new(colorStrong, 0), size=size.tiny)
+plotshape(weakCross ? rs_ratio : na, title="Bearish Exit", style=shape.circle, location=location.absolute, color=color.new(colorWeak, 0), size=size.tiny)
+
+// =========================================================================
+// DISPLAY INFO TABLE
+// =========================================================================
+// Create a 2-column × 4-row table anchored to the bottom-right corner of the pane.
+// This table provides a real-time dashboard of the asset's relative strength metrics.
+var table infoTable = table.new(position.bottom_right, 2, 4, bgcolor=color.new(color.gray, 90), border_width=1)
+
+// Populate the table only on the last (most recent) bar to avoid redundant processing.
+if barstate.islast
+    // Row 1: Current quadrant state (Strong / Weakening / Improving / Weak)
+    table.cell(infoTable, 0, 0, "State:", text_color=color.white, bgcolor=color.gray)
+    table.cell(infoTable, 1, 0, stateText, text_color=stateColor, bgcolor=color.new(stateColor, 80))
+    
+    // Row 2: RS Ratio value — above 100 = leading, below 100 = lagging
+    table.cell(infoTable, 0, 1, "RS Ratio:", text_color=color.white, bgcolor=color.gray)
+    table.cell(infoTable, 1, 1, str.tostring(rs_ratio, "#.00"), text_color=stateColor, bgcolor=color.new(stateColor, 80))
+    
+    // Row 3: RS Momentum value — above 100 = improving, below 100 = deteriorating
+    table.cell(infoTable, 0, 2, "RS Momentum:", text_color=color.white, bgcolor=color.gray)
+    momColor = isPositiveMom ? colorStrong : colorWeak
+    table.cell(infoTable, 1, 2, str.tostring(rs_mom, "#.00"), text_color=momColor, bgcolor=color.new(momColor, 80))
+    
+    // Row 4: Net Performance — single-bar alpha (asset return minus benchmark return)
+    table.cell(infoTable, 0, 3, "Net Perf:", text_color=color.white, bgcolor=color.gray)
+    perfColor = netPerformance >= 0 ? colorStrong : colorWeak
+    table.cell(infoTable, 1, 3, str.tostring(netPerformance, "+#0.00;-#0.00") + "%", text_color=perfColor, bgcolor=color.new(perfColor, 80))
+
+// =========================================================================
+// ALERTS
+// =========================================================================
+// Alert conditions allow users to set up notifications in TradingView
+// without needing to watch the chart continuously.
+
+// Fires when a Bullish Entry crossover signal occurs (RS Ratio crosses above 100 with positive momentum).
+alertcondition(strongCross, title="Alpha Strong - Bullish Entry", message="Alpha RSP: Bullish Entry - Asset starting to lead benchmark")
+
+// Fires when a Bearish Exit crossover signal occurs (RS Ratio crosses below 100 with negative momentum).
+alertcondition(weakCross, title="Alpha Weak - Bearish Exit", message="Alpha RSP: Bearish Exit - Asset falling behind benchmark")
+
+// Fires on every bar where the asset is in the Strong quadrant (leading + positive momentum).
+alertcondition(isLeading and isPositiveMom, title="Alpha Strong State", message="Alpha RSP: Asset is Strong (Leading with positive momentum)")
+
+// Fires on every bar where the asset is in the Weak quadrant (lagging + negative momentum).
+alertcondition(not isLeading and not isPositiveMom, title="Alpha Weak State", message="Alpha RSP: Asset is Weak (Lagging with negative momentum)")

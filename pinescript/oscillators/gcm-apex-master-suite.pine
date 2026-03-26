@@ -1,0 +1,342 @@
+//@version=6
+indicator('GCM Apex Master Suite', 'GCM Apx St', overlay = true, max_lines_count=500, max_labels_count=500, max_bars_back=5000)
+
+// ============================================================================
+// CUSTOM FUNCTIONS
+// ============================================================================
+// Formats large volume numbers into clean K/M strings
+format_vol(v) =>
+    v >= 1e6 ? str.tostring(v / 1e6, '#.00') + 'M' : v >= 1e3 ? str.tostring(v / 1e3, '#.00') + 'K' : str.tostring(v, '#.00')
+
+// Right-pads a string with spaces to lock column alignment perfectly
+pad_str(txt, len) =>
+    spaces = "          " // 10 spaces buffer
+    diff = len - str.length(txt)
+    txt + (diff > 0 ? str.substring(spaces, 0, diff) : "")
+
+// --- Helper: Clear Position Suit Ribbons ---
+var line activeLine  = na  
+var line slLine      = na  
+var line entryLine   = na
+var line liveLine    = na
+var line extremeLine = na  
+var linefill slFill  = na
+var linefill tpFill  = na
+var linefill erosFill= na
+
+clear_ribbons() =>
+    line.delete(activeLine), line.delete(slLine), line.delete(entryLine)
+    line.delete(liveLine), line.delete(extremeLine)
+    linefill.delete(slFill), linefill.delete(tpFill), linefill.delete(erosFill)
+
+// ============================================================================
+// THEME COLORS (Universal Default Theme)
+// ============================================================================
+c_bull    = #089981 // Standard TV Bullish Teal 
+c_bear    = #f23645 // Standard TV Bearish Red 
+c_neutral = #787B86 // Professional TV Gray
+
+// ============================================================================
+// 1. INPUTS: GCM POSITION SUIT 
+// ============================================================================
+grpSuitCore = "POSITION SUIT: CORE SETTINGS"
+prd           = input.int(3, "Pivot Period", minval = 1, group=grpSuitCore)
+tradeMode     = input.string("ALL", "Trading Mode", options=["ALL", "LONG", "SHORT"], group=grpSuitCore, tooltip="Filter trades based on your market bias.")
+
+grpSuitDash = "POSITION SUIT: DASHBOARD DESIGN"
+dbPosInput  = input.string("Bottom Right", "Dashboard Position", options=["Top Right", "Bottom Right", "Top Left", "Bottom Left", "Middle Right"], group=grpSuitDash)
+dbSizeInput = input.string("Small", "Dashboard Size", options=["Small", "Normal", "Large"], group=grpSuitDash)
+
+pos = dbPosInput == "Top Right" ? position.top_right : dbPosInput == "Bottom Right" ? position.bottom_right : dbPosInput == "Top Left" ? position.top_left : dbPosInput == "Bottom Left" ? position.bottom_left : position.middle_right
+sz  = dbSizeInput == "Small" ? size.small : dbSizeInput == "Normal" ? size.normal : size.large
+
+// ============================================================================
+// 2. INPUTS: GCM APEX HUD
+// ============================================================================
+grpShow    = "HUD: SHOW / HIDE INDICATORS"
+showVwap   = input.bool(true, "Show VWAP", group=grpShow)
+showVwma   = input.bool(true, "Show VWMA", group=grpShow)
+showObv    = input.bool(true, "Show OBV", group=grpShow)
+showSmi    = input.bool(true, "Show SMI", group=grpShow)
+showRsi    = input.bool(true, "Show RSI", group=grpShow)
+showDvol   = input.bool(true, "Show Delta Vol", group=grpShow)
+showVol    = input.bool(true, "Show Volume (Base)", group=grpShow)
+
+grpMom     = "HUD: MOMENTUM, VOL & SMI"
+rsiLength  = input.int(14, "RSI Length", group=grpMom) 
+smiKLen    = input.int(10, "SMI %K Length", group=grpMom)
+smiDLen    = input.int(2,  "SMI %D Length", group=grpMom)
+obvSmaLen  = input.int(21, "OBV SMA Length", minval=2, group=grpMom)
+volSmaLen  = input.int(20, "Volume SMA Length", minval=2, group=grpMom)
+vwmaLen    = input.int(20, "HUD VWMA Length", minval=2, group=grpMom)
+
+grpDiv     = "HUD: DUAL DIVERGENCE"
+lb         = input.int(5, "Div Pivot Lookback", minval=2, group=grpDiv)
+showReg    = input.bool(true, "Show Regular (R)", group=grpDiv)
+showHid    = input.bool(true, "Show Hidden (H)", group=grpDiv)
+
+// --- Static Y-Axis Masking for Gradients ---
+float fixedTop = ta.highest(high, 100)
+float fixedBot = ta.lowest(low, 100)
+
+color slFillCol = color.from_gradient(close, fixedBot, fixedTop, color.new(color.red, 80), color.new(color.maroon, 75))
+color tpFillCol = color.from_gradient(close, fixedBot, fixedTop, color.new(color.lime, 85), color.new(color.green, 80))
+color erosCol   = color.from_gradient(close, fixedBot, fixedTop, color.new(color.orange, 70), color.new(color.orange, 60))
+
+
+// ============================================================================
+// CORE CALCULATIONS (HUD)
+// ============================================================================
+src = close
+
+// --- RSI & SMI Logic ---
+raw_rsi_14 = ta.rsi(src, rsiLength)
+smi_hh = ta.highest(high, smiKLen)
+smi_ll = ta.lowest(low, smiKLen)
+smi_rdv = close - (smi_hh + smi_ll) / 2
+smi_diff = smi_hh - smi_ll
+smi_avgRel = ta.ema(ta.ema(smi_rdv, smiDLen), smiDLen)
+smi_avgDiff = ta.ema(ta.ema(smi_diff, smiDLen), smiDLen)
+smi_val = smi_avgDiff != 0 ? (smi_avgRel / (smi_avgDiff / 2) * 100) : 0
+smiRising = smi_val > nz(smi_val[1])
+
+// --- OBV, DELTA VOL, VWAP, VWMA & VOL Logic ---
+raw_obv      = ta.cum(math.sign(ta.change(src)) * volume)
+obv_sma      = ta.sma(raw_obv, obvSmaLen)
+vwap_val     = ta.vwap
+vwma_hud_val = ta.vwma(src, vwmaLen) 
+vol_sma      = ta.sma(volume, volSmaLen) 
+
+float range_hl = high - low
+float bp       = range_hl == 0 ? (close >= open ? 1.0 : 0.0) : (close - low) / range_hl
+float buy_vol  = volume * bp
+float sell_vol = volume - buy_vol
+float delta    = buy_vol - sell_vol
+float dvol_pct = volume == 0 ? 0 : (delta / volume) * 100
+
+// ============================================================================
+// DUAL DIVERGENCE ENGINE (HUD)
+// ============================================================================
+var float p1_LowPrice = na, var float p1_LowRSI = na, var int p1_LowBar = na
+var float p2_LowPrice = na, var float p2_LowRSI = na, var int p2_LowBar = na
+var float p1_HighPrice = na, var float p1_HighRSI = na, var int p1_HighBar = na
+var float p2_HighPrice = na, var float p2_HighRSI = na, var int p2_HighBar = na
+
+bool divDetected = false
+pHiRsi = ta.pivothigh(raw_rsi_14, lb, lb)
+pLoRsi = ta.pivotlow(raw_rsi_14, lb, lb)
+
+if not na(pLoRsi)
+    p2_LowPrice := p1_LowPrice, p2_LowRSI := p1_LowRSI, p2_LowBar := p1_LowBar
+    p1_LowPrice := low[lb],     p1_LowRSI := raw_rsi_14[lb], p1_LowBar := bar_index[lb]
+    if not na(p2_LowPrice)
+        if showReg and p1_LowPrice < p2_LowPrice and p1_LowRSI > p2_LowRSI
+            divDetected := true
+            line.new(p2_LowBar, p2_LowPrice, p1_LowBar, p1_LowPrice, color=c_bull, width=2)
+            label.new(p1_LowBar, p1_LowPrice, "R Bull", style=label.style_label_up, color=c_bull, textcolor=color.white, size=size.small)
+        if showHid and p1_LowPrice > p2_LowPrice and p1_LowRSI < p2_LowRSI
+            divDetected := true
+            line.new(p2_LowBar, p2_LowPrice, p1_LowBar, p1_LowPrice, color=color.new(c_bull, 50), width=1, style=line.style_dashed)
+            label.new(p1_LowBar, p1_LowPrice, "H Bull", style=label.style_label_up, color=color.new(c_bull, 60), textcolor=color.white, size=size.tiny)
+
+if not na(pHiRsi)
+    p2_HighPrice := p1_HighPrice, p2_HighRSI := p1_HighRSI, p2_HighBar := p1_HighBar
+    p1_HighPrice := high[lb],     p1_HighRSI := raw_rsi_14[lb], p1_HighBar := bar_index[lb]
+    if not na(p2_HighPrice)
+        if showReg and p1_HighPrice > p2_HighPrice and p1_HighRSI < p2_HighRSI
+            divDetected := true
+            line.new(p2_HighBar, p2_HighPrice, p1_HighBar, p1_HighPrice, color=c_bear, width=2)
+            label.new(p1_HighBar, p1_HighPrice, "R Bear", style=label.style_label_down, color=c_bear, textcolor=color.white, size=size.small)
+        if showHid and p1_HighPrice < p2_HighPrice and p1_HighRSI > p2_HighRSI
+            divDetected := true
+            line.new(p2_HighBar, p2_HighPrice, p1_HighBar, p1_HighPrice, color=color.new(c_bear, 50), width=1, style=line.style_dashed)
+            label.new(p1_HighBar, p1_HighPrice, "H Bear", style=label.style_label_down, color=color.new(c_bear, 60), textcolor=color.white, size=size.tiny)
+
+// ============================================================================
+// POSITION SUIT ENGINE (PIVOTS & RIBBONS)
+// ============================================================================
+var float savedEntry = na 
+var float extremePrice = na 
+var bool isLong      = false
+
+float licPct = 0.0
+float prftPct = 0.0
+float lipPct = 0.0
+bool currentlyInProfit = false
+
+// --- LIVE RR VARIABLES ---
+float risk_val = 0.0
+float pnl_val  = 0.0
+float live_rr  = 0.0
+
+float ph = ta.pivothigh(prd, prd)
+float pl = ta.pivotlow(prd, prd)
+
+bool canLong  = (tradeMode == "ALL" or tradeMode == "LONG")
+bool canShort = (tradeMode == "ALL" or tradeMode == "SHORT")
+
+if not na(ph) and canShort
+    isLong := false
+    clear_ribbons()
+    savedEntry := close
+    activeLine  := line.new(bar_index - prd, ph, bar_index, ph, color=color.red, width=2)
+    slLine      := line.new(bar_index - prd, ph, bar_index, ph, color=color.red, width=1, style=line.style_dotted)
+    entryLine   := line.new(bar_index - prd, savedEntry, bar_index, savedEntry, color=color.gray, style=line.style_dotted)
+    liveLine    := line.new(bar_index - prd, savedEntry, bar_index, savedEntry, color=color.white, width=1, style=line.style_dotted)
+    extremePrice := low
+    extremeLine  := line.new(bar_index - prd, extremePrice, bar_index, extremePrice, color=color.orange, width=1, style=line.style_dotted)
+    slFill := linefill.new(slLine, entryLine, slFillCol)
+    tpFill := linefill.new(entryLine, liveLine, tpFillCol)
+    erosFill := linefill.new(extremeLine, liveLine, erosCol)
+
+if not na(pl) and canLong
+    isLong := true
+    clear_ribbons()
+    savedEntry := close
+    activeLine  := line.new(bar_index - prd, pl, bar_index, pl, color=color.lime, width=2)
+    slLine      := line.new(bar_index - prd, pl, bar_index, pl, color=color.lime, width=1, style=line.style_dotted)
+    entryLine   := line.new(bar_index - prd, savedEntry, bar_index, savedEntry, color=color.gray, style=line.style_dotted)
+    liveLine    := line.new(bar_index - prd, savedEntry, bar_index, savedEntry, color=color.white, width=1, style=line.style_dotted)
+    extremePrice := high
+    extremeLine  := line.new(bar_index - prd, extremePrice, bar_index, extremePrice, color=color.orange, width=1, style=line.style_dotted)
+    slFill := linefill.new(slLine, entryLine, slFillCol)
+    tpFill := linefill.new(entryLine, liveLine, tpFillCol)
+    erosFill := linefill.new(extremeLine, liveLine, erosCol)
+
+if not na(activeLine)
+    line.set_x2(activeLine, bar_index), line.set_x2(slLine, bar_index), line.set_x2(entryLine, bar_index), line.set_x2(liveLine, bar_index), line.set_x2(extremeLine, bar_index)
+    line.set_y1(liveLine, close), line.set_y2(liveLine, close)
+    line.set_color(liveLine, close >= open ? color.lime : color.red)
+    
+    extremePrice := isLong ? math.max(extremePrice, high) : math.min(extremePrice, low)
+    line.set_y1(extremeLine, extremePrice), line.set_y2(extremeLine, extremePrice)
+
+    float curSL = line.get_y1(slLine)
+    licPct  := (math.abs(savedEntry - curSL) / savedEntry) * 100
+    prftPct := (math.abs(close - savedEntry) / savedEntry) * 100
+    lipPct  := (math.abs(extremePrice - close) / savedEntry) * 100
+    currentlyInProfit := isLong ? close > savedEntry : close < savedEntry
+
+    risk_val := math.abs(savedEntry - curSL)
+    pnl_val  := isLong ? (close - savedEntry) : (savedEntry - close)
+    live_rr  := risk_val != 0 ? (pnl_val / risk_val) : 0
+
+    if (isLong and close < curSL) or (not isLong and close > curSL)
+        clear_ribbons(), activeLine := na
+
+// ============================================================================
+// RENDER: APEX HUD, RR FLOAT & POSITION DASHBOARD
+// ============================================================================
+var label dashboard = label.new(na, na, "", style=label.style_label_left, textcolor=color.white, size=size.small, textalign=text.align_left, text_font_family=font.family_monospace)
+var label float_rr  = label.new(na, na, "", style=label.style_label_down, color=color.new(color.black, 100), textcolor=color.white, textalign=text.align_center)
+var table GCM_Dash  = table.new(pos, 2, 6, bgcolor=color.new(color.black, 70), border_width=1, border_color=color.gray)
+
+if barstate.islast
+    // ------------------------------------------------------------------------
+    // 1. APEX HUD RENDERING (DYNAMIC CONFLUENCE ENGINE)
+    // ------------------------------------------------------------------------
+    bool rsiRising   = raw_rsi_14 > nz(raw_rsi_14[1])
+    bool isAboveVwap = src > vwap_val
+    bool isAboveVwma = src > vwma_hud_val
+    bool isAboveObv  = raw_obv > obv_sma
+    bool volIsHigh   = volume > vol_sma
+    bool isBullVol   = close >= open
+
+    int conf_score = 0
+    int max_score  = 0
+
+    // Dynamic String Builder
+    string full_txt = "  ❖ GCM APEX CONFLUENCE ❖  \n───────────────────────────"
+
+    if showVwap
+        max_score += 1
+        conf_score += isAboveVwap ? 1 : -1
+        float vwap_diff_pct = vwap_val != 0 ? math.abs((src - vwap_val) / vwap_val) * 100 : 0
+        full_txt += str.format("\nVWAP : {0} {1} | {2}", isAboveVwap ? "🟢" : "🔴", pad_str((isAboveVwap ? "+" : "-") + str.tostring(vwap_diff_pct, "00.00") + "%", 8), isAboveVwap ? "Bullish" : "Bearish")
+
+    if showVwma
+        max_score += 1
+        conf_score += isAboveVwma ? 1 : -1
+        float vwma_diff_pct = vwma_hud_val != 0 ? math.abs((src - vwma_hud_val) / vwma_hud_val) * 100 : 0
+        full_txt += str.format("\nVWMA : {0} {1} | {2}", isAboveVwma ? "🟢" : "🔴", pad_str((isAboveVwma ? "+" : "-") + str.tostring(vwma_diff_pct, "00.00") + "%", 8), isAboveVwma ? "Bullish" : "Bearish")
+
+    if showObv
+        max_score += 1
+        conf_score += isAboveObv ? 1 : -1
+        float obv_diff_pct = math.min(obv_sma != 0 ? math.abs((raw_obv - obv_sma) / obv_sma) * 100 : 0, 999.99)
+        full_txt += str.format("\nOBV  : {0} {1} | {2}", isAboveObv ? "🟢" : "🔴", pad_str((isAboveObv ? "+" : "-") + str.tostring(obv_diff_pct, "00.00") + "%", 8), isAboveObv ? "Bullish" : "Bearish")
+
+    if showSmi
+        max_score += 1
+        conf_score += smiRising ? 1 : -1
+        full_txt += str.format("\nSMI  : {0} {1} | {2}", smiRising ? "🟢" : "🔴", pad_str((smi_val >= 0 ? "+" : "-") + str.tostring(math.abs(smi_val), "00.00"), 8), smiRising ? "Rising " : "Falling")
+
+    if showRsi
+        max_score += 1
+        conf_score += rsiRising ? 1 : -1
+        full_txt += str.format("\nRSI  : {0} {1} | {2}", rsiRising ? "🟢" : "🔴", pad_str(str.tostring(raw_rsi_14, "00.00"), 8), rsiRising ? "Rising " : "Falling")
+
+    if showDvol
+        max_score += 1
+        conf_score += (delta > 0) ? 1 : -1
+        full_txt += str.format("\nDVOL : {0} {1} | {2}", delta > 0 ? "🟢" : "🔴", pad_str((delta > 0 ? "+" : "-") + str.tostring(math.abs(dvol_pct), "00.00") + "%", 8), delta > 0 ? "Bullish" : "Bearish")
+
+    if showVol
+        full_txt += str.format("\nVOL  : {0} {1} | {2}", volIsHigh ? (isBullVol ? "🟢" : "🔴") : "⚪", pad_str(format_vol(volume), 8), volIsHigh ? (isBullVol ? "Bullish" : "Bearish") : "Low Vol")
+
+    // Dynamic Color & Opacity Engine
+    int strong_threshold = math.max(1, max_score - 2) 
+    color master_c = max_score == 0 ? c_neutral : (conf_score >= strong_threshold ? c_bull : conf_score <= -strong_threshold ? c_bear : c_neutral)
+    
+    int opacity = 80
+    if divDetected
+        opacity := 20
+    else if max_score > 0
+        if conf_score == max_score or conf_score == -max_score
+            opacity := 40
+        else if conf_score >= strong_threshold or conf_score <= -strong_threshold
+            opacity := 60
+
+    // AUTO-HIDE LOGIC UPDATE: Checking if Volume is the ONLY one active!
+    bool isHudActive = (max_score > 0) or showVol
+
+    if not isHudActive
+        label.set_xy(dashboard, na, na)
+    else
+        int hud_offset = not na(activeLine) ? 6 : 3
+        label.set_xy(dashboard, bar_index + hud_offset, src)
+        label.set_text(dashboard, full_txt)
+        label.set_color(dashboard, na(dashboard) ? na : color.new(master_c, opacity))
+
+    // ------------------------------------------------------------------------
+    // 2. FLOATING RR LABEL (ALL CAPS, Same Size)
+    // ------------------------------------------------------------------------
+    if not na(activeLine)
+        color rr_col = live_rr > 0 ? color.lime : live_rr < 0 ? color.red : color.gray
+        string rr_float_txt = "CURRENT RR:\n1 : " + str.tostring(live_rr, "0.00")
+        label.set_xy(float_rr, bar_index + 3, src)
+        label.set_text(float_rr, rr_float_txt)
+        label.set_textcolor(float_rr, rr_col)
+        label.set_size(float_rr, sz) 
+    else
+        label.set_xy(float_rr, na, na) 
+
+    // ------------------------------------------------------------------------
+    // 3. POSITION SUIT TABLE RENDERING 
+    // ------------------------------------------------------------------------
+    if not na(activeLine)
+        table.cell(GCM_Dash, 0, 0, "GCM POSITION SUIT", bgcolor=color.new(color.gray, 80), text_color=color.white, text_size=sz, text_halign=text.align_center)
+        table.merge_cells(GCM_Dash, 0, 0, 1, 0)
+        table.cell(GCM_Dash, 0, 1, "Mode", text_color=color.white, text_size=sz, text_halign=text.align_left)
+        table.cell(GCM_Dash, 1, 1, isLong ? "LONG" : "SHORT", text_color=isLong ? color.lime : color.red, text_size=sz, text_halign=text.align_right, bgcolor=color.new(isLong ? color.lime : color.red, 80))
+        color rr_col  = live_rr > 0 ? color.lime : live_rr < 0 ? color.red : color.gray
+        table.cell(GCM_Dash, 0, 2, "Current RR", text_color=color.white, text_size=sz, text_halign=text.align_left)
+        table.cell(GCM_Dash, 1, 2, "1 : " + str.tostring(live_rr, "0.00"), text_color=rr_col, text_size=sz, text_halign=text.align_right, bgcolor=color.new(rr_col, 80))
+        table.cell(GCM_Dash, 0, 3, "LIC (Risk)", text_color=color.red, text_size=sz, text_halign=text.align_left)
+        table.cell(GCM_Dash, 1, 3, str.tostring(licPct, "00.00") + "%", text_color=color.white, text_size=sz, text_halign=text.align_right, bgcolor=color.new(color.red, 80))
+        table.cell(GCM_Dash, 0, 4, "POC (Prft)", text_color=color.lime, text_size=sz, text_halign=text.align_left)
+        table.cell(GCM_Dash, 1, 4, currentlyInProfit ? str.tostring(prftPct, "00.00") + "%" : "00.00%", text_color=color.white, text_size=sz, text_halign=text.align_right, bgcolor=currentlyInProfit ? color.new(color.lime, 80) : color.new(color.gray, 90))
+        table.cell(GCM_Dash, 0, 5, "LIP (Erosion)", text_color=color.orange, text_size=sz, text_halign=text.align_left)
+        table.cell(GCM_Dash, 1, 5, currentlyInProfit ? str.tostring(lipPct, "00.00") + "%" : "00.00%", text_color=color.white, text_size=sz, text_halign=text.align_right, bgcolor=currentlyInProfit ? color.new(color.orange, 70) : color.new(color.gray, 90))
+    else
+        table.clear(GCM_Dash, 0, 0, 1, 5)

@@ -1,0 +1,208 @@
+//@version=6
+indicator('GCM Orbital Suite (OBV-RSI-BB-TRENDLINE-ATR-VOL)', 'GCM ORBITAL', overlay = true)
+
+// ============================================================================
+// CUSTOM FUNCTIONS
+// ============================================================================
+getMA(src, len, type) =>
+    switch type
+        "EMA"   => ta.ema(src, len)
+        "SMA"   => ta.sma(src, len)
+        "HMA"   => ta.hma(src, len)
+        "WMA"   => ta.wma(src, len)
+        "RMA"   => ta.rma(src, len)
+        "LSMA"  => ta.linreg(src, len, 0)
+        "ALMA"  => ta.alma(src, len, 0.85, 6)
+        "DEMA"  => 2 * ta.ema(src, len) - ta.ema(ta.ema(src, len), len)
+        "TEMA"  => 3 * (ta.ema(src, len) - ta.ema(ta.ema(src, len), len)) + ta.ema(ta.ema(ta.ema(src, len), len), len)
+        "ZLEMA" => ta.ema(src, len) + (ta.ema(src, len) - ta.ema(ta.ema(src, len), len))
+        => ta.ema(src, len)
+
+// ============================================================================
+// THEME COLORS 
+// ============================================================================
+c_up     = #2dff00 
+c_dn     = #ff0000 
+c_sqz    = #808080 
+c_dark   = #151924 
+
+// ============================================================================
+// SETTINGS
+// ============================================================================
+grpTL      = "TRENDLINES & PROJECTION"
+length     = input.int(3, 'Swing Lookback', group = grpTL)
+mult       = input.float(1., 'Slope Mult', minval = 0, step = .1, group = grpTL)
+backpaint  = input(true, 'Backpainting Offset', group = grpTL)
+
+grpStyle   = "STYLE"
+showHist   = input.bool(false, 'Show Historical Trend lines', group = grpStyle)
+
+grpBB      = "BOLLINGER BANDS"
+bbLength   = input.int(20, 'BB Length', group = grpBB)
+bbMult     = input.float(2.0, 'BB StdDev', group = grpBB)
+
+grpRSI     = "RSI SETTINGS"
+rsiSource  = input.source(close, "Source", group=grpRSI)
+rsiLength  = input.int(5, "Base Length", group=grpRSI) 
+smoothType = input.string("EMA", "Smoothing Type", options=["EMA", "SMA", "HMA", "WMA", "RMA", "LSMA", "ALMA", "DEMA", "TEMA", "ZLEMA"], group=grpRSI)
+rsiSmLen   = input.int(7, "Smoothing Length", group=grpRSI) 
+
+grpDiv     = "DIVERGENCE"
+showDiv    = input.bool(true, "Show Div Lines", group=grpDiv)
+maxDivBars = input.int(5, "Max Div Lookback", group=grpDiv)
+
+grpVol     = "VOLUME & OBV"
+volLen     = input.int(20, "Volume SMA Length", group=grpVol)
+
+// ============================================================================
+// CORE CALCULATIONS
+// ============================================================================
+src = close
+n = bar_index
+offset = backpaint ? length : 0
+
+// --- Trendlines ---
+ph = ta.pivothigh(length, length)
+pl = ta.pivotlow(length, length)
+slopeATR = ta.atr(length) / length * mult
+
+var upper = 0., var lower = 0., var slope_ph = 0., var slope_pl = 0.
+slope_ph := bool(ph) ? slopeATR : slope_ph
+slope_pl := bool(pl) ? slopeATR : slope_pl
+upper := bool(ph) ? ph : upper - slope_ph
+lower := bool(pl) ? pl : lower + slope_pl
+
+val_up = backpaint ? upper : upper - slope_ph * length
+val_dn = backpaint ? lower : lower + slope_pl * length
+
+var bool hide_lines = false
+if bool(ph) or bool(pl)
+    hide_lines := false
+if val_up <= val_dn and upper != 0 and lower != 0
+    hide_lines := true
+
+// --- BB Logic ---
+bbBasis = ta.sma(src, bbLength)
+bbDev   = bbMult * ta.stdev(src, bbLength)
+bbUpper = bbBasis + bbDev
+bbLower = bbBasis - bbDev
+bbWidth = bbUpper - bbLower
+isSqueezing = bbWidth < ta.sma(bbWidth, 20)
+
+// --- RSI, Volume & OBV Logic ---
+smoothRSI = getMA(ta.rsi(rsiSource, rsiLength), rsiSmLen, smoothType)
+slopeBull = smoothRSI > smoothRSI[1]
+
+volPct    = nz(volume / ta.sma(volume, volLen)) * 100
+volIsHigh = volPct >= 100
+
+obv = ta.cum(math.sign(ta.change(src)) * volume)
+obvUp = obv > obv[1]
+
+// --- SIGNAL LOGIC (For Alerts) ---
+isUpBreak = src > bbUpper
+isDnBreak = src < bbLower
+isSuperBull = slopeBull and isUpBreak
+isSuperBear = not slopeBull and isDnBreak
+
+tlBreakUp = ta.crossover(src, val_up) and not hide_lines
+tlBreakDn = ta.crossunder(src, val_dn) and not hide_lines
+
+// ============================================================================
+// TPL (TREND PROJECTION LINES)
+// ============================================================================
+var uptl = line.new(na, na, na, na, color = c_dn, style = line.style_dashed)
+var dntl = line.new(na, na, na, na, color = c_up, style = line.style_dashed)
+ext_len = 20 
+
+if bool(ph)
+    y1_up = backpaint ? ph : upper - slope_ph * length
+    y2_up = backpaint ? ph - (slopeATR * ext_len) : upper - slope_ph * (length + ext_len)
+    uptl.set_xy1(n - offset, y1_up)
+    uptl.set_xy2(n - offset + ext_len, y2_up)
+
+if bool(pl)
+    y1_dn = backpaint ? pl : lower + slope_pl * length
+    y2_dn = backpaint ? pl + (slopeATR * ext_len) : lower + slope_pl * (length + ext_len)
+    dntl.set_xy1(n - offset, y1_dn)
+    dntl.set_xy2(n - offset + ext_len, y2_dn)
+
+// ============================================================================
+// DIVERGENCE ENGINE
+// ============================================================================
+plRsi = not na(ta.pivotlow(smoothRSI, 1, 1))
+phRsi = not na(ta.pivothigh(smoothRSI, 1, 1))
+var float pRsiL = na, var float pPriceL = na, var int pIdxL = na
+var float pRsiH = na, var float pPriceH = na, var int pIdxH = na
+
+if plRsi
+    rL = smoothRSI[1], pL = low[1], iL = n[1]
+    if not na(pIdxL) and (iL - pIdxL <= maxDivBars)
+        if pL < pPriceL and rL > pRsiL and showDiv
+            line.new(pIdxL, pPriceL, iL, pL, color=c_up, width=1)
+            label.new(iL, pL, "R", color=color.new(c_up, 50), textcolor=color.white, style=label.style_label_up, size=size.small)
+    pRsiL := rL, pPriceL := pL, pIdxL := iL
+
+if phRsi
+    rH = smoothRSI[1], pH = high[1], iH = n[1]
+    if not na(pIdxH) and (iH - pIdxH <= maxDivBars)
+        if pH > pPriceH and rH < pRsiH and showDiv
+            line.new(pIdxH, pPriceH, iH, pH, color=c_dn, width=1)
+            label.new(iH, pH, "R", color=color.new(c_dn, 50), textcolor=color.white, style=label.style_label_down, size=size.small)
+    pRsiH := rH, pPriceH := pH, pIdxH := iH
+
+// ============================================================================
+// PLOTS & BLENDING
+// ============================================================================
+pBasis = plot(bbBasis, "Basis", color=na, display=display.none)
+pUpper = plot(bbUpper, "Upper Band", color=color.new(c_dn, 40), linestyle=plot.linestyle_dotted)
+pLower = plot(bbLower, "Lower Band", color=color.new(c_up, 40), linestyle=plot.linestyle_dotted)
+
+fill(pUpper, pBasis, color=color.new(c_up, 92), title="Upper Fill")
+fill(pLower, pBasis, color=color.new(c_dn, 92), title="Lower Fill")
+
+plot_up = hide_lines or upper == 0 or not showHist ? na : val_up
+plot_dn = hide_lines or lower == 0 or not showHist ? na : val_dn
+plot(plot_up, 'Hist Up', color=bool(ph) ? na : c_dn, offset=-offset)
+plot(plot_dn, 'Hist Dn', color=bool(pl) ? na : c_up, offset=-offset)
+
+// ============================================================================
+// DYNAMIC DASHBOARD LABEL
+// ============================================================================
+var label dashboard = label.new(na, na, "", style=label.style_label_left, textcolor=color.white, size=size.normal, textalign=text.align_left)
+
+if barstate.islast
+    atrVal = ta.atr(14)
+    isAtrExpanding = atrVal > ta.sma(atrVal, 14)
+    
+    rsiEmoji = slopeBull ? "🟢" : "🔴"
+    volEmoji = obvUp ? "🟢" : "🔴"
+    bbEmoji  = isUpBreak ? "🟢" : isDnBreak ? "🔴" : "⚪"
+    atrEmoji = isAtrExpanding ? "🟢" : "🔴"
+    
+    bbText  = isUpBreak ? "Bull Breakout" : isDnBreak ? "Bear Breakout" : isSqueezing ? "Consolidating" : "Ranging"
+    atrText = str.tostring(atrVal, "#.00") + (isAtrExpanding ? " (Rising)" : " (Falling)")
+    
+    txt = "RSI   : " + rsiEmoji + " " + str.tostring(smoothRSI, "#.00") + " | " + (slopeBull ? "Bullish" : "Bearish") + "\n" +
+          "Vol   : " + volEmoji + " " + (volIsHigh ? "High" : "Low") + " (" + str.tostring(volPct, "#.0") + "%)\n" +
+          "BB    : " + bbEmoji + " " + bbText + "\n" +
+          "ATR   : " + atrEmoji + " " + atrText
+    
+    label.set_xy(dashboard, n + 3, src)
+    label.set_text(dashboard, txt)
+    
+    heatmap_bg = isSuperBull ? color.new(c_up, 60) :    
+                 isSuperBear ? color.new(c_dn, 60) :    
+                 isSqueezing ? color.new(c_sqz, 40) :   
+                 slopeBull ? color.new(c_up, 85) :      
+                 color.new(c_dn, 85)                    
+                 
+    label.set_color(dashboard, heatmap_bg)
+
+// ============================================================================
+// ALERTS (Automated Signals)
+// ============================================================================
+alertcondition(isSuperBull and not isSuperBull[1], title="🟢 Super Bullish Signal", message="uniGram Alert: Super Bullish Confluence! RSI is Up, Price broke Upper BB.")
+alertcondition(isSuperBear and not isSuperBear[1], title="🔴 Super Bearish Signal", message="uniGram Alert: Super Bearish Confluence! RSI is Down, Price broke Lower BB.")
+alertcondition(tlBreakUp, title="🚀 TL Breakout (UP)", message="uniGram Alert: Price broke above the Down-Trendline.")
+alertcondition(tlBreakDn, title="💥 TL Breakout (DOWN)", message="uniGram Alert: Price broke below the Up-Trendline.")

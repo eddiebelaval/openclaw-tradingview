@@ -1,0 +1,641 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © officialjackofalltrades
+//@version=6
+indicator("Institutional Footprint Scanner [JOAT]", shorttitle="IFS [JOAT]", overlay=true, max_bars_back=200)
+
+// ─────────────────────────────────────────────────────────────────────────────────
+// CONFIGURATION - INSTITUTIONAL PARAMETERS
+// ─────────────────────────────────────────────────────────────────────────────────
+
+g_flow = "Order Flow Analysis"
+g_profile = "Volume Profile"
+g_micro = "Market Microstructure"
+g_footprint = "Footprint Detection"
+g_visual = "Visualization"
+
+// Order Flow Toxicity
+toxicity_lookback = input.int(14, "Toxicity Lookback", minval=10, maxval=50, group=g_flow)
+toxicity_threshold = input.float(0.7, "Toxicity Threshold", minval=0.5, maxval=0.9, step=0.05, group=g_flow)
+
+// Volume Profile
+vp_bins = input.int(10, "Volume Profile Bins", minval=5, maxval=30, group=g_profile)
+vp_lookback = input.int(30, "VP Lookback Period", minval=20, maxval=100, group=g_profile)
+poc_sensitivity = input.float(0.02, "POC Sensitivity", minval=0.01, maxval=0.05, step=0.01, group=g_profile)
+
+// Microstructure
+spread_lookback = input.int(14, "Spread Analysis Period", minval=10, maxval=50, group=g_micro)
+depth_threshold = input.float(1.5, "Depth Threshold", minval=1.0, maxval=3.0, step=0.1, group=g_micro)
+
+// Footprint Detection
+min_absorption_coef = input.float(0.75, "Min Absorption Coefficient", minval=0.5, maxval=1.0, step=0.05, group=g_footprint)
+cluster_distance = input.int(10, "Cluster Distance", minval=5, maxval=30, group=g_footprint)
+min_confidence = input.int(70, "Minimum Confidence %", minval=60, maxval=95, step=5, group=g_footprint)
+
+// Visual
+show_ribbon = input.bool(true, "Show Order Flow Ribbon", group=g_visual)
+show_poc = input.bool(true, "Show POC Levels", group=g_visual)
+show_footprints = input.bool(true, "Show Footprint Markers", group=g_visual)
+
+// ─────────────────────────────────────────────────────────────────────────────────
+// COLOR SYSTEM - INSTITUTIONAL GRADE PALETTE
+// ─────────────────────────────────────────────────────────────────────────────────
+
+color c_inst_buy = #ffd700           // Institutional buy (gold)
+color c_inst_sell = #4b0082          // Institutional sell (indigo)
+color c_toxic_buy = #00ff41          // Toxic buy flow (matrix green)
+color c_toxic_sell = #ff0066         // Toxic sell flow (hot pink)
+color c_poc = #ffeb3b                // POC level (amber)
+color c_lvn = #9c27b0                // Low volume node (purple)
+color c_hvn = #2196f3                // High volume node (blue)
+color c_text = #ffffff               // Dashboard text
+color c_bg = #0a0a0f                 // Dashboard background
+color c_border = #ffd700             // Dashboard border
+
+
+// ─────────────────────────────────────────────────────────────────────────────────
+// CORE FUNCTIONS - INSTITUTIONAL ALGORITHMS
+// ─────────────────────────────────────────────────────────────────────────────────
+
+// Order Flow Toxicity Index (OPTIMIZED - measures aggressive vs passive flow)
+f_toxicity_index(int lookback) =>
+    float aggressive_buy = 0.0
+    float aggressive_sell = 0.0
+    float passive_flow = 0.0
+    
+    // Sample every other bar for speed
+    for i = 0 to lookback - 1 by 2
+        float candle_pos = (high[i] - low[i]) > 0 ? (close[i] - low[i]) / (high[i] - low[i]) : 0.5
+        float vol_weight = volume[i]
+        
+        if close[i] > open[i] and candle_pos > 0.75
+            aggressive_buy += vol_weight
+        else if close[i] < open[i] and candle_pos < 0.25
+            aggressive_sell += vol_weight
+        else
+            passive_flow += vol_weight
+    
+    float total_flow = aggressive_buy + aggressive_sell + passive_flow
+    float toxicity_buy = total_flow > 0 ? aggressive_buy / total_flow : 0.0
+    float toxicity_sell = total_flow > 0 ? aggressive_sell / total_flow : 0.0
+    
+    [toxicity_buy, toxicity_sell, aggressive_buy, aggressive_sell]
+
+// Volume Profile with POC Detection (SIMPLIFIED FOR FREE TIER)
+f_volume_profile(int bins, int lookback) =>
+    var float cached_poc = na
+    var float cached_vah = na
+    var float cached_val = na
+    
+    // Only recalculate every 30 bars to minimize computation
+    if bar_index % 30 == 0 or na(cached_poc)
+        float price_high = ta.highest(high, lookback)
+        float price_low = ta.lowest(low, lookback)
+        float price_range = price_high - price_low
+        
+        // Simplified: Only track 3 key levels instead of full profile
+        float poc_vol = 0.0
+        cached_poc := hlc3
+        cached_vah := high
+        cached_val := low
+        
+        // Ultra-fast approximation: sample every 3rd bar
+        int limited_lookback = math.min(20, lookback)
+        for i = 0 to limited_lookback - 1 by 3
+            float bar_price = hlc3[i]
+            float bar_vol = volume[i]
+            
+            // Simple POC approximation
+            if bar_vol > poc_vol
+                poc_vol := bar_vol
+                cached_poc := bar_price
+        
+        // Estimate VAH/VAL from price range
+        cached_vah := cached_poc + (price_range * 0.15)
+        cached_val := cached_poc - (price_range * 0.15)
+    
+    var array<float> dummy_prices = array.new_float(bins, 0.0)
+    var array<float> dummy_volumes = array.new_float(bins, 0.0)
+    
+    [cached_poc, cached_vah, cached_val, dummy_prices, dummy_volumes]
+
+
+
+// Absorption Coefficient (quantifies institutional absorption strength)
+f_absorption_coefficient() =>
+    float body = math.abs(close - open)
+    float total_range = high - low
+    float body_ratio = total_range > 0 ? body / total_range : 0.0
+    
+    // Volume intensity
+    float vol_avg = ta.sma(volume, 20)
+    float vol_ratio = vol_avg > 0 ? volume / vol_avg : 1.0
+    
+    // Absorption occurs when high volume but small price movement
+    float absorption = vol_ratio * (1.0 - body_ratio)
+    
+    // Directional absorption
+    float dir_absorption = close > open ? absorption : -absorption
+    
+    [absorption, dir_absorption, body_ratio, vol_ratio]
+
+// Market Microstructure - Spread Analysis
+f_microstructure_analysis(int lookback) =>
+    float spread = (high - low) / close * 100
+    float avg_spread = ta.sma(spread, lookback)
+    float spread_std = ta.stdev(spread, lookback)
+    
+    // Normalized spread (z-score)
+    float spread_zscore = spread_std > 0 ? (spread - avg_spread) / spread_std : 0.0
+    
+    // Depth proxy (volume relative to spread)
+    float depth_proxy = spread > 0 ? volume / spread : 0.0
+    float avg_depth = ta.sma(depth_proxy, lookback)
+    
+    // Market maker activity
+    bool mm_providing = spread < avg_spread * 0.7  // Tight spreads
+    bool mm_withdrawing = spread > avg_spread * 1.5  // Wide spreads
+    
+    [spread, spread_zscore, depth_proxy, mm_providing, mm_withdrawing]
+
+// Smart Money Divergence Engine (SIMPLIFIED)
+f_smart_money_divergence(int lookback) =>
+    // Simplified: Only use RSI for speed
+    float rsi = ta.rsi(close, 14)
+    
+    // Divergence detection (price vs RSI only)
+    bool price_higher = close > close[lookback]
+    bool price_lower = close < close[lookback]
+    
+    bool rsi_lower = rsi < rsi[lookback]
+    bool rsi_higher = rsi > rsi[lookback]
+    
+    // Bullish divergence (price lower, RSI higher)
+    bool strong_bull_div = price_lower and rsi_higher
+    
+    // Bearish divergence (price higher, RSI lower)
+    bool strong_bear_div = price_higher and rsi_lower
+    
+    int bull_div_count = strong_bull_div ? 1 : 0
+    int bear_div_count = strong_bear_div ? 1 : 0
+    
+    [strong_bull_div, strong_bear_div, bull_div_count, bear_div_count, rsi, 50.0, 50.0]
+
+
+// Liquidity Void Detection (SIMPLIFIED)
+f_liquidity_void_detection(int lookback) =>
+    float vol_avg = ta.sma(volume, lookback)
+    
+    // Simplified: Just check if volume is very low
+    bool low_volume = volume < vol_avg * 0.7
+    
+    // Narrow range (consolidation)
+    float range_avg = ta.sma(high - low, lookback)
+    bool narrow_range = (high - low) < range_avg * 0.5
+    
+    // Liquidity void = low volume + narrow range
+    bool liquidity_void = low_volume and narrow_range
+    
+    // Track consecutive void bars
+    var int void_count = 0
+    if liquidity_void
+        void_count += 1
+    else
+        void_count := 0
+    
+    bool significant_void = void_count >= 3
+    
+    [liquidity_void, significant_void, void_count]
+
+// Institutional Footprint Clustering (SIMPLIFIED)
+f_footprint_clustering(array<int> footprint_bars, array<string> footprint_types, int cluster_dist) =>
+    int cluster_count = 0
+    string dominant_type = "None"
+    int buy_count = 0
+    int sell_count = 0
+    
+    int arr_size = array.size(footprint_bars)
+    if arr_size > 0
+        // Only check last 10 footprints for speed
+        int check_limit = math.min(10, arr_size)
+        for i = 0 to check_limit - 1
+            int fp_bar = array.get(footprint_bars, arr_size - 1 - i)
+            if bar_index - fp_bar <= cluster_dist
+                cluster_count += 1
+                string fp_type = array.get(footprint_types, arr_size - 1 - i)
+                if str.contains(fp_type, "BUY")
+                    buy_count += 1
+                else
+                    sell_count += 1
+        
+        if cluster_count >= 3
+            dominant_type := buy_count > sell_count ? "Bullish Cluster" : "Bearish Cluster"
+    
+    [cluster_count, dominant_type]
+
+// Tape Reading Metrics (simulates Level 2 order book)
+f_tape_reading_metrics() =>
+    // Aggressive vs passive volume estimation
+    float candle_pos = (high - low) > 0 ? (close - low) / (high - low) : 0.5
+    
+    // Calculate volume SMA for consistency
+    float vol_sma_20 = ta.sma(volume, 20)
+    
+    // Buy-side aggression (closes near high)
+    bool aggressive_buy = candle_pos > 0.8 and close > open and volume > vol_sma_20
+    
+    // Sell-side aggression (closes near low)
+    bool aggressive_sell = candle_pos < 0.2 and close < open and volume > vol_sma_20
+    
+    // Passive absorption (high volume, mid-range close)
+    bool passive_absorption = candle_pos > 0.4 and candle_pos < 0.6 and volume > vol_sma_20 * 1.5
+    
+    // Iceberg detection (repeated absorption at same price)
+    var float iceberg_price = na
+    var int iceberg_hits = 0
+    
+    if passive_absorption
+        if na(iceberg_price) or math.abs(close - iceberg_price) / close < 0.002
+            iceberg_price := close
+            iceberg_hits += 1
+        else
+            iceberg_price := close
+            iceberg_hits := 1
+    else if not na(iceberg_price) and math.abs(close - iceberg_price) / close > 0.01
+        iceberg_price := na
+        iceberg_hits := 0
+    
+    bool iceberg_detected = iceberg_hits >= 3
+    
+    [aggressive_buy, aggressive_sell, passive_absorption, iceberg_detected, candle_pos]
+
+
+// ─────────────────────────────────────────────────────────────────────────────────
+// CALCULATIONS - INSTITUTIONAL METRICS
+// ─────────────────────────────────────────────────────────────────────────────────
+
+// Order Flow Toxicity
+[tox_buy, tox_sell, agg_buy_vol, agg_sell_vol] = f_toxicity_index(toxicity_lookback)
+bool toxic_buy_flow = tox_buy > toxicity_threshold
+bool toxic_sell_flow = tox_sell > toxicity_threshold
+float toxicity_imbalance = tox_buy - tox_sell
+
+// Volume Profile Analysis
+[poc, vah, val, vp_prices, vp_volumes] = f_volume_profile(vp_bins, vp_lookback)
+float poc_distance = not na(poc) ? (close - poc) / poc * 100 : 0.0
+bool near_poc = math.abs(poc_distance) < poc_sensitivity * 100
+bool above_vah = close > vah
+bool below_val = close < val
+bool in_value_area = close >= val and close <= vah
+
+// Absorption Coefficient
+[absorption, dir_absorption, body_ratio, vol_ratio] = f_absorption_coefficient()
+bool strong_absorption = absorption > min_absorption_coef
+bool inst_buy_absorption = strong_absorption and dir_absorption > 0
+bool inst_sell_absorption = strong_absorption and dir_absorption < 0
+
+// Market Microstructure
+[spread, spread_z, depth, mm_providing, mm_withdrawing] = f_microstructure_analysis(spread_lookback)
+bool deep_market = depth > ta.sma(depth, spread_lookback) * depth_threshold
+bool shallow_market = depth < ta.sma(depth, spread_lookback) / depth_threshold
+
+// Smart Money Divergence
+[bull_div, bear_div, bull_div_cnt, bear_div_cnt, rsi_val, mfi_val, delta_val] = f_smart_money_divergence(10)
+
+// Liquidity Void
+[liq_void, sig_void, void_cnt] = f_liquidity_void_detection(20)
+
+// Tape Reading
+[tape_agg_buy, tape_agg_sell, tape_passive, iceberg, candle_position] = f_tape_reading_metrics()
+
+// Footprint Tracking
+var array<int> footprint_bars = array.new_int(0)
+var array<string> footprint_types = array.new_string(0)
+
+// Detect institutional footprints
+bool inst_footprint_buy = (inst_buy_absorption or (toxic_buy_flow and deep_market)) and not liq_void
+bool inst_footprint_sell = (inst_sell_absorption or (toxic_sell_flow and deep_market)) and not liq_void
+
+// Add to footprint tracking
+if inst_footprint_buy or inst_footprint_sell
+    array.push(footprint_bars, bar_index)
+    string fp_type = inst_footprint_buy ? "INST_BUY" : "INST_SELL"
+    array.push(footprint_types, fp_type)
+    
+    // Keep last 50 footprints
+    if array.size(footprint_bars) > 50
+        array.shift(footprint_bars)
+        array.shift(footprint_types)
+
+// Footprint Clustering
+[cluster_cnt, cluster_type] = f_footprint_clustering(footprint_bars, footprint_types, cluster_distance)
+bool in_cluster = cluster_cnt >= 3
+
+// Confidence Score (institutional-grade multi-factor)
+float confidence = 0.0
+confidence += strong_absorption ? 25.0 : 0.0
+confidence += (toxic_buy_flow or toxic_sell_flow) ? 20.0 : 0.0
+confidence += deep_market ? 15.0 : 0.0
+confidence += (bull_div or bear_div) ? 20.0 : 0.0
+confidence += in_cluster ? 10.0 : 0.0
+confidence += near_poc ? 10.0 : 0.0
+
+bool high_confidence = confidence >= min_confidence
+
+
+// ─────────────────────────────────────────────────────────────────────────────────
+// VISUALIZATION - INSTITUTIONAL ORDER FLOW RIBBON
+// ─────────────────────────────────────────────────────────────────────────────────
+
+// VWAP-based institutional reference
+float vwap_inst = ta.vwap(hlc3)
+
+// Order flow intensity ribbon (9-layer gradient)
+float flow_intensity = math.min(confidence / 100, 1.0)
+float ribbon_toxicity_intensity = math.abs(toxicity_imbalance)
+float combined_intensity = (flow_intensity + ribbon_toxicity_intensity) / 2.0
+
+// Ribbon wave calculation
+float wave_ratio = math.min(0.65, combined_intensity)
+float wave_level = vwap_inst + ((close - vwap_inst) * wave_ratio)
+
+// 9-layer ribbon levels (SIMPLIFIED - only 5 layers for speed)
+float ribbon_dist = wave_level - vwap_inst
+float ribbon_step = ribbon_dist / 5.0
+
+float rib_1 = vwap_inst + ribbon_step * 1
+float rib_2 = vwap_inst + ribbon_step * 2
+float rib_3 = vwap_inst + ribbon_step * 3
+float rib_4 = vwap_inst + ribbon_step * 4
+
+// Gradient VWAP line - changes color based on institutional activity
+color vwap_gradient = high_confidence and inst_footprint_buy ? color.new(#ffd700, 0) :
+                      high_confidence and inst_footprint_sell ? color.new(#4b0082, 0) :
+                      toxic_buy_flow ? color.new(#00ff41, 20) :
+                      toxic_sell_flow ? color.new(#ff0066, 20) :
+                      strong_absorption ? color.new(#ffeb3b, 30) :
+                      color.new(#1a1a2e, 40)
+
+// Plot gradient VWAP with dynamic coloring
+plot(show_ribbon ? vwap_inst : na, "Institutional VWAP", color=vwap_gradient, linewidth=3, style=plot.style_line)
+
+// Plot ribbon levels (SIMPLIFIED - 5 layers)
+p_vwap = plot(show_ribbon ? vwap_inst : na, display=display.none)
+p_r1 = plot(show_ribbon ? rib_1 : na, display=display.none)
+p_r2 = plot(show_ribbon ? rib_2 : na, display=display.none)
+p_r3 = plot(show_ribbon ? rib_3 : na, display=display.none)
+p_r4 = plot(show_ribbon ? rib_4 : na, display=display.none)
+p_r5 = plot(show_ribbon ? wave_level : na, display=display.none)
+
+// Ribbon direction and color
+bool ribbon_bullish = inst_footprint_buy or (toxic_buy_flow and high_confidence)
+color ribbon_color = ribbon_bullish ? c_inst_buy : c_inst_sell
+
+// 5-layer gradient transparency
+float base_transp = 90.0
+float step_transp = (100.0 - base_transp) / 5.0
+
+color rc0 = color.new(ribbon_color, base_transp)
+color rc1 = color.new(ribbon_color, math.min(100, base_transp + step_transp * 1))
+color rc2 = color.new(ribbon_color, math.min(100, base_transp + step_transp * 2))
+color rc3 = color.new(ribbon_color, math.min(100, base_transp + step_transp * 3))
+color rc4 = color.new(ribbon_color, math.min(100, base_transp + step_transp * 4))
+
+// Fill ribbon layers
+bool rib_up = wave_level >= vwap_inst
+
+fill(p_vwap, p_r1, show_ribbon ? (rib_up ? rc1 : rc0) : na, title="Flow 1")
+fill(p_r1, p_r2, show_ribbon ? (rib_up ? rc2 : rc1) : na, title="Flow 2")
+fill(p_r2, p_r3, show_ribbon ? (rib_up ? rc3 : rc2) : na, title="Flow 3")
+fill(p_r3, p_r4, show_ribbon ? (rib_up ? rc4 : rc3) : na, title="Flow 4")
+fill(p_r4, p_r5, show_ribbon ? (rib_up ? color.new(ribbon_color, 100) : rc4) : na, title="Flow 5")
+
+
+// ─────────────────────────────────────────────────────────────────────────────────
+// VISUALIZATION - INSTITUTIONAL GRADE CHART OVERLAYS
+// ─────────────────────────────────────────────────────────────────────────────────
+
+// Calculate ATR once at global scope for consistency
+float atr_14 = ta.atr(14)
+
+// TOXICITY HEATMAP - Simplified background gradient
+float toxicity_intensity = math.max(tox_buy, tox_sell)
+color toxicity_heatmap = toxicity_intensity > 0.8 ? color.new(#ff0066, 95) : na
+
+bgcolor(toxicity_heatmap, title="Toxicity Heatmap")
+
+// ABSORPTION WAVE ZONES - Simplified (removed for speed)
+// Removed to improve performance on free tier
+
+// CLUSTER INTENSITY ZONES - Simplified gradient
+color cluster_bg_color = na
+if in_cluster and cluster_cnt >= 3
+    color cluster_color = cluster_type == "Bullish Cluster" ? 
+                          color.new(#00ff41, 95) : color.new(#ff0066, 95)
+    cluster_bg_color := cluster_color
+
+bgcolor(cluster_bg_color, title="Cluster Zone")
+
+// LIQUIDITY VOID HIGHLIGHTING - Dark zones with no institutional interest
+bgcolor(sig_void ? color.new(#1a1a2e, 70) : na, title="Liquidity Void")
+
+// TOXICITY FLOW LINES - Simplified
+float toxicity_line_level = close + (atr_14 * (tox_buy - tox_sell) * 2)
+color toxicity_gradient = toxic_buy_flow ? color.new(#00ff41, 30) : toxic_sell_flow ? color.new(#ff0066, 30) : na
+
+plot(toxic_buy_flow or toxic_sell_flow ? toxicity_line_level : na, 
+     "Toxicity Flow", 
+     color=toxicity_gradient, 
+     linewidth=2, style=plot.style_line)
+
+// ABSORPTION FLOW LINE - Simplified
+float absorption_line = close + (atr_14 * dir_absorption * 1.5)
+color absorption_gradient = strong_absorption ? (dir_absorption > 0 ? color.new(#ffd700, 30) : color.new(#4b0082, 30)) : na
+
+plot(strong_absorption ? absorption_line : na,
+     "Absorption Flow",
+     color=absorption_gradient,
+     linewidth=2, style=plot.style_line)
+
+// ABSORPTION COEFFICIENT GRADIENT - Removed for speed
+// Removed to improve performance on free tier
+
+// MICROSTRUCTURE SPREAD BANDS - Removed for speed
+// Removed to improve performance on free tier
+
+// Calculate ATR offset for labels
+float atr_offset = atr_14 * 2.5
+
+// INSTITUTIONAL FOOTPRINT MARKERS - Reduced frequency for speed
+var int last_buy_label = -50
+var int last_sell_label = -50
+int label_cooldown = 20  // Increased cooldown
+
+if show_footprints and inst_footprint_buy and high_confidence and (bar_index - last_buy_label) >= label_cooldown
+    label.new(bar_index, low - atr_offset, "INST", color=color.new(#ffd700, 0), textcolor=color.black, style=label.style_label_up, size=size.small, tooltip="Institutional Buy\nConfidence: " + str.tostring(confidence, "#") + "%")
+    last_buy_label := bar_index
+
+if show_footprints and inst_footprint_sell and high_confidence and (bar_index - last_sell_label) >= label_cooldown
+    label.new(bar_index, high + atr_offset, "INST", color=color.new(#4b0082, 0), textcolor=color.white, style=label.style_label_down, size=size.small, tooltip="Institutional Sell\nConfidence: " + str.tostring(confidence, "#") + "%")
+    last_sell_label := bar_index
+
+// TOXICITY LEVEL LABELS - Reduced for speed
+var int last_tox_label = -50
+if show_footprints and (toxic_buy_flow or toxic_sell_flow) and (bar_index - last_tox_label) >= 25
+    string tox_label = toxic_buy_flow ? "TOX\nBUY" : "TOX\nSELL"
+    color tox_label_color = toxic_buy_flow ? color.new(#00ff41, 0) : color.new(#ff0066, 0)
+    float tox_y = toxic_buy_flow ? low - atr_offset * 0.7 : high + atr_offset * 0.7
+    label.new(bar_index, tox_y, tox_label, color=tox_label_color, textcolor=color.white, style=toxic_buy_flow ? label.style_label_up : label.style_label_down, size=size.tiny)
+    last_tox_label := bar_index
+
+// MARKET MAKER ACTIVITY LABELS - Show MM withdrawal
+var int last_mm_label = -35
+if show_footprints and mm_withdrawing and not mm_withdrawing[1] and (bar_index - last_mm_label) >= 20
+    label.new(bar_index, high + atr_offset * 0.8, "MM OUT", color=color.new(#ff6600, 30), textcolor=color.white, style=label.style_label_down, size=size.tiny, tooltip="Market Maker Withdrawal\nSpread widening detected")
+    last_mm_label := bar_index
+
+// BAR COLORING - Simplified for speed
+color bar_col = na
+if toxic_buy_flow and high_confidence
+    bar_col := color.new(#00ff41, 60)
+else if toxic_sell_flow and high_confidence
+    bar_col := color.new(#ff0066, 60)
+
+barcolor(bar_col, title="Institutional Flow")
+
+
+// ─────────────────────────────────────────────────────────────────────────────────
+// DASHBOARD - INSTITUTIONAL METRICS
+// ─────────────────────────────────────────────────────────────────────────────────
+
+var table dashboard = table.new(position.top_right, 2, 14, 
+                                 bgcolor=color.new(c_bg, 5), 
+                                 border_width=2, 
+                                 border_color=color.new(c_border, 30))
+
+if barstate.islast
+    // Header
+    table.cell(dashboard, 0, 0, "IFS [JOAT]", text_color=c_inst_buy, text_size=size.large, 
+               bgcolor=color.new(c_bg, 0))
+    table.merge_cells(dashboard, 0, 0, 1, 0)
+    
+    // Confidence
+    table.cell(dashboard, 0, 1, "Confidence", text_color=c_text, text_size=size.small)
+    table.cell(dashboard, 1, 1, str.tostring(confidence, "#") + "%", 
+               text_color=high_confidence ? c_inst_buy : c_text, text_size=size.small)
+    
+    // Order Flow Toxicity
+    table.cell(dashboard, 0, 2, "Toxicity", text_color=c_text, text_size=size.small)
+    string tox_text = toxic_buy_flow ? "BUY " + str.tostring(tox_buy, "#.##") : 
+                      toxic_sell_flow ? "SELL " + str.tostring(tox_sell, "#.##") : "Neutral"
+    color tox_color = toxic_buy_flow ? c_toxic_buy : toxic_sell_flow ? c_toxic_sell : c_text
+    table.cell(dashboard, 1, 2, tox_text, text_color=tox_color, text_size=size.small)
+    
+    // Absorption Coefficient
+    table.cell(dashboard, 0, 3, "Absorption", text_color=c_text, text_size=size.small)
+    table.cell(dashboard, 1, 3, str.tostring(absorption, "#.##"), 
+               text_color=strong_absorption ? c_inst_buy : c_text, text_size=size.small)
+    
+    // POC Distance
+    table.cell(dashboard, 0, 4, "POC Dist", text_color=c_text, text_size=size.small)
+    table.cell(dashboard, 1, 4, str.tostring(poc_distance, "#.##") + "%", 
+               text_color=near_poc ? c_poc : c_text, text_size=size.small)
+    
+    // Value Area Position
+    table.cell(dashboard, 0, 5, "Value Area", text_color=c_text, text_size=size.small)
+    string va_text = above_vah ? "Above VAH" : below_val ? "Below VAL" : in_value_area ? "Inside VA" : "Outside"
+    color va_color = in_value_area ? c_hvn : c_text
+    table.cell(dashboard, 1, 5, va_text, text_color=va_color, text_size=size.small)
+    
+    // Market Microstructure - Spread
+    table.cell(dashboard, 0, 6, "Spread", text_color=c_text, text_size=size.small)
+    table.cell(dashboard, 1, 6, str.tostring(spread, "#.##") + "%", 
+               text_color=math.abs(spread_z) > 2 ? c_toxic_sell : c_text, text_size=size.small)
+    
+    // Market Depth
+    table.cell(dashboard, 0, 7, "Depth", text_color=c_text, text_size=size.small)
+    string depth_text = deep_market ? "Deep" : shallow_market ? "Shallow" : "Normal"
+    color depth_color = deep_market ? c_inst_buy : shallow_market ? c_toxic_sell : c_text
+    table.cell(dashboard, 1, 7, depth_text, text_color=depth_color, text_size=size.small)
+    
+    // Market Maker Activity
+    table.cell(dashboard, 0, 8, "MM Activity", text_color=c_text, text_size=size.small)
+    string mm_text = mm_providing ? "Providing" : mm_withdrawing ? "Withdrawing" : "Neutral"
+    color mm_color = mm_providing ? c_inst_buy : mm_withdrawing ? c_toxic_sell : c_text
+    table.cell(dashboard, 1, 8, mm_text, text_color=mm_color, text_size=size.small)
+    
+    // Toxicity Imbalance
+    table.cell(dashboard, 0, 9, "Imbalance", text_color=c_text, text_size=size.small)
+    table.cell(dashboard, 1, 9, str.tostring(toxicity_imbalance, "#.##"), 
+               text_color=toxicity_imbalance > 0 ? c_toxic_buy : c_toxic_sell, text_size=size.small)
+    
+    // Footprint Cluster
+    if in_cluster
+        table.cell(dashboard, 0, 10, "Cluster", text_color=c_text, text_size=size.small)
+        table.cell(dashboard, 1, 10, str.tostring(cluster_cnt) + " FP", 
+                   text_color=c_poc, text_size=size.small)
+    
+    // Liquidity Status
+    table.cell(dashboard, 0, 11, "Liquidity", text_color=c_text, text_size=size.small)
+    string liq_text = sig_void ? "VOID" : deep_market ? "Deep" : "Normal"
+    color liq_color = sig_void ? c_lvn : deep_market ? c_inst_buy : c_text
+    table.cell(dashboard, 1, 11, liq_text, text_color=liq_color, text_size=size.small)
+    
+    // Tape Reading
+    table.cell(dashboard, 0, 12, "Tape", text_color=c_text, text_size=size.small)
+    string tape_text = tape_agg_buy ? "Agg Buy" : tape_agg_sell ? "Agg Sell" : 
+                       tape_passive ? "Passive" : "Neutral"
+    color tape_color = tape_agg_buy ? c_toxic_buy : tape_agg_sell ? c_toxic_sell : c_text
+    table.cell(dashboard, 1, 12, tape_text, text_color=tape_color, text_size=size.small)
+    
+    // Iceberg Detection
+    if iceberg
+        table.cell(dashboard, 0, 13, "Iceberg", text_color=c_text, text_size=size.small)
+        table.cell(dashboard, 1, 13, "ACTIVE", text_color=c_poc, text_size=size.small)
+
+
+// ─────────────────────────────────────────────────────────────────────────────────
+// ALERTS - INSTITUTIONAL EVENTS
+// ─────────────────────────────────────────────────────────────────────────────────
+
+alertcondition(inst_footprint_buy and high_confidence, "Institutional Buy", 
+               "IFS: Institutional buy footprint detected - Confidence: {{plot_0}}%")
+
+alertcondition(inst_footprint_sell and high_confidence, "Institutional Sell", 
+               "IFS: Institutional sell footprint detected - Confidence: {{plot_0}}%")
+
+alertcondition(toxic_buy_flow and not toxic_buy_flow[1], "Toxic Buy Flow", 
+               "IFS: Toxic buy flow initiated - Aggressive institutional buying")
+
+alertcondition(toxic_sell_flow and not toxic_sell_flow[1], "Toxic Sell Flow", 
+               "IFS: Toxic sell flow initiated - Aggressive institutional selling")
+
+alertcondition(near_poc and not near_poc[1], "Near POC", 
+               "IFS: Price approaching Point of Control - High volume node")
+
+alertcondition(bull_div and bull_div_cnt >= 2, "Smart Money Bullish Divergence", 
+               "IFS: Multi-oscillator bullish divergence detected")
+
+alertcondition(bear_div and bear_div_cnt >= 2, "Smart Money Bearish Divergence", 
+               "IFS: Multi-oscillator bearish divergence detected")
+
+alertcondition(in_cluster and not in_cluster[1], "Footprint Cluster", 
+               "IFS: Entered institutional footprint cluster zone")
+
+alertcondition(sig_void and not sig_void[1], "Liquidity Void", 
+               "IFS: Significant liquidity void detected - Low institutional interest")
+
+alertcondition(iceberg and not iceberg[1], "Iceberg Order", 
+               "IFS: Iceberg order detected - Hidden institutional liquidity")
+
+alertcondition(mm_withdrawing and not mm_withdrawing[1], "Market Maker Withdrawal", 
+               "IFS: Market makers withdrawing liquidity - Spread widening")
+
+alertcondition(deep_market and tape_agg_buy, "Deep Market Aggressive Buy", 
+               "IFS: Deep market with aggressive buying - Strong institutional demand")
+
+alertcondition(deep_market and tape_agg_sell, "Deep Market Aggressive Sell", 
+               "IFS: Deep market with aggressive selling - Strong institutional supply")
+
+// ═══════════════════════════════════════════════════════════════════════════════════
+// END OF INSTITUTIONAL FOOTPRINT SCANNER
+// ═══════════════════════════════════════════════════════════════════════════════════

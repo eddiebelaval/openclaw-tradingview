@@ -1,0 +1,290 @@
+// Open-source under the Mozilla Public License 2.0: https://mozilla.org/MPL/2.0/
+// Copyright (c) Tim Catana
+// Attribution is required for reused or republished versions of this script and derivatives.
+//
+// Adaptive RSI oscillator panel with RSI-derived wave bands projected on price.
+// The Adaptive RSI engine concept is adapted from @AdaptiveRSI on TradingView:
+// https://www.tradingview.com/script/CMBt48lk-RSI-adaptive-zones-AdaptiveRSI/
+
+//@version=6
+indicator(title = 'Adaptive RSI + RSI Wave Bands', shorttitle = 'RSI Combo', format = format.price, precision = 2, timeframe = '', timeframe_gaps = true)
+
+// RSI panel inputs.
+rsiGroup = 'RSI Settings'
+
+rsiLength = input.int(14, minval = 2, title = 'Length', group = rsiGroup)
+rsiType = input.string('candle', 'Plot RSI As:', options = ['line', 'bar', 'candle'], inline = 'RSI', group = rsiGroup)
+rsiColor = input.color(color.gray, '', inline = 'RSI', group = rsiGroup)
+
+isLine = rsiType == 'line'
+isBar = rsiType == 'bar'
+isCandle = rsiType == 'candle'
+
+// Zone visibility and colors.
+visibilityGroup = 'Visibility and Colors'
+
+showSupportResistance = input.bool(true, 'Support / Resistance Zones', inline = 'SupRes', group = visibilityGroup)
+supportResistanceColor = input.color(color.new(color.gray, 50), '', inline = 'SupRes', group = visibilityGroup)
+
+showOverboughtOversold = input.bool(true, 'Oversold / Overbought Zones', inline = 'zones_coloring', group = visibilityGroup)
+overboughtColor = input.color(#D92323, '', inline = 'zones_coloring', group = visibilityGroup)
+oversoldColor = input.color(#33A645, '', inline = 'zones_coloring', group = visibilityGroup)
+
+showStateColoring = input.bool(true, 'Oversold / Overbought Coloring', inline = 'OO_coloring', group = visibilityGroup)
+oversoldStateColor = input.color(#33E643, '', inline = 'OO_coloring', group = visibilityGroup)
+overboughtStateColor = input.color(#F22738, '', inline = 'OO_coloring', group = visibilityGroup)
+
+showZoneValues = input.bool(false, 'Show values on scale', group = visibilityGroup)
+
+// Optional logit-domain smoothing for the panel RSI.
+smoothingGroup = 'RSI Smoothing'
+maTooltip = 'All smoothing is performed in logit-transformed RSI space and then converted back to the 0-100 RSI scale.'
+bbTooltip = 'Only applies when "SMA + Bollinger Bands" is selected. Bands are computed in logit RSI space so they stay inside the 0-100 range.'
+
+panelSourceInput = input.string('Close', 'RSI input', options = ['Close', '(H + L)/2', '(H + L + C)/3', '(H + L + C + C)/4'], group = smoothingGroup, display = display.data_window)
+
+panelMaTypeInput = input.string('None', 'MA Type', options = ['None', 'SMA', 'SMA + Bollinger Bands', 'EMA', 'SMMA (RMA)', 'WMA', 'VWMA'], tooltip = maTooltip, group = smoothingGroup, display = display.data_window)
+
+useBollingerBands = panelMaTypeInput == 'SMA + Bollinger Bands'
+showMovingAverage = panelMaTypeInput != 'None'
+
+panelMaLengthInput = input.int(21, 'MA Length', inline = 'LMA', group = smoothingGroup, display = display.data_window, active = panelMaTypeInput != 'None')
+
+movingAverageColor = input.color(#F2BD1D, '', inline = 'LMA', group = smoothingGroup)
+
+bbMultInput = input.float(2.0, 'BB StdDev', minval = 0, maxval = 10, step = 0.1, tooltip = bbTooltip, inline = 'LBB', group = smoothingGroup, display = display.data_window, active = useBollingerBands)
+
+bollingerColor = input.color(#F27405, '', inline = 'LBB', group = smoothingGroup)
+showMovingAverageValues = input.bool(false, 'Show values on scale', group = smoothingGroup)
+
+// Wave-band overlay inputs.
+waveGroup = 'Wave Bands'
+
+showWaveBands = input.bool(true, 'Show Wave Bands', group = waveGroup)
+bandSmoothingLength = input.int(8, 'Band Smoothing', minval = 1, maxval = 50, group = waveGroup)
+upperLineColor = input.color(#FF6D00, 'Upper Line', inline = 'u', group = waveGroup)
+upperFillColor = input.color(#FFB74D, 'Upper Fill', inline = 'u', group = waveGroup)
+lowerLineColor = input.color(#00BCD4, 'Lower Line', inline = 'l', group = waveGroup)
+lowerFillColor = input.color(#7FDBFF, 'Lower Fill', inline = 'l', group = waveGroup)
+
+// Core constants.
+halfRange = 50.0
+epsilon = 1e-10
+smoothingFactor = 1.0 / rsiLength
+inverseSqrtLengthMinusOne = 1.0 / math.pow(math.max(rsiLength - 1.0, 1.0), 0.5)
+
+// Helper functions.
+logit_transform(value, epsilonLocal) =>
+    clampedValue = math.min(math.max(value, epsilonLocal), 100.0 - epsilonLocal)
+    math.log(clampedValue / (100.0 - clampedValue))
+
+inverse_logit_transform(value) =>
+    100.0 / (1.0 + math.exp(-value))
+
+tanh_custom(value) =>
+    exponent = math.exp(2.0 * value)
+    (exponent - 1.0) / (exponent + 1.0)
+
+rsi_distance_from_50(zScore) =>
+    halfRange * tanh_custom(zScore * inverseSqrtLengthMinusOne)
+
+ma(source, length, maType) =>
+    switch maType
+        'SMA' => ta.sma(source, length)
+        'SMA + Bollinger Bands' => ta.sma(source, length)
+        'EMA' => ta.ema(source, length)
+        'SMMA (RMA)' => ta.rma(source, length)
+        'WMA' => ta.wma(source, length)
+        'VWMA' => ta.vwma(source, length)
+
+// Adaptive RSI engine.
+middle = ta.rma(close, rsiLength)
+middleOpen = (1.0 - smoothingFactor) * middle[1] + smoothingFactor * open
+middleHigh = (1.0 - smoothingFactor) * middle[1] + smoothingFactor * high
+middleLow = (1.0 - smoothingFactor) * middle[1] + smoothingFactor * low
+
+closeVolatility = ta.rma(math.abs(close - close[1]), rsiLength)
+openVolatility = (1.0 - smoothingFactor) * closeVolatility[1] + smoothingFactor * math.abs(open - close[1])
+highVolatility = (1.0 - smoothingFactor) * closeVolatility[1] + smoothingFactor * math.abs(high - close[1])
+lowVolatility = (1.0 - smoothingFactor) * closeVolatility[1] + smoothingFactor * math.abs(low - close[1])
+
+closeDenominator = math.max(closeVolatility, epsilon) * (rsiLength - 1.0)
+openDenominator = math.max(openVolatility, epsilon) * (rsiLength - 1.0)
+highDenominator = math.max(highVolatility, epsilon) * (rsiLength - 1.0)
+lowDenominator = math.max(lowVolatility, epsilon) * (rsiLength - 1.0)
+
+adaptiveRsi = halfRange + halfRange * ((close - middle) / closeDenominator)
+adaptiveRsiOpen = halfRange + halfRange * ((open - middleOpen) / openDenominator)
+adaptiveRsiHigh = halfRange + halfRange * ((high - middleHigh) / highDenominator)
+adaptiveRsiLow = halfRange + halfRange * ((low - middleLow) / lowDenominator)
+
+logitClose = logit_transform(adaptiveRsi, epsilon)
+logitOpen = logit_transform(adaptiveRsiOpen, epsilon)
+logitHigh = logit_transform(adaptiveRsiHigh, epsilon)
+logitLow = logit_transform(adaptiveRsiLow, epsilon)
+
+panelSource = switch panelSourceInput
+    'Close' => logitClose
+    '(H + L)/2' => (logitHigh + logitLow) / 2.0
+    '(H + L + C)/3' => (logitHigh + logitLow + logitClose) / 3.0
+    '(H + L + C + C)/4' => (logitHigh + logitLow + logitClose + logitClose) / 4.0
+
+// Smoothing and Bollinger calculations in logit RSI space.
+logitMovingAverage = showMovingAverage ? ma(panelSource, panelMaLengthInput, panelMaTypeInput) : na
+logitStdDev = useBollingerBands ? ta.stdev(panelSource, panelMaLengthInput) : na
+
+smoothedRsi = inverse_logit_transform(logitMovingAverage)
+upperBollinger = inverse_logit_transform(logitMovingAverage + bbMultInput * logitStdDev)
+lowerBollinger = inverse_logit_transform(logitMovingAverage - bbMultInput * logitStdDev)
+
+// Adaptive threshold distances.
+bodyThreshold = math.sqrt((5.0 - math.sqrt(17.0)) / 2.0)
+tailThreshold = math.sqrt((5.0 + math.sqrt(17.0)) / 2.0)
+breakoutThreshold = 1.0
+reversalThreshold = math.sqrt(3.0)
+
+supportInnerDistance = rsi_distance_from_50(bodyThreshold)
+supportOuterDistance = rsi_distance_from_50(breakoutThreshold)
+extremeInnerDistance = rsi_distance_from_50(reversalThreshold)
+extremeOuterDistance = rsi_distance_from_50(tailThreshold)
+
+supportResistanceFillColor = showSupportResistance ? supportResistanceColor : color.new(rsiColor, 100)
+overboughtFillColor = showOverboughtOversold ? color.new(overboughtColor, 15) : color.new(color.red, 100)
+oversoldFillColor = showOverboughtOversold ? color.new(oversoldColor, 15) : color.new(color.green, 100)
+extremeOpacity = showOverboughtOversold ? 90 : 100
+
+isCandleUp = adaptiveRsi > adaptiveRsiOpen
+candleOpacity = isCandleUp ? 90 : 10
+
+isOverboughtLine = adaptiveRsi > (50.0 + extremeInnerDistance)
+isOversoldLine = adaptiveRsi < (50.0 - extremeInnerDistance)
+isOverboughtBar = bar_index >= rsiLength and adaptiveRsiHigh > 50.0 + extremeInnerDistance
+isOversoldBar = bar_index >= rsiLength and adaptiveRsiLow < 50.0 - extremeInnerDistance
+
+color bodyColor = na
+if not showStateColoring
+    bodyColor := color.new(rsiColor, candleOpacity)
+else if isOverboughtBar
+    bodyColor := color.new(overboughtStateColor, candleOpacity)
+else if isOversoldBar
+    bodyColor := color.new(oversoldStateColor, candleOpacity)
+else
+    bodyColor := color.new(rsiColor, candleOpacity)
+
+color borderColor = na
+if not showStateColoring
+    borderColor := color.new(rsiColor, 0)
+else if isOverboughtBar
+    borderColor := overboughtStateColor
+else if isOversoldBar
+    borderColor := oversoldStateColor
+else
+    borderColor := color.new(rsiColor, 0)
+
+// Wave bands use fixed RSI thresholds mapped into price space.
+waveOverboughtInner = 50.0 + extremeInnerDistance
+waveOverboughtOuter = 50.0 + extremeOuterDistance
+waveOversoldInner = 50.0 - extremeInnerDistance
+waveOversoldOuter = 50.0 - extremeOuterDistance
+
+price_at_rsi(rsiValue) =>
+    middle + ((rsiValue - 50.0) / 50.0) * closeDenominator
+
+upperBandRaw = price_at_rsi(waveOverboughtInner)
+lowerBandRaw = price_at_rsi(waveOversoldInner)
+upperTailRaw = price_at_rsi(waveOverboughtOuter)
+lowerTailRaw = price_at_rsi(waveOversoldOuter)
+
+upperBand = ta.rma(upperBandRaw, bandSmoothingLength)
+lowerBand = ta.rma(lowerBandRaw, bandSmoothingLength)
+upperTail = ta.rma(upperTailRaw, bandSmoothingLength)
+lowerTail = ta.rma(lowerTailRaw, bandSmoothingLength)
+
+// Panel plots (indicator pane).
+plot(rsiType == 'line' ? adaptiveRsi : na, 'RSI Line', color.new(rsiColor, 25), linewidth = 2, editable = isLine)
+
+plotcandle(
+    rsiType == 'candle' ? adaptiveRsiOpen : na,
+    rsiType == 'candle' ? adaptiveRsiHigh : na,
+    rsiType == 'candle' ? adaptiveRsiLow : na,
+    rsiType == 'candle' ? adaptiveRsi : na,
+    'RSI Candle',
+    color = bodyColor,
+    wickcolor = borderColor,
+    bordercolor = borderColor,
+    editable = isCandle)
+
+plotbar(
+    rsiType == 'bar' ? adaptiveRsiOpen : na,
+    rsiType == 'bar' ? adaptiveRsiHigh : na,
+    rsiType == 'bar' ? adaptiveRsiLow : na,
+    rsiType == 'bar' ? adaptiveRsi : na,
+    'RSI Bar',
+    color = borderColor,
+    editable = isBar)
+
+plot(
+    showStateColoring and rsiType == 'line' and (isOverboughtLine or isOversoldLine) ? adaptiveRsi : na,
+    'Dots',
+    color = borderColor,
+    linewidth = 2,
+    style = plot.style_circles,
+    editable = showStateColoring and isLine)
+
+plot(50, 'Middle', color.new(rsiColor, 50), style = plot.style_linebr, editable = true, display = showZoneValues ? display.all : display.all - display.price_scale)
+
+overboughtOuterPlot = plot(50.0 + extremeOuterDistance, 'Top of Overbought', color = oversoldFillColor, editable = showZoneValues and showOverboughtOversold, display = showZoneValues and showOverboughtOversold ? display.price_scale : display.none)
+overboughtInnerPlot = plot(50.0 + extremeInnerDistance, 'Bottom of Overbought', color = color.new(oversoldColor, extremeOpacity), editable = showZoneValues and showOverboughtOversold, display = showZoneValues and showOverboughtOversold ? display.price_scale : display.none)
+
+fill(
+    overboughtOuterPlot,
+    overboughtInnerPlot,
+    50.0 + extremeOuterDistance,
+    50.0 + extremeInnerDistance,
+    top_color = oversoldFillColor,
+    bottom_color = color.new(oversoldColor, extremeOpacity),
+    title = 'Overbought Zone')
+
+oversoldOuterPlot = plot(50.0 - extremeOuterDistance, 'Bottom of Oversold', color = overboughtFillColor, editable = showZoneValues and showOverboughtOversold, display = showZoneValues and showOverboughtOversold ? display.price_scale : display.none)
+oversoldInnerPlot = plot(50.0 - extremeInnerDistance, 'Top of Oversold', color = color.new(overboughtColor, extremeOpacity), editable = showZoneValues and showOverboughtOversold, display = showZoneValues and showOverboughtOversold ? display.price_scale : display.none)
+
+fill(
+    oversoldInnerPlot,
+    oversoldOuterPlot,
+    50.0 - extremeInnerDistance,
+    50.0 - extremeOuterDistance,
+    top_color = color.new(overboughtColor, extremeOpacity),
+    bottom_color = overboughtFillColor,
+    title = 'Oversold Zone')
+
+resistanceOuterPlot = plot(50.0 + supportOuterDistance, 'Top of Resistance', supportResistanceFillColor, editable = showZoneValues and showSupportResistance, display = showZoneValues and showSupportResistance ? display.price_scale : display.none)
+resistanceInnerPlot = plot(50.0 + supportInnerDistance, 'Bottom of Resistance', supportResistanceFillColor, editable = showZoneValues and showSupportResistance, display = showZoneValues and showSupportResistance ? display.price_scale : display.none)
+fill(resistanceOuterPlot, resistanceInnerPlot, supportResistanceFillColor, title = 'Resistance Zone')
+
+supportInnerPlot = plot(50.0 - supportInnerDistance, 'Top of Support', supportResistanceFillColor, editable = showZoneValues and showSupportResistance, display = showZoneValues and showSupportResistance ? display.price_scale : display.none)
+supportOuterPlot = plot(50.0 - supportOuterDistance, 'Bottom of Support', supportResistanceFillColor, editable = showZoneValues and showSupportResistance, display = showZoneValues and showSupportResistance ? display.price_scale : display.none)
+fill(supportOuterPlot, supportInnerPlot, supportResistanceFillColor, title = 'Support Zone')
+
+plot(smoothedRsi, 'Logit RSI based MA', movingAverageColor, display = showMovingAverage ? (showMovingAverageValues ? display.all : display.all - display.price_scale) : display.none, editable = showMovingAverage)
+plot(upperBollinger, 'Upper Bollinger Band', bollingerColor, display = useBollingerBands ? (showMovingAverageValues ? display.all : display.all - display.price_scale) : display.none, editable = useBollingerBands)
+plot(lowerBollinger, 'Lower Bollinger Band', bollingerColor, display = useBollingerBands ? (showMovingAverageValues ? display.all : display.all - display.price_scale) : display.none, editable = useBollingerBands)
+
+// Wave-band overlay (price chart).
+upperBandPlot = plot(showWaveBands ? upperBand : na, 'Upper Band', color.new(upperLineColor, 5), linewidth = 2, force_overlay = true)
+lowerBandPlot = plot(showWaveBands ? lowerBand : na, 'Lower Band', color.new(lowerLineColor, 5), linewidth = 2, force_overlay = true)
+upperTailPlot = plot(showWaveBands ? upperTail : na, 'Upper Tail', color.new(upperFillColor, 100), linewidth = 1, display = display.none, force_overlay = true)
+lowerTailPlot = plot(showWaveBands ? lowerTail : na, 'Lower Tail', color.new(lowerFillColor, 100), linewidth = 1, display = display.none, force_overlay = true)
+
+fill(
+    upperTailPlot,
+    upperBandPlot,
+    top_color = color.new(upperFillColor, 88),
+    bottom_color = color.new(upperFillColor, 70),
+    title = 'Upper Extension')
+
+fill(
+    lowerBandPlot,
+    lowerTailPlot,
+    top_color = color.new(lowerFillColor, 70),
+    bottom_color = color.new(lowerFillColor, 88),
+    title = 'Lower Extension')

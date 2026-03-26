@@ -1,0 +1,635 @@
+//@version=6
+indicator("Grand Ensemble Meta-Oscillator (24-Anchor Omni-Engine)", overlay=false, max_bars_back=4000, max_labels_count=500)
+//Anomaly inlcusive
+// =========================================================================
+// GLOBAL SETTINGS
+// =========================================================================
+grp_global = "Global Settings"
+src        = input.source(hlc3, title="Local Source", group=grp_global)
+lookback   = input.time(timestamp("21 Mar 2024 00:00 -0400"), title="Maximum Lookback", group=grp_global)
+
+grp_anomaly = "Liquidity Anomaly Triggers (The Anchor)"
+vol_length      = input.int(50, "Volume Baseline Length", minval=10, group=grp_anomaly)
+vol_z_threshold = input.float(0.5, "Anomaly Z-Score Threshold", step=0.1, group=grp_anomaly, tooltip="Recommended 0.5. Higher values cause stale anchors and session bias.")
+max_anchors     = 24
+anchor_cooldown = input.int(5, "Anchor Cooldown (Bars)", minval=1, group=grp_anomaly)
+
+grp_osc = "Omni-Engine Visuals & Scaling"
+z_len               = input.int(50, "Normalization (Z-Score) Length", minval=10, group=grp_osc)
+hist_scale          = input.float(1.0, "Histogram (d/dx) Scale Factor", step=0.1, minval=0.1, group=grp_osc)
+color_smooth        = input.int(1, "Color Smoothing (Bars)", minval=1, maxval=10, group=grp_osc)
+streak_window       = input.int(14, "Streak Lookback Window", minval=1, group=grp_osc)
+consensus_threshold = input.int(21, "Consensus Threshold (Factors)", minval=1, maxval=21, tooltip="The number of indicators required to trigger the 'Ignition' label and full glow brightness.")
+max_glow_opacity    = input.int(35, "Max Glow Opacity (0-100)", minval=1, maxval=100)
+show_labels         = input.bool(true, "Show Ignition Labels (Active Factors)", group=grp_osc)
+show_label_bg       = input.bool(true, "Show Label Background", group=grp_osc)
+label_size_select   = input.string("Small", "Label Text Size", options=["Tiny", "Small", "Normal", "Large", "Huge"], group=grp_osc)
+show_present_only   = input.bool(true, "Show Present Labels Only (Avoid Overlap)", group=grp_osc)
+
+grp_bands = "Cluster Envelope Settings"
+show_ribbons       = input.bool(true, "Show 22 Meta-Factor Ribbons", group=grp_bands)
+show_cluster_bands = input.bool(true, "Show Factor Spread Range", group=grp_bands)
+show_sd_bands      = input.bool(true, "Show Factor StdDev Bands", group=grp_bands)
+sd_mult            = input.float(2.0, "StdDev Multiplier", step=0.1, group=grp_bands)
+show_mean_line     = input.bool(true, "Show Omni-Line", group=grp_bands)
+mean_length        = input.int(9, "Signal Length (d/dx SMA)", minval=1, group=grp_bands)
+show_intersections = input.bool(true, "Show Kinetic Exhaustion Stars", group=grp_bands)
+
+// =========================================================================
+// SERIES-COMPATIBLE MATH HELPERS
+// =========================================================================
+f_wma_series(series float _s, int _l) =>
+    float _sum = 0.0
+    float _wSum = 0.0
+    int _loop = math.min(_l, 50)
+    if _l > 0
+        for i = 0 to _loop - 1
+            float _w = _l - i
+            _sum  += _s[i] * _w
+            _wSum += _w
+    _wSum > 0 ? _sum / _wSum : _s
+
+f_hma_series(series float _s, int _l) =>
+    int _len = math.max(2, _l)
+    int _hl = int(_len / 2)
+    int _sl = int(math.sqrt(_len))
+    float _diff = 2.0 * f_wma_series(_s, _hl) - f_wma_series(_s, _len)
+    f_wma_series(_diff, _sl)
+
+f_zscore(float val, int len) =>
+    float sma_v = ta.sma(val, len)
+    float sd_v  = ta.stdev(val, len)
+    sd_v > 0 ? (val - sma_v) / sd_v : 0
+
+// =========================================================================
+// ANOMALY DETECTION LOGIC
+// =========================================================================
+bool is_within_lookback = time >= lookback
+float vol_sma = ta.sma(volume, vol_length)
+float vol_sd  = ta.stdev(volume, vol_length)
+float vol_z   = vol_sd > 0 ? (volume - vol_sma) / vol_sd : 0
+var int bars_since_last_anchor = 5
+bars_since_last_anchor += 1
+bool is_anomaly = (vol_z >= vol_z_threshold) and is_within_lookback and (bars_since_last_anchor >= anchor_cooldown)
+
+// =========================================================================
+// GLOBAL ACCUMULATORS
+// =========================================================================
+var float cum_v = 0.0, cum_v += volume
+var float cum_pv = 0.0, cum_pv += src * volume
+var float cum_p = 0.0, cum_p += src
+var float cum_src_idx = 0.0, cum_src_idx += (src * bar_index)
+float delta = volume * (close >= open ? 1.0 : -1.0)
+var float cum_delta = 0.0, cum_delta += delta
+float mfm = high != low ? ((src - low) - (high - src)) / (high - low) : 0.0
+var float cum_mfv = 0.0, cum_mfv += mfm * volume
+float chg = ta.change(src)
+float gain = math.max(chg, 0.0), loss = math.max(-chg, 0.0)
+var float cum_gain = 0.0, cum_gain += gain
+var float cum_loss = 0.0, cum_loss += loss
+float raw_mf = src * volume
+float pmf = chg > 0 ? raw_mf : 0.0, nmf = chg < 0 ? raw_mf : 0.0
+var float cum_pmf = 0.0, cum_pmf += pmf
+var float cum_nmf = 0.0, cum_nmf += nmf
+float up_chg = high - nz(high[1]), dn_chg = nz(low[1]) - low
+float plus_dm = (up_chg > dn_chg and up_chg > 0) ? up_chg : 0.0
+float minus_dm = (dn_chg > up_chg and dn_chg > 0) ? dn_chg : 0.0
+var float cum_pdm = 0.0, cum_pdm += plus_dm
+var float cum_mdm = 0.0, cum_mdm += minus_dm
+float global_tr = ta.tr(true)
+var float cum_tr = 0.0, cum_tr += nz(global_tr)
+float br_dir = src > nz(src[1]) ? 1.0 : src < nz(src[1]) ? -1.0 : 0.0
+var float cum_breadth = 0.0, cum_breadth += br_dir
+float sys_raw_delta = src > nz(src[1]) ? 1.0 : src < nz(src[1]) ? -1.0 : 0.0
+float sys_smooth_delta = ta.wma(sys_raw_delta, 5)
+var float cum_sys_breadth = 0.0, cum_sys_breadth += nz(sys_smooth_delta)
+float global_sar = ta.sar(0.02, 0.02, 0.2)
+float psar_raw_dist = close - nz(global_sar, close)
+float obv_dir = chg > 0 ? volume : chg < 0 ? -volume : 0.0
+var float cum_obv = 0.0, cum_obv += obv_dir
+
+// =========================================================================
+// ANCHOR SNAPSHOT ARRAYS
+// =========================================================================
+var int[]   anc_bars       = array.new_int(max_anchors, -1)
+var float[] anc_src        = array.new_float(max_anchors, na), var float[] anc_v = array.new_float(max_anchors, na)
+var float[] anc_pv         = array.new_float(max_anchors, na), var float[] anc_p = array.new_float(max_anchors, na)
+var float[] anc_delta      = array.new_float(max_anchors, na), var float[] anc_mfv = array.new_float(max_anchors, na)
+var float[] anc_gain       = array.new_float(max_anchors, na), var float[] anc_loss = array.new_float(max_anchors, na)
+var float[] anc_pmf        = array.new_float(max_anchors, na), var float[] anc_nmf = array.new_float(max_anchors, na)
+var float[] anc_pdm        = array.new_float(max_anchors, na), var float[] anc_mdm = array.new_float(max_anchors, na)
+var float[] anc_tr         = array.new_float(max_anchors, na), var float[] anc_breadth = array.new_float(max_anchors, na)
+var float[] anc_sys        = array.new_float(max_anchors, na), var float[] anc_obv_arr = array.new_float(max_anchors, na)
+var float[] macd_f_arr     = array.new_float(max_anchors, na), var float[] macd_s_arr = array.new_float(max_anchors, na)
+var float[] macd_sig_arr   = array.new_float(max_anchors, na), var float[] anc_cum_src = array.new_float(max_anchors, na)
+var float[] anc_cum_idx    = array.new_float(max_anchors, na), var float[] aro_hi_arr = array.new_float(max_anchors, na)
+var float[] aro_lo_arr     = array.new_float(max_anchors, na), var int[]   aro_hi_bar_arr = array.new_int(max_anchors, -1)
+var int[]   aro_lo_bar_arr = array.new_int(max_anchors, -1),   var float[] aro_prev_arr = array.new_float(max_anchors, na)
+var float[] ema_prev_arr   = array.new_float(max_anchors, na)
+
+if is_anomaly
+    bars_since_last_anchor := 0
+    array.unshift(anc_bars, bar_index), array.pop(anc_bars)
+    array.unshift(anc_src, src), array.pop(anc_src)
+    
+    // Group 1: INCLUDES anchor bar in baseline (Subtract current bar so it's fresh for the loop)
+    array.unshift(anc_v, cum_v - volume), array.pop(anc_v)
+    array.unshift(anc_pv, cum_pv - (src * volume)), array.pop(anc_pv)
+    array.unshift(anc_p, cum_p - src), array.pop(anc_p)
+    array.unshift(anc_gain, cum_gain - gain), array.pop(anc_gain)
+    array.unshift(anc_loss, cum_loss - loss), array.pop(anc_loss)
+    array.unshift(anc_pmf, cum_pmf - pmf), array.pop(anc_pmf)
+    array.unshift(anc_nmf, cum_nmf - nmf), array.pop(anc_nmf)
+    array.unshift(anc_cum_src, cum_p - src), array.pop(anc_cum_src)
+    array.unshift(anc_cum_idx, cum_src_idx - (src * bar_index)), array.pop(anc_cum_idx)
+
+    // Group 2: EXCLUDES anchor bar from baseline (Store as is, differences will be 0 on anchor bar)
+    array.unshift(anc_delta, cum_delta), array.pop(anc_delta)
+    array.unshift(anc_mfv, cum_mfv), array.pop(anc_mfv)
+    array.unshift(anc_obv_arr, cum_obv), array.pop(anc_obv_arr)
+    array.unshift(anc_pdm, cum_pdm), array.pop(anc_pdm)
+    array.unshift(anc_mdm, cum_mdm), array.pop(anc_mdm)
+    array.unshift(anc_tr, cum_tr), array.pop(anc_tr)
+    array.unshift(anc_breadth, cum_breadth), array.pop(anc_breadth)
+    array.unshift(anc_sys, cum_sys_breadth), array.pop(anc_sys)
+
+    // Standalone recursion arrays
+    array.unshift(macd_f_arr, src), array.pop(macd_f_arr)
+    array.unshift(macd_s_arr, src), array.pop(macd_s_arr)
+    array.unshift(macd_sig_arr, 0.0), array.pop(macd_sig_arr)
+    array.unshift(aro_hi_arr, high), array.pop(aro_hi_arr)
+    array.unshift(aro_lo_arr, low), array.pop(aro_lo_arr)
+    array.unshift(aro_hi_bar_arr, bar_index), array.pop(aro_hi_bar_arr)
+    array.unshift(aro_lo_bar_arr, bar_index), array.pop(aro_lo_bar_arr)
+    array.unshift(aro_prev_arr, 0.0), array.pop(aro_prev_arr)
+    array.unshift(ema_prev_arr, src), array.pop(ema_prev_arr)
+
+// =========================================================================
+// HAV CORE
+// =========================================================================
+f_calc_hma(int rank) =>
+    int anchor = array.get(anc_bars, rank-1)
+    int p_cnt = anchor != -1 ? (bar_index - anchor + 1) : 0
+    (p_cnt >= 2) ? f_hma_series(src, p_cnt) : src
+
+float h1 = f_calc_hma(1), float h2 = f_calc_hma(2), float h3 = f_calc_hma(3), float h4 = f_calc_hma(4)
+float h5 = f_calc_hma(5), float h6 = f_calc_hma(6), float h7 = f_calc_hma(7), float h8 = f_calc_hma(8)
+float h9 = f_calc_hma(9), float h10 = f_calc_hma(10), float h11 = f_calc_hma(11), float h12 = f_calc_hma(12)
+float h13 = f_calc_hma(13), float h14 = f_calc_hma(14), float h15 = f_calc_hma(15), float h16 = f_calc_hma(16)
+float h17 = f_calc_hma(17), float h18 = f_calc_hma(18), float h19 = f_calc_hma(19), float h20 = f_calc_hma(20)
+float h21 = f_calc_hma(21), float h22 = f_calc_hma(22), float h23 = f_calc_hma(23), float h24 = f_calc_hma(24)
+float[] c_hmas = array.from(h1, h2, h3, h4, h5, h6, h7, h8, h9, h10, h11, h12, h13, h14, h15, h16, h17, h18, h19, h20, h21, h22, h23, h24)
+
+// =========================================================================
+// INDEPENDENT CALCULATION ENGINE
+// =========================================================================
+float sum_vwav = 0.0, float sum_twap = 0.0, float sum_bb = 0.0, float sum_ema = 0.0, float sum_cvd = 0.0
+float sum_ad = 0.0, float sum_obv = 0.0, float sum_rsi = 0.0, float sum_mfi = 0.0, float sum_cmf = 0.0, float sum_adxd = 0.0
+float sum_dmi = 0.0, float sum_pers = 0.0, float sum_sys = 0.0, float sum_macdl = 0.0, float sum_macdk = 0.0, float sum_atr = 0.0
+float sum_linreg = 0.0, float sum_aroon = 0.0, float sum_psar = 0.0
+
+int valid_count = 0
+float sum_adx_raw = 0.0
+
+// Pure Min/Max Trackers to perfectly mirror standalone logic independently
+float min_vwav = na, float max_vwav = na
+float min_twap = na, float max_twap = na
+float min_bb   = na, float max_bb   = na
+float min_ema  = na, float max_ema  = na
+float min_cvd  = na, float max_cvd  = na
+float min_ad   = na, float max_ad   = na
+float min_obv  = na, float max_obv  = na
+float min_rsi  = na, float max_rsi  = na
+float min_mfi  = na, float max_mfi  = na
+float min_cmf  = na, float max_cmf  = na
+float min_adx  = na, float max_adx  = na
+float min_dmv  = na, float max_dmv  = na
+float min_pr   = na, float max_pr   = na
+float min_sys  = na, float max_sys  = na
+float min_ml   = na, float max_ml   = na
+float min_mk   = na, float max_mk   = na
+float min_atrv = na, float max_atrv = na
+float min_lr   = na, float max_lr   = na
+float min_adf  = na, float max_adf  = na
+float min_pv   = na, float max_pv   = na
+
+for i = 0 to max_anchors - 1
+    int b_idx = array.get(anc_bars, i)
+    if b_idx != -1
+        valid_count += 1
+        int dur = bar_index - b_idx + 1
+        float a_s = array.get(anc_src, i)
+        
+        // 1. VWAV
+        float c_v = cum_v - array.get(anc_v, i), float c_pv = cum_pv - array.get(anc_pv, i)
+        float vwav = c_v > 0 ? c_pv / c_v : src
+        min_vwav := na(min_vwav) ? vwav : math.min(min_vwav, vwav)
+        max_vwav := na(max_vwav) ? vwav : math.max(max_vwav, vwav)
+        sum_vwav += (src - vwav)
+
+        // 2 & 3. TWAP & BB
+        float c_p = cum_p - array.get(anc_p, i)
+        float tb = dur > 0 ? c_p / dur : src
+        min_twap := na(min_twap) ? tb : math.min(min_twap, tb)
+        max_twap := na(max_twap) ? tb : math.max(max_twap, tb)
+        min_bb := na(min_bb) ? tb : math.min(min_bb, tb)
+        max_bb := na(max_bb) ? tb : math.max(max_bb, tb)
+        sum_twap += (src - tb)
+        sum_bb += (src - tb)
+
+        // 4. EMA
+        float p_e = array.get(ema_prev_arr, i), alpha = 2.0 / (dur + 1.0)
+        float c_e = (src - p_e) * alpha + p_e
+        array.set(ema_prev_arr, i, c_e)
+        min_ema := na(min_ema) ? c_e : math.min(min_ema, c_e)
+        max_ema := na(max_ema) ? c_e : math.max(max_ema, c_e)
+        sum_ema += (src - c_e)
+
+        // 5. CVD
+        float cv = cum_delta - array.get(anc_delta, i)
+        min_cvd := na(min_cvd) ? cv : math.min(min_cvd, cv)
+        max_cvd := na(max_cvd) ? cv : math.max(max_cvd, cv)
+        sum_cvd += cv
+        
+        // 6. A/D
+        float ad_v = cum_mfv - array.get(anc_mfv, i)
+        min_ad := na(min_ad) ? ad_v : math.min(min_ad, ad_v)
+        max_ad := na(max_ad) ? ad_v : math.max(max_ad, ad_v)
+        sum_ad += ad_v
+        
+        // 7. OBV
+        float ob = cum_obv - array.get(anc_obv_arr, i) 
+        min_obv := na(min_obv) ? ob : math.min(min_obv, ob)
+        max_obv := na(max_obv) ? ob : math.max(max_obv, ob)
+        sum_obv += ob
+        
+        // 8 & 9. RSI / MFI
+        float cg = cum_gain - array.get(anc_gain, i), cl = cum_loss - array.get(anc_loss, i)
+        float cp = cum_pmf - array.get(anc_pmf, i), cn = cum_nmf - array.get(anc_nmf, i)
+        float rv = cl == 0 ? 100.0 : cg == 0 ? 0.0 : 100.0 - (100.0 / (1.0 + (cg / cl)))
+        float mv = cn == 0 ? 100.0 : cp == 0 ? 0.0 : 100.0 - (100.0 / (1.0 + (cp / cn)))
+        
+        if not na(rv)
+            min_rsi := na(min_rsi) ? rv : math.min(min_rsi, rv)
+            max_rsi := na(max_rsi) ? rv : math.max(max_rsi, rv)
+        if not na(mv)
+            min_mfi := na(min_mfi) ? mv : math.min(min_mfi, mv)
+            max_mfi := na(max_mfi) ? mv : math.max(max_mfi, mv)
+        
+        sum_rsi += rv
+        sum_mfi += mv
+        
+        // 10. CMF
+        float cm = c_v > 0 ? ad_v / c_v : 0.0
+        min_cmf := na(min_cmf) ? cm : math.min(min_cmf, cm)
+        max_cmf := na(max_cmf) ? cm : math.max(max_cmf, cm)
+        sum_cmf += cm
+        
+        // 11 & 12. ADX & DMI
+        float cpd = cum_pdm-array.get(anc_pdm, i), cmd = cum_mdm-array.get(anc_mdm, i), ctr = cum_tr-array.get(anc_tr, i)
+        float pdi = ctr > 0 ? 100*cpd/ctr : 0, mdi = ctr > 0 ? 100*cmd/ctr : 0
+        float dmv = pdi-mdi
+        float dx = (pdi+mdi)>0 ? 100*math.abs(pdi-mdi)/(pdi+mdi) : 0
+        float adxd = dx * (src > a_s ? 1.0 : -1.0)
+        
+        min_adx := na(min_adx) ? dx : math.min(min_adx, dx)
+        max_adx := na(max_adx) ? dx : math.max(max_adx, dx)
+        min_dmv := na(min_dmv) ? dmv : math.min(min_dmv, dmv)
+        max_dmv := na(max_dmv) ? dmv : math.max(max_dmv, dmv)
+        
+        sum_dmi += dmv
+        sum_adxd += adxd
+        sum_adx_raw += dx
+        
+        // 13. PERS
+        float pr = cum_breadth - array.get(anc_breadth, i)
+        min_pr := na(min_pr) ? pr : math.min(min_pr, pr)
+        max_pr := na(max_pr) ? pr : math.max(max_pr, pr)
+        sum_pers += pr
+
+        // 14. SYS
+        float sy = cum_sys_breadth - array.get(anc_sys, i)
+        min_sys := na(min_sys) ? sy : math.min(min_sys, sy)
+        max_sys := na(max_sys) ? sy : math.max(max_sys, sy)
+        sum_sys += sy
+
+        // 15 & 16. MACDL (Line) & MACDK (Acceleration)
+        float p_f = array.get(macd_f_arr, i), p_s = array.get(macd_s_arr, i), p_sig = array.get(macd_sig_arr, i)
+        float a_f = 2.0 / (dur * 1.0 + 1.0), a_s_m = 2.0 / (dur * 2.2 + 1.0), a_sig = 2.0 / (dur * 0.75 + 1.0)
+        float cf = (src-p_f)*a_f+p_f, cs = (src-p_s)*a_s_m+p_s, ml = cf-cs, csi = (ml-p_sig)*a_sig+p_sig
+        float mk = ml-csi
+        array.set(macd_f_arr, i, cf), array.set(macd_s_arr, i, cs), array.set(macd_sig_arr, i, csi)
+        
+        min_ml := na(min_ml) ? ml : math.min(min_ml, ml)
+        max_ml := na(max_ml) ? ml : math.max(max_ml, ml)
+        min_mk := na(min_mk) ? mk : math.min(min_mk, mk)
+        max_mk := na(max_mk) ? mk : math.max(max_mk, mk)
+        
+        sum_macdl += ml
+        sum_macdk += mk
+
+        // 17. ATR (Matches original standalone logic)
+        float atrv = dur > 0 ? ctr / dur : 0.0
+        min_atrv := na(min_atrv) ? atrv : math.min(min_atrv, atrv)
+        max_atrv := na(max_atrv) ? atrv : math.max(max_atrv, atrv)
+        sum_atr += atrv
+
+        // 18. LINREG
+        float s_y = cum_p - array.get(anc_cum_src, i), s_xy = (cum_src_idx - array.get(anc_cum_idx, i)) - b_idx * s_y, rv_lr = src
+        if dur >= 2
+            float sx = dur * (dur - 1) / 2.0, sx2 = dur * (dur - 1) * (2 * dur - 1) / 6.0, den = dur * sx2 - sx * sx
+            if den != 0
+                rv_lr := ((dur*s_xy - sx*s_y)/den)*(dur-1) + (s_y-((dur*s_xy-sx*s_y)/den)*sx)/dur
+                
+        min_lr := na(min_lr) ? rv_lr : math.min(min_lr, rv_lr)
+        max_lr := na(max_lr) ? rv_lr : math.max(max_lr, rv_lr)
+        float lrd = src - rv_lr
+        sum_linreg += lrd
+
+        // 19. AROON (Temporal)
+        float ah = array.get(aro_hi_arr, i), al = array.get(aro_lo_arr, i)
+        int ahb = array.get(aro_hi_bar_arr, i), alb = array.get(aro_lo_bar_arr, i)
+        if na(ah) or high > ah
+            ah := high
+            ahb := bar_index
+        if na(al) or low < al
+            al := low
+            alb := bar_index
+        array.set(aro_hi_arr, i, ah), array.set(aro_lo_arr, i, al), array.set(aro_hi_bar_arr, i, ahb), array.set(aro_lo_bar_arr, i, alb)
+        float a_up = dur > 0 ? ((dur-(bar_index-ahb))/dur)*100.0 : 0, a_dn = dur > 0 ? ((dur-(bar_index-alb))/dur)*100.0 : 0
+        float adf = a_up - a_dn
+        
+        min_adf := na(min_adf) ? adf : math.min(min_adf, adf)
+        max_adf := na(max_adf) ? adf : math.max(max_adf, adf)
+        sum_aroon += adf
+
+        // 20. PSAR
+        float pv = atrv > 0 ? psar_raw_dist / atrv : 0
+        min_pv := na(min_pv) ? pv : math.min(min_pv, pv)
+        max_pv := na(max_pv) ? pv : math.max(max_pv, pv)
+        sum_psar += pv
+
+// =========================================================================
+// THE META-MEAN ENGINE (STANDARDIZATION)
+// =========================================================================
+var float[] fs = array.new_float(0)
+array.clear(fs)
+array.push(fs, f_zscore(sum_vwav/valid_count, z_len))  // 0
+array.push(fs, f_zscore(sum_twap/valid_count, z_len))  // 1
+array.push(fs, f_zscore(sum_bb/valid_count, z_len))    // 2
+array.push(fs, f_zscore(sum_ema/valid_count, z_len))   // 3
+array.push(fs, f_zscore(sum_cvd/valid_count, z_len))   // 4
+array.push(fs, f_zscore(sum_ad/valid_count, z_len))    // 5
+array.push(fs, f_zscore(sum_obv/valid_count, z_len))   // 6
+array.push(fs, f_zscore(sum_rsi/valid_count, z_len))   // 7
+array.push(fs, f_zscore(sum_mfi/valid_count, z_len))   // 8
+array.push(fs, f_zscore(sum_cmf/valid_count, z_len))   // 9
+array.push(fs, f_zscore(sum_adxd/valid_count, z_len))  // 10 
+array.push(fs, f_zscore(sum_dmi/valid_count, z_len))   // 11
+array.push(fs, f_zscore(sum_pers/valid_count, z_len))  // 12
+array.push(fs, f_zscore(sum_sys/valid_count, z_len))   // 13
+array.push(fs, f_zscore(sum_macdl/valid_count, z_len)) // 14
+array.push(fs, f_zscore(sum_macdk/valid_count, z_len)) // 15
+array.push(fs, f_zscore(sum_atr/valid_count, z_len))   // 16
+array.push(fs, f_zscore(sum_linreg/valid_count, z_len))// 17
+array.push(fs, f_zscore(sum_aroon/valid_count, z_len)) // 18
+array.push(fs, f_zscore(sum_psar/valid_count, z_len))  // 19
+
+float omni = array.avg(fs), o_val = f_zscore(ta.wma(omni - nz(omni[1], omni), 3), z_len), sig = ta.sma(o_val, mean_length)
+
+// =========================================================================
+// INDEPENDENT STANDALONE EVALUATION MAPPING
+// =========================================================================
+bool v_ok = valid_count > 0
+int f_sz = array.size(fs)
+
+float atr_mean = v_ok ? sum_atr / valid_count : ta.tr(true)
+float atr_sma  = ta.sma(atr_mean, 50)
+
+float adx_mean = v_ok ? sum_adx_raw / valid_count : 0
+float adx_sma  = ta.sma(adx_mean, 50)
+
+float pv_mean  = v_ok ? sum_psar / valid_count : 0
+float pv_sma   = ta.sma(pv_mean, 50)
+
+float pers_z = f_sz > 12 ? array.get(fs, 12) : 0.0
+float sys_z  = f_sz > 13 ? array.get(fs, 13) : 0.0
+
+// Red Background Equivalents (Bearish Potential / Overbought)
+bool vwav_ob   = v_ok and max_vwav < src
+bool twap_ob   = v_ok and max_twap < src
+bool bb_ob     = v_ok and max_bb < src
+bool ema_ob    = v_ok and max_ema < src
+bool cvd_ob    = valid_count == 24 and min_cvd > 0
+bool ad_ob     = valid_count == 24 and min_ad > 0
+bool obv_ob    = valid_count == 24 and min_obv > 0
+bool rsi_ob    = v_ok and min_rsi > 50.0
+bool mfi_ob    = valid_count == 24 and min_mfi > 50.0
+bool cmf_ob    = valid_count == 24 and min_cmf > 0
+bool adx_ob    = valid_count == 24 and max_adx < adx_sma // Red: All weak (Compression)
+bool dmi_ob    = valid_count == 24 and min_dmv > 0
+bool pers_ob   = valid_count == 24 and min_pr > 0 and pers_z > 1.5
+bool sys_ob    = valid_count == 24 and min_sys > 0 and sys_z > 1.5
+bool macdl_ob  = valid_count == 24 and min_ml > 0
+bool macdk_ob  = valid_count == 24 and min_mk > 0
+bool atr_ob    = valid_count == 24 and max_atrv < atr_sma // Red: Compression
+bool linreg_ob = v_ok and max_lr < src
+bool aroon_ob  = valid_count == 24 and min_adf > 0
+bool psar_ob   = valid_count == 24 and max_pv < pv_sma
+
+// Lime Background Equivalents (Bullish Potential / Oversold)
+bool vwav_os   = v_ok and min_vwav > src
+bool twap_os   = v_ok and min_twap > src
+bool bb_os     = v_ok and min_bb > src
+bool ema_os    = v_ok and min_ema > src
+bool cvd_os    = valid_count == 24 and max_cvd < 0
+bool ad_os     = valid_count == 24 and max_ad < 0
+bool obv_os    = valid_count == 24 and max_obv < 0
+bool rsi_os    = v_ok and max_rsi < 50.0
+bool mfi_os    = valid_count == 24 and max_mfi < 50.0
+bool cmf_os    = valid_count == 24 and max_cmf < 0
+bool adx_os    = valid_count == 24 and min_adx > adx_sma // Lime: All strong (Expansion)
+bool dmi_os    = valid_count == 24 and max_dmv < 0
+bool pers_os   = valid_count == 24 and max_pr < 0 and pers_z < -1.5
+bool sys_os    = valid_count == 24 and max_sys < 0 and sys_z < -1.5
+bool macdl_os  = valid_count == 24 and max_ml < 0
+bool macdk_os  = valid_count == 24 and max_mk < 0
+bool atr_os    = valid_count == 24 and min_atrv > atr_sma // Lime: Expansion
+bool linreg_os = v_ok and min_lr > src
+bool aroon_os  = valid_count == 24 and max_adf < 0
+bool psar_os   = valid_count == 24 and min_pv > pv_sma
+
+// =========================================================================
+// DYNAMIC GLOW LOGIC (21 FACTORS)
+// =========================================================================
+int ob_c = (vwav_ob?1:0)+(twap_ob?1:0)+(bb_ob?1:0)+(ema_ob?1:0)+(cvd_ob?1:0)+(ad_ob?1:0)+(obv_ob?1:0)+(rsi_ob?1:0)+(mfi_ob?1:0)+(cmf_ob?1:0)+(adx_ob?1:0)+(dmi_ob?1:0)+(pers_ob?1:0)+(sys_ob?1:0)+(macdl_ob?1:0)+(macdk_ob?1:0)+(atr_ob?1:0)+(linreg_ob?1:0)+(aroon_ob?1:0)+(psar_ob?1:0)
+int os_c = (vwav_os?1:0)+(twap_os?1:0)+(bb_os?1:0)+(ema_os?1:0)+(cvd_os?1:0)+(ad_os?1:0)+(obv_os?1:0)+(rsi_os?1:0)+(mfi_os?1:0)+(cmf_os?1:0)+(adx_os?1:0)+(dmi_os?1:0)+(pers_os?1:0)+(sys_os?1:0)+(macdl_os?1:0)+(macdk_os?1:0)+(atr_os?1:0)+(linreg_os?1:0)+(aroon_os?1:0)+(psar_os?1:0)
+
+var int b_str = 0, var int l_con = -100
+if ob_c >= consensus_threshold or os_c >= consensus_threshold
+    if bar_index - l_con <= streak_window
+        b_str += 1
+    else
+        b_str := 1
+    l_con := bar_index
+else
+    if bar_index - l_con > streak_window
+        b_str := 0
+
+float intensity_ratio = math.min(b_str, 50) / 50.0
+int dynamic_transp = int(70 + (intensity_ratio * 25))
+
+// Strict Binary Glow: Only paints if the Consensus Threshold is actively met
+color final_bg = na
+if ob_c >= consensus_threshold
+    final_bg := color.new(color.red, dynamic_transp)
+else if os_c >= consensus_threshold
+    final_bg := color.new(color.lime, dynamic_transp)
+bgcolor(final_bg)
+
+// =========================================================================
+// DYNAMIC UNIQUE ARRIVALS LABELS (ALTERNATING STAGGER LOGIC)
+// =========================================================================
+var label last_ob_l = na, var label last_os_l = na
+var bool ob_pos_toggle = true
+var bool os_pos_toggle = true
+
+f_is_new(bool _c, bool _p, bool _f) => _f ? _c : (_c and not _p)
+
+// Establish visually stable placement at the high/low of the current momentum streak
+float local_top = math.max(0, nz(ta.highest(o_val * hist_scale, 14), o_val * hist_scale))
+float local_bot = math.min(0, nz(ta.lowest(o_val * hist_scale, 14), o_val * hist_scale))
+
+if show_labels and b_str > 0
+    string ob_t = "", string os_t = "", bool f = (b_str == 1)
+    
+    // Build OB Arrivals
+    if f_is_new(vwav_ob, vwav_ob[1], f)
+        ob_t += "VWAV\n"
+    if f_is_new(twap_ob, twap_ob[1], f)
+        ob_t += "TWAP\n"
+    if f_is_new(bb_ob, bb_ob[1], f)
+        ob_t += "BB\n"
+    if f_is_new(ema_ob, ema_ob[1], f)
+        ob_t += "EMA\n"
+    if f_is_new(cvd_ob, cvd_ob[1], f)
+        ob_t += "CVD\n"
+    if f_is_new(ad_ob, ad_ob[1], f)
+        ob_t += "A/D\n"
+    if f_is_new(obv_ob, obv_ob[1], f)
+        ob_t += "OBV\n"
+    if f_is_new(rsi_ob, rsi_ob[1], f)
+        ob_t += "RSI\n"
+    if f_is_new(mfi_ob, mfi_ob[1], f)
+        ob_t += "MFI\n"
+    if f_is_new(cmf_ob, cmf_ob[1], f)
+        ob_t += "CMF\n"
+    if f_is_new(adx_ob, adx_ob[1], f)
+        ob_t += "ADX\n"
+    if f_is_new(dmi_ob, dmi_ob[1], f)
+        ob_t += "DMI\n"
+    if f_is_new(pers_ob, pers_ob[1], f)
+        ob_t += "PERS\n"
+    if f_is_new(sys_ob, sys_ob[1], f)
+        ob_t += "SYS\n"
+    if f_is_new(macdl_ob, macdl_ob[1], f)
+        ob_t += "MACDL\n"
+    if f_is_new(macdk_ob, macdk_ob[1], f)
+        ob_t += "MACDK\n"
+    if f_is_new(atr_ob, atr_ob[1], f)
+        ob_t += "ATR\n"
+    if f_is_new(linreg_ob, linreg_ob[1], f)
+        ob_t += "LR\n"
+    if f_is_new(aroon_ob, aroon_ob[1], f)
+        ob_t += "AR\n"
+    if f_is_new(psar_ob, psar_ob[1], f)
+        ob_t += "PSAR\n"
+    
+    // Build OS Arrivals
+    if f_is_new(vwav_os, vwav_os[1], f)
+        os_t += "VWAV\n"
+    if f_is_new(twap_os, twap_os[1], f)
+        os_t += "TWAP\n"
+    if f_is_new(bb_os, bb_os[1], f)
+        os_t += "BB\n"
+    if f_is_new(ema_os, ema_os[1], f)
+        os_t += "EMA\n"
+    if f_is_new(cvd_os, cvd_os[1], f)
+        os_t += "CVD\n"
+    if f_is_new(ad_os, ad_os[1], f)
+        os_t += "A/D\n"
+    if f_is_new(obv_os, obv_os[1], f)
+        os_t += "OBV\n"
+    if f_is_new(rsi_os, rsi_os[1], f)
+        os_t += "RSI\n"
+    if f_is_new(mfi_os, mfi_os[1], f)
+        os_t += "MFI\n"
+    if f_is_new(cmf_os, cmf_os[1], f)
+        os_t += "CMF\n"
+    if f_is_new(adx_os, adx_os[1], f)
+        os_t += "ADX\n"
+    if f_is_new(dmi_os, dmi_os[1], f)
+        os_t += "DMI\n"
+    if f_is_new(pers_os, pers_os[1], f)
+        os_t += "PERS\n"
+    if f_is_new(sys_os, sys_os[1], f)
+        os_t += "SYS\n"
+    if f_is_new(macdl_os, macdl_os[1], f)
+        os_t += "MACDL\n"
+    if f_is_new(macdk_os, macdk_os[1], f)
+        os_t += "MACDK\n"
+    if f_is_new(atr_os, atr_os[1], f)
+        os_t += "ATR\n"
+    if f_is_new(linreg_os, linreg_os[1], f)
+        os_t += "LR\n"
+    if f_is_new(aroon_os, aroon_os[1], f)
+        os_t += "AR\n"
+    if f_is_new(psar_os, psar_os[1], f)
+        os_t += "PSAR\n"
+
+    string l_sz = label_size_select == "Tiny" ? size.tiny : label_size_select == "Small" ? size.small : label_size_select == "Normal" ? size.normal : label_size_select == "Large" ? size.large : size.huge
+    
+    if ob_t != "" and (ob_c >= consensus_threshold or f)
+        if show_present_only and not na(last_ob_l)
+            label.delete(last_ob_l)
+        string cur_style_ob = ob_pos_toggle ? label.style_label_down : label.style_label_up
+        last_ob_l := label.new(bar_index, local_top, text=(f?"OB\n":"+\n") + str.trim(ob_t), color=show_label_bg?color.new(color.red, 30):color.new(color.white,100), style=cur_style_ob, textcolor=show_label_bg?color.white:color.red, size=l_sz)
+        ob_pos_toggle := not ob_pos_toggle
+
+    if os_t != "" and (os_c >= consensus_threshold or f)
+        if show_present_only and not na(last_os_l)
+            label.delete(last_os_l)
+        string cur_style_os = os_pos_toggle ? label.style_label_up : label.style_label_down
+        last_os_l := label.new(bar_index, local_bot, text=(f?"OS\n":"+\n") + str.trim(os_t), color=show_label_bg?color.new(color.lime, 30):color.new(color.white,100), style=cur_style_os, textcolor=show_label_bg?color.black:color.lime, size=l_sz)
+        os_pos_toggle := not os_pos_toggle
+
+// =========================================================================
+// MOMENTUM HEATMAP & RENDERING
+// =========================================================================
+bool ex_u = o_val >= 0 and ta.rising(o_val, color_smooth), ex_d = o_val < 0 and ta.falling(o_val, color_smooth)
+color hc = o_val >= 0 ? (ex_u ? color.lime : color.new(color.blue, 50)) : (ex_d ? color.red : color.new(color.yellow, 50))
+plot(o_val * hist_scale, "Omni", color=hc, style=plot.style_columns)
+plot(show_mean_line?omni:na, "Line", color=color.white, linewidth=3)
+plot(show_mean_line?sig*hist_scale:na, "Signal", color=color.new(color.white,40))
+
+int lt = 60
+plot(show_ribbons?array.get(fs,0):na, "VWAV Meta", color=color.new(#F48FB1, 60))
+plot(show_ribbons?array.get(fs,1):na, "TWAP Meta", color=color.new(#EF5350, 60))
+plot(show_ribbons?array.get(fs,2):na, "BB Meta",   color=color.new(#E53935, 60))
+plot(show_ribbons?array.get(fs,3):na, "EMA Meta",  color=color.new(#FFCC80, 60))
+plot(show_ribbons?array.get(fs,4):na, "CVD Meta",  color=color.new(#FFF176, 60))
+plot(show_ribbons?array.get(fs,5):na, "AD Meta",   color=color.new(#D4E157, 60))
+plot(show_ribbons?array.get(fs,6):na, "OBV Meta",  color=color.new(#9CCC65, 60))
+plot(show_ribbons?array.get(fs,7):na, "RSI Meta",  color=color.new(#66BB6A, 60))
+plot(show_ribbons?array.get(fs,8):na, "MFI Meta",  color=color.new(#4DB6AC, 60))
+plot(show_ribbons?array.get(fs,9):na, "CMF Meta", color=color.new(#26A69A, 60))
+plot(show_ribbons?array.get(fs,10):na, "ADX Meta", color=color.new(#80DEEA, 60))
+plot(show_ribbons?array.get(fs,11):na, "DMI Meta", color=color.new(#81D4FA, 60))
+plot(show_ribbons?array.get(fs,12):na, "PERS Meta",color=color.new(#4FC3F7, 60))
+plot(show_ribbons?array.get(fs,13):na, "SYS Meta", color=color.new(#29B6F6, 60))
+plot(show_ribbons?array.get(fs,14):na, "MACDL Meta",color=color.new(#64B5F6, 60))
+plot(show_ribbons?array.get(fs,15):na, "MACDK Meta",color=color.new(#42A5F5, 60))
+plot(show_ribbons?array.get(fs,16):na, "ATR Meta", color=color.new(#2196F3, 60))
+plot(show_ribbons?array.get(fs,17):na, "LINREG Meta",color=color.new(#B39DDB, 60))
+plot(show_ribbons?array.get(fs,18):na, "AROON Meta", color=color.new(#9575CD, 60))
+plot(show_ribbons?array.get(fs,19):na, "PSAR Meta", color=color.new(#5E35B1, 60))

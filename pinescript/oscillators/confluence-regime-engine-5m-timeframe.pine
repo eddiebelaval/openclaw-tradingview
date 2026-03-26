@@ -1,0 +1,807 @@
+//@version=6
+indicator("Confluence Regime Engine — 5m Only v5", overlay=false, max_lines_count=200, max_boxes_count=50)
+
+// ╔══════════════════════════════════════════════════════════════════════════╗
+// ║  S&P500 REGIME-AWARE CONFLUENCE ENGINE  |  5m Chart Only               ║
+// ║  v5 — DI-Cross Driven / Slow Stochastic / Living Pressure Counters     ║
+// ║                                                                          ║
+// ║  ADX LOGIC: Only DI+/DI- relationship matters (matches Wilder ADX).    ║
+// ║    DI+ (green) > DI- (red) = Bull regime.                              ║
+// ║    DI- (red)   > DI+ (green) = Bear regime.                            ║
+// ║    DI cross = highest-priority regime impulse event.                    ║
+// ║                                                                          ║
+// ║  STOCHASTIC: Proper slow stoch (double-smoothed), matching MTF Stoch.  ║
+// ║    Raw → SMA(smoothK) → SMA(smoothD).  Proxy lengths for 15m/30m.      ║
+// ╚══════════════════════════════════════════════════════════════════════════╝
+
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ░░ HELPERS
+// ═══════════════════════════════════════════════════════════════════════════
+f1(x)    => str.tostring(x, "#.0")
+f0(x)    => str.tostring(x, "#")
+clamp100(x) => math.max(0.0, math.min(100.0, x))
+
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ░░ SECTION 1 — Confluence Weights
+// ═══════════════════════════════════════════════════════════════════════════
+wt_vwap    = input.float(2.0, "VWAP Weight",          minval=0.0, step=0.5, group="⚖️ Weights")
+wt_rsi     = input.float(1.5, "RSI Weight",           minval=0.0, step=0.5, group="⚖️ Weights")
+wt_stoch5  = input.float(1.0, "Stoch 5m Weight",      minval=0.0, step=0.5, group="⚖️ Weights")
+wt_stoch15 = input.float(1.5, "Stoch 15m Proxy Wt",  minval=0.0, step=0.5, group="⚖️ Weights")
+wt_stoch30 = input.float(2.0, "Stoch 30m Proxy Wt",  minval=0.0, step=0.5, group="⚖️ Weights")
+wt_lr      = input.float(2.0, "LR Channel Weight",    minval=0.0, step=0.5, group="⚖️ Weights")
+
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ░░ SECTION 2 — VWAP Sigma Engine (6pm ET session anchor)
+// ═══════════════════════════════════════════════════════════════════════════
+vwap_sd1       = input.float(1.0,  "Sigma 1 Mult",                    step=0.25, group="📊 VWAP")
+vwap_sd2       = input.float(2.0,  "Sigma 2 Mult",                    step=0.25, group="📊 VWAP")
+vwap_sd3       = input.float(3.0,  "Sigma 3 Mult",                    step=0.25, group="📊 VWAP")
+vwap_touch_pct = input.float(15.0, "Band Touch Sensitivity (%)",       minval=1, maxval=50, step=1, group="📊 VWAP")
+trend_bars     = input.int(3,      "Trend Confirm Bars Outside ±1σ",  minval=2, maxval=8,  group="📊 VWAP")
+reclaim_bars   = input.int(2,      "Reclaim/Hold Bars Back Inside ±1σ", minval=1, maxval=5, group="📊 VWAP")
+vwap_rth_mult  = input.float(1.30, "VWAP Weight Mult (RTH)",          minval=0.25, step=0.05, group="📊 VWAP")
+vwap_eth_mult  = input.float(0.75, "VWAP Weight Mult (ETH)",          minval=0.25, step=0.05, group="📊 VWAP")
+bonus_25s_rth  = input.float(10.0, "Bonus: >2.5σ Zone (RTH)",         minval=0, step=1, group="📊 VWAP")
+bonus_25s_eth  = input.float(5.0,  "Bonus: >2.5σ Zone (ETH)",         minval=0, step=1, group="📊 VWAP")
+bonus_3s_rth   = input.float(18.0, "Bonus: 3σ Touch (RTH)",           minval=0, step=1, group="📊 VWAP")
+bonus_3s_eth   = input.float(8.0,  "Bonus: 3σ Touch (ETH)",           minval=0, step=1, group="📊 VWAP")
+
+// Session-anchored VWAP from 6pm ET
+new_session = ta.change(time("D", "1800-1700")) != 0
+var float pv_sum  = 0.0
+var float v_sum   = 0.0
+var float pv2_sum = 0.0
+hlc3_src = hlc3
+
+if new_session
+    pv_sum  := hlc3_src * volume
+    v_sum   := volume
+    pv2_sum := math.pow(hlc3_src, 2) * volume
+else
+    pv_sum  += hlc3_src * volume
+    v_sum   += volume
+    pv2_sum += math.pow(hlc3_src, 2) * volume
+
+vwap_mid   = v_sum > 0 ? pv_sum / v_sum : hlc3_src
+vwap_var   = v_sum > 0 ? math.max((pv2_sum / v_sum) - math.pow(vwap_mid, 2), 0.0) : 0.0
+vwap_sigma = math.sqrt(vwap_var)
+
+vwap_l1 = vwap_mid - vwap_sd1 * vwap_sigma
+vwap_u1 = vwap_mid + vwap_sd1 * vwap_sigma
+vwap_l2 = vwap_mid - vwap_sd2 * vwap_sigma
+vwap_u2 = vwap_mid + vwap_sd2 * vwap_sigma
+vwap_l3 = vwap_mid - vwap_sd3 * vwap_sigma
+vwap_u3 = vwap_mid + vwap_sd3 * vwap_sigma
+
+tz_size = vwap_sigma * (vwap_touch_pct / 100.0)
+near_band(price, band) => math.abs(price - band) <= tz_size
+
+// 2.5σ midpoints
+vwap_l25 = (vwap_l2 + vwap_l3) / 2.0
+vwap_u25 = (vwap_u2 + vwap_u3) / 2.0
+
+// Time
+ny_hour  = hour(time, "America/New_York")
+ny_min   = minute(time, "America/New_York")
+ny_time  = ny_hour * 100 + ny_min
+is_rth   = ny_time >= 930 and ny_time <= 1600
+
+// ToD reversal zone — VISUAL ONLY, no score changes
+is_rev_zone    = is_rth and ((ny_hour == 12 and ny_min >= 40) or (ny_hour == 13 and ny_min <= 15))
+rev_zone_start = is_rev_zone and not is_rev_zone[1]
+
+// Sigma position flags
+above_u1  = close > vwap_u1
+below_l1  = close < vwap_l1
+inside_pm1 = not above_u1 and not below_l1
+
+// Mean-reversion zone interest (raw signals, no regime filter)
+vwap_long_raw  = near_band(close, vwap_l1) or near_band(close, vwap_l2) or near_band(close, vwap_l3) or close < vwap_l2
+vwap_short_raw = near_band(close, vwap_u1) or near_band(close, vwap_u2) or near_band(close, vwap_u3) or close > vwap_u2
+
+// Deep zones
+vwap_half23_long  = close <= vwap_l25
+vwap_half23_short = close >= vwap_u25
+
+// 3σ touch (immediate reversal override trigger — bypasses all regime gating)
+vwap_3sig_long  = low  <= (vwap_l3 + tz_size)
+vwap_3sig_short = high >= (vwap_u3 - tz_size)
+
+// ±1σ streak counters (VWAP trend memory)
+var int up1_streak    = 0
+var int dn1_streak    = 0
+var int inside_streak = 0
+up1_streak    := above_u1   ? nz(up1_streak[1])    + 1 : 0
+dn1_streak    := below_l1   ? nz(dn1_streak[1])    + 1 : 0
+inside_streak := inside_pm1 ? nz(inside_streak[1]) + 1 : 0
+
+vwap_uptrend_est   = up1_streak   >= trend_bars
+vwap_downtrend_est = dn1_streak   >= trend_bars
+
+// Reclaim/hold counters (countertrend confirmation layer)
+var int hold_from_below = 0
+var int hold_from_above = 0
+hold_from_below := close > vwap_l1 ? nz(hold_from_below[1]) + 1 : 0
+hold_from_above := close < vwap_u1 ? nz(hold_from_above[1]) + 1 : 0
+long_reclaim_ok  = hold_from_below >= reclaim_bars
+short_reclaim_ok = hold_from_above >= reclaim_bars
+
+// Sigma distance (used for extreme regime detection)
+sigma_dist = vwap_sigma > 0 ? (close - vwap_mid) / vwap_sigma : 0.0
+
+vwap_level_str() =>
+    if close > vwap_u3
+        "+3σ Extreme"
+    else if close < vwap_l3
+        "-3σ Extreme"
+    else if close > vwap_u2
+        "Above +2σ"
+    else if close < vwap_l2
+        "Below -2σ"
+    else if close > vwap_u1
+        "Above +1σ"
+    else if close < vwap_l1
+        "Below -1σ"
+    else if close > vwap_mid
+        "Above VWAP"
+    else
+        "Below VWAP"
+
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ░░ SECTION 3 — RSI
+// ═══════════════════════════════════════════════════════════════════════════
+rsi_len    = input.int(14,   "RSI Length",       group="📈 RSI")
+rsi_os_lvl = input.float(30, "Oversold Level",   group="📈 RSI")
+rsi_ob_lvl = input.float(70, "Overbought Level", group="📈 RSI")
+
+rsi_val   = ta.rsi(close, rsi_len)
+rsi_long  = rsi_val <= rsi_os_lvl + 7
+rsi_short = rsi_val >= rsi_ob_lvl - 7
+
+rsi_desc() =>
+    if rsi_val <= rsi_os_lvl
+        "OS (" + f1(rsi_val) + ")"
+    else if rsi_val >= rsi_ob_lvl
+        "OB (" + f1(rsi_val) + ")"
+    else if rsi_val <= rsi_os_lvl + 7
+        "Near OS (" + f1(rsi_val) + ")"
+    else if rsi_val >= rsi_ob_lvl - 7
+        "Near OB (" + f1(rsi_val) + ")"
+    else
+        "Neutral (" + f1(rsi_val) + ")"
+
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ░░ SECTION 4 — Slow Stochastic Stack (5m + Proxy 15m/30m)
+// ║
+// ║  Uses proper SLOW stochastic formula to match MTF Stochastic indicator:
+// ║    Step 1: raw = ta.stoch(...)
+// ║    Step 2: k   = ta.sma(raw, smoothK)   ← slow %K
+// ║    Step 3: d   = ta.sma(k, smoothD)     ← signal line
+// ║
+// ║  Proxy lengths (no request.security, 5m-only safe):
+// ║    15m ≈ stoch_len × 3,  smoothK × 3
+// ║    30m ≈ stoch_len × 6,  smoothK × 6
+// ║  smoothD stays constant (signal line stays responsive)
+// ═══════════════════════════════════════════════════════════════════════════
+stoch_len = input.int(14,  "%K Length (5m base)", group="📉 Stochastics")
+stoch_sk  = input.int(3,   "Smooth %K",           group="📉 Stochastics")
+stoch_sd  = input.int(3,   "Smooth %D",           group="📉 Stochastics")
+stoch_ob  = input.float(80, "OB Level",           group="📉 Stochastics")
+stoch_os  = input.float(20, "OS Level",           group="📉 Stochastics")
+
+// 5m slow stochastic
+k5_raw = ta.stoch(close, high, low, stoch_len)
+k5     = ta.sma(k5_raw, stoch_sk)
+d5     = ta.sma(k5, stoch_sd)
+
+// 15m proxy (~3x 5m bar count)
+k15_raw = ta.stoch(close, high, low, stoch_len * 3)
+k15     = ta.sma(k15_raw, stoch_sk * 3)
+d15     = ta.sma(k15, stoch_sd)
+
+// 30m proxy (~6x 5m bar count)
+k30_raw = ta.stoch(close, high, low, stoch_len * 6)
+k30     = ta.sma(k30_raw, stoch_sk * 6)
+d30     = ta.sma(k30, stoch_sd)
+
+// Precompute all crosses (required before any conditional use in Pine v6)
+k5_xup  = ta.crossover(k5,  d5)
+k5_xdn  = ta.crossunder(k5,  d5)
+k15_xup = ta.crossover(k15, d15)
+k15_xdn = ta.crossunder(k15, d15)
+k30_xup = ta.crossover(k30, d30)
+k30_xdn = ta.crossunder(k30, d30)
+
+stoch5_long  = (k5  <= stoch_os) or (k5_xup  and k5  <= stoch_os + 15)
+stoch15_long = (k15 <= stoch_os) or (k15_xup and k15 <= stoch_os + 15)
+stoch30_long = (k30 <= stoch_os) or (k30_xup and k30 <= stoch_os + 15)
+
+stoch5_short  = (k5  >= stoch_ob) or (k5_xdn  and k5  >= stoch_ob - 15)
+stoch15_short = (k15 >= stoch_ob) or (k15_xdn and k15 >= stoch_ob - 15)
+stoch30_short = (k30 >= stoch_ob) or (k30_xdn and k30 >= stoch_ob - 15)
+
+// Oscillator cluster (all three stochs + RSI extreme simultaneously)
+osc_cluster_long  = (k5 <= stoch_os) and (k15 <= stoch_os) and (k30 <= stoch_os) and (rsi_val <= rsi_os_lvl)
+osc_cluster_short = (k5 >= stoch_ob) and (k15 >= stoch_ob) and (k30 >= stoch_ob) and (rsi_val >= rsi_ob_lvl)
+
+// UNLOCK #1 — 5m stochastic LINE leads the pack
+// (5m k-line rises above 15m and 30m proxy lines AND is above its own signal)
+stoch_lead_bull = (k5 > k15 and k5 > k30) and (k5 > d5)
+stoch_lead_bear = (k5 < k15 and k5 < k30) and (k5 < d5)
+
+stoch_desc(kv, xup, xdn) =>
+    if kv <= stoch_os
+        "OS(" + f1(kv) + ")"
+    else if kv >= stoch_ob
+        "OB(" + f1(kv) + ")"
+    else if xup
+        "↑X(" + f1(kv) + ")"
+    else if xdn
+        "↓X(" + f1(kv) + ")"
+    else
+        "N(" + f1(kv) + ")"
+
+s5_txt  = stoch_desc(k5,  k5_xup,  k5_xdn)
+s15_txt = stoch_desc(k15, k15_xup, k15_xdn)
+s30_txt = stoch_desc(k30, k30_xup, k30_xdn)
+
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ░░ SECTION 5 — Manual LR Channel (optional overlay context)
+// ═══════════════════════════════════════════════════════════════════════════
+lr_active = input.bool(false, "✏️ LR Channel Valid",  group="📐 LR Channel")
+lr_at_bnd = input.bool(false, "Price at boundary",    group="📐 LR Channel")
+lr_which  = input.string("Lower", "Boundary",        options=["Lower", "Upper"], group="📐 LR Channel")
+lr_long   = lr_active and lr_at_bnd and lr_which == "Lower"
+lr_short  = lr_active and lr_at_bnd and lr_which == "Upper"
+
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ░░ SECTION 6 — ADX / DI (Wilder-style via ta.dmi — RMA smoothing)
+// ║
+// ║  USER'S PRIMARY SIGNAL: Watch DI+ vs DI- LINE relationship only.
+// ║    DI+ (green) > DI- (red)  =  Bull trend in effect
+// ║    DI- (red)   > DI+ (green) = Bear trend in effect
+// ║    DI cross event = strongest single regime impulse in this engine
+// ║
+// ║  ta.dmi() uses ta.rma() internally = Wilder's original smoothing.
+// ║  This matches the custom ADX Wilder indicator's DI output exactly.
+// ═══════════════════════════════════════════════════════════════════════════
+adx_len       = input.int(14,    "DI / ADX Length",       group="🛡️ ADX")
+adx_thresh    = input.float(23,  "ADX Trend Threshold",   group="🛡️ ADX")
+adx_exh_level = input.float(45,  "ADX Exhaustion Level",  group="🛡️ ADX")
+
+[diplus, diminus, adx_val] = ta.dmi(adx_len, adx_len)
+
+// ADXR (Wilder approximation)
+adxr_val = na(adx_val[adx_len]) ? adx_val : (adx_val + adx_val[adx_len]) / 2.0
+
+// DI relationship — THIS IS THE PRIMARY SIGNAL
+di_bull = diplus  > diminus    // green above red = bull in charge
+di_bear = diminus > diplus     // red above green = bear in charge
+
+// Precompute DI crosses (major regime events per user's methodology)
+di_cross_bull = ta.crossover(diplus, diminus)   // DI+ crosses above DI-
+di_cross_bear = ta.crossunder(diplus, diminus)  // DI- crosses above DI+
+
+di_spread            = math.abs(diplus - diminus)
+di_spread_contracting = di_spread < nz(di_spread[2], di_spread)
+
+adx_rollover  = adx_val  < adx_val[1]
+adxr_rollover = adxr_val < adxr_val[1]
+
+adx_is_trending  = adx_val >= adx_thresh
+adx_is_exhausted = adx_val >= adx_exh_level
+
+// Strong trend = DI relationship confirmed by ADX being above threshold
+strong_bull = di_bull and adx_is_trending
+strong_bear = di_bear and adx_is_trending
+
+// Trend pressure fading (Unlock #2 composite signal)
+trend_pressure_fading = (adx_rollover or adxr_rollover) and di_spread_contracting
+
+// Unlock stages (regime gate progression)
+long_unlock_s1 = stoch_lead_bull
+long_unlock_s2 = stoch_lead_bull and trend_pressure_fading
+long_unlock_s3 = long_unlock_s2  and long_reclaim_ok
+
+short_unlock_s1 = stoch_lead_bear
+short_unlock_s2 = stoch_lead_bear and trend_pressure_fading
+short_unlock_s3 = short_unlock_s2 and short_reclaim_ok
+
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ░░ SECTION 7 — Living Trend Pressure Counters
+// ║
+// ║  Bull and bear pressure accrue per-bar based on:
+// ║    - VWAP sigma position + streaks
+// ║    - DI+/DI- relationship
+// ║    - DI cross events (highest single-bar impulse)
+// ║    - ADX strength
+// ║  Pressure decays each bar and is released by exhaustion evidence.
+// ═══════════════════════════════════════════════════════════════════════════
+p_decay    = input.float(2.0,  "Pressure Decay / Bar",       minval=0.0, step=0.5, group="🧠 Regime")
+p_rth_mult = input.float(1.25, "Pressure Multiplier (RTH)",  minval=0.5, step=0.05, group="🧠 Regime")
+p_eth_mult = input.float(0.85, "Pressure Multiplier (ETH)",  minval=0.5, step=0.05, group="🧠 Regime")
+reg_trend_t  = input.float(40.0, "Regime Trend Threshold",   minval=5,  maxval=95,  step=1, group="🧠 Regime")
+reg_extreme_t = input.float(70.0,"Regime Extreme Threshold", minval=10, maxval=100, step=1, group="🧠 Regime")
+reg_margin   = input.float(10.0, "Pressure Balance Margin",  minval=1,  maxval=50,  step=1, group="🧠 Regime")
+
+p_mult = is_rth ? p_rth_mult : p_eth_mult
+
+// ── BULL IMPULSE (per bar) ──────────────────────────────────────────────
+bull_imp = (
+    (close > vwap_u1                            ? 7.0  : 0.0) +
+    (close > vwap_u2                            ? 5.0  : 0.0) +
+    (close > vwap_u25                           ? 3.0  : 0.0) +
+    (up1_streak >= 2                            ? 4.0  : 0.0) +
+    (up1_streak >= trend_bars                   ? 5.0  : 0.0) +
+    (di_bull                                    ? 6.0  : 0.0) +
+    (strong_bull                                ? 4.0  : 0.0) +
+    (di_cross_bull                              ? 12.0 : 0.0) +   // DI cross = primary event
+    (di_bull and di_spread > 10                 ? 3.0  : 0.0)
+)
+
+// ── BEAR IMPULSE (per bar) ──────────────────────────────────────────────
+bear_imp = (
+    (close < vwap_l1                            ? 7.0  : 0.0) +
+    (close < vwap_l2                            ? 5.0  : 0.0) +
+    (close < vwap_l25                           ? 3.0  : 0.0) +
+    (dn1_streak >= 2                            ? 4.0  : 0.0) +
+    (dn1_streak >= trend_bars                   ? 5.0  : 0.0) +
+    (di_bear                                    ? 6.0  : 0.0) +
+    (strong_bear                                ? 4.0  : 0.0) +
+    (di_cross_bear                              ? 12.0 : 0.0) +   // DI cross = primary event
+    (di_bear and di_spread > 10                 ? 3.0  : 0.0)
+)
+
+// ── BULL PRESSURE RELEASE (exhaustion / reversal evidence) ─────────────
+bull_rel = (
+    (adx_rollover and di_bull                   ? 4.0  : 0.0) +
+    (di_spread_contracting and di_bull          ? 3.0  : 0.0) +
+    (short_unlock_s2                            ? 4.0  : 0.0) +   // bearish reversal clues reduce bull pressure
+    (short_reclaim_ok                           ? 5.0  : 0.0) +
+    (vwap_3sig_short                            ? 14.0 : 0.0) +   // 3σ upper touch = major bull pressure release
+    (di_cross_bear                              ? 8.0  : 0.0)     // DI flip releases prior trend pressure
+)
+
+// ── BEAR PRESSURE RELEASE (exhaustion / reversal evidence) ─────────────
+bear_rel = (
+    (adx_rollover and di_bear                   ? 4.0  : 0.0) +
+    (di_spread_contracting and di_bear          ? 3.0  : 0.0) +
+    (long_unlock_s2                             ? 4.0  : 0.0) +   // bullish reversal clues reduce bear pressure
+    (long_reclaim_ok                            ? 5.0  : 0.0) +
+    (vwap_3sig_long                             ? 14.0 : 0.0) +   // 3σ lower touch = major bear pressure release
+    (di_cross_bull                              ? 8.0  : 0.0)     // DI flip releases prior trend pressure
+)
+
+var float bull_pressure = 0.0
+var float bear_pressure = 0.0
+bull_pressure := clamp100(nz(bull_pressure[1]) - p_decay + (bull_imp * p_mult) - bull_rel)
+bear_pressure := clamp100(nz(bear_pressure[1]) - p_decay + (bear_imp * p_mult) - bear_rel)
+
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ░░ SECTION 8 — Regime Classification
+// ║
+// ║  Regime codes:
+// ║    0 = BALANCED       (neither side dominant)
+// ║    1 = TREND UP       (suppress shorts)
+// ║    2 = TREND DOWN     (suppress longs)
+// ║    3 = EXTREME UP     (hard suppress shorts, strong DI+ dominance)
+// ║    4 = EXTREME DOWN   (hard suppress longs, strong DI- dominance)
+// ║    5 = EXHAUSTING UP  (trend weakening, allow staged short setups)
+// ║    6 = EXHAUSTING DOWN (trend weakening, allow staged long setups)
+// ║    7 = TRANSITION     (price back inside ±1σ, pressure balanced)
+// ═══════════════════════════════════════════════════════════════════════════
+bull_dominant      = bull_pressure > (bear_pressure + reg_margin)
+bear_dominant      = bear_pressure > (bull_pressure + reg_margin)
+pressures_balanced = not bull_dominant and not bear_dominant
+
+bull_trend_reg = (
+    bull_dominant and
+    bull_pressure >= reg_trend_t and
+    (vwap_uptrend_est or strong_bull)
+)
+
+bear_trend_reg = (
+    bear_dominant and
+    bear_pressure >= reg_trend_t and
+    (vwap_downtrend_est or strong_bear)
+)
+
+bull_extreme_reg = (
+    bull_trend_reg and
+    (bull_pressure >= reg_extreme_t or sigma_dist >= 2.5)
+)
+
+bear_extreme_reg = (
+    bear_trend_reg and
+    (bear_pressure >= reg_extreme_t or sigma_dist <= -2.5)
+)
+
+bull_exhausting = (
+    bull_trend_reg and
+    trend_pressure_fading and
+    (short_unlock_s2 or adx_is_exhausted)
+)
+
+bear_exhausting = (
+    bear_trend_reg and
+    trend_pressure_fading and
+    (long_unlock_s2 or adx_is_exhausted)
+)
+
+transition_reg = (
+    inside_streak >= reclaim_bars and
+    trend_pressure_fading and
+    pressures_balanced
+)
+
+regime_code = (
+    bull_extreme_reg ? 3 :
+    bear_extreme_reg ? 4 :
+    bull_exhausting  ? 5 :
+    bear_exhausting  ? 6 :
+    bull_trend_reg   ? 1 :
+    bear_trend_reg   ? 2 :
+    transition_reg   ? 7 : 0
+)
+
+regime_name = (
+    regime_code == 3 ? "EXTREME UP"      :
+    regime_code == 4 ? "EXTREME DOWN"    :
+    regime_code == 5 ? "EXHAUSTING UP"   :
+    regime_code == 6 ? "EXHAUSTING DOWN" :
+    regime_code == 1 ? "TREND UP"        :
+    regime_code == 2 ? "TREND DOWN"      :
+    regime_code == 7 ? "TRANSITION"      :
+    "BALANCED"
+)
+
+// Gate flags
+suppress_longs  = (regime_code == 2 or regime_code == 4)
+suppress_shorts = (regime_code == 1 or regime_code == 3)
+
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ░░ SECTION 9 — ToD Reversal Zone (VISUAL ONLY — zero score modification)
+// ═══════════════════════════════════════════════════════════════════════════
+bgcolor(
+     is_rev_zone ? color.new(color.fuchsia, 88) : na,
+     title="Trend Reversal Zone Background"
+)
+
+plotshape(
+     rev_zone_start,
+     title="Trend Reversal Zone Label",
+     style=shape.labeldown,
+     location=location.top,
+     color=color.new(color.fuchsia, 0),
+     text="REVERSAL\nZONE",
+     textcolor=color.white,
+     size=size.tiny
+)
+
+alertcondition(
+     rev_zone_start,
+     "Trend Reversal Zone Start (12:40-1:15 ET)",
+     "Trend reversal/stagnation zone active (12:40–1:15 ET) on {{ticker}}"
+)
+
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ░░ SECTION 10 — Setup Confidence (raw confluence quality)
+// ═══════════════════════════════════════════════════════════════════════════
+eff_wt_vwap = wt_vwap * (is_rth ? vwap_rth_mult : vwap_eth_mult)
+
+long_score = (
+    (vwap_long_raw  ? eff_wt_vwap : 0.0) +
+    (rsi_long       ? wt_rsi      : 0.0) +
+    (stoch5_long    ? wt_stoch5   : 0.0) +
+    (stoch15_long   ? wt_stoch15  : 0.0) +
+    (stoch30_long   ? wt_stoch30  : 0.0) +
+    (lr_long        ? wt_lr       : 0.0)
+)
+
+short_score = (
+    (vwap_short_raw ? eff_wt_vwap : 0.0) +
+    (rsi_short      ? wt_rsi      : 0.0) +
+    (stoch5_short   ? wt_stoch5   : 0.0) +
+    (stoch15_short  ? wt_stoch15  : 0.0) +
+    (stoch30_short  ? wt_stoch30  : 0.0) +
+    (lr_short       ? wt_lr       : 0.0)
+)
+
+max_pts   = eff_wt_vwap + wt_rsi + wt_stoch5 + wt_stoch15 + wt_stoch30 + (lr_active ? wt_lr : 0.0)
+long_base  = max_pts > 0 ? (long_score  / max_pts) * 100.0 : 0.0
+short_base = max_pts > 0 ? (short_score / max_pts) * 100.0 : 0.0
+
+// Soft ADX directional penalty (countertrend in confirmed trend = reduced setup quality)
+long_setup  = long_base  * (strong_bear and not adx_is_exhausted ? 0.75 : 1.0)
+short_setup = short_base * (strong_bull and not adx_is_exhausted ? 0.75 : 1.0)
+
+// VWAP deep/extreme zone bonuses
+long_setup  += (
+    vwap_3sig_long    ? (is_rth ? bonus_3s_rth  : bonus_3s_eth)  :
+    vwap_half23_long  ? (is_rth ? bonus_25s_rth : bonus_25s_eth) : 0.0
+)
+short_setup += (
+    vwap_3sig_short   ? (is_rth ? bonus_3s_rth  : bonus_3s_eth)  :
+    vwap_half23_short ? (is_rth ? bonus_25s_rth : bonus_25s_eth) : 0.0
+)
+
+// Setup quality floor (oscillator cluster extreme = setup is notable even in suppressed regime)
+// This is SETUP floor only — does NOT auto-create executable confidence
+setup_floor_pct = input.float(60.0, "Setup Floor % (Osc Cluster Extreme)", minval=0, maxval=100, step=0.5, group="🚦 Gate")
+if osc_cluster_long
+    long_setup := math.max(long_setup, setup_floor_pct)
+if osc_cluster_short
+    short_setup := math.max(short_setup, setup_floor_pct)
+
+long_setup  := clamp100(long_setup)
+short_setup := clamp100(short_setup)
+
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ░░ SECTION 11 — Executable Confidence (regime-gated output)
+// ║
+// ║  Gate progression in suppressed regimes:
+// ║    No unlock:  score capped at cap_locked (default 0 — fully muted)
+// ║    S1 unlock:  5m stoch line leading       → cap_s1
+// ║    S2 unlock:  S1 + ADX/DI fading          → cap_s2
+// ║    S3 unlock:  S2 + reclaim/hold ±1σ       → cap_s3 (near tradeable)
+// ║    3σ touch:   Bypasses all gating entirely → override_score
+// ║
+// ║  Exhausting regimes (5/6): gating softens to allow staged setups
+// ║  at S2+ unlock level so you can begin positioning for the reversal.
+// ═══════════════════════════════════════════════════════════════════════════
+use_hard_gate    = input.bool(true,  "Use Hard Regime Gate", group="🚦 Gate")
+alert_thresh     = input.float(70.0, "Executable Alert Threshold (%)", minval=1, maxval=100, step=0.5, group="🚦 Gate")
+cap_locked       = input.float(0.0,  "Cap: Locked (strong trend, no unlock)", minval=0, maxval=50,  step=0.5, group="🚦 Gate")
+cap_s1           = input.float(52.0, "Cap: Unlock S1 (5m Stoch Leads)",       minval=0, maxval=100, step=0.5, group="🚦 Gate")
+cap_s2           = input.float(63.0, "Cap: Unlock S2 (ADX/DI Fade)",          minval=0, maxval=100, step=0.5, group="🚦 Gate")
+cap_s3           = input.float(76.0, "Cap: Unlock S3 (Reclaim + Hold)",        minval=0, maxval=100, step=0.5, group="🚦 Gate")
+override_rth     = input.float(90.0, "3σ Override Score (RTH)",                minval=50, maxval=100, step=0.5, group="🚦 Gate")
+override_eth     = input.float(80.0, "3σ Override Score (ETH)",                minval=50, maxval=100, step=0.5, group="🚦 Gate")
+
+long_exec  = long_setup
+short_exec = short_setup
+
+// ── 3σ IMMEDIATE OVERRIDE (bypasses all regime gating, by design) ──────
+if vwap_3sig_long
+    long_exec  := math.max(long_exec,  is_rth ? override_rth : override_eth)
+if vwap_3sig_short
+    short_exec := math.max(short_exec, is_rth ? override_rth : override_eth)
+
+// ── Unlock stage integers (for gating logic + dashboard) ────────────────
+long_unlk = (
+    vwap_3sig_long  ? 99 :
+    long_unlock_s3  ? 3  :
+    long_unlock_s2  ? 2  :
+    long_unlock_s1  ? 1  : 0
+)
+
+short_unlk = (
+    vwap_3sig_short ? 99 :
+    short_unlock_s3 ? 3  :
+    short_unlock_s2 ? 2  :
+    short_unlock_s1 ? 1  : 0
+)
+
+// ── HARD REGIME GATE ────────────────────────────────────────────────────
+if use_hard_gate and suppress_longs and not vwap_3sig_long
+    if long_unlk >= 3
+        long_exec := math.min(long_exec, cap_s3)
+    else if long_unlk == 2
+        long_exec := math.min(long_exec, cap_s2)
+    else if long_unlk == 1
+        long_exec := math.min(long_exec, cap_s1)
+    else
+        long_exec := math.min(long_exec, cap_locked)
+
+if use_hard_gate and suppress_shorts and not vwap_3sig_short
+    if short_unlk >= 3
+        short_exec := math.min(short_exec, cap_s3)
+    else if short_unlk == 2
+        short_exec := math.min(short_exec, cap_s2)
+    else if short_unlk == 1
+        short_exec := math.min(short_exec, cap_s1)
+    else
+        short_exec := math.min(short_exec, cap_locked)
+
+// ── EXHAUSTING REGIMES — soften suppression to allow staged entry ────────
+// EXHAUSTING DOWN (6): allow longs to get to S2 cap if unlock is present
+if regime_code == 6 and not vwap_3sig_long and use_hard_gate
+    if long_unlk >= 2
+        long_exec := math.max(long_exec, math.min(long_setup, cap_s2))
+
+// EXHAUSTING UP (5): allow shorts to get to S2 cap if unlock is present
+if regime_code == 5 and not vwap_3sig_short and use_hard_gate
+    if short_unlk >= 2
+        short_exec := math.max(short_exec, math.min(short_setup, cap_s2))
+
+long_pct  = clamp100(long_exec)
+short_pct = clamp100(short_exec)
+
+long_tradeable  = long_pct  >= alert_thresh
+short_tradeable = short_pct >= alert_thresh
+
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ░░ SECTION 12 — Dashboard (compressed: 8 rows)
+// ║  Row merges vs prior version:
+// ║    Regime + ToD indicator merged into row 1
+// ║    Pressure + Unlock merged into row 2
+// ║    ADX/DI + ±1σ streak merged into row 3
+// ║    VWAP zone + 3σ override merged into row 4
+// ║    Stoch stack + RSI merged into row 5
+// ║    Setup % + Exec % shown together in row 6 ("setup → exec")
+// ║    Alert state = row 7
+// ═══════════════════════════════════════════════════════════════════════════
+show_dash = input.bool(true, "Show Dashboard", group="🖥️ Display")
+
+var table dash = table.new(
+     position.top_right, 4, 9,
+     bgcolor=color.new(color.black, 15),
+     border_width=1,
+     border_color=color.new(color.gray, 60),
+     frame_width=2,
+     frame_color=color.new(color.silver, 40)
+)
+
+C_BULL = color.new(#00e676, 0)
+C_BEAR = color.new(#ff1744, 0)
+C_ORNG = color.new(#ff9800, 0)
+C_YELL = color.new(#ffee58, 0)
+C_WHTE = color.white
+C_GRAY = color.new(color.gray, 30)
+C_DARK = color.new(color.black, 75)
+C_MED  = color.new(#0d1b2a, 20)
+C_FUCH = color.fuchsia
+
+f_score_col(x) => (
+    x >= alert_thresh        ? C_BULL :
+    x >= alert_thresh * 0.75 ? C_ORNG :
+    C_GRAY
+)
+
+// Compact unlock label
+unlk_txt(stage) => (
+    stage == 99 ? "⚡3σ"   :
+    stage == 3  ? "S3✓"    :
+    stage == 2  ? "S2✓"    :
+    stage == 1  ? "S1✓"    :
+    "🔒"
+)
+
+unlk_col(stage) => (
+    stage == 99 ? C_YELL :
+    stage >= 2  ? C_ORNG :
+    stage == 1  ? color.new(#ff9800, 50) :
+    C_BEAR
+)
+
+regime_col = (
+    regime_code == 3 or regime_code == 1 ? C_BULL :
+    regime_code == 4 or regime_code == 2 ? C_BEAR :
+    regime_code == 5 or regime_code == 6 ? C_ORNG :
+    C_GRAY
+)
+
+if show_dash and barstate.islast
+    // ── Row 0: Header ───────────────────────────────────────────────────
+    table.cell(dash, 0, 0, "REGIME v5", text_color=C_WHTE, bgcolor=C_DARK, text_size=size.small)
+    table.cell(dash, 1, 0, "STATUS",    text_color=C_GRAY, bgcolor=C_DARK, text_size=size.small)
+    table.cell(dash, 2, 0, "▲ LONG",   text_color=C_BULL, bgcolor=C_DARK, text_size=size.small)
+    table.cell(dash, 3, 0, "▼ SHORT",  text_color=C_BEAR, bgcolor=C_DARK, text_size=size.small)
+
+    // ── Row 1: Regime + ToD ─────────────────────────────────────────────
+    // Status col: regime name. If ToD zone is active, appended in fuchsia via color choice on gate cells.
+    _reg_status = regime_name + (is_rev_zone ? " ⏰" : "")
+    table.cell(dash, 0, 1, "Regime", text_color=C_WHTE, bgcolor=C_MED, text_size=size.tiny)
+    table.cell(dash, 1, 1, _reg_status, text_color=is_rev_zone ? C_FUCH : regime_col, bgcolor=C_MED, text_size=size.tiny)
+    table.cell(dash, 2, 1, suppress_longs  ? "⛔ GATED" : "✅ OPEN", text_color=suppress_longs  ? C_BEAR : C_BULL, bgcolor=C_MED, text_size=size.tiny)
+    table.cell(dash, 3, 1, suppress_shorts ? "⛔ GATED" : "✅ OPEN", text_color=suppress_shorts ? C_BULL : C_BEAR, bgcolor=C_MED, text_size=size.tiny)
+
+    // ── Row 2: Pressure + Unlock stage ──────────────────────────────────
+    // Status: bull/bear pressure values. Long/Short cols: unlock stage label.
+    table.cell(dash, 0, 2, "Pressure", text_color=C_WHTE, bgcolor=C_MED, text_size=size.tiny)
+    table.cell(dash, 1, 2, "🐂" + f1(bull_pressure) + " 🐻" + f1(bear_pressure), text_color=C_YELL, bgcolor=C_MED, text_size=size.tiny)
+    table.cell(dash, 2, 2, unlk_txt(long_unlk),  text_color=unlk_col(long_unlk),  bgcolor=C_MED, text_size=size.tiny)
+    table.cell(dash, 3, 2, unlk_txt(short_unlk), text_color=unlk_col(short_unlk), bgcolor=C_MED, text_size=size.tiny)
+
+    // ── Row 3: ADX/DI values + ±1σ streak ───────────────────────────────
+    // Status: ADX value + DI state. Long col: DI cross / streak suppress. Short col: same.
+    _di_txt   = "ADX " + f1(adx_val) + " +" + f1(diplus) + " -" + f1(diminus)
+    _long_adx = di_cross_bull ? "DI+✕" : (long_unlock_s2 ? "Fade" : "—")  + "  ↓" + f0(dn1_streak)
+    _shrt_adx = di_cross_bear ? "DI-✕" : (short_unlock_s2 ? "Fade" : "—") + "  ↑" + f0(up1_streak)
+    table.cell(dash, 0, 3, "ADX/Streak", text_color=C_WHTE, bgcolor=C_MED, text_size=size.tiny)
+    table.cell(dash, 1, 3, _di_txt, text_color=di_bull ? C_BULL : C_BEAR, bgcolor=C_MED, text_size=size.tiny)
+    table.cell(dash, 2, 3, _long_adx, text_color=di_cross_bull ? C_BULL : (dn1_streak >= trend_bars ? C_BEAR : C_GRAY), bgcolor=C_MED, text_size=size.tiny)
+    table.cell(dash, 3, 3, _shrt_adx, text_color=di_cross_bear ? C_BEAR : (up1_streak >= trend_bars ? C_BULL : C_GRAY), bgcolor=C_MED, text_size=size.tiny)
+
+    // ── Row 4: VWAP zone + 3σ override status ───────────────────────────
+    // Status: sigma level. Long/Short cols: zone signal, 3σ bypass if active.
+    _long_vwap = vwap_3sig_long ? "⚡-3σ BYPASS" : (vwap_long_raw ? "IN ZONE" : "—")
+    _shrt_vwap = vwap_3sig_short ? "⚡+3σ BYPASS" : (vwap_short_raw ? "IN ZONE" : "—")
+    table.cell(dash, 0, 4, "VWAP", text_color=C_WHTE, bgcolor=C_MED, text_size=size.tiny)
+    table.cell(dash, 1, 4, vwap_level_str(), text_color=C_YELL, bgcolor=C_MED, text_size=size.tiny)
+    table.cell(dash, 2, 4, _long_vwap, text_color=(vwap_3sig_long ? C_YELL : (vwap_long_raw ? C_BULL : C_GRAY)), bgcolor=C_MED, text_size=size.tiny)
+    table.cell(dash, 3, 4, _shrt_vwap, text_color=(vwap_3sig_short ? C_YELL : (vwap_short_raw ? C_BEAR : C_GRAY)), bgcolor=C_MED, text_size=size.tiny)
+
+    // ── Row 5: Stoch stack + RSI ─────────────────────────────────────────
+    // Status: stoch 5/15/30 values + RSI in one line. Long/Short: stoch lead + rsi signal.
+    _osc_status = s5_txt + "/" + s15_txt + "/" + s30_txt + "  R:" + f1(rsi_val)
+    _long_osc   = (stoch_lead_bull ? "5m↑ " : "— ") + (rsi_long  ? "RSI✓" : "")
+    _shrt_osc   = (stoch_lead_bear ? "5m↓ " : "— ") + (rsi_short ? "RSI✓" : "")
+    table.cell(dash, 0, 5, "Stoch/RSI", text_color=C_WHTE, bgcolor=C_MED, text_size=size.tiny)
+    table.cell(dash, 1, 5, _osc_status, text_color=C_YELL, bgcolor=C_MED, text_size=size.tiny)
+    table.cell(dash, 2, 5, _long_osc, text_color=(stoch_lead_bull or rsi_long  ? C_ORNG : C_GRAY), bgcolor=C_MED, text_size=size.tiny)
+    table.cell(dash, 3, 5, _shrt_osc, text_color=(stoch_lead_bear or rsi_short ? C_ORNG : C_GRAY), bgcolor=C_MED, text_size=size.tiny)
+
+    // ── Row 6: Setup → Exec scores ───────────────────────────────────────
+    // Shows both setup and exec in one row: "setup% → exec%"
+    _long_scores  = f1(long_setup)  + "→" + f1(long_pct)  + "%"
+    _shrt_scores  = f1(short_setup) + "→" + f1(short_pct) + "%"
+    table.cell(dash, 0, 6, "Stup→Exec", text_color=C_WHTE, bgcolor=C_DARK, text_size=size.tiny)
+    table.cell(dash, 1, 6, "raw → gated", text_color=C_GRAY, bgcolor=C_DARK, text_size=size.tiny)
+    table.cell(dash, 2, 6, _long_scores,  text_color=f_score_col(long_pct),  bgcolor=C_DARK, text_size=size.small)
+    table.cell(dash, 3, 6, _shrt_scores,  text_color=f_score_col(short_pct), bgcolor=C_DARK, text_size=size.small)
+
+    // ── Row 7: Executable alert state ────────────────────────────────────
+    table.cell(dash, 0, 7, "EXEC Alert", text_color=C_WHTE, bgcolor=C_DARK, text_size=size.tiny)
+    table.cell(dash, 1, 7, "≥" + f1(alert_thresh) + "%", text_color=C_GRAY, bgcolor=C_DARK, text_size=size.tiny)
+    table.cell(dash, 2, 7, long_tradeable  ? "▲ FIRE" : "—", text_color=long_tradeable  ? C_BULL : C_GRAY, bgcolor=C_DARK, text_size=size.normal)
+    table.cell(dash, 3, 7, short_tradeable ? "▼ FIRE" : "—", text_color=short_tradeable ? C_BEAR : C_GRAY, bgcolor=C_DARK, text_size=size.normal)
+
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ░░ SECTION 13 — Plots & Alerts (executable outputs only)
+// ═══════════════════════════════════════════════════════════════════════════
+
+// Main output lines
+plot(long_pct,  "Long Confidence (Exec)",  color=color.new(#00e676, 0), linewidth=2)
+plot(short_pct, "Short Confidence (Exec)", color=color.new(#ff1744, 0), linewidth=2)
+hline(alert_thresh, "Alert Threshold", color=color.new(color.yellow, 30), linestyle=hline.style_dashed)
+
+// Debug plots (all hidden by default — enable in Style tab as needed)
+plot(bull_pressure,  "Bull Trend Pressure",  color=color.new(color.green,  60), linewidth=1, display=display.none)
+plot(bear_pressure,  "Bear Trend Pressure",  color=color.new(color.red,    60), linewidth=1, display=display.none)
+plot(long_setup,     "Long Setup %",         color=color.new(color.teal,   60), linewidth=1, display=display.none)
+plot(short_setup,    "Short Setup %",        color=color.new(color.orange, 60), linewidth=1, display=display.none)
+plot(up1_streak,     "Up1σ Streak",          color=color.new(color.lime,   80), display=display.none)
+plot(dn1_streak,     "Dn1σ Streak",          color=color.new(color.maroon, 80), display=display.none)
+plot(float(regime_code), "Regime Code",      color=color.new(color.purple, 60), display=display.none)
+
+// ── EXECUTABLE ALERTS (only thing that should fire trade notifications) ──
+alertcondition(
+     ta.crossover(long_pct, alert_thresh),
+     "▲ LONG Executable Alert",
+     "LONG executable confluence ≥ threshold on {{ticker}} at {{time}}"
+)
+
+alertcondition(
+     ta.crossover(short_pct, alert_thresh),
+     "▼ SHORT Executable Alert",
+     "SHORT executable confluence ≥ threshold on {{ticker}} at {{time}}"
+)
+
+// ── 3σ IMMEDIATE REVERSAL TRIGGER ALERTS ────────────────────────────────
+alertcondition(
+     vwap_3sig_long,
+     "▲ -3σ VWAP Reversal Trigger",
+     "Price touched lower 3σ VWAP band — immediate long reversal trigger on {{ticker}}"
+)
+
+alertcondition(
+     vwap_3sig_short,
+     "▼ +3σ VWAP Reversal Trigger",
+     "Price touched upper 3σ VWAP band — immediate short reversal trigger on {{ticker}}"
+)

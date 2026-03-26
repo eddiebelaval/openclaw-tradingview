@@ -1,0 +1,267 @@
+//@version=5
+
+indicator("HM2 - Ehlers Fisher Transform Zones", overlay=true, max_labels_count=500, max_bars_back=500)
+
+// ========================================
+// INPUT PARAMETERS
+// ========================================
+// --- Core ---
+i_period      = input.int(9, "Fisher Period", minval=2, maxval=50, group="Core", tooltip="Lookback for price normalization. Ehlers' original default is 9.")
+i_source      = input.string("HL2", "Price Source", options=["HL2", "Close", "HLC3", "OHLC4"], group="Core", tooltip="HL2 (midpoint) is the classic Ehlers source.")
+
+// --- Signal Filtering ---
+i_extremeHigh = input.float(1.5, "Overbought Threshold", minval=0.5, maxval=4.0, step=0.1, group="Signals", tooltip="Fisher above this = overbought zone. Signals from this zone carry more weight.")
+i_extremeLow  = input.float(-1.5, "Oversold Threshold", minval=-4.0, maxval=-0.5, step=0.1, group="Signals", tooltip="Fisher below this = oversold zone. Signals from this zone carry more weight.")
+i_showStrong  = input.bool(true, "Show Strong Signals (BUY/SELL)", group="Signals")
+i_showWeak    = input.bool(false, "Show Weak Signals (●)", group="Signals", tooltip="Crossovers outside extreme zones. Off by default to reduce clutter.")
+i_cooldown    = input.int(5, "Signal Cooldown (bars)", minval=1, maxval=20, group="Signals", tooltip="Minimum bars between signals. Increase on lower timeframes.")
+i_divLookback = input.int(5, "Divergence Lookback", minval=3, maxval=20, group="Signals", tooltip="Window size for comparing price vs Fisher highs/lows in divergence detection.")
+i_showDiv     = input.bool(false, "Show Divergence Signals (DIV)", group="Signals", tooltip="Price vs Fisher divergence markers. Off by default — turn on for additional confluence.")
+
+// --- Display ---
+i_showZones   = input.bool(true, "Show Background Zones", group="Display", tooltip="Color the chart background based on Fisher intensity.")
+i_showMidline = input.bool(true, "Show Fisher Midline", group="Display", tooltip="An EMA weighted by Fisher direction, representing fair value.")
+i_showTable   = input.bool(true, "Show Info Table", group="Display")
+i_barColor    = input.bool(false, "Color Bars by Fisher", group="Display")
+i_zoneOpacity = input.int(88, "Zone Transparency", minval=70, maxval=95, group="Display")
+
+// --- Colors ---
+i_bullColor   = input.color(color.rgb(0, 150, 136), "Bullish Color", group="Colors")
+i_bearColor   = input.color(color.rgb(233, 30, 99), "Bearish Color", group="Colors")
+i_neutralColor= input.color(color.rgb(158, 158, 158), "Neutral Color", group="Colors")
+i_midColor    = input.color(color.rgb(255, 193, 7), "Midline Color", group="Colors")
+i_buyColor    = input.color(color.rgb(0, 230, 118), "Buy Signal Color", group="Colors")
+i_sellColor   = input.color(color.rgb(255, 82, 82), "Sell Signal Color", group="Colors")
+
+// ========================================
+// PRICE SOURCE SELECTION
+// ========================================
+getSrc() =>
+    switch i_source
+        "HL2"  => hl2
+        "Close" => close
+        "HLC3" => hlc3
+        "OHLC4" => ohlc4
+        => hl2
+
+float src = getSrc()
+
+// ========================================
+// EHLERS FISHER TRANSFORM CALCULATION
+// ========================================
+// Following Ehlers' original formulation:
+// 1. Normalize price to [-1, +1] range over the lookback period
+// 2. Smooth with EMA (alpha = 0.33 per Ehlers)
+// 3. Clamp to avoid log blowup at ±1
+// 4. Apply Fisher Transform: 0.5 * ln((1+x)/(1-x))
+// 5. Smooth result with feedback (0.5 * current + 0.5 * previous)
+
+float highestH = ta.highest(src, i_period)
+float lowestL  = ta.lowest(src, i_period)
+
+// Normalized value: where is price within its N-period range, mapped to [-1, +1]
+float range_hl = highestH - lowestL
+float rawNorm  = range_hl > 0 ? 2.0 * ((src - lowestL) / range_hl) - 1.0 : 0.0
+
+// Smooth with Ehlers' alpha (0.33 current + 0.67 previous)
+var float normSmooth = 0.0
+normSmooth := 0.33 * rawNorm + 0.67 * nz(normSmooth[1])
+
+// Clamp to prevent Fisher Transform from blowing up at ±1
+float normClamped = math.max(-0.999, math.min(0.999, normSmooth))
+
+// Fisher Transform: 0.5 * ln((1 + x) / (1 - x)) with feedback
+var float fisher = 0.0
+bool hasWarmup = bar_index >= i_period
+float rawFisher = 0.5 * math.log((1.0 + normClamped) / (1.0 - normClamped))
+fisher := hasWarmup ? 0.5 * rawFisher + 0.5 * nz(fisher[1]) : 0.0
+
+// Trigger line: Fisher delayed by one bar (Ehlers' original)
+float trigger = nz(fisher[1])
+
+// ========================================
+// ZONE CLASSIFICATION
+// ========================================
+bool isOverbought  = fisher > i_extremeHigh
+bool isOversold    = fisher < i_extremeLow
+
+// ========================================
+// BACKGROUND ZONES
+// ========================================
+// Only paint background at extreme readings (overbought/oversold).
+// This prevents the entire chart from being tinted green/pink,
+// and makes the zones a meaningful "pay attention here" signal.
+color zoneColor = na
+
+if i_showZones
+    if isOverbought
+        zoneColor := color.new(i_bearColor, i_zoneOpacity)
+    else if isOversold
+        zoneColor := color.new(i_bullColor, i_zoneOpacity)
+
+bgcolor(zoneColor, title="Fisher Zone")
+
+// ========================================
+// FISHER MIDLINE (Adaptive Fair Value)
+// ========================================
+// An EMA that adjusts its effective length based on Fisher intensity.
+// Strong Fisher = shorter EMA (tracks price closely)
+// Weak Fisher = longer EMA (smooths more, less reactive)
+float fisherAbs    = math.abs(fisher)
+float alphaMin     = 2.0 / (50 + 1)  // Equivalent to EMA 50 (slow)
+float alphaMax     = 2.0 / (10 + 1)  // Equivalent to EMA 10 (fast)
+float fisherIntens = math.min(fisherAbs / 2.0, 1.0)  // Normalize to [0, 1]
+float alpha        = alphaMin + fisherIntens * (alphaMax - alphaMin)
+
+var float midline = na
+midline := na(midline[1]) ? src : alpha * src + (1.0 - alpha) * nz(midline[1])
+
+plot(i_showMidline ? midline : na, "Fisher Midline", color=color.new(i_midColor, 20), linewidth=2)
+
+// ========================================
+// BAR COLORING
+// ========================================
+color barCol = na
+if i_barColor
+    if isOverbought
+        barCol := i_bearColor
+    else if isOversold
+        barCol := i_bullColor
+    else if fisher > 0
+        barCol := i_bullColor
+    else if fisher < 0
+        barCol := i_bearColor
+    else
+        barCol := i_neutralColor
+
+barcolor(barCol)
+
+// ========================================
+// BUY / SELL SIGNAL LOGIC
+// ========================================
+// Crossover detection
+bool fisherCrossUp   = ta.crossover(fisher, trigger)
+bool fisherCrossDown = ta.crossunder(fisher, trigger)
+
+// Track whether Fisher was recently in an extreme zone
+// "Recently" = within the last 3 bars (gives the crossover time to form)
+// nz() with default 999 handles the case where condition was never true
+bool wasOversold  = nz(ta.barssince(fisher < i_extremeLow), 999) <= 3
+bool wasOverbought = nz(ta.barssince(fisher > i_extremeHigh), 999) <= 3
+
+// Strong signals: crossover FROM an extreme zone with momentum confirmation
+// Momentum: Fisher's direction should agree (rising for buy, falling for sell)
+bool fisherRising  = fisher > nz(fisher[1])
+bool fisherFalling = fisher < nz(fisher[1])
+
+bool strongBuy  = fisherCrossUp and wasOversold and fisherRising
+bool strongSell = fisherCrossDown and wasOverbought and fisherFalling
+
+// Weak signals: crossover at zero line or non-extreme crossover
+bool weakBuy  = fisherCrossUp and not strongBuy
+bool weakSell = fisherCrossDown and not strongSell
+
+// Cooldown: prevent rapid-fire signals
+// Buy and sell share a mutual cooldown — a signal of either type resets both timers
+var int barsSinceBuy  = 999
+var int barsSinceSell = 999
+barsSinceBuy  += 1
+barsSinceSell += 1
+
+bool filteredStrongBuy  = strongBuy and barsSinceBuy >= i_cooldown
+bool filteredStrongSell = strongSell and barsSinceSell >= i_cooldown
+bool filteredWeakBuy    = weakBuy and barsSinceBuy >= i_cooldown and not filteredStrongBuy
+bool filteredWeakSell   = weakSell and barsSinceSell >= i_cooldown and not filteredStrongSell
+
+if filteredStrongBuy or filteredWeakBuy
+    barsSinceBuy  := 0
+    barsSinceSell := 0  // Reset opposite side too
+if filteredStrongSell or filteredWeakSell
+    barsSinceSell := 0
+    barsSinceBuy  := 0  // Reset opposite side too
+
+// ========================================
+// PLOT SIGNALS
+// ========================================
+// Strong signals: large labeled markers
+plotshape(i_showStrong and filteredStrongBuy, "BUY", shape.labelup, location.belowbar,
+         i_buyColor, text="BUY", textcolor=color.white, size=size.small)
+plotshape(i_showStrong and filteredStrongSell, "SELL", shape.labeldown, location.abovebar,
+         i_sellColor, text="SELL", textcolor=color.white, size=size.small)
+
+// Weak signals: small circles (awareness only)
+plotshape(i_showWeak and filteredWeakBuy, "Weak Buy", shape.circle, location.belowbar,
+         color.new(i_buyColor, 40), size=size.tiny)
+plotshape(i_showWeak and filteredWeakSell, "Weak Sell", shape.circle, location.abovebar,
+         color.new(i_sellColor, 40), size=size.tiny)
+
+// ========================================
+// DIVERGENCE DETECTION
+// ========================================
+// Bullish divergence: price makes lower low but Fisher makes higher low
+// Bearish divergence: price makes higher high but Fisher makes lower high
+
+float priceLow1  = ta.lowest(low, i_divLookback)
+float priceLow2  = ta.lowest(low[i_divLookback], i_divLookback)
+float priceHigh1 = ta.highest(high, i_divLookback)
+float priceHigh2 = ta.highest(high[i_divLookback], i_divLookback)
+
+float fisherLow1  = ta.lowest(fisher, i_divLookback)
+float fisherLow2  = ta.lowest(fisher[i_divLookback], i_divLookback)
+float fisherHigh1 = ta.highest(fisher, i_divLookback)
+float fisherHigh2 = ta.highest(fisher[i_divLookback], i_divLookback)
+
+bool bullDiv = priceLow1 < priceLow2 and fisherLow1 > fisherLow2 and fisher < 0
+bool bearDiv = priceHigh1 > priceHigh2 and fisherHigh1 < fisherHigh2 and fisher > 0
+
+// Only fire divergence at confirmed crossovers to reduce noise
+// Suppress when a strong signal already fires on the same bar
+bool divBuySignal  = bullDiv and fisherCrossUp and not filteredStrongBuy
+bool divSellSignal = bearDiv and fisherCrossDown and not filteredStrongSell
+
+plotshape(i_showDiv and divBuySignal, "Bullish Divergence", shape.diamond, location.belowbar,
+         i_buyColor, text="DIV", textcolor=i_buyColor, size=size.tiny)
+plotshape(i_showDiv and divSellSignal, "Bearish Divergence", shape.diamond, location.abovebar,
+         i_sellColor, text="DIV", textcolor=i_sellColor, size=size.tiny)
+
+// ========================================
+// INFO TABLE
+// ========================================
+if barstate.islast and i_showTable
+    var table infoTable = table.new(position.top_right, 2, 4, bgcolor=color.new(color.black, 80), border_width=1)
+    
+    string zone = isOverbought ? "OVERBOUGHT" : isOversold ? "OVERSOLD" : fisher > 0 ? "BULLISH" : fisher < 0 ? "BEARISH" : "NEUTRAL"
+    color  zc   = isOverbought ? i_bearColor : isOversold ? i_bullColor : fisher > 0 ? i_bullColor : fisher < 0 ? i_bearColor : i_neutralColor
+    
+    table.cell(infoTable, 0, 0, "Fisher", text_color=color.gray, text_size=size.tiny)
+    table.cell(infoTable, 1, 0, str.tostring(fisher, "#.###"), text_color=zc, text_size=size.small)
+    
+    table.cell(infoTable, 0, 1, "Trigger", text_color=color.gray, text_size=size.tiny)
+    table.cell(infoTable, 1, 1, str.tostring(trigger, "#.###"), text_color=color.white, text_size=size.small)
+    
+    table.cell(infoTable, 0, 2, "Zone", text_color=color.gray, text_size=size.tiny)
+    table.cell(infoTable, 1, 2, zone, text_color=zc, text_size=size.small)
+    
+    float spread = fisher - trigger
+    string spreadStr = (spread >= 0 ? "+" : "") + str.tostring(spread, "#.###")
+    
+    table.cell(infoTable, 0, 3, "Spread", text_color=color.gray, text_size=size.tiny)
+    table.cell(infoTable, 1, 3, spreadStr, text_color=fisher > trigger ? i_bullColor : i_bearColor, text_size=size.small)
+
+// ========================================
+// PLOTS FOR ALERTS (hidden)
+// ========================================
+plot(fisher, "Fisher Value", color=color.new(color.blue, 100), display=display.none)
+plot(trigger, "Trigger Value", color=color.new(color.orange, 100), display=display.none)
+
+// ========================================
+// ALERTS
+// ========================================
+alertcondition(filteredStrongBuy, "BUY Signal", "Fisher Transform: Strong BUY — crossover from oversold zone")
+alertcondition(filteredStrongSell, "SELL Signal", "Fisher Transform: Strong SELL — crossover from overbought zone")
+alertcondition(filteredWeakBuy, "Weak Buy", "Fisher Transform: Weak buy — crossover outside extreme zone")
+alertcondition(filteredWeakSell, "Weak Sell", "Fisher Transform: Weak sell — crossover outside extreme zone")
+alertcondition(isOverbought, "Overbought", "Fisher Transform entered overbought zone")
+alertcondition(isOversold, "Oversold", "Fisher Transform entered oversold zone")
+alertcondition(divBuySignal, "Bullish Divergence", "Fisher Transform: Bullish divergence detected at crossover")
+alertcondition(divSellSignal, "Bearish Divergence", "Fisher Transform: Bearish divergence detected at crossover")

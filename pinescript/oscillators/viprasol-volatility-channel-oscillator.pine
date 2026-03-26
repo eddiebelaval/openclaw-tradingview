@@ -1,0 +1,439 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © Viprasol Tech Private Limited
+// Based on "Volatility Channel Oscillator" concept by Uncle_the_shooter.
+// Significantly enhanced with momentum histogram, squeeze detection, confluence filter,
+// signal cooldown, zone classification, dashboard, and dynamic alerts under Viprasol branding.
+
+//@version=6
+indicator("[Viprasol] Volatility Channel Oscillator", shorttitle = "VP - VCO", overlay = false,
+     max_bars_back = 500, precision = 2)
+
+// ══════════════════════════════════════════════════════════════════
+// ─── CONSTANTS ───
+// ══════════════════════════════════════════════════════════════════
+var string GRP_OSC       = "Oscillator Settings"
+var string GRP_THRESH    = "Threshold Levels"
+var string GRP_DIV       = "Divergence Detection"
+var string GRP_SIGNAL    = "Signal Settings"
+var string GRP_SQUEEZE   = "Squeeze Detection"
+var string GRP_HIST      = "Momentum Histogram"
+var string GRP_DASH      = "Dashboard"
+var string GRP_GRADIENT  = "Gradient Settings"
+var string GRP_STYLE     = "Style"
+
+// Zone constants
+var int ZONE_STRONG_BULL =  2
+var int ZONE_WEAK_BULL   =  1
+var int ZONE_NEUTRAL     =  0
+var int ZONE_WEAK_BEAR   = -1
+var int ZONE_STRONG_BEAR = -2
+
+// ══════════════════════════════════════════════════════════════════
+// ─── INPUTS ───
+// ══════════════════════════════════════════════════════════════════
+
+// Oscillator
+smaLenInput         = input.int(30, "SMA Length / Volatility Window",       group = GRP_OSC, minval = 5, maxval = 200, tooltip = "Lookback period for the SMA of candle midpoints and the average range calculation. Controls the volatility channel width.")
+bandScaleInput      = input.float(200.0, "Band Scaling (%)",                group = GRP_OSC, minval = 100.0, maxval = 500.0, step = 10.0, tooltip = "Multiplier for the channel offset. Higher values widen the bands, compressing the oscillator range.")
+signalLenInput      = input.int(20, "Signal SMA Length",                    group = GRP_OSC, minval = 3, maxval = 100, tooltip = "Period for the signal line (SMA of the oscillator). Acts as a smoothed reference for momentum and crossover signals.")
+
+// Thresholds
+obThreshInput       = input.float(50.0, "Overbought Threshold",            group = GRP_THRESH, step = 1.0, tooltip = "Oscillator value above which the market is considered overbought.")
+osThreshInput       = input.float(-50.0, "Oversold Threshold",             group = GRP_THRESH, step = 1.0, tooltip = "Oscillator value below which the market is considered oversold.")
+maObThreshInput     = input.float(30.0, "MA Overbought Threshold",         group = GRP_THRESH, step = 1.0, tooltip = "Signal SMA value above which the smoothed trend is considered overbought.")
+maOsThreshInput     = input.float(-30.0, "MA Oversold Threshold",          group = GRP_THRESH, step = 1.0, tooltip = "Signal SMA value below which the smoothed trend is considered oversold.")
+
+// Divergence
+pivotLenInput       = input.int(2, "Pivot Length (Left/Right)",             group = GRP_DIV, minval = 1, maxval = 10, tooltip = "Bars left and right for pivot detection in divergence analysis.")
+enableDivInput      = input.bool(true, "Enable Divergence Detection",       group = GRP_DIV, tooltip = "Scan for regular bullish and bearish divergences between price and oscillator pivots.")
+
+// Signal Settings
+signalModeInput     = input.string("Overbought/Oversold", "Signal Type",   group = GRP_SIGNAL, options = ["None", "Overbought/Oversold", "Zero Line", "MA Zero Line", "All"], tooltip = "Which crossover signals to display. 'All' enables every signal type simultaneously.")
+enableConfluenceInput = input.bool(false, "Confluence Filter",              group = GRP_SIGNAL, tooltip = "When enabled, OB/OS signals only fire if a divergence was detected within the lookback window, filtering for higher-probability setups.")
+cooldownBarsInput   = input.int(5, "Signal Cooldown (Bars)",               group = GRP_SIGNAL, minval = 0, maxval = 30, tooltip = "Minimum bars between consecutive signals of the same type. Prevents rapid-fire noise in choppy markets. Set to 0 to disable.")
+
+// Squeeze Detection
+enableSqueezeInput  = input.bool(true, "Enable Squeeze Detection",         group = GRP_SQUEEZE, tooltip = "Detect when the volatility channel bandwidth contracts below its average, signaling potential breakout conditions.")
+squeezeLenInput     = input.int(50, "Squeeze Lookback",                    group = GRP_SQUEEZE, minval = 10, maxval = 200, tooltip = "Period for the bandwidth moving average used in squeeze detection.")
+squeezeMultInput    = input.float(0.8, "Squeeze Threshold",                group = GRP_SQUEEZE, minval = 0.3, maxval = 1.0, step = 0.05, tooltip = "Bandwidth must be below its SMA multiplied by this factor to qualify as a squeeze. Lower = stricter.")
+
+// Momentum Histogram
+showHistInput       = input.bool(true, "Show Momentum Histogram",          group = GRP_HIST, tooltip = "Display the difference between oscillator and signal line as a histogram (similar to MACD histogram).")
+histGrowBullInput   = input.color(#26a69a, "Histogram Growing Bull",       group = GRP_HIST, tooltip = "Color when histogram is positive and increasing.")
+histFadeBullInput   = input.color(color.new(#26a69a, 50), "Histogram Fading Bull", group = GRP_HIST, tooltip = "Color when histogram is positive but decreasing.")
+histGrowBearInput   = input.color(#ef5350, "Histogram Growing Bear",       group = GRP_HIST, tooltip = "Color when histogram is negative and decreasing.")
+histFadeBearInput   = input.color(color.new(#ef5350, 50), "Histogram Fading Bear", group = GRP_HIST, tooltip = "Color when histogram is negative but increasing.")
+
+// Dashboard
+showDashInput       = input.bool(true, "Show Dashboard",                    group = GRP_DASH, tooltip = "Display an info panel with oscillator value, zone, signal status, and squeeze state.")
+dashPosInput        = input.string("Top Right", "Position",                 group = GRP_DASH, options = ["Top Left", "Top Right", "Bottom Left", "Bottom Right"], tooltip = "Dashboard position on chart pane.")
+dashSizeInput       = input.string("Small", "Size",                         group = GRP_DASH, options = ["Tiny", "Small", "Normal"], tooltip = "Dashboard text size.")
+
+// Gradient Settings
+showZeroGradInput   = input.bool(true, "Show Zero Line Gradient",          group = GRP_GRADIENT, tooltip = "Thick glow behind the zero line.")
+showObGradInput     = input.bool(true, "Show Overbought Gradient",         group = GRP_GRADIENT, tooltip = "Thick glow behind the overbought level.")
+showOsGradInput     = input.bool(true, "Show Oversold Gradient",           group = GRP_GRADIENT, tooltip = "Thick glow behind the oversold level.")
+showOscGradInput    = input.bool(true, "Show Oscillator Gradient",         group = GRP_GRADIENT, tooltip = "Glow around the oscillator line.")
+showMaGradInput     = input.bool(true, "Show MA Gradient",                 group = GRP_GRADIENT, tooltip = "Glow around the signal SMA line.")
+enableFillInput     = input.bool(true, "Enable Gradient Fill",             group = GRP_GRADIENT, tooltip = "Multi-layer fill between oscillator and zero line.")
+fillTranspInput     = input.int(70, "Fill Transparency",                   group = GRP_GRADIENT, minval = 0, maxval = 100, tooltip = "Base transparency for gradient fill layers.")
+bandTranspInput     = input.int(40, "Band Gradient Transparency",          group = GRP_GRADIENT, minval = 0, maxval = 100, tooltip = "Transparency for the thick band glow effects.")
+
+// Style
+bullOscTintInput    = input.color(color.rgb(6, 162, 47), "Bullish Osc",    group = GRP_STYLE, tooltip = "Color when oscillator is positive.")
+bearOscTintInput    = input.color(color.rgb(207, 23, 23), "Bearish Osc",   group = GRP_STYLE, tooltip = "Color when oscillator is negative.")
+signalTintInput     = input.color(color.yellow, "Signal SMA",              group = GRP_STYLE, tooltip = "Color for the signal SMA line.")
+zeroTintInput       = input.color(color.gray, "Zero Line",                 group = GRP_STYLE, tooltip = "Color for the zero reference line.")
+obTintInput         = input.color(color.red, "Overbought Line",            group = GRP_STYLE, tooltip = "Color for the overbought threshold line.")
+osTintInput         = input.color(color.green, "Oversold Line",            group = GRP_STYLE, tooltip = "Color for the oversold threshold line.")
+bullDivTintInput    = input.color(color.green, "Bullish Divergence",       group = GRP_STYLE, tooltip = "Color for bullish divergence labels.")
+bearDivTintInput    = input.color(color.red, "Bearish Divergence",         group = GRP_STYLE, tooltip = "Color for bearish divergence labels.")
+labelTextTintInput  = input.color(color.white, "Label Text",               group = GRP_STYLE, tooltip = "Text color for divergence labels.")
+showZoneBgInput     = input.bool(true, "Show Zone Background",             group = GRP_STYLE, tooltip = "Shade the oscillator pane background based on the current trend zone.")
+
+// ══════════════════════════════════════════════════════════════════
+// ─── HELPER FUNCTIONS ───
+// ══════════════════════════════════════════════════════════════════
+
+resolveTablePos(string posStr) =>
+    switch posStr
+        "Top Left"     => position.top_left
+        "Top Right"    => position.top_right
+        "Bottom Left"  => position.bottom_left
+        =>                position.bottom_right
+
+resolveTextSize(string sizeStr) =>
+    switch sizeStr
+        "Tiny"   => size.tiny
+        "Normal" => size.normal
+        =>          size.small
+
+classifyZone(float oscVal, float obLvl, float osLvl) =>
+    if oscVal >= obLvl
+        ZONE_STRONG_BULL
+    else if oscVal > 0
+        ZONE_WEAK_BULL
+    else if oscVal <= osLvl
+        ZONE_STRONG_BEAR
+    else if oscVal < 0
+        ZONE_WEAK_BEAR
+    else
+        ZONE_NEUTRAL
+
+zoneLabel(int zone) =>
+    switch zone
+        ZONE_STRONG_BULL => "Strong Bull"
+        ZONE_WEAK_BULL   => "Weak Bull"
+        ZONE_STRONG_BEAR => "Strong Bear"
+        ZONE_WEAK_BEAR   => "Weak Bear"
+        =>                  "Neutral"
+
+zoneColor(int zone) =>
+    switch zone
+        ZONE_STRONG_BULL => color.new(#26a69a, 0)
+        ZONE_WEAK_BULL   => color.new(#26a69a, 40)
+        ZONE_STRONG_BEAR => color.new(#ef5350, 0)
+        ZONE_WEAK_BEAR   => color.new(#ef5350, 40)
+        =>                  color.new(#787b86, 50)
+
+// ══════════════════════════════════════════════════════════════════
+// ─── CORE OSCILLATOR CALCULATION ───
+// ══════════════════════════════════════════════════════════════════
+
+float candleMidpoint = (high + low) / 2.0
+float midpointSma    = ta.sma(candleMidpoint, smaLenInput)
+float avgCandleRange = ta.sma(high - low, smaLenInput)
+float avgBodySize    = ta.sma(math.abs(close - open), smaLenInput)
+float channelOffset  = avgCandleRange * bandScaleInput / 100.0 * (1.0 + avgBodySize / math.max(avgCandleRange, 1e-10))
+float upperChannel   = midpointSma + channelOffset
+float lowerChannel   = midpointSma - channelOffset
+
+float bandSpan       = math.max(upperChannel - lowerChannel, 1e-10)
+float rawOscillator  = 100.0 * (close - lowerChannel) / bandSpan - 50.0
+float oscValue       = math.max(math.min(rawOscillator, 100.0), -100.0)
+
+float signalLine     = ta.sma(oscValue, signalLenInput)
+
+// ══════════════════════════════════════════════════════════════════
+// ─── MOMENTUM HISTOGRAM ───
+// ══════════════════════════════════════════════════════════════════
+
+float histValue = oscValue - signalLine
+
+color histColor = histValue >= 0 ?
+     (histValue >= histValue[1] ? histGrowBullInput : histFadeBullInput) :
+     (histValue <= histValue[1] ? histGrowBearInput : histFadeBearInput)
+
+// ══════════════════════════════════════════════════════════════════
+// ─── SQUEEZE DETECTION ───
+// ══════════════════════════════════════════════════════════════════
+
+float bandwidthPct   = bandSpan / math.max(midpointSma, 1e-10) * 100.0
+float bandwidthSma   = ta.sma(bandwidthPct, squeezeLenInput)
+bool  isSqueeze      = enableSqueezeInput and bandwidthPct < bandwidthSma * squeezeMultInput
+
+// ══════════════════════════════════════════════════════════════════
+// ─── ZONE CLASSIFICATION ───
+// ══════════════════════════════════════════════════════════════════
+
+int currentZone = classifyZone(oscValue, obThreshInput, osThreshInput)
+
+// ══════════════════════════════════════════════════════════════════
+// ─── DIVERGENCE DETECTION ───
+// ══════════════════════════════════════════════════════════════════
+
+int RANGE_UPPER = 60
+int RANGE_LOWER = 5
+int GRAD_TRANSP = 85
+
+pivotHighPrice  = ta.pivothigh(high, pivotLenInput, pivotLenInput)
+pivotLowPrice   = ta.pivotlow(low, pivotLenInput, pivotLenInput)
+pivotHighOsc    = ta.pivothigh(oscValue, pivotLenInput, pivotLenInput)
+pivotLowOsc     = ta.pivotlow(oscValue, pivotLenInput, pivotLenInput)
+
+var bool pivotLowFound  = false
+var bool pivotHighFound = false
+var bool bullDivCond    = false
+var bool bearDivCond    = false
+
+float oscAtPivot = oscValue[pivotLenInput]
+
+inDivRange(bool cond) =>
+    int barCount = ta.barssince(cond)
+    RANGE_LOWER <= barCount and barCount <= RANGE_UPPER
+
+if enableDivInput
+    pivotLowFound := not na(pivotLowOsc)
+    bool oscHigherLow  = oscAtPivot > ta.valuewhen(pivotLowFound, oscAtPivot, 1) and inDivRange(pivotLowFound[1])
+    float priceLow     = low[pivotLenInput]
+    bool  priceLowerLow = priceLow < ta.valuewhen(pivotLowFound, priceLow, 1)
+    bullDivCond := priceLowerLow and oscHigherLow and pivotLowFound
+
+    pivotHighFound := not na(pivotHighOsc)
+    bool oscLowerHigh  = oscAtPivot < ta.valuewhen(pivotHighFound, oscAtPivot, 1) and inDivRange(pivotHighFound[1])
+    float priceHigh    = high[pivotLenInput]
+    bool  priceHigherHigh = priceHigh > ta.valuewhen(pivotHighFound, priceHigh, 1)
+    bearDivCond := priceHigherHigh and oscLowerHigh and pivotHighFound
+
+// Track recent divergence for confluence filter
+var int barsSinceBullDiv = 999
+var int barsSinceBearDiv = 999
+barsSinceBullDiv := bullDivCond ? 0 : barsSinceBullDiv + 1
+barsSinceBearDiv := bearDivCond ? 0 : barsSinceBearDiv + 1
+bool recentBullDiv = barsSinceBullDiv <= 10
+bool recentBearDiv = barsSinceBearDiv <= 10
+
+// ══════════════════════════════════════════════════════════════════
+// ─── SIGNAL GENERATION + COOLDOWN ───
+// ══════════════════════════════════════════════════════════════════
+
+// Raw crossover signals
+bool rawLongObos    = ta.crossover(oscValue, osThreshInput)
+bool rawShortObos   = ta.crossunder(oscValue, obThreshInput)
+bool rawLongZero    = ta.crossover(oscValue, 0)
+bool rawShortZero   = ta.crossunder(oscValue, 0)
+bool rawLongMaZero  = ta.crossover(signalLine, 0)
+bool rawShortMaZero = ta.crossunder(signalLine, 0)
+
+// Confluence gate: if enabled, OB/OS signals require recent divergence
+bool longObos  = enableConfluenceInput ? (rawLongObos and recentBullDiv) : rawLongObos
+bool shortObos = enableConfluenceInput ? (rawShortObos and recentBearDiv) : rawShortObos
+
+// Cooldown tracking
+var int lastLongBar  = -999
+var int lastShortBar = -999
+
+bool cooldownLongOk  = (bar_index - lastLongBar) >= cooldownBarsInput
+bool cooldownShortOk = (bar_index - lastShortBar) >= cooldownBarsInput
+
+// Apply cooldown to all long/short signals
+bool longObosFiltered    = longObos and cooldownLongOk
+bool shortObosFiltered   = shortObos and cooldownShortOk
+bool longZeroFiltered    = rawLongZero and cooldownLongOk
+bool shortZeroFiltered   = rawShortZero and cooldownShortOk
+bool longMaZeroFiltered  = rawLongMaZero and cooldownLongOk
+bool shortMaZeroFiltered = rawShortMaZero and cooldownShortOk
+
+// Update cooldown bars
+bool anyLongFired  = longObosFiltered or longZeroFiltered or longMaZeroFiltered
+bool anyShortFired = shortObosFiltered or shortZeroFiltered or shortMaZeroFiltered
+
+if anyLongFired
+    lastLongBar := bar_index
+if anyShortFired
+    lastShortBar := bar_index
+
+// Visibility flags
+bool showObos   = signalModeInput == "Overbought/Oversold" or signalModeInput == "All"
+bool showZero   = signalModeInput == "Zero Line" or signalModeInput == "All"
+bool showMaZero = signalModeInput == "MA Zero Line" or signalModeInput == "All"
+
+// ══════════════════════════════════════════════════════════════════
+// ─── PLOTS ───
+// ══════════════════════════════════════════════════════════════════
+
+// Zero line
+hline(0, title = "Zero Line", color = zeroTintInput, linestyle = hline.style_dashed)
+plot(showZeroGradInput ? 0 : na, title = "Zero Gradient", color = color.new(zeroTintInput, GRAD_TRANSP), linewidth = 10, editable = false)
+
+// OB / OS levels
+hline(obThreshInput, title = "Overbought Level", color = obTintInput, linestyle = hline.style_dashed)
+hline(osThreshInput, title = "Oversold Level", color = osTintInput, linestyle = hline.style_dashed)
+
+color obGradColor = signalLine >= maObThreshInput ? obTintInput : zeroTintInput
+color osGradColor = signalLine <= maOsThreshInput ? osTintInput : zeroTintInput
+plot(showObGradInput ? obThreshInput : na, title = "OB Gradient", color = color.new(obGradColor, bandTranspInput), linewidth = 10, editable = false)
+plot(showOsGradInput ? osThreshInput : na, title = "OS Gradient", color = color.new(osGradColor, bandTranspInput), linewidth = 10, editable = false)
+
+// Oscillator
+color oscPlotColor = oscValue >= 0 ? bullOscTintInput : bearOscTintInput
+pOsc = plot(oscValue, title = "Oscillator", color = oscPlotColor, linewidth = 2)
+plot(showOscGradInput ? oscValue : na, title = "Osc Gradient", color = color.new(oscPlotColor, GRAD_TRANSP), linewidth = 10)
+
+// Signal SMA
+pSignal = plot(signalLine, title = "Signal SMA", color = signalTintInput, linewidth = 2, style = plot.style_line)
+plot(showMaGradInput ? signalLine : na, title = "MA Gradient", color = color.new(signalTintInput, GRAD_TRANSP), linewidth = 6)
+
+// Momentum histogram
+plot(showHistInput ? histValue : na, title = "Momentum Histogram", color = histColor, style = plot.style_columns, linewidth = 1)
+
+// Gradient fill layers (oscillator to zero)
+pMid1 = plot(oscValue * 0.8, title = "Mid Layer 1", color = na, display = display.none)
+pMid2 = plot(oscValue * 0.6, title = "Mid Layer 2", color = na, display = display.none)
+pMid3 = plot(oscValue * 0.4, title = "Mid Layer 3", color = na, display = display.none)
+pMid4 = plot(oscValue * 0.2, title = "Mid Layer 4", color = na, display = display.none)
+pZero = plot(0, title = "Zero Fill", color = na, display = display.none)
+
+fill(pOsc,  pMid1, color = enableFillInput ? color.new(oscPlotColor, fillTranspInput)      : na, title = "Fill 1")
+fill(pMid1, pMid2, color = enableFillInput ? color.new(oscPlotColor, fillTranspInput + 5)  : na, title = "Fill 2")
+fill(pMid2, pMid3, color = enableFillInput ? color.new(oscPlotColor, fillTranspInput + 10) : na, title = "Fill 3")
+fill(pMid3, pMid4, color = enableFillInput ? color.new(oscPlotColor, fillTranspInput + 15) : na, title = "Fill 4")
+fill(pMid4, pZero, color = enableFillInput ? color.new(oscPlotColor, fillTranspInput + 20) : na, title = "Fill 5")
+
+// Squeeze marker on zero line
+plotshape(isSqueeze, title = "Squeeze Dot", style = shape.diamond, location = location.absolute, color = color.new(#ff9800, 30), size = size.tiny, text = "", offset = 0)
+
+// Zone background
+color zoneBgColor = showZoneBgInput ?
+     (currentZone == ZONE_STRONG_BULL ? color.new(#26a69a, 92) :
+      currentZone == ZONE_WEAK_BULL   ? color.new(#26a69a, 96) :
+      currentZone == ZONE_STRONG_BEAR ? color.new(#ef5350, 92) :
+      currentZone == ZONE_WEAK_BEAR   ? color.new(#ef5350, 96) :
+      na) : na
+bgcolor(zoneBgColor, title = "Zone Background")
+
+// ══════════════════════════════════════════════════════════════════
+// ─── DIVERGENCE PLOTS ───
+// ══════════════════════════════════════════════════════════════════
+
+plot(enableDivInput and pivotLowFound ? oscAtPivot : na, offset = -pivotLenInput, title = "Bull Div Line", linewidth = 2,
+     color = bullDivCond ? bullDivTintInput : color.new(color.white, 100))
+plot(enableDivInput and pivotHighFound ? oscAtPivot : na, offset = -pivotLenInput, title = "Bear Div Line", linewidth = 2,
+     color = bearDivCond ? bearDivTintInput : color.new(color.white, 100))
+
+plotshape(bullDivCond ? oscAtPivot : na, offset = -pivotLenInput, title = "Bull Div Label", text = " Bull ",
+     style = shape.labelup, location = location.absolute, color = color.new(bullDivTintInput, bandTranspInput),
+     textcolor = labelTextTintInput, display = enableDivInput ? display.all : display.none)
+plotshape(bearDivCond ? oscAtPivot : na, offset = -pivotLenInput, title = "Bear Div Label", text = " Bear ",
+     style = shape.labeldown, location = location.absolute, color = color.new(bearDivTintInput, bandTranspInput),
+     textcolor = labelTextTintInput, display = enableDivInput ? display.all : display.none)
+
+// ══════════════════════════════════════════════════════════════════
+// ─── SIGNAL PLOTS ───
+// ══════════════════════════════════════════════════════════════════
+
+plotshape(showObos and longObosFiltered ? oscValue : na, title = "Buy (OB/OS)", location = location.bottom,
+     color = osTintInput, style = shape.triangleup, size = size.tiny)
+plotshape(showObos and shortObosFiltered ? oscValue : na, title = "Sell (OB/OS)", location = location.top,
+     color = obTintInput, style = shape.triangledown, size = size.tiny)
+plotshape(showZero and longZeroFiltered ? oscValue : na, title = "Buy (Zero)", location = location.bottom,
+     color = osTintInput, style = shape.triangleup, size = size.tiny)
+plotshape(showZero and shortZeroFiltered ? oscValue : na, title = "Sell (Zero)", location = location.top,
+     color = obTintInput, style = shape.triangledown, size = size.tiny)
+plotshape(showMaZero and longMaZeroFiltered ? signalLine : na, title = "Buy (MA Zero)", location = location.bottom,
+     color = osTintInput, style = shape.triangleup, size = size.tiny)
+plotshape(showMaZero and shortMaZeroFiltered ? signalLine : na, title = "Sell (MA Zero)", location = location.top,
+     color = obTintInput, style = shape.triangledown, size = size.tiny)
+
+// ══════════════════════════════════════════════════════════════════
+// ─── DASHBOARD ───
+// ══════════════════════════════════════════════════════════════════
+
+var table dashPanel = na
+
+if showDashInput and barstate.islast
+    tblPos  = resolveTablePos(dashPosInput)
+    tblSize = resolveTextSize(dashSizeInput)
+
+    dashPanel := table.new(tblPos, 2, 8, bgcolor = color.new(#1e222d, 10), border_color = color.new(chart.fg_color, 80), border_width = 1, frame_color = color.new(chart.fg_color, 80), frame_width = 1)
+
+    // Header
+    table.cell(dashPanel, 0, 0, "VP - VCO", text_color = color.new(#2196f3, 0), text_size = tblSize, text_halign = text.align_center)
+    table.merge_cells(dashPanel, 0, 0, 1, 0)
+
+    // Oscillator value
+    table.cell(dashPanel, 0, 1, "Oscillator", text_color = chart.fg_color, text_size = tblSize)
+    table.cell(dashPanel, 1, 1, str.tostring(math.round(oscValue, 2)), text_color = oscPlotColor, text_size = tblSize)
+
+    // Signal line
+    table.cell(dashPanel, 0, 2, "Signal", text_color = chart.fg_color, text_size = tblSize)
+    table.cell(dashPanel, 1, 2, str.tostring(math.round(signalLine, 2)), text_color = signalTintInput, text_size = tblSize)
+
+    // Histogram
+    table.cell(dashPanel, 0, 3, "Histogram", text_color = chart.fg_color, text_size = tblSize)
+    table.cell(dashPanel, 1, 3, str.tostring(math.round(histValue, 2)), text_color = histColor, text_size = tblSize)
+
+    // Zone
+    string zoneStr = zoneLabel(currentZone)
+    color  zoneClr = zoneColor(currentZone)
+    table.cell(dashPanel, 0, 4, "Zone", text_color = chart.fg_color, text_size = tblSize)
+    table.cell(dashPanel, 1, 4, zoneStr, text_color = zoneClr, text_size = tblSize)
+
+    // Squeeze
+    string sqzStr = isSqueeze ? "ACTIVE" : "None"
+    color  sqzClr = isSqueeze ? color.new(#ff9800, 0) : color.new(#787b86, 50)
+    table.cell(dashPanel, 0, 5, "Squeeze", text_color = chart.fg_color, text_size = tblSize)
+    table.cell(dashPanel, 1, 5, sqzStr, text_color = sqzClr, text_size = tblSize)
+
+    // Divergence
+    string divStr = recentBullDiv ? "Bull" : recentBearDiv ? "Bear" : "None"
+    color  divClr = recentBullDiv ? bullDivTintInput : recentBearDiv ? bearDivTintInput : color.new(#787b86, 50)
+    table.cell(dashPanel, 0, 6, "Divergence", text_color = chart.fg_color, text_size = tblSize)
+    table.cell(dashPanel, 1, 6, divStr, text_color = divClr, text_size = tblSize)
+
+    // Branding
+    table.cell(dashPanel, 0, 7, "VIPRASOL", text_color = color.new(#2196f3, 30), text_size = size.tiny, text_halign = text.align_center)
+    table.merge_cells(dashPanel, 0, 7, 1, 7)
+
+// ══════════════════════════════════════════════════════════════════
+// ─── ALERTS — DYNAMIC v6 ───
+// ══════════════════════════════════════════════════════════════════
+
+if anyLongFired
+    alert("VP-VCO | BULLISH SIGNAL | " + syminfo.ticker + " | " + timeframe.period +
+         " | Price: " + str.tostring(close) + " | Osc: " + str.tostring(math.round(oscValue, 2)) +
+         " | Zone: " + zoneLabel(currentZone) +
+         (isSqueeze ? " | SQUEEZE" : ""), alert.freq_once_per_bar_close)
+
+if anyShortFired
+    alert("VP-VCO | BEARISH SIGNAL | " + syminfo.ticker + " | " + timeframe.period +
+         " | Price: " + str.tostring(close) + " | Osc: " + str.tostring(math.round(oscValue, 2)) +
+         " | Zone: " + zoneLabel(currentZone) +
+         (isSqueeze ? " | SQUEEZE" : ""), alert.freq_once_per_bar_close)
+
+if isSqueeze and not isSqueeze[1]
+    alert("VP-VCO | SQUEEZE STARTED | " + syminfo.ticker + " | " + timeframe.period +
+         " | Bandwidth: " + str.tostring(math.round(bandwidthPct, 3)) + "%", alert.freq_once_per_bar_close)
+
+// ─── Legacy alertcondition (static) ───
+alertcondition(bullDivCond, title = "Bullish Divergence", message = "VP-VCO: Bullish divergence detected at oscillator pivot.")
+alertcondition(bearDivCond, title = "Bearish Divergence", message = "VP-VCO: Bearish divergence detected at oscillator pivot.")
+alertcondition(longObosFiltered, title = "Buy Signal (OB/OS)", message = "VP-VCO: Oscillator crossed above oversold threshold.")
+alertcondition(shortObosFiltered, title = "Sell Signal (OB/OS)", message = "VP-VCO: Oscillator crossed below overbought threshold.")
+alertcondition(rawLongZero, title = "Buy Signal (Zero)", message = "VP-VCO: Oscillator crossed above zero line.")
+alertcondition(rawShortZero, title = "Sell Signal (Zero)", message = "VP-VCO: Oscillator crossed below zero line.")
+alertcondition(rawLongMaZero, title = "Buy Signal (MA Zero)", message = "VP-VCO: Signal SMA crossed above zero line.")
+alertcondition(rawShortMaZero, title = "Sell Signal (MA Zero)", message = "VP-VCO: Signal SMA crossed below zero line.")
+alertcondition(isSqueeze and not isSqueeze[1], title = "Squeeze Started", message = "VP-VCO: Volatility squeeze detected — bandwidth contracted below average.")
+alertcondition(anyLongFired, title = "Any Bullish Signal", message = "VP-VCO: A bullish signal fired (any type).")
+alertcondition(anyShortFired, title = "Any Bearish Signal", message = "VP-VCO: A bearish signal fired (any type).")

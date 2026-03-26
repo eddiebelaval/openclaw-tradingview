@@ -1,0 +1,128 @@
+// © Karpychev Igor Sergeevich
+//@version=6
+indicator("Capital Dynamics v0.3", shorttitle="CD v0.3", overlay=false)
+
+// ==========================================
+//               НАСТРОЙКИ
+// ==========================================
+group_math = "Математика ядра (Без ATR/TR/ER)"
+slow_len   = input.int(10, "Базовый период памяти (Slow)", minval=2, group=group_math)
+fast_len   = input.int(3, "Турбо-период (Fast)", minval=1, group=group_math)
+decay_rate = input.float(0.7, "Коэффициент полураспада (Decay)", minval=0.1, maxval=0.9, step=0.1, group=group_math, tooltip="Сколько старой энергии остается на следующем баре. 0.7 = 70%. Заменяет жесткую сумму.")
+mult       = input.float(1.5, "Множитель каналов сжатия", minval=0.5, step=0.1, group=group_math)
+
+group_style = "Визуал NSFO"
+bullColor   = input.color(#089981, "Цвет Быков", inline="colors", group=group_style)
+bearColor   = input.color(#F23645, "Цвет Медведей", inline="colors", group=group_style)
+
+// ==========================================
+//    ШАГ 1: АБСОЛЮТНАЯ КИНЕТИКА + ДЕТЕКТОР ГЭПОВ
+// ==========================================
+float body_abs   = math.abs(close - open)
+float upper_wick = high - math.max(open, close)
+float lower_wick = math.min(open, close) - low
+
+// Детектор скрытой энергии (разрывы цены)
+float prev_close = nz(close[1], open)
+float gap_up     = open > prev_close ? open - prev_close : 0
+float gap_down   = open < prev_close ? prev_close - open : 0
+float abs_gap    = gap_up + gap_down
+
+// Полный честный путь (БЕЗ искусственного раздутия теней х2)
+float total_path = upper_wick + lower_wick + body_abs + abs_gap
+total_path := total_path == 0 ? 0.00001 : total_path 
+
+// Разделение тел
+float bull_body = close > open ? body_abs : 0
+float bear_body = close < open ? body_abs : 0
+
+// Сырая сила
+float bull_force = bull_body + lower_wick + gap_up
+float bear_force = bear_body + upper_wick + gap_down
+
+// ==========================================
+//    ШАГ 2: КИНЕТИЧЕСКИЕ БАССЕЙНЫ ПОЛУРАСПАДА
+// ==========================================
+// Энергия больше не обрубается топором, она испаряется плавно!
+float pool_bull = 0.0
+float pool_bear = 0.0
+float pool_path = 0.0
+
+pool_bull := bull_force + nz(pool_bull[1]) * decay_rate
+pool_bear := bear_force + nz(pool_bear[1]) * decay_rate
+pool_path := total_path + nz(pool_path[1]) * decay_rate
+
+// Считаем среднюю волатильность одной свечи для защиты от штиля
+float avg_path = ta.sma(total_path, slow_len)
+avg_path := avg_path == 0 ? 0.00001 : avg_path
+
+// Высчитываем эквивалентный объем бассейна для порога активности
+float decay_mult = 1.0 / (1.0 - decay_rate)
+bool is_active = pool_path > (avg_path * decay_mult * 0.7)
+
+// Ищем доминацию через плавные бассейны, а не сырые пункты
+bool bull_impulse = (pool_bull > (pool_bear * 1.5)) and is_active
+bool bear_impulse = (pool_bear > (pool_bull * 1.5)) and is_active
+
+var float adapt_len = na
+if na(adapt_len)
+    adapt_len := slow_len
+
+if bull_impulse or bear_impulse
+    adapt_len := fast_len
+else
+    // Плавно возвращаем память
+    adapt_len := math.min(slow_len, adapt_len + 1)
+
+// ==========================================
+//    ШАГ 3: КАСТОМНОЕ СГЛАЖИВАНИЕ RMA (WILDER)
+// ==========================================
+// Сглаживаем СЫРЫЕ пункты (бассейны нужны только для триггера памяти!)
+f_adaptive_rma(series float src, series float dyn_len) =>
+    float rma = 0.0
+    rma := na(rma[1]) ? src : (src + nz(rma[1]) * (dyn_len - 1.0)) / dyn_len
+    rma
+
+float sm_bull = f_adaptive_rma(bull_force, adapt_len)
+float sm_bear = f_adaptive_rma(bear_force, adapt_len)
+float sm_path = f_adaptive_rma(total_path, adapt_len)
+
+sm_path := sm_path <= 0 ? 0.00001 : sm_path
+
+// Проценты доминации от плавной волны
+float smoothed_cd_plus = (sm_bull / sm_path) * 100
+float smoothed_cd_minus = (sm_bear / sm_path) * 100
+float raw_cd_net = smoothed_cd_plus - smoothed_cd_minus
+
+// Финальная визуальная полировка линии (TEMA с коротким периодом 5)
+f_tema(series float src, int len) =>
+    float ema1 = ta.ema(src, len)
+    float ema2 = ta.ema(ema1, len)
+    float ema3 = ta.ema(ema2, len)
+    3 * (ema1 - ema2) + ema3
+
+float smoothed_cd_net = f_tema(raw_cd_net, 5)
+
+// ==========================================
+//    ШАГ 4: СЖАТИЕ/РАСШИРЕНИЕ И ВИЗУАЛ
+// ==========================================
+float stdev_net = ta.stdev(smoothed_cd_net, slow_len)
+float upper_band = stdev_net * mult
+float lower_band = -stdev_net * mult
+
+color oscColor = color.from_gradient(smoothed_cd_net, lower_band, upper_band, bearColor, bullColor)
+
+plot(upper_band, "Upper Band", color = color.new(bearColor, 50), style = plot.style_line, linewidth = 1)
+plot(lower_band, "Lower Band", color = color.new(bullColor, 50), style = plot.style_line, linewidth = 1)
+
+// Нулевая линия снова выводится в статус (убрали display.pane)
+baseline = plot(0, "Baseline", color = color.new(color.gray, 50))
+
+oscPlot = plot(smoothed_cd_net, "CD Net", color = oscColor, linewidth = 2, style = plot.style_line)
+
+// Гистограмма остается скрытой из статуса
+plot(smoothed_cd_net, "Histogram", color = color.new(oscColor, 70), style = plot.style_histogram, display=display.pane)
+
+fill(oscPlot, baseline, math.max(smoothed_cd_net, 0), math.min(smoothed_cd_net, 0), 
+     smoothed_cd_net > 0 ? color.new(bullColor, 50) : color.new(bearColor, 100), 
+     smoothed_cd_net > 0 ? color.new(bullColor, 100) : color.new(bearColor, 50))

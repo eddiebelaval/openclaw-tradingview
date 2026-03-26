@@ -1,0 +1,147 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © Tonzlnxz
+
+//@version=6
+indicator("Elder Unified Trading System", shorttitle="Elder Unified", overlay=true, max_lines_count=500, max_labels_count=500)
+
+// ═════════════════════════════════════════════════════════════════════════════
+// 1. SETTINGS & CONFIGURATION
+// ═════════════════════════════════════════════════════════════════════════════
+
+// --- Strategy Logic ---
+grp_strat   = "1. System Control"
+trade_mode  = input.string("Standard (Triple Screen)", "Signal Logic", options=["Standard (Triple Screen)", "Aggressive (Impulse Momentum)", "Hybrid (Show All)"], group=grp_strat)
+tide_src    = input.string("HTF EMA Direction (Trend)", "Tide Filter (Screen 1)", options=["MACD Histogram Slope (Classic)", "HTF EMA Direction (Trend)"], group=grp_strat, tooltip="• MACD Slope: Classic Elder. Very strict.\n• EMA Direction: Trend Following. Buys allowed as long as price is above HTF EMA.")
+tf_mult     = input.int(5, "HTF Multiplier", minval=2, group=grp_strat, tooltip="Example: 5 on M15 = H1 Data.")
+
+// --- Visual Settings ---
+grp_vis     = "2. Visual Style"
+show_emas   = input.bool(true, "Show Tactical EMAs (13 & 26)", group=grp_vis)
+show_htf    = input.bool(true, "Show HTF EMA (200)", group=grp_vis)
+show_chan   = input.bool(true, "Show Envelope Channel", group=grp_vis)
+col_bull    = input.color(#089981, "Impulse Bullish", group=grp_vis)
+col_bear    = input.color(#f23645, "Impulse Bearish", group=grp_vis)
+col_neut    = input.color(#5b9cf6, "Impulse Neutral", group=grp_vis)
+
+// --- Engine Parameters ---
+grp_eng     = "⚙️ Engine Parameters"
+ema_fast_len= input.int(13, "Tactical EMA Fast", group=grp_eng)
+ema_slow_len= input.int(26, "Tactical EMA Slow", group=grp_eng)
+ema_L_len   = input.int(200, "Strategic (HTF) EMA", group=grp_eng)
+macd_fast   = input.int(12, "MACD Fast", group=grp_eng)
+macd_slow   = input.int(26, "MACD Slow", group=grp_eng)
+macd_sig    = input.int(9,  "MACD Signal", group=grp_eng)
+stoch_k     = input.int(14, "Stoch K Length", group=grp_eng)
+stoch_ob    = input.int(80, "Stoch Overbought", group=grp_eng)
+stoch_os    = input.int(20, "Stoch Oversold", group=grp_eng)
+env_len     = input.int(26, "Envelope Baseline", group=grp_eng)
+env_mult    = input.float(2.7, "Envelope Factor", step=0.1, group=grp_eng)
+
+// ═════════════════════════════════════════════════════════════════════════════
+// 2. CALCULATIONS
+// ═════════════════════════════════════════════════════════════════════════════
+
+// ➤ Screen 1: The Tide (Higher Timeframe)
+f_getHTF(_mult) =>
+    _min = timeframe.in_seconds(timeframe.period) / 60
+    _target = math.round(_min * _mult)
+    _res = timeframe.isdaily ? str.tostring(timeframe.multiplier * _mult) + "D" : 
+           timeframe.isweekly ? str.tostring(timeframe.multiplier * _mult) + "W" : 
+           str.tostring(_target)
+    _res
+
+htf_res = f_getHTF(tf_mult)
+
+// Fetch HTF Data securely
+[macd_L, sig_L, hist_L] = request.security(syminfo.tickerid, htf_res, ta.macd(close, macd_fast, macd_slow, macd_sig), gaps = barmerge.gaps_off, lookahead = barmerge.lookahead_off)
+ema_L_val = request.security(syminfo.tickerid, htf_res, ta.ema(close, ema_L_len), gaps = barmerge.gaps_off, lookahead = barmerge.lookahead_off)
+close_L   = request.security(syminfo.tickerid, htf_res, close, gaps = barmerge.gaps_off, lookahead = barmerge.lookahead_off)
+
+// Tide Logic
+bool tide_bull = tide_src == "MACD Histogram Slope (Classic)" ? hist_L > hist_L[1] : close_L > ema_L_val
+bool tide_bear = tide_src == "MACD Histogram Slope (Classic)" ? hist_L < hist_L[1] : close_L < ema_L_val
+
+// ➤ Screen 2: The Wave (Tactical Chart)
+ema_13 = ta.ema(close, ema_fast_len)
+ema_26 = ta.ema(close, ema_slow_len)
+[macd_S, sig_S, hist_S] = ta.macd(close, macd_fast, macd_slow, macd_sig)
+
+// Impulse Logic
+impulse_up   = ema_13 > ema_13[1] and hist_S > hist_S[1]
+impulse_down = ema_13 < ema_13[1] and hist_S < hist_S[1]
+
+// Stochastic
+stoch_val = ta.stoch(close, high, low, stoch_k)
+stoch_smooth = ta.sma(stoch_val, 3)
+
+// ➤ Screen 3: The Ripple (Trigger)
+trigger_buy  = close > high[1]
+trigger_sell = close < low[1]
+
+// ➤ AutoEnvelope
+env_basis = ta.ema(close, env_len)
+env_dev   = ta.sma(math.abs(close - env_basis), 100) * env_mult
+env_upper = env_basis + env_dev
+env_lower = env_basis - env_dev
+
+// ═════════════════════════════════════════════════════════════════════════════
+// 3. SIGNAL GENERATION
+// ═════════════════════════════════════════════════════════════════════════════
+
+stoch_crossover  = ta.crossover(stoch_smooth, stoch_os)
+stoch_crossunder = ta.crossunder(stoch_smooth, stoch_ob)
+buy_zone         = stoch_smooth < stoch_os or stoch_crossover
+sell_zone        = stoch_smooth > stoch_ob or stoch_crossunder
+
+sig_std_buy  = tide_bull and buy_zone and trigger_buy
+sig_std_sell = tide_bear and sell_zone and trigger_sell
+sig_mom_buy  = tide_bull and impulse_up and not impulse_up[1]
+sig_mom_sell = tide_bear and impulse_down and not impulse_down[1]
+
+bool plot_buy_std  = (trade_mode == "Standard (Triple Screen)" or trade_mode == "Hybrid (Show All)") and sig_std_buy
+bool plot_sell_std = (trade_mode == "Standard (Triple Screen)" or trade_mode == "Hybrid (Show All)") and sig_std_sell
+bool plot_buy_mom  = (trade_mode == "Aggressive (Impulse Momentum)" or trade_mode == "Hybrid (Show All)") and sig_mom_buy
+bool plot_sell_mom = (trade_mode == "Aggressive (Impulse Momentum)" or trade_mode == "Hybrid (Show All)") and sig_mom_sell
+
+// ═════════════════════════════════════════════════════════════════════════════
+// 4. PLOTTING & VISUALS
+// ═════════════════════════════════════════════════════════════════════════════
+
+barcolor(impulse_up ? col_bull : impulse_down ? col_bear : col_neut, title="Impulse Candles")
+
+plot(show_emas ? ema_13 : na, "Tactical EMA 13", color.new(col_bull, 0), 1)
+plot(show_emas ? ema_26 : na, "Tactical EMA 26", color.new(col_neut, 0), 1)
+plot(show_htf ? ema_L_val : na, "HTF EMA 200", color.new(chart.fg_color, 0), 2)
+
+p_up = plot(show_chan ? env_upper : na, "Env Upper", color.new(color.gray, 50))
+p_dn = plot(show_chan ? env_lower : na, "Env Lower", color.new(color.gray, 50))
+fill(p_up, p_dn, color.new(col_neut, 90), "Channel Fill")
+
+plotshape(plot_buy_std, "TS Buy", shape.labelup, location.belowbar, col_bull, size=size.small, text="TS BUY", textcolor=color.white)
+plotshape(plot_sell_std, "TS Sell", shape.labeldown, location.abovebar, col_bear, size=size.small, text="TS SELL", textcolor=color.white)
+plotshape(plot_buy_mom, "Mom Buy", shape.triangleup, location.belowbar, col_bull, size=size.tiny, text="MOM", textcolor=col_bull)
+plotshape(plot_sell_mom, "Mom Sell", shape.triangledown, location.abovebar, col_bear, size=size.tiny, text="MOM", textcolor=col_bear)
+
+// ═════════════════════════════════════════════════════════════════════════════
+// 5. DASHBOARD
+// ═════════════════════════════════════════════════════════════════════════════
+var table dash = table.new(position.top_right, 2, 4, bgcolor = color.new(color.black, 40), border_width=1, border_color=color.gray)
+
+if barstate.islast
+    table.cell(dash, 0, 0, "SYSTEM", bgcolor=color.new(color.gray, 20), text_color=color.white, text_size=size.small)
+    table.cell(dash, 1, 0, "STATUS", bgcolor=color.new(color.gray, 20), text_color=color.white, text_size=size.small)
+    
+    table.cell(dash, 0, 1, "Tide (HTF)", text_color=color.white, text_size=size.small, text_halign=text.align_left)
+    table.cell(dash, 1, 1, tide_bull ? "BULLISH" : "BEARISH", text_color=tide_bull ? col_bull : col_bear, text_size=size.small)
+    
+    wave_txt = stoch_smooth < stoch_os ? "OVERSOLD" : stoch_smooth > stoch_ob ? "OVERBOUGHT" : "NEUTRAL"
+    table.cell(dash, 0, 2, "Wave (Stoch)", text_color=color.white, text_size=size.small, text_halign=text.align_left)
+    table.cell(dash, 1, 2, wave_txt, text_color=stoch_smooth < stoch_os ? col_bull : stoch_smooth > stoch_ob ? col_bear : color.gray, text_size=size.small)
+
+    imp_txt = impulse_up ? "MOM UP" : impulse_down ? "MOM DOWN" : "NEUTRAL"
+    table.cell(dash, 0, 3, "Impulse", text_color=color.white, text_size=size.small, text_halign=text.align_left)
+    table.cell(dash, 1, 3, imp_txt, text_color=impulse_up ? col_bull : impulse_down ? col_bear : col_neut, text_size=size.small)
+
+// Alerts
+alertcondition(plot_buy_std or plot_buy_mom, "Unified BUY", "Buy Signal Detected")
+alertcondition(plot_sell_std or plot_sell_mom, "Unified SELL", "Sell Signal Detected")

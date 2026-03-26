@@ -1,0 +1,426 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © TheRealDrip2Rip
+
+//@version=5
+indicator(title="RSI Extension + Divergence", shorttitle="RSI Div+", overlay=true, max_lines_count=500, max_labels_count=500)
+
+//  INPUTS
+grp_rsi = "RSI Settings"
+rsiLength   = input.int(14,       title="RSI Length",                 group=grp_rsi)
+rsiSource   = input.source(close, title="RSI Source",                 group=grp_rsi)
+obLevel     = input.int(70,       title="Overbought Level",           group=grp_rsi, minval=50, maxval=100)
+osLevel     = input.int(30,       title="Oversold Level",             group=grp_rsi, minval=0,  maxval=50)
+
+grp_div = "Divergence Settings"
+lookback    = input.int(7,        title="Pivot Lookback",             group=grp_div, minval=2,  maxval=20)
+divLookback = input.int(60,       title="Divergence Lookback (bars)", group=grp_div, minval=10, maxval=200)
+showBearDiv = input.bool(true,    title="Show Bearish Divergence",    group=grp_div)
+showBullDiv = input.bool(true,    title="Show Bullish Divergence",    group=grp_div)
+showHidBear = input.bool(true,    title="Show Hidden Bearish Div",    group=grp_div)
+showHidBull = input.bool(true,    title="Show Hidden Bullish Div",    group=grp_div)
+
+grp_style = "Style"
+theme = input.string("Gray Scale", title="Theme", group=grp_style,
+     options=["Gray Scale", "Normal", "Neon", "Sunset Vapor"])
+
+// Level-up visuals (NO logic changes)
+extendRight      = input.bool(false, "Extend Divergence Lines → Right", group=grp_style)
+showEndLabels    = input.bool(true,  "Show End Labels (Div Type)",      group=grp_style)
+showPivotDots    = input.bool(true,  "Show Pivot Dots",                 group=grp_style)
+baseLineWidth    = input.int(4, "Base Line Width", group=grp_style, minval=1, maxval=8)
+coreLineWidth    = input.int(2, "Core Line Width", group=grp_style, minval=1, maxval=6)
+maxDrawings      = input.int(80, "Max Divergence Drawings (auto-clean)", group=grp_style, minval=20, maxval=400)
+
+grp_dash = "Dashboard"
+showDash     = input.bool(true,   title="Show Dashboard", group=grp_dash)
+dashPosition = input.string("Top Right", title="Position", group=grp_dash,
+     options=["Top Right","Top Left","Bottom Right","Bottom Left"])
+
+grp = "Ribbon"
+preset = input.string("Day Trading (9-12)", "Preset",
+     options=["Day Trading (9-12)", "Swing (21-34)", "Higher TF (50-80)"],
+     group=grp)
+
+src = input.source(hlc3, "Source", group=grp)
+showRibbon = input.bool(true, "Show Ribbon", group=grp)
+showCenter = input.bool(true, "Show Center Line", group=grp)
+
+smoothFactor = input.float(0.30, "EMA Smoothing", minval=0.05, maxval=0.90, step=0.05, group=grp)
+
+fillTrans = input.int(80, "Cloud Transparency (0-100)", minval=0, maxval=100, group=grp)
+edgeTrans = input.int(25, "Edge Transparency (0-100)",  minval=0, maxval=100, group=grp)
+centerW   = input.int(2, "Center Line Width", minval=1, maxval=4, group=grp)
+
+//  HELPERS
+xExtend = extendRight ? extend.right : extend.none
+
+// Drawing management (visual cleanup, no logic changes)
+var line[]  drawnLines  = array.new_line()
+var label[] drawnLabels = array.new_label()
+
+f_prune_drawings() =>
+    while array.size(drawnLines) > maxDrawings
+        ln = array.shift(drawnLines)
+        if not na(ln)
+            line.delete(ln)
+    while array.size(drawnLabels) > maxDrawings
+        lb = array.shift(drawnLabels)
+        if not na(lb)
+            label.delete(lb)
+
+// THEME SYSTEM (theme drives EVERYTHING)
+isGray   = theme == "Gray Scale"
+isNormal = theme == "Normal"
+isNeon   = theme == "Neon"
+isVapor  = theme == "Sunset Vapor"
+
+// Core UI palette
+bg        = isGray   ? color.rgb(0, 0, 0) : isNeon ? color.rgb(0, 0, 0) : isVapor ? color.rgb(10, 6, 14) : color.rgb(13, 17, 23)
+panel     = isGray   ? color.rgb(12, 12, 12) : isNeon ? color.rgb(8, 8, 12) : isVapor ? color.rgb(18, 10, 24)  : color.rgb(22, 27, 34)
+hdr       = isGray   ? color.rgb(30, 30, 30) : isNeon ? color.rgb(18, 18, 24) : isVapor ? color.rgb(30, 16, 36)  : color.rgb(33, 38, 45)
+border    = isGray   ? color.rgb(110, 110, 110) : isNeon ? color.rgb(60, 60, 70) : isVapor ? color.rgb(90, 70, 120) : color.rgb(48, 54, 61)
+
+txt       = isGray   ? color.rgb(235,235,235) : isNeon ? color.rgb(220,240,255) : isVapor ? color.rgb(250,235,255) : color.rgb(230,237,243)
+subtxt    = isGray   ? color.rgb(180,180,180) : isNeon ? color.rgb(140,200,255) : isVapor ? color.rgb(200,170,220) : color.rgb(139,148,158)
+
+// Signal palette
+bullCore  = isGray   ? color.rgb(220,220,220) : isNeon ? color.rgb(0, 255, 200)   : isVapor ? color.rgb(120, 210, 255): color.rgb(0, 230, 118)
+bearCore  = isGray   ? color.rgb(90,90,90)  : isNeon ? color.rgb(255, 50, 120)  : isVapor ? color.rgb(255, 120, 120): color.rgb(255, 61, 61)
+neuCore   = isGray   ? color.rgb(150,150,150) : isNeon ? color.rgb(180, 180, 255) : isVapor ? color.rgb(255, 190, 90) : color.rgb(158,158,158)
+
+warnCore  = isGray   ? color.rgb(235,235,235) : isNeon ? color.rgb(255, 255, 0)   : isVapor ? color.rgb(255, 160, 60) : color.rgb(255, 215, 64)
+
+// “Base” shadow behind core lines
+lineBase  = isGray   ? color.new(color.rgb(0,0,0), 0) :isNeon   ? color.new(color.rgb(0,0,0), 10) : isVapor  ? color.new(color.rgb(0,0,0), 18) :color.new(color.rgb(0,0,0), 22)
+
+// Divergence color variants (hidden = softer + more transparent)
+bearBase      = isGray ? color.new(color.rgb(0,0,0), 0)  : color.new(lineBase, 0)
+bullBase      = isGray ? color.new(color.rgb(0,0,0), 0)  : color.new(lineBase, 0)
+
+hidBearBase   = isGray ? color.new(color.rgb(0,0,0), 35) : color.new(lineBase, 45)
+hidBullBase   = isGray ? color.new(color.rgb(0,0,0), 35) : color.new(lineBase, 45)
+
+hidBearCore   = color.new(bearCore, isGray ? 35 : 55)
+hidBullCore   = color.new(bullCore, isGray ? 25 : 55)
+
+// Pivot dots
+bearCircle     = color.new(bearCore, 0)
+bullCircle     = color.new(bullCore, 0)
+hidBearCircle  = color.new(bearCore, isGray ? 25 : 45)
+hidBullCircle  = color.new(bullCore, isGray ? 25 : 45)
+
+// Dashboard palette
+schemeText     = txt
+schemeSub      = subtxt
+schemeBg       = color.new(bg, isGray ? 0 : 8)
+schemeCellBg   = color.new(panel, 0)
+schemeHdrBg    = color.new(hdr, 0)
+schemeBorder   = color.new(border, 0)
+
+// Labels should follow theme too
+labelTextCol   = isGray ? color.rgb(235,235,235) : txt
+labelBgBear    = color.new(bearCore, isGray ? 10 : 0)
+labelBgBull    = color.new(bullCore, isGray ? 10 : 0)
+labelBgHBear   = color.new(bearCore, isGray ? 35 : 55)
+labelBgHBull   = color.new(bullCore, isGray ? 35 : 55)
+
+// Ribbon theme colors
+ribUp   = bullCore
+ribDown = bearCore
+ribNeu  = neuCore
+
+//  RSI CALCULATION
+rsi = ta.rsi(rsiSource, rsiLength)
+
+//  PIVOT DETECTION
+pivotHigh_price = ta.pivothigh(high, lookback, lookback)
+pivotLow_price  = ta.pivotlow(low,  lookback, lookback)
+
+//  PIVOT HISTORY ARRAYS
+var float[] ph_price_vals = array.new_float(0)
+var int[]   ph_price_bars = array.new_int(0)
+var float[] pl_price_vals = array.new_float(0)
+var int[]   pl_price_bars = array.new_int(0)
+
+if not na(pivotHigh_price)
+    array.push(ph_price_vals, pivotHigh_price)
+    array.push(ph_price_bars, bar_index - lookback)
+    if array.size(ph_price_vals) > 10
+        array.shift(ph_price_vals)
+        array.shift(ph_price_bars)
+
+if not na(pivotLow_price)
+    array.push(pl_price_vals, pivotLow_price)
+    array.push(pl_price_bars, bar_index - lookback)
+    if array.size(pl_price_vals) > 10
+        array.shift(pl_price_vals)
+        array.shift(pl_price_bars)
+
+//  BEARISH DIVERGENCE
+bearDiv    = false
+hidBearDiv = false
+var int   bearDiv_bar1 = na
+var int   bearDiv_bar2 = na
+var float bearDiv_ph1  = na
+var float bearDiv_ph2  = na
+
+if not na(pivotHigh_price) and array.size(ph_price_vals) >= 2
+    currPH_price = array.get(ph_price_vals, array.size(ph_price_vals) - 1)
+    currPH_bar   = array.get(ph_price_bars, array.size(ph_price_bars) - 1)
+    rsi_at_curr  = rsi[lookback]
+
+    for i = array.size(ph_price_vals) - 2 to 0
+        prevPH_price = array.get(ph_price_vals, i)
+        prevPH_bar   = array.get(ph_price_bars, i)
+        if (currPH_bar - prevPH_bar) > 2 and (currPH_bar - prevPH_bar) <= divLookback
+            barsBack     = bar_index - lookback - prevPH_bar
+            rsi_at_prev  = rsi[barsBack + lookback]
+            if currPH_price > prevPH_price and rsi_at_curr < rsi_at_prev
+                bearDiv      := true
+                bearDiv_bar1 := prevPH_bar
+                bearDiv_bar2 := currPH_bar
+                bearDiv_ph1  := prevPH_price
+                bearDiv_ph2  := currPH_price
+                break
+            if currPH_price < prevPH_price and rsi_at_curr > rsi_at_prev
+                hidBearDiv   := true
+                bearDiv_bar1 := prevPH_bar
+                bearDiv_bar2 := currPH_bar
+                bearDiv_ph1  := prevPH_price
+                bearDiv_ph2  := currPH_price
+                break
+
+//  BULLISH DIVERGENCE
+bullDiv    = false
+hidBullDiv = false
+var int   bullDiv_bar1 = na
+var int   bullDiv_bar2 = na
+var float bullDiv_pl1  = na
+var float bullDiv_pl2  = na
+
+if not na(pivotLow_price) and array.size(pl_price_vals) >= 2
+    currPL_price = array.get(pl_price_vals, array.size(pl_price_vals) - 1)
+    currPL_bar   = array.get(pl_price_bars, array.size(pl_price_bars) - 1)
+    rsi_at_curr  = rsi[lookback]
+
+    for i = array.size(pl_price_vals) - 2 to 0
+        prevPL_price = array.get(pl_price_vals, i)
+        prevPL_bar   = array.get(pl_price_bars, i)
+        if (currPL_bar - prevPL_bar) > 2 and (currPL_bar - prevPL_bar) <= divLookback
+            barsBack     = bar_index - lookback - prevPL_bar
+            rsi_at_prev  = rsi[barsBack + lookback]
+            if currPL_price < prevPL_price and rsi_at_curr > rsi_at_prev
+                bullDiv      := true
+                bullDiv_bar1 := prevPL_bar
+                bullDiv_bar2 := currPL_bar
+                bullDiv_pl1  := prevPL_price
+                bullDiv_pl2  := currPL_price
+                break
+            if currPL_price > prevPL_price and rsi_at_curr < rsi_at_prev
+                hidBullDiv   := true
+                bullDiv_bar1 := prevPL_bar
+                bullDiv_bar2 := currPL_bar
+                bullDiv_pl1  := prevPL_price
+                bullDiv_pl2  := currPL_price
+                break
+
+//  DRAW DIVERGENCE
+var string lastDiv = "None"
+var int    lastSigBar = na
+
+f_draw_div(_bar1, _p1, _bar2, _p2, _baseCol, _coreCol, _isHidden, _labelText, _labelBg) =>
+    st = _isHidden ? line.style_dashed : line.style_solid
+
+    ln1 = line.new(_bar1, _p1, _bar2, _p2, color=_baseCol, width=baseLineWidth, style=st, xloc=xloc.bar_index, extend=xExtend)
+    ln2 = line.new(_bar1, _p1, _bar2, _p2, color=_coreCol, width=coreLineWidth, style=st, xloc=xloc.bar_index, extend=xExtend)
+
+    array.push(drawnLines, ln1)
+    array.push(drawnLines, ln2)
+
+    if showEndLabels
+        lb = label.new(_bar2, _p2, _labelText, xloc=xloc.bar_index,
+     style=label.style_label_left, textcolor=color.black, color=_labelBg, size=size.tiny)
+        array.push(drawnLabels, lb)
+
+    f_prune_drawings()
+
+//  DIVERGENCE LINES
+if showBearDiv and bearDiv
+    f_draw_div(bearDiv_bar1, bearDiv_ph1, bearDiv_bar2, bearDiv_ph2,
+         bearBase, bearCore, false, "Bear Div", labelBgBear)
+    lastDiv    := "Bear Div"
+    lastSigBar := bearDiv_bar2
+
+if showHidBear and hidBearDiv
+    f_draw_div(bearDiv_bar1, bearDiv_ph1, bearDiv_bar2, bearDiv_ph2,
+         hidBearBase, hidBearCore, true, "Hid Bear", labelBgHBear)
+    lastDiv    := "Hid Bear"
+    lastSigBar := bearDiv_bar2
+
+if showBullDiv and bullDiv
+    f_draw_div(bullDiv_bar1, bullDiv_pl1, bullDiv_bar2, bullDiv_pl2,
+         bullBase, bullCore, false, "Bull Div", labelBgBull)
+    lastDiv    := "Bull Div"
+    lastSigBar := bullDiv_bar2
+
+if showHidBull and hidBullDiv
+    f_draw_div(bullDiv_bar1, bullDiv_pl1, bullDiv_bar2, bullDiv_pl2,
+         hidBullBase, hidBullCore, true, "Hid Bull", labelBgHBull)
+    lastDiv    := "Hid Bull"
+    lastSigBar := bullDiv_bar2
+
+//  PIVOT DOTS (optional, visual-only)
+plotshape(showPivotDots and showBearDiv and bearDiv,    title="● Bear Div", style=shape.circle, location=location.abovebar, color=bearCircle,    size=size.tiny, offset=-lookback)
+plotshape(showPivotDots and showBullDiv and bullDiv,    title="● Bull Div", style=shape.circle, location=location.belowbar, color=bullCircle,    size=size.tiny, offset=-lookback)
+plotshape(showPivotDots and showHidBear and hidBearDiv, title="● Hid Bear", style=shape.circle, location=location.abovebar, color=hidBearCircle, size=size.tiny, offset=-lookback)
+plotshape(showPivotDots and showHidBull and hidBullDiv, title="● Hid Bull", style=shape.circle, location=location.belowbar, color=hidBullCircle, size=size.tiny, offset=-lookback)
+
+//  BAR COLORING — OB / OS tint (theme-driven)
+obTint = isGray ? color.new(color.rgb(0,0,0), 82) : color.new(bearCore, 72)
+osTint = isGray ? color.new(color.rgb(90,90,90), 82) : color.new(bullCore, 72)
+barcolor(rsi >= obLevel ? obTint : rsi <= osLevel ? osTint : na, title="OB/OS Bar Tint")
+
+//  DASHBOARD
+rsiZone = rsi >= obLevel ? "⚠ OVERBOUGHT" :
+          rsi <= osLevel ? "⚠ OVERSOLD"   :
+          rsi > 60       ? "Bullish"      :
+          rsi < 40       ? "Bearish"      : "Neutral"
+
+rsiZoneColor =
+     rsi >= obLevel ? (isGray ? txt : bearCore) :
+     rsi <= osLevel ? (isGray ? subtxt : bullCore) :
+     rsi > 60       ? bullCore :
+     rsi < 40       ? bearCore :
+                      neuCore
+
+biasArrow = rsi > 55 ? "▲  Bullish" : rsi < 45 ? "▼  Bearish" : "◆  Neutral"
+biasColor = rsi > 55 ? bullCore : rsi < 45 ? bearCore : neuCore
+
+activeBear    = showBearDiv and bearDiv
+activeBull    = showBullDiv and bullDiv
+activeHidBear = showHidBear and hidBearDiv
+activeHidBull = showHidBull and hidBullDiv
+
+bearStr   = activeBear    ? "● ACTIVE" : "–"
+bullStr   = activeBull    ? "● ACTIVE" : "–"
+hbearStr  = activeHidBear ? "● ACTIVE" : "–"
+hbullStr  = activeHidBull ? "● ACTIVE" : "–"
+
+bearC  = activeBear    ? bearCircle    : schemeSub
+bullC  = activeBull    ? bullCircle    : schemeSub
+hbearC = activeHidBear ? hidBearCircle : schemeSub
+hbullC = activeHidBull ? hidBullCircle : schemeSub
+
+lastC =
+     lastDiv == "Bear Div" ? bearCircle :
+     lastDiv == "Bull Div" ? bullCircle :
+     lastDiv == "Hid Bear" ? hidBearCircle :
+     lastDiv == "Hid Bull" ? hidBullCircle :
+                             schemeSub
+
+barsAgo = na(lastSigBar) ? "–" : str.tostring(bar_index - lastSigBar)
+
+// Table init (8 rows)
+var table dash = table.new(
+     dashPosition == "Top Right"    ? position.top_right    :
+     dashPosition == "Top Left"     ? position.top_left     :
+     dashPosition == "Bottom Right" ? position.bottom_right :
+                                      position.bottom_left,
+     columns=2, rows=8,
+     bgcolor=schemeBg,
+     border_width=1, border_color=schemeBorder,
+     frame_width=1,  frame_color=schemeBorder)
+
+f_row(r, lbl, val, valCol) =>
+    table.cell(dash, 0, r, lbl,
+         text_color=schemeSub,   text_size=size.small,
+         bgcolor=schemeCellBg,   text_halign=text.align_left)
+    table.cell(dash, 1, r, val,
+         text_color=valCol,      text_size=size.small,
+         bgcolor=schemeCellBg,   text_halign=text.align_right)
+
+if showDash and barstate.islast
+    table.cell(dash, 0, 0, "RSI  DIV+",
+         text_color=schemeText,  text_size=size.normal,
+         bgcolor=schemeHdrBg,    text_halign=text.align_left)
+    table.cell(dash, 1, 0, str.tostring(math.round(rsi, 2)),
+         text_color=rsiZoneColor, text_size=size.normal,
+         bgcolor=schemeHdrBg,    text_halign=text.align_right)
+
+    f_row(1, "Zone", rsiZone, rsiZoneColor)
+    f_row(2, "Bias", biasArrow, biasColor)
+
+    f_row(3, "Bear Div  ━━", bearStr,  bearC)
+    f_row(4, "Bull Div  ━━", bullStr,  bullC)
+    f_row(5, "Hid Bear  ╌╌", hbearStr, hbearC)
+    f_row(6, "Hid Bull  ╌╌", hbullStr, hbullC)
+    f_row(7, "Last (" + barsAgo + ")", lastDiv, lastC)
+
+// TREND LOGIC
+TrendT3(_src, _len, _i) =>
+    ema1 = ta.ema(_src, _len)
+    ema2 = ta.ema(ema1, _len)
+    ema3 = ta.ema(ema2, _len)
+    ema4 = ta.ema(ema3, _len)
+    ema5 = ta.ema(ema4, _len)
+    ema6 = ta.ema(ema5, _len)
+    c1 = -_i * _i * _i
+    c2 = 3 * _i * _i + 3 * _i * _i * _i
+    c3 = -6 * _i * _i - 3 * _i - 3 * _i * _i * _i
+    c4 = 1 + 3 * _i + _i * _i * _i + 3 * _i * _i
+    c1 * ema6 + c2 * ema5 + c3 * ema4 + c4 * ema3
+
+// PRESET LENGTHS
+int L1 = na
+int L2 = na
+int L3 = na
+int L4 = na
+
+if preset == "Day Trading (9-12)"
+    L1 := 9
+    L2 := 10
+    L3 := 11
+    L4 := 12
+else if preset == "Swing (21-34)"
+    L1 := 21
+    L2 := 24
+    L3 := 30
+    L4 := 34
+else
+    L1 := 50
+    L2 := 55
+    L3 := 72
+    L4 := 80
+
+// CALC
+w1 = TrendT3(src, L1, smoothFactor)
+w2 = TrendT3(src, L2, smoothFactor)
+w3 = TrendT3(src, L3, smoothFactor)
+w4 = TrendT3(src, L4, smoothFactor)
+
+upper  = math.max(math.max(w1, w2), math.max(w3, w4))
+lower  = math.min(math.min(w1, w2), math.min(w3, w4))
+center = (w1 + w2 + w3 + w4) / 4.0
+
+fastAvg = (w1 + w2) / 2.0
+slowAvg = (w3 + w4) / 2.0
+
+isUp   = fastAvg > slowAvg and center > center[1]
+isDown = fastAvg < slowAvg and center < center[1]
+
+// Theme-driven ribbon color
+rClr = isUp ? ribUp : isDown ? ribDown : ribNeu
+
+pU = plot(showRibbon ? upper : na, "Ribbon Upper", color=color.new(rClr, edgeTrans), linewidth=1)
+pL = plot(showRibbon ? lower : na, "Ribbon Lower", color=color.new(rClr, edgeTrans), linewidth=1)
+
+fill(pU, pL, color = showRibbon ? color.new(rClr, fillTrans) : na)
+plot(showCenter ? center : na, "Ribbon Center", color=color.new(rClr, 0), linewidth=centerW)
+
+//  ALERTS
+alertcondition(bearDiv, title="Bearish Divergence", message="RSI Bearish Divergence on {{ticker}} ({{interval}})")
+alertcondition(bullDiv, title="Bullish Divergence", message="RSI Bullish Divergence on {{ticker}} ({{interval}})")
+alertcondition(hidBearDiv, title="Hidden Bearish Divergence", message="RSI Hidden Bearish Divergence on {{ticker}} ({{interval}})")
+alertcondition(hidBullDiv, title="Hidden Bullish Divergence", message="RSI Hidden Bullish Divergence on {{ticker}} ({{interval}})")
+alertcondition(rsi >= obLevel, title="RSI Overbought", message="RSI Overbought on {{ticker}}")
+alertcondition(rsi <= osLevel, title="RSI Oversold", message="RSI Oversold on {{ticker}}")
