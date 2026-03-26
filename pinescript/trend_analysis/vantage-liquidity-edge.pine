@@ -1,0 +1,644 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © TheRealDrip2Rip
+
+//@version=5
+indicator("Vantage Liquidity Edge", overlay=true, max_lines_count=500, max_labels_count=200, max_boxes_count=200)
+
+// ─────────────────────────────────────────────
+// INPUTS
+// ─────────────────────────────────────────────
+grp_core   = "Core Settings"
+grp_style  = "Style"
+
+lookback = input.int(120, "Lookback (1H Bars)",minval=8, maxval=200, group=grp_core,tooltip="How far back Vantage learns the market's behavior to build today's levels. Higher values create smoother, more stable levels that adapt slower. Lower values adapt faster but can be more sensitive to noise. Reference (on 1H): 24 bars is about 1 full trading day and 120 bars is about 1 trading week. If levels feel too reactive, increase lookback. If levels feel too slow, decrease it.")
+
+atr_period = input.int(14, "ATR Smoothing Period",minval=5, maxval=50, group=grp_core,tooltip="Controls how stable the level spacing is by smoothing volatility (ATR). Lower values make levels react faster to volatility changes and are better for aggressive scalping or fast markets. Higher values make levels more stable and smoother, which is better for structured intraday trading or choppy conditions. If levels feel jumpy or overly reactive, increase this value. If levels feel slow to adapt during strong moves, decrease it. A balanced intraday setting is typically 14–20.")
+
+entropy_mult = input.float(5.0, "Entropy Sensitivity",minval=0.1, maxval=5.0, step=0.1, group=grp_core,tooltip="Adjusts how strongly volume behavior affects the width of the levels. Higher values cause levels to expand more during high participation and strong momentum sessions, which helps avoid premature targets on trend days. Lower values tighten the levels and increase the likelihood of touches and reversals, which is better for range or mean reversion trading. If price frequently blows through targets, increase this value. If levels feel too wide and unrealistic, decrease it. Balanced settings typically fall between 3.0 and 4.5.")
+
+cycle_mult = input.float(5.0, "Cycle Sensitivity",minval=0.1, maxval=5.0, step=0.1, group=grp_core, tooltip="Controls how strongly market rhythm and price oscillation influence level spacing. Higher values allow levels to adapt more aggressively to momentum and shifting tempo, which is useful during breakout and expansion days. Lower values produce more static and predictable spacing, which works better in slower or rotational markets. If levels feel too rigid during strong trends, increase this setting. If levels feel overly reactive or inconsistent, reduce it. A balanced range for most intraday traders is 3.0 to 5.0.")
+
+maxEchos      = input.int(18,     "Max echo zones kept",               group=grp_core, minval=5, maxval=40, tooltip="Maximum number of echo zones to keep displayed. Higher values show more historical zones but may clutter the chart.")
+decayBars     = input.int(180,    "Decay if untouched (bars)",         group=grp_core, minval=20, maxval=2000, tooltip="Number of bars after which an untouched echo zone fades away. Adjust to control how long inactive zones remain visible.")
+
+pL = input.int(2, "Pivot left bars",  group=grp_core, minval=1, maxval=10, tooltip="Number of bars to the left for pivot confirmation. Higher values require stronger pivots but may detect fewer.")
+pR = input.int(2, "Pivot right bars", group=grp_core, minval=1, maxval=10, tooltip="Number of bars to the right for pivot confirmation. Higher values require stronger pivots but may detect fewer.")
+
+// Theme selector
+theme = input.string("Blacked Out", "Theme",
+     options=["Normal", "Blacked Out", "Neon Flux", "Infrared"],
+     group=grp_style,
+     tooltip="Normal: classic red/green. Blacked Out: near-invisible dark shadows. Neon Flux: electric cyberpunk. Infrared: heat-map thermal.")
+
+// Toggle for LEM
+show_lem = input.bool(true, "Show Liquidity Echo Map", group=grp_style, tooltip="Toggle to enable or disable the Liquidity Echo Map overlays.")
+
+// ───────────────────────────────────────────────
+// Theme definitions
+// ───────────────────────────────────────────────
+
+// ── Normal ───────────────────────────────────────────────────────────────────
+var color n_pivot = #FFFFFF
+var color n_bear  = #FF4757
+var color n_bull  = #2ED573
+var int   n_bg    = 90
+var int   n_line  = 0
+var int   n_base  = 87
+var int   n_step  = 8
+var int   n_min   = 55
+
+// ── Blacked Out ──────────────────────────────────────────────────────────────
+var color b_pivot = #808080   // medium gray for pivot
+var color b_bear  = #505050   // dark gray for bear zones
+var color b_bull  = #E0E0E0   // light gray/white for bull zones
+var int   b_bg    = 96        // extremely faint
+var int   b_line  = 50        // ghost-like lines
+var int   b_base  = 96        // extremely faint to start
+var int   b_step  = 6         // subtle deepening with retests
+var int   b_min   = 75        // always remains somewhat transparent, never fully solid
+
+// ── Neon Flux ────────────────────────────────────────────────────────────────
+var color nf_pivot = #FFFFFF
+var color nf_bear = #FF2D78   // hot magenta
+var color nf_bull = #00E5FF   // electric cyan
+var int   nf_bg    = 85
+var int   nf_line  = 0
+var int   nf_base = 85
+var int   nf_step = 9
+var int   nf_min  = 49
+
+// ── Infrared ─────────────────────────────────────────────────────────────────
+var color ir_pivot = #FFFFFF
+var color ir_bear  = #FF6B00   // burnt orange heat
+var color ir_bull  = #7B2FFF   // deep violet cold
+var int   ir_bg    = 85
+var int   ir_line  = 0
+var int   ir_base = 85
+var int   ir_step = 9
+var int   ir_min  = 50
+
+// ───────────────────────────────────────────────
+// Resolve active theme values
+// ───────────────────────────────────────────────
+themePivot = theme == "Blacked Out" ? b_pivot : theme == "Neon Flux" ? nf_pivot : theme == "Infrared" ? ir_pivot : n_pivot
+themeBear  = theme == "Blacked Out" ? b_bear  : theme == "Neon Flux" ? nf_bear  : theme == "Infrared" ? ir_bear  : n_bear
+themeBull  = theme == "Blacked Out" ? b_bull  : theme == "Neon Flux" ? nf_bull  : theme == "Infrared" ? ir_bull  : n_bull
+themeBg    = theme == "Blacked Out" ? b_bg    : theme == "Neon Flux" ? nf_bg    : theme == "Infrared" ? ir_bg    : n_bg
+themeLine  = theme == "Blacked Out" ? b_line  : theme == "Neon Flux" ? nf_line  : theme == "Infrared" ? ir_line  : n_line
+
+themeBase = theme == "Blacked Out" ? b_base  : theme == "Neon Flux"   ? nf_base : theme == "Infrared"    ? ir_base : n_base
+themeStep = theme == "Blacked Out" ? b_step  :theme == "Neon Flux"   ? nf_step : theme == "Infrared"    ? ir_step : n_step
+themeMin  = theme == "Blacked Out" ? b_min   : theme == "Neon Flux"   ? nf_min  :theme == "Infrared"    ? ir_min  : n_min
+
+// Hardcoded values for minimal inputs
+line_w = 1
+ext_right = true
+show_labels = true
+show_table = true
+show_bg = true
+lock_levels = true
+lock_level_prob = true
+noon_recheck = true
+noon_trend_threshold = 25.0
+rth_session  = "0930-1600"
+early_bars = 6
+prob_smooth = 5
+
+// Hardcoded non-essential LEM inputs
+useATRBuffer  = true
+bufAtrMult    = 0.10
+bufTicks      = 2
+zoneAtrFloor  = 0.10
+zoneWickScale = 0.50
+
+// ─────────────────────────────────────────────
+// HELPERS
+// ─────────────────────────────────────────────
+clamp(x, lo, hi) =>
+    math.min(math.max(x, lo), hi)
+
+// ─────────────────────────────────────────────
+// CORE CALCS — VANTAGE LEVEL ENGINE
+// ─────────────────────────────────────────────
+// STEP 1 — Kinetic energy per bar
+velocity  = close[1] != 0 ? (close - close[1]) / close[1] : 0.0
+ke_raw    = 0.5 * volume * math.pow(velocity, 2)
+ke_signed = velocity >= 0 ? ke_raw : -ke_raw
+
+// STEP 2 — Energy Equilibrium Point (KE-weighted average price)
+var float sum_ke       = 0.0
+var float sum_ke_price = 0.0
+sum_ke       := 0.0
+sum_ke_price := 0.0
+
+for i = 0 to lookback - 1
+    w = math.abs(ke_raw[i])
+    sum_ke       += w
+    sum_ke_price += w * close[i]
+
+eep = sum_ke > 0 ? sum_ke_price / sum_ke : close
+
+// STEP 3 — Volume entropy factor (log-scaled CV)
+vol_mean      = ta.sma(volume, lookback)
+vol_std       = ta.stdev(volume, lookback)
+cv            = vol_mean != 0 ? vol_std / vol_mean : 1.0
+entropy_score = 1.0 + math.log(1.0 + cv) * entropy_mult  // ≥ 1.0
+
+// STEP 4 — Dominant kinetic cycle (zero-crossings)
+cross_count = 0
+for i = 1 to lookback - 1
+    prev = ke_signed[i]
+    curr = ke_signed[i - 1]
+    if (curr >= 0 and prev < 0) or (curr < 0 and prev >= 0)
+        cross_count += 1
+
+half_periods    = math.max(cross_count / 2.0, 1.0)
+dominant_cycle  = math.min(math.max(lookback / half_periods, 2.0), float(lookback))
+cycle_ratio     = (dominant_cycle / float(lookback)) * cycle_mult
+
+// STEP 5 — Resonance amplitude
+atr           = ta.atr(atr_period)
+resonance_amp = atr * entropy_score * cycle_ratio
+
+// STEP 6 — Golden ratio projections
+phi = 1.6180339887498948482
+
+r1 = eep + resonance_amp * math.pow(phi, 1)
+r2 = eep + resonance_amp * math.pow(phi, 2)
+r3 = eep + resonance_amp * math.pow(phi, 3)
+s1 = eep - resonance_amp * math.pow(phi, 1)
+s2 = eep - resonance_amp * math.pow(phi, 2)
+s3 = eep - resonance_amp * math.pow(phi, 3)
+
+// ─────────────────────────────────────────────
+// SESSION LOCK — lock once per day at market open
+// ─────────────────────────────────────────────
+tz = syminfo.timezone
+lockTs  = timestamp(tz, year, month, dayofmonth, 9, 30)   // market open
+probTs  = timestamp(tz, year, month, dayofmonth, 10, 00)  // 30 minutes after open
+noonTs  = timestamp(tz, year, month, dayofmonth, 12, 00)  // noon recheck
+
+isNewDay = ta.change(time("D"))
+
+var float eep_locked = na
+var float r1_locked  = na
+var float r2_locked  = na
+var float r3_locked  = na
+var float s1_locked  = na
+var float s2_locked  = na
+var float s3_locked  = na
+var bool  levels_locked = false
+
+if isNewDay
+    levels_locked := false
+    eep_locked := na
+    r1_locked  := na
+    r2_locked  := na
+    r3_locked  := na
+    s1_locked  := na
+    s2_locked  := na
+    s3_locked  := na
+
+didCrossLock = (time_close >= lockTs) and (nz(time_close[1]) < lockTs)
+
+if lock_levels and not levels_locked and didCrossLock
+    eep_locked := eep
+    r1_locked := r1
+    r2_locked := r2
+    r3_locked := r3
+    s1_locked := s1
+    s2_locked := s2
+    s3_locked := s3
+    levels_locked := true
+
+eep_use = (lock_levels and levels_locked) ? eep_locked : eep
+r1_use  = (lock_levels and levels_locked) ? r1_locked  : r1
+r2_use  = (lock_levels and levels_locked) ? r2_locked  : r2
+r3_use  = (lock_levels and levels_locked) ? r3_locked  : r3
+s1_use  = (lock_levels and levels_locked) ? s1_locked  : s1
+s2_use  = (lock_levels and levels_locked) ? s2_locked  : s2
+s3_use  = (lock_levels and levels_locked) ? s3_locked  : s3
+
+// ─────────────────────────────────────────────
+// Vantage — Bias, In Play, Trend Prob
+// ─────────────────────────────────────────────
+inRTH = not na(time(timeframe.period, rth_session))
+
+biasRaw = close > eep_use ? 1 : close < eep_use ? -1 : 0
+
+distAtr = atr != 0 ? (close - eep_use) / atr : 0.0
+biasStrength =
+     biasRaw == 0 ? "NEUTRAL" :
+     math.abs(distAtr) >= 1.0 ? (biasRaw > 0 ? "BULL (STRONG)" : "BEAR (STRONG)") :
+     math.abs(distAtr) >= 0.35 ? (biasRaw > 0 ? "BULL" : "BEAR") :
+     "NEUTRAL"
+
+// Expansion target “in play”
+float tgtPrice = na
+string tgtName = "—"
+
+if biasRaw > 0
+    if close < r1_use
+        tgtPrice := r1_use, tgtName := "R1"
+    else if close < r2_use
+        tgtPrice := r2_use, tgtName := "R2"
+    else
+        tgtPrice := r3_use, tgtName := "R3"
+else if biasRaw < 0
+    if close > s1_use
+        tgtPrice := s1_use, tgtName := "S1"
+    else if close > s2_use
+        tgtPrice := s2_use, tgtName := "S2"
+    else
+        tgtPrice := s3_use, tgtName := "S3"
+
+tgtDistPts  = na(tgtPrice) ? na : (tgtPrice - close)
+tgtDistAtr  = (not na(tgtPrice) and atr != 0) ? math.abs(tgtDistPts) / atr : na
+
+// Early window tracking after lock
+var int   barsSinceLock = 0
+var float earlyHigh = na
+var float earlyLow  = na
+var bool  earlyWindowDone = false
+
+if isNewDay
+    barsSinceLock := 0
+    earlyHigh := na
+    earlyLow  := na
+    earlyWindowDone := false
+
+lockActive = lock_levels ? levels_locked : true
+
+if lockActive and inRTH
+    barsSinceLock += 1
+    if not earlyWindowDone
+        earlyHigh := na(earlyHigh) ? high : math.max(earlyHigh, high)
+        earlyLow  := na(earlyLow)  ? low  : math.min(earlyLow, low)
+        if barsSinceLock >= early_bars
+            earlyWindowDone := true
+
+// Trend day probability components
+expansionComp = clamp((resonance_amp / math.max(atr, 1e-10) - 1.0) / 2.5, 0.0, 1.0)
+entropyComp   = clamp(1.0 / math.max(entropy_score, 1e-10), 0.0, 1.0)
+rhythmComp    = clamp(dominant_cycle / float(lookback), 0.0, 1.0)
+
+earlyBreak = false
+if earlyWindowDone and not na(earlyHigh) and not na(earlyLow)
+    earlyBreak := (close > earlyHigh) or (close < earlyLow)
+
+earlyDistComp = clamp(math.abs(distAtr) / 1.5, 0.0, 1.0)
+earlyComp     = clamp((earlyBreak ? 0.6 : 0.0) + (earlyDistComp * 0.4), 0.0, 1.0)
+
+// Weighted probability + smoothing
+rawProb = 100.0 * (expansionComp * 0.30 + entropyComp * 0.20 + rhythmComp * 0.20 + earlyComp * 0.30)
+trendProb = ta.ema(rawProb, prob_smooth)
+trendProb := clamp(trendProb, 0.0, 100.0)
+
+// ─────────────────────────────────────────────
+// LEVEL PROBABILITY (AM lock @ 10:00, optional Noon recheck)
+// Displays like: "R3 65%"
+// ─────────────────────────────────────────────
+bullScore =
+     (biasRaw > 0 ? 0.35 : 0.0) +
+     clamp(distAtr / 1.5, 0.0, 0.25) +
+     clamp((trendProb / 100.0) * 0.25, 0.0, 0.25) +
+     (close > r1_use ? 0.15 : 0.0)
+
+bearScore =
+     (biasRaw < 0 ? 0.35 : 0.0) +
+     clamp(math.abs(distAtr) / 1.5, 0.0, 0.25) +
+     clamp((trendProb / 100.0) * 0.25, 0.0, 0.25) +
+     (close < s1_use ? 0.15 : 0.0)
+
+// Convert to % (capped to avoid “100%” nonsense)
+prob_R2 = clamp(bullScore * 100.0, 0.0, 95.0)
+prob_R3 = clamp(prob_R2 * 0.65,   0.0, 90.0)
+
+prob_S2 = clamp(bearScore * 100.0, 0.0, 95.0)
+prob_S3 = clamp(prob_S2 * 0.65,    0.0, 90.0)
+
+// Live text
+string levelProb_live = "—"
+if biasRaw > 0
+    levelProb_live := (prob_R3 > prob_R2) ? ("R3 " + str.tostring(prob_R3, "#") + "%") : ("R2 " + str.tostring(prob_R2, "#") + "%")
+else if biasRaw < 0
+    levelProb_live := (prob_S3 > prob_S2) ? ("S3 " + str.tostring(prob_S3, "#") + "%") : ("S2 " + str.tostring(prob_S2, "#") + "%")
+
+// AM lock at 10:00am ET (Option B)
+var bool   lvlProb_locked = false
+var string levelProb_hold = "—"
+
+// Noon snapshot + switch control
+var bool   lvlProb_noon_locked = false
+var string levelProb_noon_hold = "—"
+var bool   use_noon_prob = false
+
+if isNewDay
+    lvlProb_locked := false
+    levelProb_hold := "—"
+    lvlProb_noon_locked := false
+    levelProb_noon_hold := "—"
+    use_noon_prob := false
+
+didCrossProb = (time_close >= probTs) and (nz(time_close[1]) < probTs)
+didCrossNoon = (time_close >= noonTs) and (nz(time_close[1]) < noonTs)
+
+if lock_level_prob and inRTH and not lvlProb_locked and didCrossProb
+    levelProb_hold := levelProb_live
+    lvlProb_locked := true
+
+// Noon snapshot & decision to switch
+// Switch when: low trend at noon OR pivot flip OR outer levels were tagged (regime changed)
+pivotFlip = (close > eep_use and close[1] < eep_use) or (close < eep_use and close[1] > eep_use)
+hitUpper  = high >= r2_use or high >= r3_use
+hitLower  = low  <= s2_use or low  <= s3_use
+lowTrendAtNoon = trendProb <= noon_trend_threshold
+
+if noon_recheck and inRTH and not lvlProb_noon_locked and didCrossNoon
+    levelProb_noon_hold := levelProb_live
+    lvlProb_noon_locked := true
+    use_noon_prob := lowTrendAtNoon or pivotFlip or hitUpper or hitLower
+
+// Final selection
+levelProb_morning = (lock_level_prob and lvlProb_locked) ? levelProb_hold : levelProb_live
+levelProb_noon    = (noon_recheck and lvlProb_noon_locked) ? levelProb_noon_hold : levelProb_morning
+levelProb_use     = use_noon_prob ? levelProb_noon : levelProb_morning
+
+// ─────────────────────────────────────────────
+// DRAWING — Lines, Labels, Zones (locked/live)
+// ─────────────────────────────────────────────
+ext_mode = ext_right ? extend.right : extend.none
+
+var line ln_eep = na, var line ln_r1 = na, var line ln_r2 = na, var line ln_r3 = na
+var line ln_s1  = na, var line ln_s2 = na, var line ln_s3 = na
+
+var label lb_eep = na, var label lb_r1 = na, var label lb_r2 = na, var label lb_r3 = na
+var label lb_s1  = na, var label lb_s2 = na, var label lb_s3 = na
+
+var box bx_r1 = na, var box bx_s1 = na
+
+draw_line(price, col, style) =>
+    line.new(bar_index - lookback, price, bar_index, price, color=color.new(col, themeLine), width=line_w, extend=ext_mode, style=style)
+
+draw_label(price, txt, col, txt_col) =>
+    label.new(bar_index + 3, price, txt, color=color.new(col, themeLine), textcolor=txt_col, style=label.style_label_left, size=size.small)
+
+price_str(p) => str.tostring(p, format.mintick)
+
+if barstate.islast
+    line.delete(ln_eep), line.delete(ln_r1), line.delete(ln_r2), line.delete(ln_r3)
+    line.delete(ln_s1),  line.delete(ln_s2), line.delete(ln_s3)
+    label.delete(lb_eep), label.delete(lb_r1), label.delete(lb_r2), label.delete(lb_r3)
+    label.delete(lb_s1),  label.delete(lb_s2), label.delete(lb_s3)
+    box.delete(bx_r1), box.delete(bx_s1)
+
+    ln_eep := draw_line(eep_use, themePivot, line.style_solid)
+    ln_r1  := draw_line(r1_use,  themeBear,  line.style_dashed)
+    ln_r2  := draw_line(r2_use,  themeBear,  line.style_dashed)
+    ln_r3  := draw_line(r3_use,  themeBear,  line.style_dotted)
+    ln_s1  := draw_line(s1_use,  themeBull,  line.style_dashed)
+    ln_s2  := draw_line(s2_use,  themeBull,  line.style_dashed)
+    ln_s3  := draw_line(s3_use,  themeBull,  line.style_dotted)
+
+    if show_bg
+        bx_r1 := box.new(bar_index - lookback, r1_use, bar_index, eep_use,
+             border_color=color.new(themeBear, themeBg), bgcolor=color.new(themeBear, themeBg))
+        bx_s1 := box.new(bar_index - lookback, eep_use, bar_index, s1_use,
+             border_color=color.new(themeBull, themeBg), bgcolor=color.new(themeBull, themeBg))
+
+    if show_labels
+        pivot_text_col = theme == "Blacked Out" ? color.white : color.black
+        bear_text_col  = color.white
+        bull_text_col  = theme == "Blacked Out" ? color.black : color.white
+        lb_eep := draw_label(eep_use, " PIVOT  " + price_str(eep_use), themePivot, pivot_text_col)
+        lb_r1  := draw_label(r1_use,  "R1  " + price_str(r1_use), themeBear, bear_text_col)
+        lb_r2  := draw_label(r2_use,  "R2  " + price_str(r2_use), themeBear, bear_text_col)
+        lb_r3  := draw_label(r3_use,  "R3  " + price_str(r3_use), color.new(themeBear, 30), bear_text_col)
+        lb_s1  := draw_label(s1_use,  "S1  " + price_str(s1_use), themeBull, bull_text_col)
+        lb_s2  := draw_label(s2_use,  "S2  " + price_str(s2_use), themeBull, bull_text_col)
+        lb_s3  := draw_label(s3_use,  "S3  " + price_str(s3_use), color.new(themeBull, 30), bull_text_col)
+
+// ─────────────────────────────────────────────
+// VANTAGE DASHBOARD (adds Level Prob between Trend Prob and In Play)
+// ─────────────────────────────────────────────
+if show_table and barstate.islast
+    var table t = table.new(position.bottom_right, 2, 12,
+         frame_color=color.new(color.white, 70),
+         frame_width=1,
+         border_color=color.new(color.white, 85),
+         border_width=1)
+
+    header_bg  = color.new(#1a1a2e, 10)
+    cell_bg    = color.new(#16213e, 20)
+    sub_bg     = color.new(#101827, 15)
+    txt_head   = color.new(#e0e0e0, 0)
+    txt_muted  = color.new(color.silver, 0)
+
+    lockTxt = lock_levels ? (levels_locked ? "LOCKED" : "WAITING") : "OFF"
+    biasTxt = biasStrength
+    tgtTxt  = na(tgtPrice) ? "—" : (tgtName + "  (" + str.tostring(tgtDistAtr, "#.##") + " ATR)")
+    probTxt = str.tostring(trendProb, "#") + "%"
+
+    // show when Level Prob is using NOON snapshot
+    lvlModeTxt = use_noon_prob ? "PM" : "AM"
+    lvlTxt = levelProb_use + (noon_recheck and lvlProb_noon_locked and use_noon_prob ? " (" + lvlModeTxt + ")" : (lock_level_prob and lvlProb_locked ? " (" + lvlModeTxt + ")" : ""))
+
+    table.cell(t, 0, 0, "VANTAGE", text_color=txt_head, bgcolor=header_bg, text_size=size.small)
+    table.cell(t, 1, 0, timeframe.period + "m", text_color=txt_head, bgcolor=header_bg, text_size=size.small)
+
+    table.cell(t, 0, 1, "Levels", text_color=txt_muted, bgcolor=cell_bg, text_size=size.small)
+    table.cell(t, 1, 1, lockTxt, text_color=lockTxt == "LOCKED" ? color.new(#2ED573, 0) : txt_head, bgcolor=cell_bg, text_size=size.small)
+
+    table.cell(t, 0, 2, "Bias", text_color=txt_muted, bgcolor=cell_bg, text_size=size.small)
+    table.cell(t, 1, 2, biasTxt, text_color=biasRaw > 0 ? themeBull : biasRaw < 0 ? themeBear : txt_head, bgcolor=cell_bg, text_size=size.small)
+
+    table.cell(t, 0, 3, "Trend Prob", text_color=txt_muted, bgcolor=cell_bg, text_size=size.small)
+    table.cell(t, 1, 3, probTxt, text_color=trendProb >= 65 ? color.new(#2ED573, 0) : trendProb <= 35 ? color.new(#FF4757, 0) : txt_head, bgcolor=cell_bg, text_size=size.small)
+
+    table.cell(t, 0, 4, "Level Prob", text_color=txt_muted, bgcolor=cell_bg, text_size=size.small)
+    table.cell(t, 1, 4, lvlTxt, text_color=(use_noon_prob ? color.new(#FFD166, 0) : (lock_level_prob and lvlProb_locked ? color.new(#2ED573, 0) : txt_head)), bgcolor=cell_bg, text_size=size.small)
+
+    table.cell(t, 0, 5, "In Play", text_color=txt_muted, bgcolor=cell_bg, text_size=size.small)
+    table.cell(t, 1, 5, tgtTxt, text_color=txt_head, bgcolor=cell_bg, text_size=size.small)
+
+    table.cell(t, 0, 6, "R3", text_color=color.new(themeBear, 30), bgcolor=sub_bg, text_size=size.small)
+    table.cell(t, 1, 6, price_str(r3_use), text_color=color.new(themeBear, 30), bgcolor=sub_bg, text_size=size.small)
+
+    table.cell(t, 0, 7, "R2", text_color=themeBear, bgcolor=sub_bg, text_size=size.small)
+    table.cell(t, 1, 7, price_str(r2_use), text_color=themeBear, bgcolor=sub_bg, text_size=size.small)
+
+    table.cell(t, 0, 8, "R1", text_color=themeBear, bgcolor=sub_bg, text_size=size.small)
+    table.cell(t, 1, 8, price_str(r1_use), text_color=themeBear, bgcolor=sub_bg, text_size=size.small)
+
+    table.cell(t, 0, 9, "PIVOT", text_color=themePivot, bgcolor=header_bg, text_size=size.small)
+    table.cell(t, 1, 9, price_str(eep_use), text_color=themePivot, bgcolor=header_bg, text_size=size.small)
+
+    table.cell(t, 0, 10, "S1", text_color=themeBull, bgcolor=sub_bg, text_size=size.small)
+    table.cell(t, 1, 10, price_str(s1_use), text_color=themeBull, bgcolor=sub_bg, text_size=size.small)
+
+    table.cell(t, 0, 11, "S2/S3", text_color=color.new(themeBull, 10), bgcolor=sub_bg, text_size=size.small)
+    table.cell(t, 1, 11, price_str(s2_use) + " / " + price_str(s3_use), text_color=color.new(themeBull, 10), bgcolor=sub_bg, text_size=size.small)
+
+// ─────────────────────────────────────────────
+// DATA WINDOW PLOTS
+// ─────────────────────────────────────────────
+plot(eep_use, "PIVOT", color=themePivot, display=display.data_window)
+plot(r1_use,  "R1",    color=themeBear,  display=display.data_window)
+plot(r2_use,  "R2",    color=themeBear,  display=display.data_window)
+plot(r3_use,  "R3",    color=themeBear,  display=display.data_window)
+plot(s1_use,  "S1",    color=themeBull,  display=display.data_window)
+plot(s2_use,  "S2",    color=themeBull,  display=display.data_window)
+plot(s3_use,  "S3",    color=themeBull,  display=display.data_window)
+
+plot(trendProb, "Trend Day Probability", display=display.data_window)
+plot(entropy_score, "Entropy Score", display=display.data_window)
+plot(dominant_cycle, "Dominant Cycle", display=display.data_window)
+
+// ─────────────────────────────────────────────
+// LEM Helpers
+// ─────────────────────────────────────────────
+buffer = useATRBuffer ? (atr * bufAtrMult) : (syminfo.mintick * bufTicks)
+
+calcZoneThick(float wickSize) =>
+    math.max(wickSize * zoneWickScale, atr * zoneAtrFloor)
+
+strengthToAlpha(int s) =>
+    int c = math.min(math.max(s, 1), 5)
+    math.max(themeBase - (c - 1) * themeStep, themeMin)
+
+// ──────────────────────────────────────────────
+// LEM Confirmed pivots (non-repainting)
+// ──────────────────────────────────────────────
+ph = ta.pivothigh(high, pL, pR)
+pl = ta.pivotlow(low, pL, pR)
+
+var float lastSwingHigh = na
+var float lastSwingLow  = na
+
+if not na(ph)
+    lastSwingHigh := ph
+if not na(pl)
+    lastSwingLow := pl
+
+// ──────────────────────────────────────────────
+// LEM Echo storage
+// ──────────────────────────────────────────────
+var float[] echoLvl          = array.new_float()
+var float[] echoThick        = array.new_float()
+var int[]   echoDir          = array.new_int()
+var int[]   echoStrength     = array.new_int()
+var int[]   echoLastTouchBar = array.new_int()
+var box[]   echoBox          = array.new_box()
+
+// ──────────────────────────────────────────────
+// LEM Add echo
+// ──────────────────────────────────────────────
+f_addEcho(float lvl, int dir, float thick) =>
+    if array.size(echoLvl) >= maxEchos
+        box bx0 = array.shift(echoBox)
+        if not na(bx0)
+            box.delete(bx0)
+        array.shift(echoLvl)
+        array.shift(echoThick)
+        array.shift(echoDir)
+        array.shift(echoStrength)
+        array.shift(echoLastTouchBar)
+
+    color zCol = dir == 1 ? themeBear : themeBull
+
+    box bx = box.new(
+         left         = time,
+         top          = lvl + thick,
+         right        = time,
+         bottom       = lvl - thick,
+         xloc         = xloc.bar_time,
+         extend       = extend.right,
+         border_color = color.new(color.black, 100),
+         border_width = 0,
+         bgcolor      = color.new(zCol, strengthToAlpha(1)))
+
+    array.push(echoLvl,          lvl)
+    array.push(echoThick,        thick)
+    array.push(echoDir,          dir)
+    array.push(echoStrength,     1)
+    array.push(echoLastTouchBar, bar_index)
+    array.push(echoBox,          bx)
+
+// ──────────────────────────────────────────────
+// LEM Refresh visuals
+// ──────────────────────────────────────────────
+f_refreshEchoVisuals(int i) =>
+    int   s     = array.get(echoStrength, i)
+    int   dir   = array.get(echoDir,      i)
+    float lvl   = array.get(echoLvl,      i)
+    float thick = array.get(echoThick,    i)
+    box   bx    = array.get(echoBox,      i)
+    color zCol  = dir == 1 ? themeBear : themeBull
+
+    if not na(bx)
+        box.set_bgcolor(bx,      color.new(zCol, strengthToAlpha(s)))
+        box.set_top(bx,          lvl + thick)
+        box.set_bottom(bx,       lvl - thick)
+        box.set_border_color(bx, color.new(color.black, 100))
+
+// ──────────────────────────────────────────────
+// LEM Sweep detection
+// ──────────────────────────────────────────────
+bool upSweepReject = false
+bool dnSweepReject = false
+
+if show_lem
+    upSweepReject :=
+         not na(lastSwingHigh) and
+         high > (lastSwingHigh + buffer) and
+         close < lastSwingHigh
+
+    dnSweepReject :=
+         not na(lastSwingLow) and
+         low < (lastSwingLow - buffer) and
+         close > lastSwingLow
+
+    if upSweepReject
+        f_addEcho(lastSwingHigh, 1,  calcZoneThick(high - lastSwingHigh))
+
+    if dnSweepReject
+        f_addEcho(lastSwingLow, -1, calcZoneThick(lastSwingLow - low))
+
+// ──────────────────────────────────────────────
+// LEM Retest strength + decay
+// ──────────────────────────────────────────────
+if show_lem
+    int sz = array.size(echoLvl)
+    if sz > 0
+        for i = sz - 1 to 0
+            float lvl       = array.get(echoLvl,          i)
+            float thick     = array.get(echoThick,         i)
+            int   s         = array.get(echoStrength,      i)
+            int   lastTouch = array.get(echoLastTouchBar,  i)
+            float zoneTop   = lvl + thick
+            float zoneBot   = lvl - thick
+
+            if bar_index - lastTouch > decayBars
+                box bx = array.get(echoBox, i)
+                if not na(bx)
+                    box.delete(bx)
+                array.remove(echoLvl,          i)
+                array.remove(echoThick,        i)
+                array.remove(echoDir,          i)
+                array.remove(echoStrength,     i)
+                array.remove(echoLastTouchBar, i)
+                array.remove(echoBox,          i)
+            else
+                bool touched = (high >= zoneBot and low <= zoneTop)
+                if touched
+                    array.set(echoLastTouchBar, i, bar_index)
+                    array.set(echoStrength,     i, math.min(s + 1, 5))
+                f_refreshEchoVisuals(i)
+
+// ──────────────────────────────────────────────
+// LEM Alerts
+// ──────────────────────────────────────────────
+alertcondition(upSweepReject, title="LEM: Bear Echo Created",
+     message="Up-sweep + rejection confirmed. Bear echo zone created.")
+alertcondition(dnSweepReject, title="LEM: Bull Echo Created",
+     message="Down-sweep + rejection confirmed. Bull echo zone created.")

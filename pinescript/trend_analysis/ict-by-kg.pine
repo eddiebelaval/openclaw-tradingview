@@ -1,0 +1,346 @@
+//@version=6
+indicator("ICT by KG", overlay=true, max_labels_count=500, max_boxes_count=500)
+
+//──────────────────────────────────────────────────────────────────────────────
+// INPUTS
+//──────────────────────────────────────────────────────────────────────────────
+
+// === STRUCTURE SETTINGS ===
+swingLength = input.int(5, "Swing High/Low Length", minval=3, maxval=20, group="📊 Market Structure")
+tfBias = input.timeframe("60", "HTF Bias Timeframe", group="📊 Market Structure")
+showSwings = input.bool(true, "Show Swing Points", group="📊 Market Structure")
+
+// === DISPLACEMENT SETTINGS ===
+dispMultiplier = input.float(1.5, "Displacement ATR Multiplier", minval=1.0, maxval=3.0, step=0.1, group="🚀 Displacement")
+dispWickRatio = input.float(0.35, "Max Wick/Body Ratio", minval=0.1, maxval=0.5, step=0.05, group="🚀 Displacement")
+minDispBars = input.int(2, "Min Displacement Bars", minval=1, maxval=5, group="🚀 Displacement")
+
+// === FVG/OB SETTINGS ===
+showFVG = input.bool(true, "Show Fair Value Gaps", group="📦 PD Arrays")
+showOB = input.bool(true, "Show Order Blocks", group="📦 PD Arrays")
+fvgBoxes = input.int(5, "Max FVG/OB to Track", minval=3, maxval=20, group="📦 PD Arrays")
+obLookback = input.int(3, "Order Block Candle Lookback", minval=1, maxval=10, group="📦 PD Arrays")
+ceEntry = input.bool(true, "Require CE Tag (50%)", group="📦 PD Arrays") // New: Force CE entry
+
+// === VWAP SETTINGS ===
+showVwap = input.bool(true, "Show VWAP", group="📈 VWAP")
+vwapSession = input.string("Session", "VWAP Reset", options=["Session", "Week"], group="📈 VWAP")
+vwapFilter = input.bool(true, "Filter Longs > VWAP / Shorts < VWAP", group="📈 VWAP") // New: VWAP Filter
+
+// === KILL ZONE SETTINGS ===
+useKillZones = input.bool(true, "Enable Kill Zone Filter", group="⏰ Kill Zones")
+showNYKZ = input.bool(true, "NY Kill Zone (7-10 AM, 1-4 PM ET)", group="⏰ Kill Zones")
+
+// === VISUAL SETTINGS ===
+colBullFVG = input.color(color.new(color.green, 85), "Bullish FVG/OB", group="🎨 Colors")
+colBearFVG = input.color(color.new(color.red, 85), "Bearish FVG/OB", group="🎨 Colors")
+
+//──────────────────────────────────────────────────────────────────────────────
+// CORE CALCULATIONS
+//──────────────────────────────────────────────────────────────────────────────
+
+atr = ta.atr(14)
+
+// === VWAP ===
+vwapVal = vwapSession == "Session" ? ta.vwap(hlc3) : ta.vwap(hlc3, timeframe.change("W"))
+
+// === KILL ZONES ===
+isNYMorning = hour(time, "America/New_York") >= 7 and hour(time, "America/New_York") < 10
+isNYAfternoon = hour(time, "America/New_York") >= 13 and hour(time, "America/New_York") < 16
+isActiveKZ = showNYKZ and (isNYMorning or isNYAfternoon)
+
+//──────────────────────────────────────────────────────────────────────────────
+// MARKET STRUCTURE: Swing Highs/Lows
+//──────────────────────────────────────────────────────────────────────────────
+
+// Identify swing points using pivot logic
+swingHigh = ta.pivothigh(high, swingLength, swingLength)
+swingLow = ta.pivotlow(low, swingLength, swingLength)
+
+// Track most recent swing levels
+var float lastSwingHigh = na
+var float lastSwingLow = na
+var int lastSwingHighBar = 0
+var int lastSwingLowBar = 0
+
+if not na(swingHigh)
+    lastSwingHigh := swingHigh
+    lastSwingHighBar := bar_index - swingLength
+    if showSwings
+        label.new(bar_index - swingLength, swingHigh, "H", style=label.style_label_down, color=color.red, textcolor=color.white, size=size.tiny)
+
+if not na(swingLow)
+    lastSwingLow := swingLow
+    lastSwingLowBar := bar_index - swingLength
+    if showSwings
+        label.new(bar_index - swingLength, swingLow, "L", style=label.style_label_up, color=color.green, textcolor=color.white, size=size.tiny)
+
+//──────────────────────────────────────────────────────────────────────────────
+// BREAK OF STRUCTURE (BOS)
+//──────────────────────────────────────────────────────────────────────────────
+
+var string currentStructure = "NEUTRAL"
+var int lastBOSBar = 0
+var float bosLevel = na
+
+// Bullish BOS: Close above last swing high
+bool bullishBOS = not na(lastSwingHigh) and close > lastSwingHigh and bar_index > lastSwingHighBar + swingLength
+if bullishBOS and currentStructure != "BULLISH"
+    currentStructure := "BULLISH"
+    lastBOSBar := bar_index
+    bosLevel := lastSwingHigh
+    label.new(bar_index, high, "BOS↑", style=label.style_label_down, color=color.new(color.lime, 30), textcolor=color.white, size=size.small)
+
+// Bearish BOS: Close below last swing low  
+bool bearishBOS = not na(lastSwingLow) and close < lastSwingLow and bar_index > lastSwingLowBar + swingLength
+if bearishBOS and currentStructure != "BEARISH"
+    currentStructure := "BEARISH"
+    lastBOSBar := bar_index
+    bosLevel := lastSwingLow
+    label.new(bar_index, low, "BOS↓", style=label.style_label_up, color=color.new(color.red, 30), textcolor=color.white, size=size.small)
+
+//──────────────────────────────────────────────────────────────────────────────
+// DISPLACEMENT DETECTION
+//──────────────────────────────────────────────────────────────────────────────
+
+bodySize = math.abs(close - open)
+wickSize = (high - low) - bodySize
+isDisplacement = bodySize > (atr * dispMultiplier) and (wickSize / bodySize < dispWickRatio)
+isBullDisp = isDisplacement and close > open
+isBearDisp = isDisplacement and close < open
+
+// Track consecutive displacement bars
+var int bullDispCount = 0
+var int bearDispCount = 0
+var int lastBullDispBar = 0
+var int lastBearDispBar = 0
+
+if isBullDisp
+    bullDispCount += 1
+    lastBullDispBar := bar_index
+else
+    bullDispCount := 0
+
+if isBearDisp
+    bearDispCount += 1
+    lastBearDispBar := bar_index
+else
+    bearDispCount := 0
+
+// Valid displacement = minimum consecutive bars
+validBullDisp = bullDispCount >= minDispBars
+validBearDisp = bearDispCount >= minDispBars
+
+//──────────────────────────────────────────────────────────────────────────────
+// FVG DETECTION (Post-Displacement)
+//──────────────────────────────────────────────────────────────────────────────
+
+bullFVG = low > high[2]
+bearFVG = high < low[2]
+
+var box[] bullFVGBoxes = array.new<box>()
+var box[] bearFVGBoxes = array.new<box>()
+var int[] bullFVGBars = array.new<int>()
+var int[] bearFVGBars = array.new<int>()
+
+// Only create FVG if it occurred AFTER a BOS (within last 20 bars of BOS)
+if showFVG and bullFVG and currentStructure == "BULLISH" and (bar_index - lastBOSBar) < 20 and (bar_index - lastBOSBar) >= 0
+    fvgTop = low
+    fvgBot = high[2]
+    ce = (fvgTop + fvgBot) / 2 // Draw CE line
+    newBox = box.new(bar_index-2, fvgTop, bar_index + 20, fvgBot, bgcolor=colBullFVG, border_color=color.new(color.green, 50), border_width=1)
+    array.push(bullFVGBoxes, newBox)
+    array.push(bullFVGBars, bar_index)
+    if array.size(bullFVGBoxes) > fvgBoxes
+        box.delete(array.shift(bullFVGBoxes))
+        array.shift(bullFVGBars)
+
+if showFVG and bearFVG and currentStructure == "BEARISH" and (bar_index - lastBOSBar) < 20 and (bar_index - lastBOSBar) >= 0
+    fvgTop = low[2]
+    fvgBot = high
+    ce = (fvgTop + fvgBot) / 2
+    newBox = box.new(bar_index-2, fvgTop, bar_index + 20, fvgBot, bgcolor=colBearFVG, border_color=color.new(color.red, 50), border_width=1)
+    array.push(bearFVGBoxes, newBox)
+    array.push(bearFVGBars, bar_index)
+    if array.size(bearFVGBoxes) > fvgBoxes
+        box.delete(array.shift(bearFVGBoxes))
+        array.shift(bearFVGBars)
+
+//──────────────────────────────────────────────────────────────────────────────
+// ORDER BLOCK DETECTION (Last opposite candle before displacement)
+//──────────────────────────────────────────────────────────────────────────────
+
+var box[] bullOBBoxes = array.new<box>()
+var box[] bearOBBoxes = array.new<box>()
+
+// Bullish OB: Last red candle before bullish displacement
+if showOB and validBullDisp and close[minDispBars] < open[minDispBars]
+    obTop = high[minDispBars]
+    obBot = low[minDispBars]
+    newBox = box.new(bar_index - minDispBars, obTop, bar_index + 20, obBot, bgcolor=colBullFVG, border_color=color.new(color.green, 30), border_width=2)
+    array.push(bullOBBoxes, newBox)
+    if array.size(bullOBBoxes) > fvgBoxes
+        box.delete(array.shift(bullOBBoxes))
+
+// Bearish OB: Last green candle before bearish displacement
+if showOB and validBearDisp and close[minDispBars] > open[minDispBars]
+    obTop = high[minDispBars]
+    obBot = low[minDispBars]
+    newBox = box.new(bar_index - minDispBars, obTop, bar_index + 20, obBot, bgcolor=colBearFVG, border_color=color.new(color.red, 30), border_width=2)
+    array.push(bearOBBoxes, newBox)
+    if array.size(bearOBBoxes) > fvgBoxes
+        box.delete(array.shift(bearOBBoxes))
+
+//──────────────────────────────────────────────────────────────────────────────
+// ENTRY LOGIC: Price retraces into FVG/OB after BOS + Displacement
+//──────────────────────────────────────────────────────────────────────────────
+
+bool inBullFVG = false
+bool inBearFVG = false
+bool inBullOB = false
+bool inBearOB = false
+
+// Check if price is tapping into any valid FVG (with CE requirement)
+if array.size(bullFVGBoxes) > 0
+    for i = 0 to array.size(bullFVGBoxes) - 1
+        bx = array.get(bullFVGBoxes, i)
+        fvgBar = array.get(bullFVGBars, i)
+        if bar_index - fvgBar < 30 and bar_index > fvgBar
+            boxTop = box.get_top(bx)
+            boxBot = box.get_bottom(bx)
+            ce = (boxTop + boxBot) / 2
+            
+            // CE Logic: Low must touch or go below CE
+            hitZone = ceEntry ? (low <= ce and high >= boxBot) : (low <= boxTop and high >= boxBot)
+            
+            if hitZone
+                inBullFVG := true
+                break
+
+if array.size(bearFVGBoxes) > 0
+    for i = 0 to array.size(bearFVGBoxes) - 1
+        bx = array.get(bearFVGBoxes, i)
+        fvgBar = array.get(bearFVGBars, i)
+        if bar_index - fvgBar < 30 and bar_index > fvgBar
+            boxTop = box.get_top(bx)
+            boxBot = box.get_bottom(bx)
+            ce = (boxTop + boxBot) / 2
+            
+            // CE Logic: High must touch or go above CE
+            hitZone = ceEntry ? (high >= ce and low <= boxTop) : (high >= boxBot and low <= boxTop)
+            
+            if hitZone
+                inBearFVG := true
+                break
+
+// Check if price is tapping into OB
+if array.size(bullOBBoxes) > 0
+    bx = array.get(bullOBBoxes, array.size(bullOBBoxes) - 1)
+    boxTop = box.get_top(bx)
+    boxBot = box.get_bottom(bx)
+    if low <= boxTop and high >= boxBot
+        inBullOB := true
+
+if array.size(bearOBBoxes) > 0
+    bx = array.get(bearOBBoxes, array.size(bearOBBoxes) - 1)
+    boxTop = box.get_top(bx)
+    boxBot = box.get_bottom(bx)
+    if low <= boxTop and high >= boxBot
+        inBearOB := true
+
+//──────────────────────────────────────────────────────────────────────────────
+// CONFLUENCE: All conditions must align
+//──────────────────────────────────────────────────────────────────────────────
+
+recentBOS = bar_index - lastBOSBar < 30 and lastBOSBar > 0
+recentBullDisp = bar_index - lastBullDispBar < 15 and lastBullDispBar > lastBOSBar
+recentBearDisp = bar_index - lastBearDispBar < 15 and lastBearDispBar > lastBOSBar
+
+// VWAP Filter Logic
+vwapLong = not vwapFilter or (close > vwapVal)
+vwapShort = not vwapFilter or (close < vwapVal)
+
+validLongSetup = currentStructure == "BULLISH" and recentBOS and recentBullDisp and (inBullFVG or inBullOB) and (not useKillZones or isActiveKZ) and vwapLong
+
+validShortSetup = currentStructure == "BEARISH" and recentBOS and recentBearDisp and (inBearFVG or inBearOB) and (not useKillZones or isActiveKZ) and vwapShort
+
+// Only trigger signal once per setup
+var bool longSignalFired = false
+var bool shortSignalFired = false
+
+if validLongSetup and not validLongSetup[1]
+    longSignalFired := false
+
+if validShortSetup and not validShortSetup[1]
+    shortSignalFired := false
+
+//──────────────────────────────────────────────────────────────────────────────
+// PLOTTING
+//──────────────────────────────────────────────────────────────────────────────
+
+plot(showVwap ? vwapVal : na, "VWAP", color=color.new(color.blue, 30), linewidth=2)
+
+// Background shading for structure
+bgcolor(currentStructure == "BULLISH" ? color.new(color.green, 97) : currentStructure == "BEARISH" ? color.new(color.red, 97) : na, title="Structure Bias")
+
+// Highlight displacement bars
+barcolor(isBullDisp ? color.new(color.lime, 60) : isBearDisp ? color.new(color.red, 60) : na, title="Displacement")
+
+// ENTRY SIGNALS
+if validLongSetup and not longSignalFired
+    label.new(bar_index, low, "⚡ LONG", style=label.style_label_up, color=color.new(color.lime, 0), textcolor=color.black, size=size.normal)
+    longSignalFired := true
+
+if validShortSetup and not shortSignalFired
+    label.new(bar_index, high, "⚡ SHORT", style=label.style_label_down, color=color.new(color.red, 0), textcolor=color.white, size=size.normal)
+    shortSignalFired := true
+
+//──────────────────────────────────────────────────────────────────────────────
+// HUD
+//──────────────────────────────────────────────────────────────────────────────
+
+var table hud = table.new(position.top_right, 2, 8, border_width=1)
+
+if barstate.islast
+    table.cell(hud, 0, 0, "ICT STRUCTURE HUD", bgcolor=color.black, text_color=color.white, text_size=size.normal)
+    table.cell(hud, 1, 0, syminfo.ticker, bgcolor=color.black, text_color=color.white, text_size=size.normal)
+    
+    string kzStatus = isNYMorning ? "NY AM ✓" : isNYAfternoon ? "NY PM ✓" : "OUTSIDE KZ"
+    color kzColor = isActiveKZ ? color.new(color.green, 30) : color.new(color.orange, 30)
+    table.cell(hud, 0, 1, "Kill Zone", bgcolor=color.gray, text_color=color.white, text_size=size.small)
+    table.cell(hud, 1, 1, kzStatus, bgcolor=kzColor, text_color=color.white, text_size=size.small)
+    
+    color structColor = currentStructure == "BULLISH" ? color.green : currentStructure == "BEARISH" ? color.red : color.gray
+    table.cell(hud, 0, 2, "Structure", bgcolor=color.gray, text_color=color.white, text_size=size.small)
+    table.cell(hud, 1, 2, currentStructure, bgcolor=structColor, text_color=color.white, text_size=size.small)
+    
+    string bosStatus = recentBOS ? "BOS ✓ (" + str.tostring(bar_index - lastBOSBar) + ")" : "No Recent BOS"
+    table.cell(hud, 0, 3, "BOS", bgcolor=color.gray, text_color=color.white, text_size=size.small)
+    table.cell(hud, 1, 3, bosStatus, bgcolor=recentBOS ? color.green : color.gray, text_color=color.white, text_size=size.small)
+    
+    string dispStatus = (recentBullDisp or recentBearDisp) ? "DISP ✓" : "No Displacement"
+    table.cell(hud, 0, 4, "Displacement", bgcolor=color.gray, text_color=color.white, text_size=size.small)
+    table.cell(hud, 1, 4, dispStatus, bgcolor=(recentBullDisp or recentBearDisp) ? color.green : color.gray, text_color=color.white, text_size=size.small)
+    
+    string pdStatus = (inBullFVG or inBullOB) ? "IN BULL FVG/OB ⚡" : (inBearFVG or inBearOB) ? "IN BEAR FVG/OB ⚡" : "No Zone"
+    color pdColor = (inBullFVG or inBullOB) ? color.lime : (inBearFVG or inBearOB) ? color.red : color.gray
+    table.cell(hud, 0, 5, "PD Array", bgcolor=color.gray, text_color=color.white, text_size=size.small)
+    table.cell(hud, 1, 5, pdStatus, bgcolor=pdColor, text_color=color.white, text_size=size.small)
+
+    string vwapStatus = vwapLong ? "ABOVE VWAP" : vwapShort ? "BELOW VWAP" : "NEUTRAL"
+    table.cell(hud, 0, 6, "VWAP Filter", bgcolor=color.gray, text_color=color.white, text_size=size.small)
+    table.cell(hud, 1, 6, vwapStatus, bgcolor=color.gray, text_color=color.white, text_size=size.small)
+    
+    string action = validLongSetup ? "⚡ EXECUTE LONG ⚡" : validShortSetup ? "⚡ EXECUTE SHORT ⚡" : recentBOS ? "WAIT FOR PULLBACK" : "WAIT FOR BOS"
+    color actionColor = validLongSetup ? color.new(color.lime, 0) : validShortSetup ? color.new(color.red, 0) : recentBOS ? color.new(color.orange, 30) : color.gray
+    table.cell(hud, 0, 7, "ACTION", bgcolor=color.black, text_color=color.white, text_size=size.small)
+    table.cell(hud, 1, 7, action, bgcolor=actionColor, text_color=color.white, text_size=size.large)
+
+//──────────────────────────────────────────────────────────────────────────────
+// ALERTS
+//──────────────────────────────────────────────────────────────────────────────
+
+alertcondition(validLongSetup and not longSignalFired, "LONG Entry", "⚡ LONG: BOS + Displacement + FVG/OB Tap")
+alertcondition(validShortSetup and not shortSignalFired, "SHORT Entry", "⚡ SHORT: BOS + Displacement + FVG/OB Tap")
+alertcondition(bullishBOS, "Bullish BOS", "📈 Bullish Break of Structure")
+alertcondition(bearishBOS, "Bearish BOS", "📉 Bearish Break of Structure")

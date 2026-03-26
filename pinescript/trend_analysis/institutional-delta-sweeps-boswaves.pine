@@ -1,0 +1,303 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © BOSWaves
+
+//@version=6
+indicator("Institutional Delta Sweeps [BOSWaves]", overlay = true, max_labels_count = 500, max_boxes_count = 500, max_lines_count = 500, calc_bars_count = 3000, max_bars_back = 5000)
+ 
+// ┌───────────────────────────── BOSWaves ─ Inputs ──────────────────────────────────┐
+// └──────────────────────────────────────────────────────────────────────────────────┘
+
+const string GRP_SWING = "Swing Detection"
+swingLeft    = input.int(20, "Pivot Lookback Left",  minval = 5, group = GRP_SWING, tooltip = "Number of bars to the left used to identify a major swing high/low.")
+swingRight   = input.int(20, "Pivot Lookback Right", minval = 5, group = GRP_SWING, tooltip = "Number of bars to the right required to confirm a swing point.")
+cooldownBars = input.int(10, "Sweep Cooldown Bars",  minval = 0, group = GRP_SWING, tooltip = "Minimum bars required between detecting sweeps of the exact same zone to prevent alert spam.")
+
+const string GRP_LIQ = "Liquidity Zones"
+showLiqZones   = input.bool(true, "Show Liquidity Pools", group = GRP_LIQ, tooltip = "Toggles the visibility of the liquidity blocks and lines.")
+liqZoneWidth   = input.float(0.3, "Zone ATR Width", minval = 0.1, maxval = 1.0, step = 0.1, group = GRP_LIQ, tooltip = "Defines the vertical depth of the liquidity block.")
+liqLineWidth   = input.int(1, "Liquidity Line Thickness", minval = 1, maxval = 5, group = GRP_LIQ)
+maxZoneAge     = input.int(200, "Max Zone Age (bars)", minval = 50, group = GRP_LIQ, tooltip = "How many bars a liquidity pool persists before fading out.")
+
+const string GRP_SWEEP = "Sweep Visuals & Zones"
+showSweepZone    = input.bool(true, "Highlight Sweep Zone", group = GRP_SWEEP, tooltip = "Draws a localized box highlighting the exact candle wick that swept the liquidity.")
+showSweepData    = input.bool(true, "Show Sweep Labels",    group = GRP_SWEEP, tooltip = "Displays a text label showing the exact percentage the liquidity zone was penetrated.")
+showBuySellZones = input.bool(true, "Project Buy/Sell Zones After Sweep", group = GRP_SWEEP, tooltip = "Draws explicitly labeled, forward-projecting action zones immediately following a sweep.")
+zoneExtension    = input.int(50, "Buy/Sell Zone Projection (Bars)", minval=10, group=GRP_SWEEP, tooltip = "How many bars into the future the Buy/Sell zone boxes are projected.")
+zoneBorderWidth  = input.int(1, "Zone Border Thickness", minval = 1, maxval = 5, group = GRP_SWEEP, tooltip = "Adjusts the thickness of the dashed borders on the projected Buy/Sell zones.")
+
+const string GRP_ZZ = "Structure"
+showZigZag     = input.bool(true, "Show Market Structure", inline = "zz", group = GRP_ZZ, tooltip = "Draws lines connecting the major swing highs and lows to visualize market structure.")
+zzStyle        = input.string("Dotted", "", ["Dotted", "Dashed", "Solid"], inline = "zz", group = GRP_ZZ)
+zzWidth        = input.int(1, "Thickness", minval = 1, maxval = 5, inline = "zz", group = GRP_ZZ, tooltip = "Adjusts the thickness of the structure/zigzag lines.")
+
+const string GRP_CLR = "Colors"
+bullColor      = input.color(#089981, "Bullish / Buy Zone", inline = "clr", group = GRP_CLR, tooltip = "Color used for support lines, uptrend structure, and Buy Zones.") 
+bearColor      = input.color(#F23645, "Bearish / Sell Zone", inline = "clr", group = GRP_CLR, tooltip = "Color used for resistance lines, downtrend structure, and Sell Zones.")  
+sweepBullColor = input.color(#089981, "Sweep Bull Highlight", inline = "clr2", group = GRP_CLR, tooltip = "Color of the flash/highlight when a bullish sweep occurs.")
+sweepBearColor = input.color(#F23645, "Sweep Bear Highlight", inline = "clr2", group = GRP_CLR, tooltip = "Color of the flash/highlight when a bearish sweep occurs.")
+
+// ┌───────────────────────────── BOSWaves ─ Helpers ─────────────────────────────────┐
+// └──────────────────────────────────────────────────────────────────────────────────┘
+
+getLineStyle() =>
+    switch zzStyle
+        "Dotted" => line.style_dotted
+        "Dashed" => line.style_dashed
+        => line.style_solid
+
+// ┌───────────────────────────── BOSWaves ─ Types ───────────────────────────────────┐
+// └──────────────────────────────────────────────────────────────────────────────────┘
+
+type LiquidityZone
+    float   price
+    int     startIndex
+    bool    isHigh
+    bool    swept
+    int     sweepIndex
+    float   sweepWick
+    float   sweepVol
+    line    levelLine
+    box     poolBox
+    box     poolBoxInner
+    box     sweepHighlight
+
+type SweepStats
+    int     bullCount
+    int     bearCount
+    float   avgBullDepth
+    float   avgBearDepth
+
+type SwingPoint
+    float price
+    int   idx
+
+// ┌───────────────────────────── BOSWaves ─ State ───────────────────────────────────┐
+// └──────────────────────────────────────────────────────────────────────────────────┘
+
+var zones       = array.new<LiquidityZone>()
+var stats       = SweepStats.new(0, 0, 0.0, 0.0)
+var int lastBullSweepBar = 0
+var int lastBearSweepBar = 0
+
+var highSwing  = SwingPoint.new(na, na)
+var lowSwing   = SwingPoint.new(na, na)
+var isDownMove = false
+
+atr = ta.atr(200)
+
+// ┌───────────────────────────── BOSWaves ─ Pivot Detection ─────────────────────────┐
+// └──────────────────────────────────────────────────────────────────────────────────┘
+
+pHigh = ta.pivothigh(high, swingLeft, swingRight)
+pLow  = ta.pivotlow(low, swingLeft, swingRight)
+
+H = ta.highest(high, swingLeft)
+L = ta.lowest(low, swingLeft)
+
+if high == H
+    isDownMove := true
+if low == L
+    isDownMove := false
+
+if high[1] == H[1] and high < H
+    highSwing.idx   := bar_index[1]
+    highSwing.price := high[1]
+
+if low[1] == L[1] and low > L
+    lowSwing.idx   := bar_index[1]
+    lowSwing.price := low[1]
+
+// ┌───────────────────────────── BOSWaves ─ ZigZag Structure ────────────────────────┐
+// └──────────────────────────────────────────────────────────────────────────────────┘
+
+if showZigZag and isDownMove != isDownMove[1]
+    zzColor = isDownMove ? bearColor : bullColor
+    line.new(highSwing.idx, highSwing.price, lowSwing.idx, lowSwing.price, color = color.new(zzColor, 60), style = getLineStyle(), width = zzWidth)
+
+// ┌───────────────────────────── BOSWaves ─ Create Liquidity Zones ──────────────────┐
+// └──────────────────────────────────────────────────────────────────────────────────┘
+
+if not na(pHigh) and showLiqZones
+    pivotPrice = high[swingRight]
+    pivotIdx   = bar_index[swingRight]
+    zoneTop    = pivotPrice + (atr * liqZoneWidth)
+    zoneMid    = pivotPrice + (atr * liqZoneWidth * 0.3)
+
+    zone = LiquidityZone.new()
+    zone.price      := pivotPrice
+    zone.startIndex := pivotIdx
+    zone.isHigh     := true
+    zone.swept      := false
+
+    zone.poolBox := box.new(pivotIdx, zoneTop, bar_index + 10, pivotPrice, border_color = color.new(bearColor, 60), bgcolor = color.new(bearColor, 90))
+    zone.poolBoxInner := box.new(pivotIdx, zoneMid, bar_index + 10, pivotPrice, border_color = na, bgcolor = color.new(bearColor, 85))
+    zone.levelLine := line.new(pivotIdx, pivotPrice, bar_index + 10, pivotPrice, color = color.new(bearColor, 40), style = line.style_solid, width = liqLineWidth)
+
+    zones.push(zone)
+
+    label.new(pivotIdx, pivotPrice, "◆",
+         style     = label.style_none,
+         textcolor = color.new(bearColor, 30),
+         size      = size.tiny)
+
+if not na(pLow) and showLiqZones
+    pivotPrice = low[swingRight]
+    pivotIdx   = bar_index[swingRight]
+    zoneBot    = pivotPrice - (atr * liqZoneWidth)
+    zoneMid    = pivotPrice - (atr * liqZoneWidth * 0.3)
+
+    zone = LiquidityZone.new()
+    zone.price      := pivotPrice
+    zone.startIndex := pivotIdx
+    zone.isHigh     := false
+    zone.swept      := false
+
+    zone.poolBox := box.new(pivotIdx, pivotPrice, bar_index + 10, zoneBot, border_color = color.new(bullColor, 60), bgcolor = color.new(bullColor, 90))
+    zone.poolBoxInner := box.new(pivotIdx, pivotPrice, bar_index + 10, zoneMid, border_color = na, bgcolor = color.new(bullColor, 85))
+    zone.levelLine := line.new(pivotIdx, pivotPrice, bar_index + 10, pivotPrice, color = color.new(bullColor, 40), style = line.style_solid, width = liqLineWidth)
+
+    zones.push(zone)
+
+    label.new(pivotIdx, pivotPrice, "◆",
+         style     = label.style_none,
+         textcolor = color.new(bullColor, 30),
+         size      = size.tiny)
+
+// ┌───────────────────────────── BOSWaves ─ Zone Management & Sweep Detection ───────┐
+// └──────────────────────────────────────────────────────────────────────────────────┘
+
+if zones.size() > 0
+    for i = zones.size() - 1 to 0
+
+        zone = zones.get(i)
+        age  = bar_index - zone.startIndex
+
+        if zone.swept
+            continue
+
+        if age > maxZoneAge
+            box.delete(zone.poolBox)
+            box.delete(zone.poolBoxInner)
+            line.delete(zone.levelLine)
+            zones.remove(i)
+            continue
+
+        // ── Comet Fade Math ──
+        fadePct     = math.min(age / maxZoneAge, 1.0)
+        cometCurve  = math.pow(fadePct, 3) 
+        bgTransp    = int(90.0 + (10.0 * cometCurve))   
+        innerTransp = int(85.0 + (15.0 * cometCurve))   
+        borderTransp = int(60.0 + (40.0 * cometCurve))
+        lineTransp  = int(40.0 + (60.0 * cometCurve))   
+
+        zoneColor = zone.isHigh ? bearColor : bullColor
+
+        box.set_right(zone.poolBox, bar_index + 5)
+        box.set_right(zone.poolBoxInner, bar_index + 5)
+        line.set_x2(zone.levelLine, bar_index + 5)
+        
+        box.set_bgcolor(zone.poolBox, color.new(zoneColor, bgTransp))
+        box.set_bgcolor(zone.poolBoxInner, color.new(zoneColor, innerTransp))
+        box.set_border_color(zone.poolBox, color.new(zoneColor, borderTransp))
+        line.set_color(zone.levelLine, color.new(zoneColor, lineTransp))
+
+        // Bearish Sweep
+        if zone.isHigh and high > zone.price and close < zone.price and open < zone.price
+            if bar_index >= lastBearSweepBar + cooldownBars
+                zone.swept      := true
+                zone.sweepIndex := bar_index
+                zone.sweepWick  := high
+                zone.sweepVol   := volume
+                lastBearSweepBar := bar_index
+
+                box.set_right(zone.poolBox, bar_index)
+                box.set_right(zone.poolBoxInner, bar_index)
+                line.set_x2(zone.levelLine, bar_index)
+
+                if showSweepZone
+                    zone.sweepHighlight := box.new(
+                         bar_index - 1, high, bar_index + 1, zone.price,
+                         border_color = color.new(sweepBearColor, 40),
+                         border_width = zoneBorderWidth,
+                         bgcolor      = color.new(sweepBearColor, 85))
+
+                if showSweepData
+                    penetration = ((high - zone.price) / zone.price) * 100
+                    label.new(bar_index, high,
+                         "SWEEP  " + str.tostring(penetration, "#.##") + "%",
+                         style     = label.style_label_down,
+                         color     = color.new(sweepBearColor, 30),
+                         textcolor = color.white,
+                         size      = size.small)
+                         
+                if showBuySellZones
+                    zoneTop = high
+                    zoneBot = math.max(open, close)
+                    box.new(left = bar_index, top = zoneTop, right = bar_index + zoneExtension, bottom = zoneBot, 
+                         border_color = color.new(bearColor, 40), border_width = zoneBorderWidth, border_style = line.style_dashed, 
+                         bgcolor = color.new(bearColor, 90), 
+                         text = "SELL ZONE", text_color = color.new(bearColor, 40), 
+                         text_halign = text.align_right, text_valign = text.align_top)
+
+                stats.bearCount += 1
+                penetration = ((high - zone.price) / zone.price) * 100
+                stats.avgBearDepth := ((stats.avgBearDepth * (stats.bearCount - 1)) + penetration) / stats.bearCount
+
+        // Bullish Sweep
+        if not zone.isHigh and low < zone.price and close > zone.price and open > zone.price
+            if bar_index >= lastBullSweepBar + cooldownBars
+                zone.swept      := true
+                zone.sweepIndex := bar_index
+                zone.sweepWick  := low
+                zone.sweepVol   := volume
+                lastBullSweepBar := bar_index
+
+                box.set_right(zone.poolBox, bar_index)
+                box.set_right(zone.poolBoxInner, bar_index)
+                line.set_x2(zone.levelLine, bar_index)
+
+                if showSweepZone
+                    zone.sweepHighlight := box.new(
+                         bar_index - 1, zone.price, bar_index + 1, low,
+                         border_color = color.new(sweepBullColor, 40),
+                         border_width = zoneBorderWidth,
+                         bgcolor      = color.new(sweepBullColor, 85))
+
+                if showSweepData
+                    penetration = ((zone.price - low) / zone.price) * 100
+                    label.new(bar_index, low,
+                         "SWEEP  " + str.tostring(penetration, "#.##") + "%",
+                         style     = label.style_label_up,
+                         color     = color.new(sweepBullColor, 30),
+                         textcolor = color.white,
+                         size      = size.small)
+                         
+                if showBuySellZones
+                    zoneTop = math.min(open, close)
+                    zoneBot = low
+                    box.new(left = bar_index, top = zoneTop, right = bar_index + zoneExtension, bottom = zoneBot, 
+                         border_color = color.new(bullColor, 40), border_width = zoneBorderWidth, border_style = line.style_dashed, 
+                         bgcolor = color.new(bullColor, 90), 
+                         text = "BUY ZONE", text_color = color.new(bullColor, 40), 
+                         text_halign = text.align_right, text_valign = text.align_bottom)
+
+                stats.bullCount += 1
+                penetration = ((zone.price - low) / zone.price) * 100
+                stats.avgBullDepth := ((stats.avgBullDepth * (stats.bullCount - 1)) + penetration) / stats.bullCount
+
+// ┌───────────────────────────── BOSWaves ─ Alerts ──────────────────────────────────┐
+// └──────────────────────────────────────────────────────────────────────────────────┘
+
+bullSweepSignal = false
+bearSweepSignal = false
+
+if zones.size() > 0
+    for z in zones
+        if z.swept and z.sweepIndex == bar_index
+            if z.isHigh
+                bearSweepSignal := true
+            else
+                bullSweepSignal := true
+
+alertcondition(bullSweepSignal, title = "Bullish Sweep", message = "{{ticker}} Bullish Liquidity Sweep at {{close}}")
+alertcondition(bearSweepSignal, title = "Bearish Sweep", message = "{{ticker}} Bearish Liquidity Sweep at {{close}}")

@@ -1,0 +1,497 @@
+//@version=5
+indicator("Neural Ribbon", overlay=true, max_bars_back=5000)
+
+grp_net = "Network"
+base_lr = input.float(0.01, "Learning Rate", minval=0.001, maxval=0.1, step=0.001, group=grp_net)
+mbeta   = input.float(0.88, "Momentum", minval=0.0, maxval=0.99, step=0.01, group=grp_net)
+train_lr_mult  = input.float(8.0, "Trader LR Mult", minval=0.1, maxval=10.0, step=0.1, group=grp_net)
+edge_thresh    = input.float(0.1, "Min Edge", minval=0.01, maxval=0.5, step=0.01, group=grp_net)
+lookfwd        = input.int(8, "Lookahead Bars", minval=2, maxval=10, group=grp_net)
+
+// ============= SELF-ADJUSTING TRADE PARAMETERS =============
+// These start at sensible defaults and RL tunes them after each trade.
+// Rolling window of recent trades drives adjustments.
+var float p_entry    = 0.1    // entry threshold
+var float p_exit     = 0.5    // exit threshold
+var float p_sl       = 3.0    // hard stop ATR mult
+var int   p_hold     = 3      // min bars in trade
+var float p_smooth   = 0.7    // signal responsiveness
+var float p_scale    = 3.0    // signal amplification
+var int   p_cooldown = 1      // cooldown bars
+var float p_tp       = 0.0    // take profit ATR mult (0=off)
+var float p_rl       = 2.0    // reinforcement strength
+
+// Rolling trade outcome tracker (EMA-style, no arrays)
+var int rl_window = 30
+var float rl_adapt_lr = 0.03
+
+N_NETS=5, H1=6, H2=4, WD=0.001, GC=3.0
+
+safe(x)=>nz(x,0.0)
+tanh_f(x)=>
+    xx=safe(x)
+    xx>10?1.0:xx<-10?-1.0:(math.exp(2.0*xx)-1.0)/(math.exp(2.0*xx)+1.0)
+leaky_relu(x)=>
+    xx=safe(x)
+    xx>=0.0?xx:0.01*xx
+lrelu_d(x)=>safe(x)>=0.0?1.0:0.01
+clamp(x,lo,hi)=>math.max(lo,math.min(hi,safe(x)))
+safe_div(a,b)=>math.abs(safe(b))<1e-10?0.0:safe(a)/safe(b)
+seed_val(idx)=>
+    raw=math.abs(math.sin(idx*127.1+311.7)*43758.5453)
+    raw-math.floor(raw)
+
+atr_val=nz(ta.atr(14),close*0.01)
+var float avg_range=na
+price_range=nz(ta.highest(high,16)-ta.lowest(low,16),close*0.02)
+avg_range:=na(avg_range)?price_range:0.92*nz(avg_range,price_range)+0.08*price_range
+nf=math.max(nz(avg_range,close*0.02)*0.55+nz(ta.highest(high,5)-ta.lowest(low,5),close*0.01)*0.25+nz(ta.highest(high,50)-ta.lowest(low,50),close*0.03)*0.20,close*0.008,syminfo.mintick)
+
+c=nz(close,0.0),op=nz(open,c),h=nz(high,c),l=nz(low,c),v=nz(volume,0.0)
+c1=nz(close[1],c),op1=nz(open[1],c),h1=nz(high[1],c),l1=nz(low[1],c),v1=nz(volume[1],v)
+c2=nz(close[2],c1),op2=nz(open[2],c1),v2=nz(volume[2],v)
+c3=nz(close[3],c2),v3=nz(volume[3],v)
+c4=nz(close[4],c3),v4=nz(volume[4],v)
+c5=nz(close[5],c4),c8=nz(close[8],c5),c13=nz(close[13],c8),c21=nz(close[21],c13)
+cr=math.max(h-l,syminfo.mintick),cr1=math.max(h1-l1,syminfo.mintick)
+cr2=math.max(nz(high[2],h)-nz(low[2],l),syminfo.mintick)
+body=c-op,body1=c1-op1,body2=c2-op2
+uw=h-math.max(op,c),lw=math.min(op,c)-l
+uw1=h1-math.max(op1,c1),lw1=math.min(op1,c1)-l1
+hv5=math.max(nz(ta.highest(volume,5),v),1.0)
+hv16=math.max(nz(ta.highest(volume,16),v),1.0)
+ll8=nz(ta.lowest(low,8),l),hh8=nz(ta.highest(high,8),h),r8=math.max(hh8-ll8,syminfo.mintick)
+ll16=nz(ta.lowest(low,16),l),hh16=nz(ta.highest(high,16),h),r16=math.max(hh16-ll16,syminfo.mintick)
+ll50=nz(ta.lowest(low,50),l),hh50=nz(ta.highest(high,50),h),r50=math.max(hh50-ll50,syminfo.mintick)
+avg_r5=(cr+cr1+cr2+math.max(nz(high[3],h)-nz(low[3],l),syminfo.mintick)+math.max(nz(high[4],h)-nz(low[4],l),syminfo.mintick))/5.0
+avg_v5=(v+v1+v2+v3+v4)/5.0
+swept_h=h>h1 and c<h1?safe_div(h-h1,cr):0.0
+swept_l=l<l1 and c>l1?safe_div(l1-l,cr):0.0
+
+// ============= 5 PREDICTION NETS =============
+N0=8
+f0=array.from(clamp(safe_div(body,cr)*2.0,-2.0,2.0),clamp(((c-l)/cr)*2.0-1.0,-1.0,1.0),clamp(safe_div(lw-uw,cr)*2.0,-2.0,2.0),clamp(safe_div(body1,cr1)*2.0,-2.0,2.0),clamp(safe_div(v,hv5)*2.0-1.0,-1.0,1.5),clamp(safe_div(v-v1,math.max(v1,1.0)),-2.0,2.0),clamp(safe_div(cr,cr1)-1.0,-2.0,2.0),clamp((swept_l-swept_h)*3.0,-2.0,2.0))
+N1=10
+f1=array.from(tanh_f(safe_div(c-c5,nf)*4.0),clamp(safe_div(body+body1+body2,nf)*4.0,-2.0,2.0),clamp(safe_div(v,hv5)*2.0-1.0,-1.0,1.5),clamp(safe_div(cr,avg_r5)-1.0,-2.0,2.0),clamp(safe_div(body,cr)*2.0,-2.0,2.0),clamp(((c-l)/cr)*2.0-1.0,-1.0,1.0),clamp(safe_div(lw-uw,cr)*2.0,-2.0,2.0),clamp(safe_div(r8,r16)-0.5,-1.5,1.5),clamp((swept_l-swept_h)*3.0,-2.0,2.0),clamp(safe_div(body,cr)*safe_div(v,hv5)*2.0,-2.0,2.0))
+N2=10
+f2=array.from(tanh_f(safe_div(c-c8,nf)*3.0),tanh_f(safe_div(c-c5,nf)*4.0),clamp(safe_div(c-(hh8+ll8)/2.0,r8*0.5),-1.5,1.5),clamp(safe_div(c-(hh16+ll16)/2.0,r16*0.5),-1.5,1.5),clamp(safe_div(r8,r16)-0.5,-1.5,1.5),clamp(safe_div(cr,avg_r5)-1.0,-2.0,2.0),clamp(safe_div(v,hv5)*2.0-1.0,-1.0,1.5),clamp(safe_div(body+body1+body2,nf)*4.0,-2.0,2.0),clamp(safe_div(body,cr)*2.0,-2.0,2.0),clamp((swept_l-swept_h)*3.0,-2.0,2.0))
+N3=10
+f3=array.from(tanh_f(safe_div(c-c13,nf)*2.0),tanh_f(safe_div(c-c8,nf)*3.0),clamp(safe_div(c-(hh16+ll16)/2.0,r16*0.5),-1.5,1.5),clamp(safe_div(c-(hh50+ll50)/2.0,r50*0.5),-1.5,1.5),clamp(safe_div(r8,r16)-0.5,-1.5,1.5),clamp(safe_div(hh16-c,r16),-0.5,1.5),clamp(safe_div(c-ll16,r16),-0.5,1.5),clamp(safe_div(cr,avg_r5)-1.0,-2.0,2.0),clamp(safe_div(v,hv5)*2.0-1.0,-1.0,1.5),clamp(safe_div(body,cr)*2.0,-2.0,2.0))
+N4=10
+f4=array.from(tanh_f(safe_div(c-c21,nf)*1.5),tanh_f(safe_div(c-c13,nf)*2.0),clamp(safe_div(c-(hh50+ll50)/2.0,r50*0.5),-1.5,1.5),clamp(safe_div(r16,r50)*2.0-1.0,-1.5,1.5),clamp(safe_div(hh50-c,r50),-0.5,1.5),clamp(safe_div(c-ll50,r50),-0.5,1.5),clamp(safe_div(c-(hh16+ll16)/2.0,r16*0.5),-1.5,1.5),clamp(safe_div(r8,r16)-0.5,-1.5,1.5),clamp(safe_div(cr,avg_r5)-1.0,-2.0,2.0),clamp(safe_div(avg_v5,nz(ta.highest(volume,50),v))*2.0-1.0,-1.5,1.5))
+N_MAX=10
+
+WSIZ1=N_MAX*H1,WSIZ2=H1*H2,WSIZO=H2
+var w1=array.new<float>(WSIZ1*N_NETS,0.0),var b1=array.new<float>(H1*N_NETS,0.0)
+var w2=array.new<float>(WSIZ2*N_NETS,0.0),var b2=array.new<float>(H2*N_NETS,0.0)
+var wo=array.new<float>(WSIZO*N_NETS,0.0),var bo=array.new<float>(N_NETS,0.0)
+var mw1=array.new<float>(WSIZ1*N_NETS,0.0),var mb1=array.new<float>(H1*N_NETS,0.0)
+var mw2=array.new<float>(WSIZ2*N_NETS,0.0),var mb2=array.new<float>(H2*N_NETS,0.0)
+var mwo=array.new<float>(WSIZO*N_NETS,0.0),var mbo=array.new<float>(N_NETS,0.0)
+
+if bar_index==0
+    for net=0 to N_NETS-1
+        s_off=net*50000
+        for ii=0 to WSIZ1-1
+            array.set(w1,net*WSIZ1+ii,(seed_val(ii+s_off)-0.5)*1.0)
+        for ij=0 to H1-1
+            array.set(b1,net*H1+ij,(seed_val(ij+s_off+5000)-0.5)*0.1)
+        for ik=0 to WSIZ2-1
+            array.set(w2,net*WSIZ2+ik,(seed_val(ik+s_off+10000)-0.5)*1.0)
+        for il=0 to H2-1
+            array.set(b2,net*H2+il,(seed_val(il+s_off+15000)-0.5)*0.1)
+            array.set(wo,net*WSIZO+il,(seed_val(il+s_off+20000)-0.5)*1.4)
+        array.set(bo,net,0.0)
+
+fwd_n(net_idx,f_arr,n_in)=>
+    o1=net_idx*WSIZ1,ob1=net_idx*H1,o2=net_idx*WSIZ2,ob2=net_idx*H2,oo=net_idx*WSIZO
+    a1=array.new<float>(H1,0.0),z1=array.new<float>(H1,0.0)
+    for fn=0 to H1-1
+        s=safe(array.get(b1,ob1+fn))
+        for fi=0 to n_in-1
+            s+=safe(array.get(f_arr,fi))*safe(array.get(w1,o1+fn*N_MAX+fi))
+        s:=clamp(s,-6.0,6.0)
+        array.set(z1,fn,s),array.set(a1,fn,leaky_relu(s))
+    a2=array.new<float>(H2,0.0)
+    for fn2=0 to H2-1
+        s=safe(array.get(b2,ob2+fn2))
+        for fj=0 to H1-1
+            s+=safe(array.get(a1,fj))*safe(array.get(w2,o2+fn2*H1+fj))
+        array.set(a2,fn2,tanh_f(clamp(s,-6.0,6.0)))
+    out=safe(array.get(bo,net_idx))
+    for fn3=0 to H2-1
+        out+=safe(array.get(a2,fn3))*safe(array.get(wo,oo+fn3))
+    out:=tanh_f(out)
+    [a1,z1,a2,out]
+
+bp_n(net_idx,f_arr,n_in,target,sw)=>
+    o1=net_idx*WSIZ1,ob1=net_idx*H1,o2=net_idx*WSIZ2,ob2=net_idx*H2,oo=net_idx*WSIZO
+    [a1,z1,a2,out]=fwd_n(net_idx,f_arr,n_in)
+    e=clamp((target-out)*sw,-2.5,2.5)
+    e_out=e*(1.0-out*out)
+    old_m0=safe(array.get(mbo,net_idx)),new_m0=mbeta*old_m0+(1.0-mbeta)*e_out
+    array.set(mbo,net_idx,new_m0),array.set(bo,net_idx,safe(array.get(bo,net_idx))+base_lr*new_m0)
+    for tn=0 to H2-1
+        g=clamp(e_out*safe(array.get(a2,tn)),-GC,GC)
+        old_m=safe(array.get(mwo,oo+tn)),new_m=mbeta*old_m+(1.0-mbeta)*g
+        array.set(mwo,oo+tn,new_m),ow=safe(array.get(wo,oo+tn)),array.set(wo,oo+tn,ow+base_lr*new_m-base_lr*WD*ow)
+    g2=array.new<float>(H2,0.0)
+    for tn2=0 to H2-1
+        err=e_out*safe(array.get(wo,oo+tn2)),a2v=safe(array.get(a2,tn2)),g=clamp(err*(1.0-a2v*a2v),-GC,GC)
+        array.set(g2,tn2,g)
+        old_mb2v=safe(array.get(mb2,ob2+tn2)),new_mb2v=mbeta*old_mb2v+(1.0-mbeta)*g
+        array.set(mb2,ob2+tn2,new_mb2v),array.set(b2,ob2+tn2,safe(array.get(b2,ob2+tn2))+base_lr*new_mb2v)
+        for tj=0 to H1-1
+            idx=o2+tn2*H1+tj,grad=clamp(g*safe(array.get(a1,tj)),-GC,GC)
+            old_m2=safe(array.get(mw2,idx)),new_m2=mbeta*old_m2+(1.0-mbeta)*grad
+            array.set(mw2,idx,new_m2),ow2=safe(array.get(w2,idx)),array.set(w2,idx,ow2+base_lr*new_m2-base_lr*WD*ow2)
+    for tn3=0 to H1-1
+        err=0.0
+        for tk=0 to H2-1
+            err+=safe(array.get(g2,tk))*safe(array.get(w2,o2+tk*H1+tn3))
+        g=clamp(err*lrelu_d(safe(array.get(z1,tn3))),-GC,GC)
+        old_mb1v=safe(array.get(mb1,ob1+tn3)),new_mb1v=mbeta*old_mb1v+(1.0-mbeta)*g
+        array.set(mb1,ob1+tn3,new_mb1v),array.set(b1,ob1+tn3,safe(array.get(b1,ob1+tn3))+base_lr*new_mb1v)
+        for ti=0 to n_in-1
+            idx=o1+tn3*N_MAX+ti,grad=clamp(g*safe(array.get(f_arr,ti)),-GC,GC)
+            old_mw1v=safe(array.get(mw1,idx)),new_mw1v=mbeta*old_mw1v+(1.0-mbeta)*grad
+            array.set(mw1,idx,new_mw1v),ow3=safe(array.get(w1,idx)),array.set(w1,idx,ow3+base_lr*new_mw1v-base_lr*WD*ow3)
+    true
+
+// ============= PREDICTION TRAINING =============
+get_cb(delta,body_v,cr_v)=>
+    bd=body_v>0?1.0:-1.0,md=delta>0?1.0:-1.0
+    bd!=md and math.abs(body_v)/cr_v>0.5?1.5:1.0
+
+horizons=array.from(2,4,8,16,32)
+if barstate.isconfirmed and bar_index>35
+    for back=0 to 3
+        bk=back+1,ref=nz(close[bk],c),body_ref=ref-nz(open[bk],c)
+        cr_ref=math.max(nz(high[bk],h)-nz(low[bk],l),syminfo.mintick),sw=math.pow(0.85,back)
+        for net=0 to N_NETS-1
+            hz=math.round(safe(array.get(horizons,net)))
+            if bk>=hz
+                future_c=nz(close[bk-hz],c),delta=safe_div(future_c-ref,nf)
+                tgt=clamp(delta*3.0,-1.0,1.0),cb=get_cb(delta,body_ref,cr_ref)
+                if net==0
+                    bp_n(net,f0,N0,tgt,sw*cb)
+                else if net==1
+                    bp_n(net,f1,N1,tgt,sw*cb)
+                else if net==2
+                    bp_n(net,f2,N2,tgt,sw*cb)
+                else if net==3
+                    bp_n(net,f3,N3,tgt,sw*cb)
+                else if net==4
+                    bp_n(net,f4,N4,tgt,sw*cb)
+
+// ============= PREDICT =============
+[_,_,_,p0]=fwd_n(0,f0,N0)
+[_,_,_,p1]=fwd_n(1,f1,N1)
+[_,_,_,p2]=fwd_n(2,f2,N2)
+[_,_,_,p3]=fwd_n(3,f3,N3)
+[_,_,_,p4]=fwd_n(4,f4,N4)
+
+var float lv0=na,var float lv1=na,var float lv2=na,var float lv3=na,var float lv4=na
+ms0=nf*0.7,ms1=nf*1.3,ms2=nf*2.2,ms3=nf*3.5,ms4=nf*5.5
+tgt0=c+p0*ms0,tgt1=c+p1*ms1,tgt2=c+p2*ms2,tgt3=c+p3*ms3,tgt4=c+p4*ms4
+lv0:=na(lv0)?tgt0:lv0+clamp(tgt0-lv0,-atr_val*0.5,atr_val*0.5)
+lv1:=na(lv1)?tgt1:lv1+clamp(tgt1-lv1,-atr_val*0.4,atr_val*0.4)
+lv2:=na(lv2)?tgt2:lv2+clamp(tgt2-lv2,-atr_val*0.3,atr_val*0.3)
+lv3:=na(lv3)?tgt3:lv3+clamp(tgt3-lv3,-atr_val*0.2,atr_val*0.2)
+lv4:=na(lv4)?tgt4:lv4+clamp(tgt4-lv4,-atr_val*0.12,atr_val*0.12)
+
+// ============= TRADER NETWORK — 30 inputs, 12→8→1 =============
+T_IN=30,T_H1=12,T_H2=8
+var tw1=array.new<float>(T_IN*T_H1,0.0),var tb1=array.new<float>(T_H1,0.0)
+var tw2=array.new<float>(T_H1*T_H2,0.0),var tb2=array.new<float>(T_H2,0.0)
+var two=array.new<float>(T_H2,0.0),var tbo=array.new<float>(1,0.0)
+var tmw1=array.new<float>(T_IN*T_H1,0.0),var tmb1=array.new<float>(T_H1,0.0)
+var tmw2=array.new<float>(T_H1*T_H2,0.0),var tmb2=array.new<float>(T_H2,0.0)
+var tmwo=array.new<float>(T_H2,0.0),var tmbo=array.new<float>(1,0.0)
+
+if bar_index==0
+    for ii=0 to T_IN*T_H1-1
+        array.set(tw1,ii,(seed_val(ii+600000)-0.5)*0.8)
+    for ij=0 to T_H1-1
+        array.set(tb1,ij,(seed_val(ij+610000)-0.5)*0.1)
+    for ik=0 to T_H1*T_H2-1
+        array.set(tw2,ik,(seed_val(ik+620000)-0.5)*0.8)
+    for il=0 to T_H2-1
+        array.set(tb2,il,(seed_val(il+630000)-0.5)*0.1)
+        array.set(two,il,(seed_val(il+640000)-0.5)*1.2)
+    array.set(tbo,0,0.0)
+
+// Gradients of all 5 lines
+lv0_g1=lv0-nz(lv0[1],lv0),lv0_g3=lv0-nz(lv0[3],lv0),lv0_g5=lv0-nz(lv0[5],lv0)
+lv1_g1=lv1-nz(lv1[1],lv1),lv1_g3=lv1-nz(lv1[3],lv1),lv1_g5=lv1-nz(lv1[5],lv1)
+lv2_g1=lv2-nz(lv2[1],lv2),lv2_g3=lv2-nz(lv2[3],lv2),lv2_g5=lv2-nz(lv2[5],lv2)
+lv3_g1=lv3-nz(lv3[1],lv3),lv3_g3=lv3-nz(lv3[3],lv3),lv3_g5=lv3-nz(lv3[5],lv3)
+lv4_g1=lv4-nz(lv4[1],lv4),lv4_g3=lv4-nz(lv4[3],lv4),lv4_g5=lv4-nz(lv4[5],lv4)
+
+// Order flow
+buy_press=safe_div(c-l,math.max(h-l,syminfo.mintick))
+bp1=safe_div(c1-l1,cr1),bp2=safe_div(c2-nz(low[2],l),cr2)
+buy_press_3=(buy_press+bp1+bp2)/3.0
+sell_press=safe_div(h-c,math.max(h-l,syminfo.mintick))
+sp1=safe_div(h1-c1,cr1),sp2=safe_div(nz(high[2],h)-c2,cr2)
+sell_press_3=(sell_press+sp1+sp2)/3.0
+var float cum_vd_8=0.0,var float cum_vd_16=0.0
+bar_vd=c>op?v:-v
+cum_vd_8:=nz(cum_vd_8[1],0.0)*0.85+bar_vd*0.15
+cum_vd_16:=nz(cum_vd_16[1],0.0)*0.92+bar_vd*0.08
+vol_delta=safe_div(v-avg_v5,math.max(avg_v5,1.0))
+vol_clim=safe_div(v,hv16)
+pred_ag=(p0>0.02?1.0:p0<-0.02?-1.0:0.0)+(p1>0.02?1.0:p1<-0.02?-1.0:0.0)+(p2>0.02?1.0:p2<-0.02?-1.0:0.0)+(p3>0.02?1.0:p3<-0.02?-1.0:0.0)+(p4>0.02?1.0:p4<-0.02?-1.0:0.0)
+fs_div=(p0+p1)/2.0-(p3+p4)/2.0
+
+gs=math.max(atr_val,syminfo.mintick)
+tfeat=array.from(p0,p1,p2,p3,p4,clamp(lv0_g1/gs,-2.0,2.0),clamp(lv0_g3/gs,-2.0,2.0),clamp(lv0_g5/gs,-2.0,2.0),clamp(lv1_g1/gs,-2.0,2.0),clamp(lv1_g3/gs,-2.0,2.0),clamp(lv1_g5/gs,-2.0,2.0),clamp(lv2_g1/gs,-2.0,2.0),clamp(lv2_g3/gs,-2.0,2.0),clamp(lv2_g5/gs,-2.0,2.0),clamp(lv3_g1/gs,-2.0,2.0),clamp(lv3_g3/gs,-2.0,2.0),clamp(lv3_g5/gs,-2.0,2.0),clamp(lv4_g1/gs,-2.0,2.0),clamp(lv4_g3/gs,-2.0,2.0),clamp(lv4_g5/gs,-2.0,2.0),clamp(buy_press_3*2.0-1.0,-1.0,1.0),clamp(sell_press_3*2.0-1.0,-1.0,1.0),clamp(safe_div(cum_vd_8,math.max(avg_v5,1.0)),-2.0,2.0),clamp(safe_div(cum_vd_16,math.max(avg_v5,1.0)),-2.0,2.0),clamp(vol_delta,-2.0,2.0),clamp(vol_clim*2.0-1.0,-1.0,1.5),clamp(pred_ag/5.0,-1.0,1.0),clamp(fs_div*3.0,-2.0,2.0),clamp((swept_l-swept_h)*3.0,-2.0,2.0),clamp(safe_div(cr,avg_r5)-1.0,-2.0,2.0))
+
+fwd_trader()=>
+    a1t=array.new<float>(T_H1,0.0),z1t=array.new<float>(T_H1,0.0)
+    for fn=0 to T_H1-1
+        s=safe(array.get(tb1,fn))
+        for fi=0 to T_IN-1
+            s+=safe(array.get(tfeat,fi))*safe(array.get(tw1,fn*T_IN+fi))
+        s:=clamp(s,-6.0,6.0),array.set(z1t,fn,s),array.set(a1t,fn,leaky_relu(s))
+    a2t=array.new<float>(T_H2,0.0)
+    for fn2=0 to T_H2-1
+        s=safe(array.get(tb2,fn2))
+        for fj=0 to T_H1-1
+            s+=safe(array.get(a1t,fj))*safe(array.get(tw2,fn2*T_H1+fj))
+        array.set(a2t,fn2,tanh_f(clamp(s,-6.0,6.0)))
+    out=safe(array.get(tbo,0))
+    for fn3=0 to T_H2-1
+        out+=safe(array.get(a2t,fn3))*safe(array.get(two,fn3))
+    out:=tanh_f(out)
+    [a1t,z1t,a2t,out]
+
+train_trader(target,sw)=>
+    [a1t,z1t,a2t,out]=fwd_trader()
+    e=clamp((target-out)*sw,-2.5,2.5),e_out=e*(1.0-out*out)
+    lr_t=base_lr*train_lr_mult
+    old_m0=safe(array.get(tmbo,0)),new_m0=mbeta*old_m0+(1.0-mbeta)*e_out
+    array.set(tmbo,0,new_m0),array.set(tbo,0,safe(array.get(tbo,0))+lr_t*new_m0)
+    for tn=0 to T_H2-1
+        g=clamp(e_out*safe(array.get(a2t,tn)),-GC,GC)
+        old_m=safe(array.get(tmwo,tn)),new_m=mbeta*old_m+(1.0-mbeta)*g
+        array.set(tmwo,tn,new_m),ow=safe(array.get(two,tn)),array.set(two,tn,ow+lr_t*new_m-lr_t*WD*ow)
+    g2t=array.new<float>(T_H2,0.0)
+    for tn2=0 to T_H2-1
+        err=e_out*safe(array.get(two,tn2)),a2v=safe(array.get(a2t,tn2)),g=clamp(err*(1.0-a2v*a2v),-GC,GC)
+        array.set(g2t,tn2,g)
+        old_mb2=safe(array.get(tmb2,tn2)),new_mb2=mbeta*old_mb2+(1.0-mbeta)*g
+        array.set(tmb2,tn2,new_mb2),array.set(tb2,tn2,safe(array.get(tb2,tn2))+lr_t*new_mb2)
+        for tj=0 to T_H1-1
+            idx=tn2*T_H1+tj,grad=clamp(g*safe(array.get(a1t,tj)),-GC,GC)
+            old_m2=safe(array.get(tmw2,idx)),new_m2=mbeta*old_m2+(1.0-mbeta)*grad
+            array.set(tmw2,idx,new_m2),ow2=safe(array.get(tw2,idx)),array.set(tw2,idx,ow2+lr_t*new_m2-lr_t*WD*ow2)
+    for tn3=0 to T_H1-1
+        err=0.0
+        for tk=0 to T_H2-1
+            err+=safe(array.get(g2t,tk))*safe(array.get(tw2,tk*T_H1+tn3))
+        g=clamp(err*lrelu_d(safe(array.get(z1t,tn3))),-GC,GC)
+        old_mb1=safe(array.get(tmb1,tn3)),new_mb1=mbeta*old_mb1+(1.0-mbeta)*g
+        array.set(tmb1,tn3,new_mb1),array.set(tb1,tn3,safe(array.get(tb1,tn3))+lr_t*new_mb1)
+        for ti=0 to T_IN-1
+            idx=tn3*T_IN+ti,grad=clamp(g*safe(array.get(tfeat,ti)),-GC,GC)
+            old_mw=safe(array.get(tmw1,idx)),new_mw=mbeta*old_mw+(1.0-mbeta)*grad
+            array.set(tmw1,idx,new_mw),ow3=safe(array.get(tw1,idx)),array.set(tw1,idx,ow3+lr_t*new_mw-lr_t*WD*ow3)
+    true
+
+// ============= STANDARD TRAINING — historical P&L =============
+if barstate.isconfirmed and bar_index>40
+    for bk=1 to 8
+        ref_c=nz(close[bk],c)
+        end_move=safe_div(nz(close[bk-math.min(bk,lookfwd)],c)-ref_c,nf)
+        best_up=0.0,best_dn=0.0,worst_l=0.0,worst_s=0.0
+        for fb=1 to math.min(bk,lookfwd+2)
+            best_up:=math.max(best_up,safe_div(nz(high[bk-fb],h)-ref_c,nf))
+            best_dn:=math.max(best_dn,safe_div(ref_c-nz(low[bk-fb],l),nf))
+            worst_l:=math.max(worst_l,safe_div(ref_c-nz(low[bk-fb],l),nf))
+            worst_s:=math.max(worst_s,safe_div(nz(high[bk-fb],h)-ref_c,nf))
+        long_edge=best_up-worst_l,short_edge=best_dn-worst_s
+        sw_v=math.pow(0.9,bk-1),tgt=0.0
+        if end_move>edge_thresh and best_up>edge_thresh*1.5 and long_edge>0
+            tgt:=clamp(end_move*3.0,0.15,1.0),sw_v:=sw_v*(1.0+long_edge*4.0)
+        else if end_move<-edge_thresh and best_dn>edge_thresh*1.5 and short_edge>0
+            tgt:=clamp(end_move*3.0,-1.0,-0.15),sw_v:=sw_v*(1.0+short_edge*4.0)
+        else
+            tgt:=0.0,sw_v:=sw_v*0.8
+        train_trader(tgt,sw_v)
+
+// ============= SIGNAL =============
+[_ta1,_tz1,_ta2,trade_sig]=fwd_trader()
+var float smooth_sig=0.0
+smooth_sig:=smooth_sig*(1.0-p_smooth)+(trade_sig*p_scale)*p_smooth
+
+// Soft consensus multiplier
+bulls=(p0>0.02?1:0)+(p1>0.02?1:0)+(p2>0.02?1:0)+(p3>0.02?1:0)+(p4>0.02?1:0)
+bears=(p0<-0.02?1:0)+(p1<-0.02?1:0)+(p2<-0.02?1:0)+(p3<-0.02?1:0)+(p4<-0.02?1:0)
+cons_mult=smooth_sig>0?(bulls>=4?1.3:bulls>=3?1.1:bulls>=2?0.9:0.7):smooth_sig<0?(bears>=4?1.3:bears>=3?1.1:bears>=2?0.9:0.7):1.0
+adj_sig=smooth_sig*cons_mult
+
+// ============= TRADE STATE + RL PARAM ADJUSTMENT =============
+var int state=0,var int bars_in=0,var float entry_p=na
+var int entry_dir=0
+var int exit_type=0  // 0=signal, 1=stop, 2=tp
+
+// Rolling stats — EMA so recent trades matter more, old ones fade
+var float rwr=0.5
+var float ravg=0.0
+var float r_sr=0.0
+var float r_tpr=0.0
+var int r_count=0
+rl_decay=0.92
+
+if barstate.isconfirmed
+    bars_in+=1
+    if state==0
+        if adj_sig>p_entry and bars_in>=p_cooldown
+            state:=1,entry_p:=c,bars_in:=0,entry_dir:=1
+        else if adj_sig<-p_entry and bars_in>=p_cooldown
+            state:=-1,entry_p:=c,bars_in:=0,entry_dir:=-1
+    else if state==1
+        was_stop=c<nz(entry_p,c)-atr_val*p_sl
+        sig_exit=adj_sig<-p_exit and bars_in>=p_hold
+        tp_hit=p_tp>0 and c>nz(entry_p,c)+atr_val*p_tp
+        if was_stop or sig_exit or tp_hit
+            trade_pnl=safe_div(c-nz(entry_p,c),nf)
+            exit_type:=was_stop?1:tp_hit?2:0
+            if trade_pnl>0
+                train_trader(clamp(trade_pnl*2.0,0.3,1.0),p_rl*(1.0+trade_pnl))
+            else
+                train_trader(0.0,p_rl*(1.0+math.abs(trade_pnl)))
+            r_count+=1
+            rwr:=rwr*rl_decay+(trade_pnl>0?1.0:0.0)*(1.0-rl_decay)
+            ravg:=ravg*rl_decay+trade_pnl*(1.0-rl_decay)
+            r_sr:=r_sr*rl_decay+(exit_type==1?1.0:0.0)*(1.0-rl_decay)
+            r_tpr:=r_tpr*rl_decay+(exit_type==2?1.0:0.0)*(1.0-rl_decay)
+            if r_count>=8
+                lr_a=rl_adapt_lr
+                p_entry:=rwr<0.42?math.min(p_entry+lr_a*0.3,0.8):rwr>0.52 and ravg>0?math.max(p_entry-lr_a*0.2,0.05):p_entry
+                p_exit:=ravg<0?math.max(p_exit-lr_a*0.3,0.05):ravg>0 and rwr>0.48?math.min(p_exit+lr_a*0.2,1.5):p_exit
+                p_sl:=r_sr>0.3?math.min(p_sl+lr_a*1.5,6.0):r_sr<0.1?math.max(p_sl-lr_a*0.5,1.5):p_sl
+                p_hold:=rwr<0.42?math.min(p_hold+1,8):rwr>0.52?math.max(p_hold-1,1):p_hold
+                p_scale:=rwr<0.38?math.max(p_scale-lr_a*1.0,1.5):rwr>0.52 and ravg>0?math.min(p_scale+lr_a*0.5,5.0):p_scale
+                p_smooth:=rwr<0.38?math.max(p_smooth-lr_a*0.5,0.3):rwr>0.52?math.min(p_smooth+lr_a*0.3,1.0):p_smooth
+                p_cooldown:=rwr<0.38?math.min(p_cooldown+1,5):rwr>0.52?math.max(p_cooldown-1,0):p_cooldown
+                p_tp:=r_sr>0.25 and ravg<0?(p_tp<0.5?1.5:math.max(p_tp-lr_a*1.0,0.75)):r_tpr>0.4?math.min(p_tp+lr_a*1.0,8.0):p_tp
+                p_rl:=rwr<0.42?math.min(p_rl+lr_a*1.0,5.0):rwr>0.52?math.max(p_rl-lr_a*0.5,0.5):p_rl
+            state:=0,bars_in:=0
+    else
+        was_stop=c>nz(entry_p,c)+atr_val*p_sl
+        sig_exit=adj_sig>p_exit and bars_in>=p_hold
+        tp_hit=p_tp>0 and c<nz(entry_p,c)-atr_val*p_tp
+        if was_stop or sig_exit or tp_hit
+            trade_pnl=safe_div(nz(entry_p,c)-c,nf)
+            exit_type:=was_stop?1:tp_hit?2:0
+            if trade_pnl>0
+                train_trader(clamp(-trade_pnl*2.0,-1.0,-0.3),p_rl*(1.0+trade_pnl))
+            else
+                train_trader(0.0,p_rl*(1.0+math.abs(trade_pnl)))
+            r_count+=1
+            rwr:=rwr*rl_decay+(trade_pnl>0?1.0:0.0)*(1.0-rl_decay)
+            ravg:=ravg*rl_decay+trade_pnl*(1.0-rl_decay)
+            r_sr:=r_sr*rl_decay+(exit_type==1?1.0:0.0)*(1.0-rl_decay)
+            r_tpr:=r_tpr*rl_decay+(exit_type==2?1.0:0.0)*(1.0-rl_decay)
+            if r_count>=8
+                lr_a=rl_adapt_lr
+                p_entry:=rwr<0.42?math.min(p_entry+lr_a*0.3,0.8):rwr>0.52 and ravg>0?math.max(p_entry-lr_a*0.2,0.05):p_entry
+                p_exit:=ravg<0?math.max(p_exit-lr_a*0.3,0.05):ravg>0 and rwr>0.48?math.min(p_exit+lr_a*0.2,1.5):p_exit
+                p_sl:=r_sr>0.3?math.min(p_sl+lr_a*1.5,6.0):r_sr<0.1?math.max(p_sl-lr_a*0.5,1.5):p_sl
+                p_hold:=rwr<0.42?math.min(p_hold+1,8):rwr>0.52?math.max(p_hold-1,1):p_hold
+                p_scale:=rwr<0.38?math.max(p_scale-lr_a*1.0,1.5):rwr>0.52 and ravg>0?math.min(p_scale+lr_a*0.5,5.0):p_scale
+                p_smooth:=rwr<0.38?math.max(p_smooth-lr_a*0.5,0.3):rwr>0.52?math.min(p_smooth+lr_a*0.3,1.0):p_smooth
+                p_cooldown:=rwr<0.38?math.min(p_cooldown+1,5):rwr>0.52?math.max(p_cooldown-1,0):p_cooldown
+                p_tp:=r_sr>0.25 and ravg<0?(p_tp<0.5?1.5:math.max(p_tp-lr_a*1.0,0.75)):r_tpr>0.4?math.min(p_tp+lr_a*1.0,8.0):p_tp
+                p_rl:=rwr<0.42?math.min(p_rl+lr_a*1.0,5.0):rwr>0.52?math.max(p_rl-lr_a*0.5,0.5):p_rl
+            state:=0,bars_in:=0
+
+// ============= VISUALIZATION =============
+bull_mode=adj_sig>0.1
+bear_mode=adj_sig<-0.1
+
+c0_col=bull_mode?color.new(#00EE88,10):bear_mode?color.new(#FF4466,10):color.new(color.white,30)
+c1_col=bull_mode?color.new(#00EE88,25):bear_mode?color.new(#FF4466,25):color.new(color.white,45)
+c2_col=bull_mode?color.new(#00EE88,40):bear_mode?color.new(#FF4466,40):color.new(color.white,55)
+c3_col=bull_mode?color.new(#00EE88,55):bear_mode?color.new(#FF4466,55):color.new(color.white,65)
+c4_col=bull_mode?color.new(#00EE88,70):bear_mode?color.new(#FF4466,70):color.new(color.white,75)
+
+pl0=plot(lv0,"T+2",c0_col,linewidth=2)
+pl1=plot(lv1,"T+4",c1_col,linewidth=2)
+pl2=plot(lv2,"T+8",c2_col,linewidth=1)
+pl3=plot(lv3,"T+16",c3_col,linewidth=1)
+pl4=plot(lv4,"T+32",c4_col,linewidth=1)
+
+fc=bull_mode?color.new(#00EE88,93):bear_mode?color.new(#FF4466,93):color.new(color.white,96)
+fill(pl0,pl1,fc),fill(pl1,pl2,fc),fill(pl2,pl3,fc),fill(pl3,pl4,fc)
+
+// Trade markers — reset every confirmed bar FIRST, then evaluate
+var int prev_state=0
+var bool did_el=false,var bool did_es=false,var bool did_xl=false,var bool did_xs=false
+var float xpnl=0.0
+
+did_el:=false,did_es:=false,did_xl:=false,did_xs:=false
+
+if barstate.isconfirmed
+    did_el:=state==1 and prev_state!=1
+    did_es:=state==-1 and prev_state!=-1
+    did_xl:=prev_state==1 and state!=1
+    did_xs:=prev_state==-1 and state!=-1
+    if did_xl
+        xpnl:=c-nz(entry_p,c)
+    if did_xs
+        xpnl:=nz(entry_p,c)-c
+    prev_state:=state
+
+plotshape(did_el,"▲",shape.triangleup,location.belowbar,#00EE88,size=size.small)
+plotshape(did_es,"▼",shape.triangledown,location.abovebar,#FF4466,size=size.small)
+plotshape(did_xl and xpnl>0,"W",shape.square,location.abovebar,#00EE88,size=size.tiny)
+plotshape(did_xl and xpnl<=0,"L",shape.square,location.abovebar,#FF4466,size=size.tiny)
+plotshape(did_xs and xpnl>0,"W",shape.square,location.belowbar,#00EE88,size=size.tiny)
+plotshape(did_xs and xpnl<=0,"L",shape.square,location.belowbar,#FF4466,size=size.tiny)
+barcolor(state==1?color.new(#00EE88,60):state==-1?color.new(#FF4466,60):na)
+
+// Stats
+var table stats=table.new(position.bottom_right,2,9,bgcolor=color.new(color.black,60),border_width=1)
+var int tt=0,var float tp=0.0,var float ep_s=na,var int ed_s=0,var int wi=0,var int lo=0
+
+if barstate.isconfirmed
+    if (did_el or did_es)
+        if not na(ep_s)
+            tt+=1,pnl=ed_s==1?c-ep_s:ep_s-c,tp+=pnl
+            if pnl>0
+                wi+=1
+            else
+                lo+=1
+        ep_s:=c,ed_s:=state
+    else if (did_xl or did_xs) and not na(ep_s)
+        tt+=1,pnl=ed_s==1?c-ep_s:ep_s-c,tp+=pnl
+        if pnl>0
+            wi+=1
+        else
+            lo+=1
+        ep_s:=na,ed_s:=0
+
+wr=wi+lo>0?wi*100.0/(wi+lo):0.0
+avg_pnl=tt>0?tp/tt:0.0
+if barstate.islast
+    table.cell(stats,0,0,"Signal",text_color=color.white,text_size=size.small)
+    table.cell(stats,1,0,str.tostring(adj_sig,"#.##")+" ("+str.tostring(bulls)+"▲"+str.tostring(bears)+"▼)",text_color=adj_sig>p_entry?#00EE88:adj_sig<-p_entry?#FF4466:color.gray,text_size=size.small)
+    table.cell(stats,0,1,"State",text_color=color.white,text_size=size.small)
+    table.cell(stats,1,1,state==1?"LONG":state==-1?"SHORT":"FLAT",text_color=state==1?#00EE88:state==-1?#FF4466:color.gray,text_size=size.small)
+    table.cell(stats,0,2,"Trades",text_color=color.white,text_size=size.small)
+    table.cell(stats,1,2,str.tostring(tt),text_color=color.white,text_size=size.small)
+    table.cell(stats,0,3,"Win Rate",text_color=color.white,text_size=size.small)
+    table.cell(stats,1,3,str.tostring(wr,"#.#")+"% ("+str.tostring(wi)+"/"+str.tostring(lo)+")",text_color=wr>=50?#00EE88:#FF4466,text_size=size.small)
+    table.cell(stats,0,4,"Avg P&L",text_color=color.white,text_size=size.small)
+    table.cell(stats,1,4,str.tostring(avg_pnl,"#.##"),text_color=avg_pnl>=0?#00EE88:#FF4466,text_size=size.small)
+    table.cell(stats,0,5,"Total P&L",text_color=color.white,text_size=size.small)
+    table.cell(stats,1,5,str.tostring(tp,"#.##"),text_color=tp>=0?#00EE88:#FF4466,text_size=size.small)
+    table.cell(stats,0,6,"RL Params",text_color=#FFAA00,text_size=size.tiny)
+    table.cell(stats,1,6,"E:"+str.tostring(p_entry,"#.##")+" X:"+str.tostring(p_exit,"#.##")+" SL:"+str.tostring(p_sl,"#.#")+" TP:"+str.tostring(p_tp,"#.#"),text_color=#FFAA00,text_size=size.tiny)
+    table.cell(stats,0,7,"RL Params2",text_color=#FFAA00,text_size=size.tiny)
+    table.cell(stats,1,7,"Sc:"+str.tostring(p_scale,"#.#")+" Sm:"+str.tostring(p_smooth,"#.#")+" H:"+str.tostring(p_hold)+" CD:"+str.tostring(p_cooldown)+" RL:"+str.tostring(p_rl,"#.#"),text_color=#FFAA00,text_size=size.tiny)
+    table.cell(stats,0,8,"Preds",text_color=color.white,text_size=size.small)
+    table.cell(stats,1,8,str.tostring(p0,"#.##")+" "+str.tostring(p1,"#.##")+" "+str.tostring(p2,"#.##")+" "+str.tostring(p3,"#.##")+" "+str.tostring(p4,"#.##"),text_color=color.gray,text_size=size.tiny)

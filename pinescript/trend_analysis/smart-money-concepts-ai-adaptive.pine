@@ -1,0 +1,778 @@
+// ============================================================================
+// SMART MONEY CONCEPTS AI — Adaptive Zone Scoring
+// ============================================================================
+// 100% original implementation — all ICT/SMC concepts coded from first
+// principles. NOT derived from any existing script.
+//
+// Core: Detects Fair Value Gaps, Order Blocks, and Market Structure
+// (BOS / CHoCH) — the building blocks of Smart Money / ICT trading.
+//
+// AI Layer: Every FVG and Order Block is scored 0-100 by a 5-factor
+// quality engine analyzing gap size, displacement strength, volume,
+// trend alignment, and structure context. Zones fade in opacity as
+// their score drops — you instantly see which zones matter.
+//
+// Confluence Engine: When a high-quality FVG overlaps with a scored
+// Order Block in the direction of structure, the AI fires a signal.
+// ★ Bright = high confluence. ○ Dim = proceed with caution.
+//
+// Non-repainting: All signals confirmed on bar close.
+//
+// Best on: BTC, ETH, Gold, ES/NQ — 15min to Daily
+// Works on: Any liquid instrument with volume data
+//
+// ⚠ This is an indicator, not financial advice. Always use
+//   proper risk management.
+// ============================================================================
+
+//@version=5
+indicator("Smart Money Concepts AI [Adaptive]", "SMC AI ◈", overlay=true,
+  max_lines_count=500, max_boxes_count=500, max_labels_count=500, max_bars_back=500)
+
+// ============================================================================
+// INPUTS
+// ============================================================================
+
+// --- Market Structure ---
+GRP_MS  = "◈ Market Structure"
+i_swLen = input.int(5,    "Swing Length",    minval=3, maxval=20, group=GRP_MS, tooltip="Lookback for pivot detection. Higher = fewer, more significant structure points.")
+i_sBOS  = input.bool(false, "Show BOS",     inline="ms1", group=GRP_MS)
+i_sCHCH = input.bool(true,  "Show CHoCH",   inline="ms1", group=GRP_MS)
+
+// --- Fair Value Gaps ---
+GRP_FVG  = "◈ Fair Value Gaps"
+i_sFVG   = input.bool(true, "Show FVGs",    group=GRP_FVG)
+i_mxFVG  = input.int(5,     "Max Visible (per side)", minval=1, maxval=20, group=GRP_FVG)
+i_fvgExt = input.int(15,    "Extend Bars",  minval=1, maxval=50, group=GRP_FVG, tooltip="How far to extend unfilled FVG boxes.")
+i_fFVG   = input.string("AI Scored", "Quality Filter", options=["All", "AI Scored", "High Only"], group=GRP_FVG, tooltip="All = show everything.\nAI Scored = opacity reflects quality score.\nHigh Only = hide FVGs scoring below 50.")
+
+// --- Order Blocks ---
+GRP_OB   = "◈ Order Blocks"
+i_sOB    = input.bool(true, "Show Order Blocks", group=GRP_OB)
+i_mxOB   = input.int(3,     "Max Visible (per side)", minval=1, maxval=10, group=GRP_OB)
+i_obBdy  = input.bool(true, "Use Candle Body", group=GRP_OB, tooltip="Body (open/close) gives tighter zones.\nFull range (high/low) gives wider zones.")
+
+// --- AI Engine ---
+GRP_AI   = "◈ AI Engine"
+i_trLen  = input.int(50,    "Trend EMA Length", minval=10, maxval=200, group=GRP_AI)
+i_atLen  = input.int(14,    "ATR Length",       minval=5,  maxval=50,  group=GRP_AI)
+i_vlLen  = input.int(20,    "Volume MA Length", minval=5,  maxval=50,  group=GRP_AI)
+i_minSc  = input.int(50,    "Min Signal Score", minval=0, maxval=90,  group=GRP_AI, tooltip="Minimum AI confluence score (0-100) to trigger entry signals.")
+
+// --- Signals ---
+GRP_SIG  = "◈ Signals"
+i_sSig   = input.bool(true, "Show Entry Signals", group=GRP_SIG)
+i_hiBrt  = input.int(70,    "★ Bright Threshold", minval=40, maxval=95, group=GRP_SIG, tooltip="Signals above this score appear bright (★). Below = dim (○).")
+i_sDim   = input.bool(false, "Show Dim (○) Signals", group=GRP_SIG, tooltip="When off, only bright ★ signals are shown. Reduces clutter on lower timeframes.")
+i_sigCD  = input.int(10,    "Signal Cooldown (bars)", minval=1, maxval=50, group=GRP_SIG, tooltip="Minimum bars between signals. Higher = less clutter.")
+
+// --- Dashboard ---
+GRP_DSH  = "◈ Dashboard"
+i_sDash  = input.bool(true,  "Show Dashboard", group=GRP_DSH)
+i_dLoc   = input.string("Top Right", "Location", options=["Top Right", "Bottom Right", "Top Left", "Bottom Left"], group=GRP_DSH)
+
+// --- Colors ---
+GRP_COL  = "◈ Colors"
+i_cBFVG  = input.color(color.new(#089981, 0), "Bull FVG",    inline="c1", group=GRP_COL)
+i_cRFVG  = input.color(color.new(#f23645, 0), "Bear FVG",    inline="c1", group=GRP_COL)
+i_cBOB   = input.color(color.new(#2962FF, 0), "Bull OB",     inline="c2", group=GRP_COL)
+i_cROB   = input.color(color.new(#FF6D00, 0), "Bear OB",     inline="c2", group=GRP_COL)
+i_cBMS   = input.color(color.new(#00e6a1, 0), "Bull Struct",  inline="c3", group=GRP_COL)
+i_cRMS   = input.color(color.new(#e05656, 0), "Bear Struct",  inline="c3", group=GRP_COL)
+
+// ============================================================================
+// CORE CALCULATIONS
+// ============================================================================
+
+float trendMa   = ta.ema(close, i_trLen)
+float atr       = ta.atr(i_atLen)
+float safeAtr   = nz(atr, ta.tr)
+float volMa     = ta.sma(volume, i_vlLen)
+float volRatio  = nz(volume / nz(volMa, volume), 1.0)
+bool  trendUp   = close > trendMa
+bool  trendDn   = close < trendMa
+int   n         = bar_index
+bool  per       = last_bar_index - n <= 500
+
+// Candle metrics
+float bodySize  = math.abs(close - open)
+float candRange = high - low
+float dispRatio = candRange > 0 ? bodySize / candRange : 0
+
+// ============================================================================
+// MARKET STRUCTURE — BOS / CHoCH Detection
+// ============================================================================
+
+var int   structDir = 0          // 1=bullish, -1=bearish, 0=undefined
+var float sh1 = na               // most recent swing high
+var float sl1 = na               // most recent swing low
+var int   sh1bar = 0
+var int   sl1bar = 0
+var bool  sh1broken = false
+var bool  sl1broken = false
+
+// Track structure lines for drawing
+var line[]  msLines  = array.new_line(0)
+var label[] msLabels = array.new_label(0)
+
+// Swing detection via pivots (confirmed i_swLen bars ago)
+float _ph = ta.pivothigh(high, i_swLen, i_swLen)
+float _pl = ta.pivotlow(low,   i_swLen, i_swLen)
+
+if not na(_ph)
+    sh1        := _ph
+    sh1bar     := n - i_swLen
+    sh1broken  := false
+
+if not na(_pl)
+    sl1        := _pl
+    sl1bar     := n - i_swLen
+    sl1broken  := false
+
+// Structure break: close crosses swing level (confirmed bar data)
+bool bullBreak = not na(sh1) and not sh1broken and close > sh1 and close[1] <= sh1 and per
+bool bearBreak = not na(sl1) and not sl1broken and close < sl1 and close[1] >= sl1 and per
+
+// Classify: CHoCH = trend reversal, BOS = trend continuation
+bool isCHoCH_bull = bullBreak and structDir <= 0
+bool isBOS_bull   = bullBreak and structDir > 0
+bool isCHoCH_bear = bearBreak and structDir >= 0
+bool isBOS_bear   = bearBreak and structDir < 0
+
+// Update direction
+if bullBreak
+    sh1broken := true
+    structDir := 1
+if bearBreak
+    sl1broken := true
+    structDir := -1
+
+// ── Draw Structure Lines ──
+if bullBreak and ((isCHoCH_bull and i_sCHCH) or (isBOS_bull and i_sBOS))
+    lbl = isCHoCH_bull ? "CHoCH" : "BOS"
+    css = i_cBMS
+    sty = isCHoCH_bull ? line.style_solid : line.style_dashed
+    newLine = line.new(sh1bar, sh1, n, sh1, color=css, style=sty, width=isCHoCH_bull ? 2 : 1)
+    newLabel = label.new(int(math.avg(sh1bar, n)), sh1, lbl,
+      style=label.style_label_down, color=color.new(css, 88), textcolor=css, size=size.tiny)
+    msLines.unshift(newLine)
+    msLabels.unshift(newLabel)
+
+if bearBreak and ((isCHoCH_bear and i_sCHCH) or (isBOS_bear and i_sBOS))
+    lbl = isCHoCH_bear ? "CHoCH" : "BOS"
+    css = i_cRMS
+    sty = isCHoCH_bear ? line.style_solid : line.style_dashed
+    newLine = line.new(sl1bar, sl1, n, sl1, color=css, style=sty, width=isCHoCH_bear ? 2 : 1)
+    newLabel = label.new(int(math.avg(sl1bar, n)), sl1, lbl,
+      style=label.style_label_up, color=color.new(css, 88), textcolor=css, size=size.tiny)
+    msLines.unshift(newLine)
+    msLabels.unshift(newLabel)
+
+// Cleanup old structure drawings
+if msLines.size() > 40
+    msLines.pop().delete()
+    msLabels.pop().delete()
+
+// ============================================================================
+// AI SCORING FUNCTIONS
+// ============================================================================
+
+// Score a Fair Value Gap (0-100)
+scoreFVG(float gapATR, float midDispRatio, float vRatio, bool trendAligned, bool structAligned) =>
+    // Factor 1: Gap size relative to ATR (0-25)
+    //   Sweet spot 0.3-1.5 ATR. Too small = noise, too big = likely fills
+    s1 = gapATR < 0.15 ? 3 : gapATR < 0.3 ? 12 : gapATR < 0.8 ? 25 : gapATR < 1.5 ? 20 : gapATR < 2.5 ? 12 : 5
+    // Factor 2: Displacement candle body/range (0-25)
+    //   Full-body candles = strong institutional conviction
+    s2 = midDispRatio > 0.8 ? 25 : midDispRatio > 0.6 ? 20 : midDispRatio > 0.4 ? 15 : midDispRatio > 0.2 ? 8 : 3
+    // Factor 3: Volume on displacement candle (0-20)
+    s3 = vRatio > 2.0 ? 20 : vRatio > 1.5 ? 16 : vRatio > 1.0 ? 12 : vRatio > 0.7 ? 8 : 4
+    // Factor 4: Trend EMA alignment (0-20)
+    s4 = trendAligned ? 20 : 8
+    // Factor 5: Market structure alignment (0-10)
+    s5 = structAligned ? 10 : 3
+    math.min(s1 + s2 + s3 + s4 + s5, 100)
+
+// Score an Order Block (0-100)
+scoreOB(float obATR, float dispATR, float vRatio, bool trendAligned, bool structAligned) =>
+    // Factor 1: OB size relative to ATR (0-20)
+    //   Tight zones (0.3-1.0 ATR) are more precise
+    s1 = obATR < 0.2 ? 5 : obATR < 0.5 ? 15 : obATR < 1.0 ? 20 : obATR < 2.0 ? 12 : 5
+    // Factor 2: Displacement after OB (0-30)
+    //   Strong moves away from OB = more institutional interest
+    s2 = dispATR > 3.0 ? 30 : dispATR > 2.0 ? 25 : dispATR > 1.0 ? 18 : dispATR > 0.5 ? 10 : 5
+    // Factor 3: Volume (0-20)
+    s3 = vRatio > 2.0 ? 20 : vRatio > 1.5 ? 16 : vRatio > 1.0 ? 12 : vRatio > 0.7 ? 8 : 4
+    // Factor 4: Trend alignment (0-20)
+    s4 = trendAligned ? 20 : 8
+    // Factor 5: Structure alignment (0-10)
+    s5 = structAligned ? 10 : 3
+    math.min(s1 + s2 + s3 + s4 + s5, 100)
+
+// Map score to transparency (higher score = more visible)
+scoreToTransp(int score, string filterMode) =>
+    hide = filterMode == "High Only" and score < 50
+    t = hide ? 100 : score >= 80 ? 60 : score >= 60 ? 72 : score >= 40 ? 82 : 90
+    t
+
+// ============================================================================
+// FAIR VALUE GAP DETECTION + SCORING
+// ============================================================================
+
+// FVG Arrays: track active zones
+var box[]   fvgBullBoxes   = array.new_box(0)
+var int[]   fvgBullScores  = array.new_int(0)
+var float[] fvgBullTops    = array.new_float(0)
+var float[] fvgBullBtms    = array.new_float(0)
+var bool[]  fvgBullActive  = array.new_bool(0)
+var bool[]  fvgBullSignaled = array.new_bool(0)
+
+var box[]   fvgBearBoxes   = array.new_box(0)
+var int[]   fvgBearScores  = array.new_int(0)
+var float[] fvgBearTops    = array.new_float(0)
+var float[] fvgBearBtms    = array.new_float(0)
+var bool[]  fvgBearActive  = array.new_bool(0)
+var bool[]  fvgBearSignaled = array.new_bool(0)
+
+// Detection: standard 3-bar FVG
+// Bull FVG: current low > 2-bar-ago high (gap up)
+// Bear FVG: current high < 2-bar-ago low (gap down)
+bool rawBullFVG = low > high[2] and close[1] > open[1] and per
+bool rawBearFVG = high < low[2] and close[1] < open[1] and per
+
+// Score and draw bull FVGs
+if rawBullFVG and i_sFVG
+    float gapSize = low - high[2]
+    float gapATR  = safeAtr > 0 ? gapSize / safeAtr : 0.5
+    float midDisp = candRange[1] > 0 ? bodySize[1] / candRange[1] : 0.5
+    float vRat    = nz(volume[1] / nz(volMa[1], volume[1]), 1.0)
+    bool  trAlgn  = close[1] > trendMa[1]
+    bool  stAlgn  = structDir >= 0
+
+    int sc = scoreFVG(gapATR, midDisp, vRat, trAlgn, stAlgn)
+    int tr = scoreToTransp(sc, i_fFVG)
+
+    if tr < 100
+        box bx = box.new(n-2, low, n + i_fvgExt, high[2],
+          bgcolor=color.new(i_cBFVG, tr),
+          border_color=color.new(i_cBFVG, math.max(tr - 20, 0)),
+          border_width=1,
+          text=str.tostring(sc), text_size=size.tiny,
+          text_color=color.new(i_cBFVG, math.max(tr - 30, 0)),
+          text_halign=text.align_right, text_valign=text.align_bottom)
+
+        fvgBullBoxes.unshift(bx)
+        fvgBullScores.unshift(sc)
+        fvgBullTops.unshift(low)
+        fvgBullBtms.unshift(high[2])
+        fvgBullActive.unshift(true)
+        fvgBullSignaled.unshift(false)
+
+    // Trim excess
+    while fvgBullBoxes.size() > i_mxFVG
+        fvgBullBoxes.pop().delete()
+        fvgBullScores.pop()
+        fvgBullTops.pop()
+        fvgBullBtms.pop()
+        fvgBullActive.pop()
+        fvgBullSignaled.pop()
+
+// Score and draw bear FVGs
+if rawBearFVG and i_sFVG
+    float gapSize = low[2] - high
+    float gapATR  = safeAtr > 0 ? gapSize / safeAtr : 0.5
+    float midDisp = candRange[1] > 0 ? bodySize[1] / candRange[1] : 0.5
+    float vRat    = nz(volume[1] / nz(volMa[1], volume[1]), 1.0)
+    bool  trAlgn  = close[1] < trendMa[1]
+    bool  stAlgn  = structDir <= 0
+
+    int sc = scoreFVG(gapATR, midDisp, vRat, trAlgn, stAlgn)
+    int tr = scoreToTransp(sc, i_fFVG)
+
+    if tr < 100
+        box bx = box.new(n-2, low[2], n + i_fvgExt, high,
+          bgcolor=color.new(i_cRFVG, tr),
+          border_color=color.new(i_cRFVG, math.max(tr - 20, 0)),
+          border_width=1,
+          text=str.tostring(sc), text_size=size.tiny,
+          text_color=color.new(i_cRFVG, math.max(tr - 30, 0)),
+          text_halign=text.align_right, text_valign=text.align_top)
+
+        fvgBearBoxes.unshift(bx)
+        fvgBearScores.unshift(sc)
+        fvgBearTops.unshift(low[2])
+        fvgBearBtms.unshift(high)
+        fvgBearActive.unshift(true)
+        fvgBearSignaled.unshift(false)
+
+    while fvgBearBoxes.size() > i_mxFVG
+        fvgBearBoxes.pop().delete()
+        fvgBearScores.pop()
+        fvgBearTops.pop()
+        fvgBearBtms.pop()
+        fvgBearActive.pop()
+        fvgBearSignaled.pop()
+
+// ── FVG Mitigation (price fills the gap) ──
+// Bull FVG mitigated when close drops below the bottom of the gap
+if fvgBullActive.size() > 0
+    for i = fvgBullActive.size() - 1 to 0
+        if fvgBullActive.get(i)
+            // Extend active boxes
+            fvgBullBoxes.get(i).set_right(n + 5)
+            // Check mitigation
+            if close < fvgBullBtms.get(i)
+                fvgBullActive.set(i, false)
+                fvgBullBoxes.get(i).set_right(n)
+                fvgBullBoxes.get(i).set_border_style(line.style_dashed)
+                fvgBullBoxes.get(i).set_bgcolor(color.new(i_cBFVG, 94))
+                fvgBullBoxes.get(i).set_text("")
+
+// Bear FVG mitigated when close rises above the top of the gap
+if fvgBearActive.size() > 0
+    for i = fvgBearActive.size() - 1 to 0
+        if fvgBearActive.get(i)
+            fvgBearBoxes.get(i).set_right(n + 5)
+            if close > fvgBearTops.get(i)
+                fvgBearActive.set(i, false)
+                fvgBearBoxes.get(i).set_right(n)
+                fvgBearBoxes.get(i).set_border_style(line.style_dashed)
+                fvgBearBoxes.get(i).set_bgcolor(color.new(i_cRFVG, 94))
+                fvgBearBoxes.get(i).set_text("")
+
+// ============================================================================
+// ORDER BLOCK DETECTION + SCORING
+// ============================================================================
+
+var box[]   obBullBoxes   = array.new_box(0)
+var int[]   obBullScores  = array.new_int(0)
+var float[] obBullTops    = array.new_float(0)
+var float[] obBullBtms    = array.new_float(0)
+var bool[]  obBullActive  = array.new_bool(0)
+
+var box[]   obBearBoxes   = array.new_box(0)
+var int[]   obBearScores  = array.new_int(0)
+var float[] obBearTops    = array.new_float(0)
+var float[] obBearBtms    = array.new_float(0)
+var bool[]  obBearActive  = array.new_bool(0)
+
+// Bullish OB: when bullish structure break → find last bearish candle before the break
+if bullBreak and i_sOB
+    float obTop = na
+    float obBtm = na
+    int   obBar = na
+    float obVol = na
+    // Search back for last bearish candle (the institutional accumulation candle)
+    int maxLook = math.min(n - sh1bar, 30)
+    for i = 1 to math.max(maxLook, 1)
+        if close[i] < open[i]  // bearish candle
+            obTop  := i_obBdy ? open[i]  : high[i]
+            obBtm  := i_obBdy ? close[i] : low[i]
+            obBar  := n - i
+            obVol  := nz(volume[i], 0)
+            break
+
+    if not na(obTop)
+        float obSize   = obTop - obBtm
+        float obATR    = safeAtr > 0 ? obSize / safeAtr : 0.5
+        float dispSize = close - obTop  // displacement from OB to break point
+        float dispATR  = safeAtr > 0 ? dispSize / safeAtr : 0.5
+        float vRat     = nz(obVol / nz(volMa, obVol), 1.0)
+        bool  trAlgn   = close > trendMa
+        bool  stAlgn   = true  // it IS the structure break
+
+        int sc = scoreOB(obATR, dispATR, vRat, trAlgn, stAlgn)
+        int tr = scoreToTransp(sc, "AI Scored")
+
+        box bx = box.new(obBar, obTop, n + 10, obBtm,
+          bgcolor=color.new(i_cBOB, tr),
+          border_color=color.new(i_cBOB, math.max(tr - 25, 0)),
+          border_width=2,
+          text="OB " + str.tostring(sc), text_size=size.tiny,
+          text_color=color.new(i_cBOB, math.max(tr - 30, 0)),
+          text_halign=text.align_left, text_valign=text.align_bottom)
+
+        obBullBoxes.unshift(bx)
+        obBullScores.unshift(sc)
+        obBullTops.unshift(obTop)
+        obBullBtms.unshift(obBtm)
+        obBullActive.unshift(true)
+
+    while obBullBoxes.size() > i_mxOB
+        obBullBoxes.pop().delete()
+        obBullScores.pop()
+        obBullTops.pop()
+        obBullBtms.pop()
+        obBullActive.pop()
+
+// Bearish OB: when bearish structure break → find last bullish candle before the break
+if bearBreak and i_sOB
+    float obTop = na
+    float obBtm = na
+    int   obBar = na
+    float obVol = na
+    int maxLook = math.min(n - sl1bar, 30)
+    for i = 1 to math.max(maxLook, 1)
+        if close[i] > open[i]  // bullish candle
+            obTop  := i_obBdy ? close[i] : high[i]
+            obBtm  := i_obBdy ? open[i]  : low[i]
+            obBar  := n - i
+            obVol  := nz(volume[i], 0)
+            break
+
+    if not na(obTop)
+        float obSize   = obTop - obBtm
+        float obATR    = safeAtr > 0 ? obSize / safeAtr : 0.5
+        float dispSize = obBtm - close
+        float dispATR  = safeAtr > 0 ? dispSize / safeAtr : 0.5
+        float vRat     = nz(obVol / nz(volMa, obVol), 1.0)
+        bool  trAlgn   = close < trendMa
+        bool  stAlgn   = true
+
+        int sc = scoreOB(obATR, dispATR, vRat, trAlgn, stAlgn)
+        int tr = scoreToTransp(sc, "AI Scored")
+
+        box bx = box.new(obBar, obTop, n + 10, obBtm,
+          bgcolor=color.new(i_cROB, tr),
+          border_color=color.new(i_cROB, math.max(tr - 25, 0)),
+          border_width=2,
+          text="OB " + str.tostring(sc), text_size=size.tiny,
+          text_color=color.new(i_cROB, math.max(tr - 30, 0)),
+          text_halign=text.align_left, text_valign=text.align_top)
+
+        obBearBoxes.unshift(bx)
+        obBearScores.unshift(sc)
+        obBearTops.unshift(obTop)
+        obBearBtms.unshift(obBtm)
+        obBearActive.unshift(true)
+
+    while obBearBoxes.size() > i_mxOB
+        obBearBoxes.pop().delete()
+        obBearScores.pop()
+        obBearTops.pop()
+        obBearBtms.pop()
+        obBearActive.pop()
+
+// ── OB Management: extend active, detect breaks ──
+if obBullActive.size() > 0
+    for i = obBullActive.size() - 1 to 0
+        if obBullActive.get(i)
+            obBullBoxes.get(i).set_right(n + 5)
+            if close < obBullBtms.get(i)  // price breaks below bull OB = invalidated
+                obBullActive.set(i, false)
+                obBullBoxes.get(i).set_right(n)
+                obBullBoxes.get(i).set_border_style(line.style_dashed)
+                obBullBoxes.get(i).set_bgcolor(color.new(i_cBOB, 95))
+                obBullBoxes.get(i).set_text("")
+
+if obBearActive.size() > 0
+    for i = obBearActive.size() - 1 to 0
+        if obBearActive.get(i)
+            obBearBoxes.get(i).set_right(n + 5)
+            if close > obBearTops.get(i)  // price breaks above bear OB = invalidated
+                obBearActive.set(i, false)
+                obBearBoxes.get(i).set_right(n)
+                obBearBoxes.get(i).set_border_style(line.style_dashed)
+                obBearBoxes.get(i).set_bgcolor(color.new(i_cROB, 95))
+                obBearBoxes.get(i).set_text("")
+
+// ============================================================================
+// CONFLUENCE ENGINE + SIGNAL GENERATION
+// ============================================================================
+
+// Check if price is entering any active zone and compute confluence
+var int   lastSigBar  = 0
+var float confluScore = 0.0
+var float lastSigScore = 0.0   // persisted score from last signal for dashboard
+var bool  lastSigBright = false // persisted bright status
+var int   lastSigDir  = 0      // 1=bull, -1=bear
+var int   bestFVGsc   = 0
+var int   bestOBsc    = 0
+var int   bullFVGcnt  = 0
+var int   bearFVGcnt  = 0
+var int   bullOBcnt   = 0
+var int   bearOBcnt   = 0
+
+// Count active zones
+bullFVGcnt := 0
+bearFVGcnt := 0
+bullOBcnt  := 0
+bearOBcnt  := 0
+
+if fvgBullActive.size() > 0
+    for i = 0 to fvgBullActive.size() - 1
+        if fvgBullActive.get(i)
+            bullFVGcnt += 1
+if fvgBearActive.size() > 0
+    for i = 0 to fvgBearActive.size() - 1
+        if fvgBearActive.get(i)
+            bearFVGcnt += 1
+if obBullActive.size() > 0
+    for i = 0 to obBullActive.size() - 1
+        if obBullActive.get(i)
+            bullOBcnt += 1
+if obBearActive.size() > 0
+    for i = 0 to obBearActive.size() - 1
+        if obBearActive.get(i)
+            bearOBcnt += 1
+
+// Find best active FVG and OB scores in current direction
+bestFVGsc := 0
+bestOBsc  := 0
+
+if structDir >= 0
+    if fvgBullScores.size() > 0
+        for i = 0 to fvgBullScores.size() - 1
+            if i < fvgBullActive.size() and fvgBullActive.get(i)
+                bestFVGsc := math.max(bestFVGsc, fvgBullScores.get(i))
+    if obBullScores.size() > 0
+        for i = 0 to obBullScores.size() - 1
+            if i < obBullActive.size() and obBullActive.get(i)
+                bestOBsc := math.max(bestOBsc, obBullScores.get(i))
+
+if structDir <= 0
+    if fvgBearScores.size() > 0
+        for i = 0 to fvgBearScores.size() - 1
+            if i < fvgBearActive.size() and fvgBearActive.get(i)
+                bestFVGsc := math.max(bestFVGsc, fvgBearScores.get(i))
+    if obBearScores.size() > 0
+        for i = 0 to obBearScores.size() - 1
+            if i < obBearActive.size() and obBearActive.get(i)
+                bestOBsc := math.max(bestOBsc, obBearScores.get(i))
+
+// Confluence: check for zone overlap + price proximity
+// Signal fires when price enters a scored zone with structure + trend alignment
+bool bullSignal = false
+bool bearSignal = false
+float sigScore  = 0.0
+
+if barstate.isconfirmed or barstate.ishistory
+    if i_sSig and per and (n - lastSigBar) > i_sigCD  // min cooldown bars between signals
+
+        // ── Bullish Signal ──
+        if structDir > 0 and trendUp
+            float bestBullConf = 0
+            // Check if price is touching/entering any bull FVG
+            if fvgBullActive.size() > 0
+                for i = 0 to fvgBullActive.size() - 1
+                    if fvgBullActive.get(i) and not fvgBullSignaled.get(i)
+                        fTop = fvgBullTops.get(i)
+                        fBtm = fvgBullBtms.get(i)
+                        if low <= fTop and high >= fBtm  // price touches the FVG zone
+                            float fScore = fvgBullScores.get(i)
+                            float oScore = 0
+                            // Check if any bull OB overlaps this FVG
+                            if obBullActive.size() > 0
+                                for j = 0 to obBullActive.size() - 1
+                                    if obBullActive.get(j)
+                                        oTop = obBullTops.get(j)
+                                        oBtm = obBullBtms.get(j)
+                                        // Overlap check
+                                        if oTop > fBtm and fTop > oBtm
+                                            oScore := math.max(oScore, obBullScores.get(j))
+                            // Confluence formula
+                            float conf = fScore * 0.45 + oScore * 0.35 + 20  // base 20 for structure alignment
+                            if conf > bestBullConf
+                                bestBullConf := conf
+                                fvgBullSignaled.set(i, true)
+
+            if bestBullConf >= i_minSc
+                bullSignal := true
+                sigScore   := math.min(bestBullConf, 100)
+                lastSigBar := n
+                lastSigScore := sigScore
+                lastSigBright := sigScore >= i_hiBrt
+                lastSigDir := 1
+
+        // ── Bearish Signal ──
+        if structDir < 0 and trendDn
+            float bestBearConf = 0
+            if fvgBearActive.size() > 0
+                for i = 0 to fvgBearActive.size() - 1
+                    if fvgBearActive.get(i) and not fvgBearSignaled.get(i)
+                        fTop = fvgBearTops.get(i)
+                        fBtm = fvgBearBtms.get(i)
+                        if low <= fTop and high >= fBtm
+                            float fScore = fvgBearScores.get(i)
+                            float oScore = 0
+                            if obBearActive.size() > 0
+                                for j = 0 to obBearActive.size() - 1
+                                    if obBearActive.get(j)
+                                        oTop = obBearTops.get(j)
+                                        oBtm = obBearBtms.get(j)
+                                        if oTop > fBtm and fTop > oBtm
+                                            oScore := math.max(oScore, obBearScores.get(j))
+                            float conf = fScore * 0.45 + oScore * 0.35 + 20
+                            if conf > bestBearConf
+                                bestBearConf := conf
+                                fvgBearSignaled.set(i, true)
+
+            if bestBearConf >= i_minSc
+                bearSignal := true
+                sigScore   := math.min(bestBearConf, 100)
+                lastSigBar := n
+                lastSigScore := sigScore
+                lastSigBright := sigScore >= i_hiBrt
+                lastSigDir := -1
+
+// ── Overall confluence score for dashboard ──
+confluScore := 0
+if structDir != 0
+    float fPart = bestFVGsc * 0.40
+    float oPart = bestOBsc  * 0.30
+    float sPart = structDir != 0 ? 15 : 0
+    float tPart = (structDir > 0 and trendUp) or (structDir < 0 and trendDn) ? 15 : 5
+    confluScore := math.min(fPart + oPart + sPart + tPart, 100)
+
+bool isBright = sigScore >= i_hiBrt
+bool showThisSignal = isBright or i_sDim  // only show dim signals if enabled
+
+// ============================================================================
+// SIGNAL MARKERS
+// ============================================================================
+
+if bullSignal and showThisSignal
+    int sc    = int(math.round(sigScore))
+    color css = isBright ? color.new(#00e676, 0)  : color.new(#546e7a, 0)
+    string sz = isBright ? size.small : size.tiny
+    string tag = isBright ? "★ " : "○ "
+
+    label.new(n, low, tag + str.tostring(sc),
+      color=css, style=label.style_label_up, textcolor=color.white, size=sz,
+      tooltip="🟢 " + (isBright ? "AI-CONFIRMED" : "CAUTIOUS") + " LONG" +
+              "\n━━━━━━━━━━━━━━━━━━━" +
+              "\nConfluence: " + str.tostring(sc) + " / 100" +
+              "\nBest FVG Score: " + str.tostring(bestFVGsc) +
+              "\nBest OB Score: " + str.tostring(bestOBsc) +
+              "\nStructure: BULLISH" +
+              "\nTrend: " + (trendUp ? "ALIGNED ✓" : "COUNTER ✗") +
+              "\n━━━━━━━━━━━━━━━━━━━" +
+              "\nPrice entered a scored demand zone" +
+              "\nwith structural + trend alignment.")
+
+if bearSignal and showThisSignal
+    int sc    = int(math.round(sigScore))
+    color css = isBright ? color.new(#ff5252, 0)  : color.new(#546e7a, 0)
+    string sz = isBright ? size.small : size.tiny
+    string tag = isBright ? "★ " : "○ "
+
+    label.new(n, high, tag + str.tostring(sc),
+      color=css, style=label.style_label_down, textcolor=color.white, size=sz,
+      tooltip="🔴 " + (isBright ? "AI-CONFIRMED" : "CAUTIOUS") + " SHORT" +
+              "\n━━━━━━━━━━━━━━━━━━━" +
+              "\nConfluence: " + str.tostring(sc) + " / 100" +
+              "\nBest FVG Score: " + str.tostring(bestFVGsc) +
+              "\nBest OB Score: " + str.tostring(bestOBsc) +
+              "\nStructure: BEARISH" +
+              "\nTrend: " + (trendDn ? "ALIGNED ✓" : "COUNTER ✗") +
+              "\n━━━━━━━━━━━━━━━━━━━" +
+              "\nPrice entered a scored supply zone" +
+              "\nwith structural + trend alignment.")
+
+// ============================================================================
+// PLOTS
+// ============================================================================
+
+// Trend EMA — color shows direction
+plot(trendMa, "Trend EMA", color=trendUp ? color.new(i_cBMS, 40) : color.new(i_cRMS, 40), linewidth=2)
+
+// Bar coloring — subtle when in active signal zone proximity
+bool inBullZone = structDir > 0 and bullFVGcnt > 0
+bool inBearZone = structDir < 0 and bearFVGcnt > 0
+barcolor(bullSignal ? color.new(#00e676, 0) : bearSignal ? color.new(#ff5252, 0) :
+  inBullZone ? color.new(#089981, 60) : inBearZone ? color.new(#f23645, 60) : na)
+
+// ============================================================================
+// AI DASHBOARD
+// ============================================================================
+
+if i_sDash
+    var dashPos = switch i_dLoc
+        "Top Right"    => position.top_right
+        "Bottom Right" => position.bottom_right
+        "Top Left"     => position.top_left
+        => position.bottom_left
+
+    var table dash = table.new(dashPos, 3, 8,
+      bgcolor=color.new(#0c1018, 5),
+      border_width=1, border_color=color.new(#1a2030, 0),
+      frame_width=2,  frame_color=color.new(#1a2030, 0))
+
+    if barstate.islast
+        // ── Row 0: Header ──
+        dash.cell(0, 0, " SMC", text_color=color.new(#4fc3f7, 0), text_size=size.normal, bgcolor=color.new(#0a0f1a, 0), text_halign=text.align_left)
+        dash.cell(1, 0, "AI ◈", text_color=color.new(#00e5ff, 0), text_size=size.normal, bgcolor=color.new(#0a0f1a, 0))
+        dash.cell(2, 0, "",     text_size=size.tiny, bgcolor=color.new(#0a0f1a, 0))
+
+        // ── Row 1: Structure ──
+        dash.cell(0, 1, "Structure", text_color=color.new(#5c6b7a, 0), text_size=size.normal, text_halign=text.align_left)
+        string strText = structDir > 0 ? "▲ BULLISH" : structDir < 0 ? "▼ BEARISH" : "— RANGING"
+        color  strCol  = structDir > 0 ? i_cBMS : structDir < 0 ? i_cRMS : color.new(#5c6b7a, 0)
+        dash.cell(1, 1, strText, text_color=strCol, text_size=size.normal)
+        dash.cell(2, 1, structDir != 0 ? (structDir > 0 ? "longs" : "shorts") : "", text_color=color.new(#455a64, 0), text_size=size.small)
+
+        // ── Row 2: Trend ──
+        dash.cell(0, 2, "Trend(" + str.tostring(i_trLen) + ")", text_color=color.new(#5c6b7a, 0), text_size=size.normal, text_halign=text.align_left)
+        bool aligned = (structDir > 0 and trendUp) or (structDir < 0 and trendDn)
+        string trText = structDir == 0 ? "—" : aligned ? "✓ ALIGNED" : "✗ COUNTER"
+        color  trCol  = aligned ? color.new(#00e676, 0) : color.new(#ffab00, 0)
+        dash.cell(1, 2, trText, text_color=structDir == 0 ? color.new(#455a64, 0) : trCol, text_size=size.normal)
+        dash.cell(2, 2, "", text_size=size.tiny)
+
+        // ── Row 3: Divider ──
+        dash.cell(0, 3, "", bgcolor=color.new(#1a2030, 0), text_size=size.tiny)
+        dash.cell(1, 3, "── Zone Scores ──", text_color=color.new(#2a3a4a, 0), text_size=size.tiny, bgcolor=color.new(#1a2030, 0))
+        dash.cell(2, 3, "", bgcolor=color.new(#1a2030, 0), text_size=size.tiny)
+
+        // ── Row 4: Best FVG ──
+        dash.cell(0, 4, "Best FVG", text_color=color.new(#5c6b7a, 0), text_size=size.normal, text_halign=text.align_left)
+        color fvgCol = bestFVGsc >= 70 ? color.new(#00e676, 0) : bestFVGsc >= 50 ? color.new(#69f0ae, 0) : bestFVGsc >= 30 ? color.new(#ffab00, 0) : color.new(#ff5252, 0)
+        string fvgBar = ""
+        for b = 1 to 10
+            fvgBar += b <= int(bestFVGsc / 10) ? "■" : "□"
+        dash.cell(1, 4, bestFVGsc > 0 ? str.tostring(bestFVGsc) : "—", text_color=bestFVGsc > 0 ? fvgCol : color.new(#455a64, 0), text_size=size.normal)
+        dash.cell(2, 4, bestFVGsc > 0 ? fvgBar : "", text_color=fvgCol, text_size=size.tiny)
+
+        // ── Row 5: Best OB ──
+        dash.cell(0, 5, "Best OB", text_color=color.new(#5c6b7a, 0), text_size=size.normal, text_halign=text.align_left)
+        color obCol = bestOBsc >= 70 ? color.new(#00e676, 0) : bestOBsc >= 50 ? color.new(#69f0ae, 0) : bestOBsc >= 30 ? color.new(#ffab00, 0) : color.new(#ff5252, 0)
+        string obBar = ""
+        for b = 1 to 10
+            obBar += b <= int(bestOBsc / 10) ? "■" : "□"
+        dash.cell(1, 5, bestOBsc > 0 ? str.tostring(bestOBsc) : "—", text_color=bestOBsc > 0 ? obCol : color.new(#455a64, 0), text_size=size.normal)
+        dash.cell(2, 5, bestOBsc > 0 ? obBar : "", text_color=obCol, text_size=size.tiny)
+
+        // ── Row 6: Signal ──
+        dash.cell(0, 6, "Signal", text_color=color.new(#5c6b7a, 0), text_size=size.normal, text_halign=text.align_left)
+        bool recentSig = lastSigBar > 0 and (n - lastSigBar) < 20
+        bool recentBull = recentSig and lastSigDir > 0
+        bool recentBear = recentSig and lastSigDir < 0
+        string sigText = recentBull ? (lastSigBright ? "★ LONG" : "○ LONG") : recentBear ? (lastSigBright ? "★ SHORT" : "○ SHORT") : "— WAITING"
+        color  sigCol  = recentBull ? color.new(#00e676, 0) : recentBear ? color.new(#ff5252, 0) : color.new(#455a64, 0)
+        dash.cell(1, 6, sigText, text_color=sigCol, text_size=size.normal)
+        dash.cell(2, 6, recentSig ? str.tostring(int(lastSigScore)) + " pts" : "", text_color=color.new(#455a64, 0), text_size=size.small)
+
+        // ── Row 7: Zone Counts ──
+        dash.cell(0, 7, "Zones", text_color=color.new(#5c6b7a, 0), text_size=size.normal, text_halign=text.align_left)
+        dash.cell(1, 7, str.tostring(bullFVGcnt) + "↑ " + str.tostring(bearFVGcnt) + "↓ FVG", text_color=color.new(#b0bec5, 0), text_size=size.small)
+        dash.cell(2, 7, str.tostring(bullOBcnt)  + "↑ " + str.tostring(bearOBcnt)  + "↓ OB",  text_color=color.new(#78909c, 0), text_size=size.small)
+
+// ============================================================================
+// ALERTS
+// ============================================================================
+
+alertcondition(bullSignal,                          "Bull Signal",        "SMC AI: LONG — Price entered demand zone with confluence")
+alertcondition(bullSignal and isBright,             "AI-Confirmed Long",  "SMC AI: ★ AI-CONFIRMED LONG — High confluence demand zone")
+alertcondition(bearSignal,                          "Bear Signal",        "SMC AI: SHORT — Price entered supply zone with confluence")
+alertcondition(bearSignal and isBright,             "AI-Confirmed Short", "SMC AI: ★ AI-CONFIRMED SHORT — High confluence supply zone")
+alertcondition(bullBreak,                           "Bullish Break",      "SMC AI: Bullish structure break detected")
+alertcondition(bearBreak,                           "Bearish Break",      "SMC AI: Bearish structure break detected")
+alertcondition(isCHoCH_bull,                        "Bullish CHoCH",      "SMC AI: Bullish Change of Character — potential trend reversal")
+alertcondition(isCHoCH_bear,                        "Bearish CHoCH",      "SMC AI: Bearish Change of Character — potential trend reversal")
+alertcondition(confluScore >= 80,                   "High Confluence",    "SMC AI: High confluence zone detected (80+)")
+
+// Hidden plots for external use
+plot(confluScore,    "Confluence Score", display=display.none)
+plot(float(bestFVGsc), "Best FVG Score", display=display.none)
+plot(float(bestOBsc),  "Best OB Score",  display=display.none)
+plot(structDir,      "Structure Dir",    display=display.none)

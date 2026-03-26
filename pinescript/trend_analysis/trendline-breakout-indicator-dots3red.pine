@@ -1,0 +1,311 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © Dots3Red
+
+//@version=6
+indicator("Trendline Breakout Indicator [Dots3Red]",  max_labels_count=500, max_polylines_count = 100, max_boxes_count = 500 ,overlay = true )
+
+//indicator inputs
+var bool isChannel = input.bool(true, "Channel/Polygon")
+var bool showVolumePerc = input.bool(false, "Volume % Bar")
+
+var breakOutPercentage = 1 + input.float(3, "Breakout %", [0.5,1, 1.5, 2, 2.5,3, 3.5,4,4.5,5,6,7,8,9,10]) /100
+var float slopeThreshold = input.float(1.05, "Slope factor", [1.01, 1.02, 1.03, 1.04, 1.05, 1.06, 1.07, 1.08, 1.09,1.1,1.2,1.3,1.4,1.5])
+var int pivotLen = input.int(3, "Pivot Length", [2,3,4,5,6,7,8,9,10])
+var int minChannelLength = input.int(30, "Channel's min length", [15,20,30,40,50,60,70,80,90,100,120,140,150,160,180,200])
+var float volumeBreakout = input.float(50, "Volume % Breakout", [10,20,30,40,50,60,70,80,90,100,125,150])
+//
+ph = ta.pivothigh(high, pivotLen, pivotLen)
+pl = ta.pivotlow(low, pivotLen, pivotLen)
+
+//colors
+var color colorBg      = #131722
+var color colorBar = #b2b5be
+var color boLblClBear = #ff2a6d
+var color boLblClBull = #00ff9d
+
+//bear colors
+var color colorChannelBear = color.new(#ff007b,75)
+var color colorPolygonBear = color.new(#1A237E,60)  
+var color colorChannelEdgesBear = color.new(#f23645,30)
+var color colorPolygonEdgeBear = color.new(#FF5252,40)
+
+//bull colors
+var color colorChannelBull      = color.new(#00f2ff, 75) // Transparent Cyan
+var color colorPolygonBull      = color.new(#00f2ff, 60) // Faint Glow
+var color colorChannelEdgesBull = color.new(#00ff9d,30)
+var color colorPolygonEdgeBull = color.new(#00ff9d,40)
+
+//variables for volume
+volMA = ta.sma(volume, 20)
+volPercent = math.abs((volume - volMA)*100 / volMA)    
+
+//
+type trendLineData
+    line line_id
+    int  lIdx
+    int  rIdx
+    float lVal
+    float rVal
+    float min_max
+    int min_max_idx
+    int r_extIdx
+    float r_ext
+    bool active
+
+var trendLinesBearish = array.new<trendLineData>()
+var trendLinesBullish = array.new<trendLineData>()
+
+getExtremeInRange(leftIdx, rightIdx, isBullish)=>
+    float extreme = isBullish ? 0.0 : 1000000000.0
+    int extreme_idx = 0
+
+    for i = leftIdx to rightIdx
+        val = isBullish ? high[bar_index - i] : low[bar_index - i]
+
+        if isBullish
+            if val > extreme
+                extreme := val
+                extreme_idx := i
+        else
+            if val < extreme
+                extreme := val
+                extreme_idx := i
+
+    [extreme, extreme_idx]
+
+
+findMaxDeviation(slope, lIdx, lVal, rIdx, rVal, bool isBullish)=>
+    float maxDeviation = 0.0
+
+    for x = lIdx to rIdx
+        lineVal = lVal + slope * (x - lIdx)
+        gap = isBullish ? (high[bar_index - x] - lineVal) : (lineVal - low[bar_index - x])
+        if gap > maxDeviation
+            maxDeviation := gap
+
+    maxDeviation
+           
+drawBoxVolume(channelExtreme, isBullish)=>
+    if volPercent > volumeBreakout
+
+        boxbgcolor = color.new(#ffae00, 80)
+        boxborder  = #ffff00
+
+        volNorm = math.min(volPercent, 50) / 100
+
+        rangeFactor = syminfo.type != "forex" ? 0.01 : 0.05
+        offsetFactor = syminfo.type != "forex" ? 0.25 : 0.08
+
+        base = low // isBullish ? high : 
+        maxTop = base - base * rangeFactor // isBullish ? base + base * rangeFactor : 
+
+        boxBottom = channelExtreme - channelExtreme * offsetFactor // isBullish ? channelExtreme + channelExtreme * offsetFactor :
+        boxTop = boxBottom + (maxTop - boxBottom) * volNorm
+
+        box.new(bar_index-1,boxBottom,bar_index+1,boxTop, bgcolor = boxbgcolor,border_color = boxborder, force_overlay = true)
+        labelY = isBullish ? boxTop + boxTop * 0.02 : boxBottom - boxBottom * 0.02
+        label.new(bar_index,labelY,text = str.tostring(math.round(volPercent,1)) + "%",style = label.style_none,textcolor = color.new(color.white,20),size = 12,yloc = yloc.price)
+
+drawBOLabel(int boIdx, isBullish)=>
+    dirText = isBullish ? "BO▼" : "BO▲" 
+    lblColor = isBullish ? boLblClBear : boLblClBull
+
+    high_point = isBullish ? chart.point.from_index(boIdx, low * 0.93) : chart.point.from_index(boIdx, high * 1.05)
+    low_point  = chart.point.from_index(boIdx, low)
+
+    line.new(low_point, high_point, width = 1, style = line.style_dotted, color = lblColor)
+    label.new(boIdx-1,isBullish ? low*0.93 : high*1.05, dirText, style = label.style_none,textcolor = lblColor,size = 12)
+
+
+drawTheEdges(upPoints, downPoints, isBullish)=>
+    fillColor = isBullish ? colorChannelEdgesBull : colorChannelEdgesBear
+    polyline.new(upPoints, closed = true, fill_color = fillColor,  line_color = color.new(color.blue,99))
+    polyline.new(downPoints, closed = true,fill_color = fillColor, line_color = color.new(color.blue,99))    
+
+
+
+shadeTheArea(trendLineData lineData, bool isBullish)=>
+    // Base trendline points
+    baseL = chart.point.from_index(lineData.lIdx, lineData.lVal)
+    baseR = chart.point.from_index(lineData.r_extIdx, lineData.r_ext)
+
+    points = array.new<chart.point>()    
+    if isChannel 
+        slope  = (lineData.rVal - lineData.lVal) / (lineData.rIdx - lineData.lIdx)
+        offset = findMaxDeviation(slope, lineData.lIdx, lineData.lVal, lineData.r_extIdx, lineData.r_ext, isBullish)
+
+        // Determine channel boundaries
+        upperL = isBullish ? lineData.lVal + offset : lineData.lVal
+        upperR = isBullish ? lineData.r_ext + offset : lineData.r_ext
+
+        lowerL = isBullish ? lineData.lVal : lineData.lVal - offset
+        lowerR = isBullish ? lineData.r_ext : lineData.r_ext - offset
+
+        // Channel boundary points
+        pointLH = chart.point.from_index(lineData.lIdx, upperL)
+        pointRH = chart.point.from_index(lineData.r_extIdx, upperR)
+
+        pointLL = chart.point.from_index(lineData.lIdx, lowerL)
+        pointRL = chart.point.from_index(lineData.r_extIdx, lowerR)
+
+        // Edge buffers
+        pointLH_E = chart.point.from_index(lineData.lIdx, upperL + offset * 0.05)
+        pointRH_E = chart.point.from_index(lineData.r_extIdx, upperR + offset * 0.05)
+
+        pointLL_E = chart.point.from_index(lineData.lIdx, lowerL - offset * 0.05)
+        pointRL_E = chart.point.from_index(lineData.r_extIdx, lowerR - offset * 0.05)
+
+        // Extend channel visually into future
+        if barstate.islast
+            futureBars = 50
+            futureVal  = lineData.lVal + slope * (lineData.rIdx + futureBars - lineData.lIdx)
+
+            futureUpper = isBullish ? futureVal + offset : futureVal
+            futureLower = isBullish ? futureVal : futureVal - offset
+
+            pointRH   := chart.point.from_index(lineData.r_extIdx + futureBars, futureUpper)
+            pointRL   := chart.point.from_index(lineData.r_extIdx + futureBars, futureLower)
+
+            pointRH_E := chart.point.from_index(lineData.r_extIdx + futureBars, futureUpper + offset * 0.05)
+            pointRL_E := chart.point.from_index(lineData.r_extIdx + futureBars, futureLower - offset * 0.05)
+
+        // Edge shading
+        edgePointsUP   = array.from(pointLH, pointLH_E, pointRH_E, pointRH)
+        edgePointsDOWN = array.from(pointLL, pointRL, pointRL_E, pointLL_E)
+
+        drawTheEdges(edgePointsUP, edgePointsDOWN,isBullish)
+
+
+        // Main channel polygon
+        channelColor = isBullish ? colorChannelBull : colorChannelBear
+        points := array.from(pointLH, pointRH, pointRL, pointLL)
+        polyline.new( points,closed = true, fill_color = channelColor, line_color = color.new(color.blue, 99) )
+
+    else if not isChannel
+        // Polygon mode
+        pointLH = chart.point.from_index(lineData.lIdx, lineData.lVal)
+        pointRH = chart.point.from_index(lineData.r_extIdx, lineData.r_ext)
+
+        pointLL = chart.point.from_index(lineData.lIdx, lineData.min_max)
+        pointRL = chart.point.from_index(lineData.r_extIdx, lineData.min_max)
+        polygonColor = isBullish ? colorPolygonBull : colorPolygonBear
+
+        points := array.from(pointLH, pointLL, pointRL, pointRH)
+        polyline.new( points, closed = true, fill_color = polygonColor, line_color = colorPolygonEdgeBear)
+
+mapTrendLines(arrOfTrendLines, isBullish)=>
+    for i = 0 to array.size(arrOfTrendLines)-1
+        data = array.get(arrOfTrendLines, i)
+
+        if data.active
+            slope    = (data.rVal - data.lVal) / (data.rIdx - data.lIdx)
+            expected = data.lVal + slope * (bar_index - data.lIdx)
+            
+            if isBullish
+                if high > data.min_max
+                    data.min_max     := high
+                    data.min_max_idx := bar_index
+            else
+                if low < data.min_max
+                    data.min_max     := low
+                    data.min_max_idx := bar_index
+
+            breakout = isBullish ? low < expected / breakOutPercentage : close > expected * breakOutPercentage
+            isLongEnough = data.r_extIdx - data.lIdx >=minChannelLength
+
+            if breakout
+                data.active   := false
+                data.r_extIdx := bar_index
+                data.r_ext    := expected
+                if isLongEnough  
+                    shadeTheArea(data, isBullish)
+                    drawBOLabel(bar_index, isBullish)                    
+                    if showVolumePerc                        
+                        drawBoxVolume(data.min_max, isBullish)  
+            else if barstate.islast and isLongEnough
+                shadeTheArea(data, isBullish)
+            else
+                line.set_x2(data.line_id, bar_index)
+                line.set_y2(data.line_id, expected)
+                data.r_extIdx := bar_index
+                data.r_ext    := expected
+
+            if isBullish
+                array.set(trendLinesBullish, i, data)
+            else
+                array.set(trendLinesBearish, i, data)
+
+
+isDuplicateTrend(lVal, rVal, lIdx, rIdx, arrOfTrendLines)=>
+    isDuplicate = false
+    if array.size(arrOfTrendLines)>0    
+        newSlope = (rVal - lVal) / (rIdx - lIdx)
+        for i = 0 to array.size(arrOfTrendLines) - 1
+            existing = array.get(arrOfTrendLines, i)
+            if existing.active
+                oldSlope = (existing.rVal - existing.lVal) / (existing.rIdx - existing.lIdx)            
+                slopeSimilar = math.abs(newSlope - oldSlope) / math.abs(oldSlope) < 0.9
+                overlapping  = lIdx > existing.lIdx and rIdx <= existing.r_extIdx            
+
+                if overlapping //and slopeSimilar
+                    isDuplicate := true
+                    break
+
+    isDuplicate
+
+var int  lastPivotIdxBear = na
+var float lastPivotValBear = na
+var int  lastPivotIdxBull = na
+var float lastPivotValBull = na
+
+collectTrendLines(isBullish, arrOfTrendLines)=>
+    pivotIdx = bar_index - pivotLen
+    pivotVal = isBullish ? pl : ph
+    int lastPivotIdx = isBullish ? lastPivotIdxBull : lastPivotIdxBear   
+    float lastPivotVal = isBullish ? lastPivotValBull :lastPivotValBear
+    if na(lastPivotIdx)
+        lastPivotIdx := pivotIdx
+        lastPivotVal := pivotVal
+        [lastPivotIdx, lastPivotVal]    
+    else
+        lIdx = lastPivotIdx
+        lVal = lastPivotVal
+        rIdx = pivotIdx
+        rVal = pivotVal
+
+        isValidSlope = isBullish ? (rVal / lVal > slopeThreshold) : (lVal / rVal > slopeThreshold)
+        initMinMax = isBullish ? math.max(lVal, rVal) : math.min(lVal, rVal)
+
+       
+        if isValidSlope
+            if isDuplicateTrend(lVal, rVal, lIdx, rIdx, arrOfTrendLines)==false
+                ln = line.new(lIdx, lVal, rIdx, rVal, color=na)                
+                newData = trendLineData.new(ln, lIdx, rIdx, lVal, rVal, initMinMax, lIdx, rIdx, na, true)                
+                array.push(arrOfTrendLines, newData) 
+                
+        
+        lastPivotIdx := pivotIdx
+        lastPivotVal := pivotVal
+        [lastPivotIdx, lastPivotVal]
+
+
+if not na(ph)
+    [lastPivotIdx, lastPivotVal] = collectTrendLines(false, trendLinesBearish)
+    lastPivotIdxBear:=lastPivotIdx
+    lastPivotValBear:=lastPivotVal
+
+if not na(pl)
+    [lastPivotIdx, lastPivotVal] = collectTrendLines(true, trendLinesBullish)
+    lastPivotIdxBull:=lastPivotIdx
+    lastPivotValBull:=lastPivotVal
+    
+
+//extension of the trendLines
+if array.size(trendLinesBearish)>0 or array.size(trendLinesBullish)> 0
+    if array.size(trendLinesBullish)> 0        
+        mapTrendLines(trendLinesBullish, true)
+    if array.size(trendLinesBearish)> 0        
+        mapTrendLines(trendLinesBearish, false)
+
+barcolor(colorBar)
+bgcolor(colorBg)

@@ -1,0 +1,304 @@
+// This work is licensed under Creative Commons Attribution-NonCommercial-ShareAlike 4.0 International  
+// https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © UAlgo
+//@version=6
+indicator("Trend Lines [UAlgo]", overlay=true, max_lines_count=300, max_labels_count=300)
+
+groupDetect = "Detection"
+groupRules = "Rules"
+groupStyle = "Style"
+
+pivotLength = input.int(5, "Pivot Length", minval=2, maxval=30, group=groupDetect)
+sourceMode = input.string("Wick", "Touch Source", options=["Wick", "Body"], group=groupDetect, tooltip="Wick uses high/low pivots. Body uses candle body extremes.")
+pivotMemory = input.int(10, "Stored Pivots", minval=3, maxval=20, group=groupDetect)
+minBarsBetweenPivots = input.int(4, "Min Bars Between Pivots", minval=2, maxval=100, group=groupDetect, tooltip="Requires the selected pivots to be separated by at least this many chart bars.")
+atrLength = input.int(14, "ATR Length", minval=1, maxval=100, group=groupDetect)
+touchAtrMult = input.float(0.12, "Touch Tolerance ATR Mult", minval=0.01, maxval=1.0, step=0.01, group=groupDetect)
+maxTrackedLines = input.int(18, "Max Tracked Lines Per Side", minval=4, maxval=60, group=groupDetect)
+maxNewLinesPerPivot = input.int(1, "Max New Lines Per Pivot", minval=1, maxval=4, group=groupDetect, tooltip="Limits how many new trendline candidates a fresh pivot can create. Lower values reduce noise.")
+
+minTouches = input.int(3, "Minimum Touches", minval=2, maxval=10, group=groupRules, tooltip="Two anchor pivots create a line. A line becomes valid when its touch count reaches this threshold.")
+enforceBodyRule = input.bool(true, "Reject Lines Cutting Through Bodies", group=groupRules, tooltip="Filters out lines that pass through candle bodies between anchor pivots.")
+breakMethod = input.string("Body With Tolerance", "Break Method", options=["Body With Tolerance", "Body No Tolerance"], group=groupRules, tooltip="Break checks always use candle body. Choose whether body breaks use the configured tolerance or zero tolerance.")
+showCandidates = input.bool(false, "Show Candidate Lines", group=groupRules)
+showBrokenLines = input.bool(true, "Show Broken Lines", group=groupRules)
+
+bullColor = input.color(color.rgb(11, 153, 133), "Bull Break Color", group=groupStyle)
+bearColor = input.color(color.rgb(214, 78, 88), "Bear Break Color", group=groupStyle)
+candidateOpacity = input.int(84, "Candidate Opacity", minval=40, maxval=95, group=groupStyle)
+activeOpacityFloor = input.int(12, "Active Opacity Floor", minval=0, maxval=40, group=groupStyle)
+brokenOpacity = input.int(68, "Broken Opacity", minval=20, maxval=90, group=groupStyle)
+lineWidth = input.int(2, "Active Line Width", minval=1, maxval=4, group=groupStyle)
+showTouchMarkers = input.bool(true, "Show Touch Count On Active Lines", group=groupStyle)
+labelSize = input.string("small", "Label Size", options=["tiny", "small", "normal"], group=groupStyle)
+
+type PivotPoint
+    int pivotTime
+    float price
+
+type TrendlineState
+    int t1
+    float y1
+    int t2
+    float y2
+    float slope
+    bool isUpper
+    int touches = 2
+    int lastTouchTime
+    bool isActive = false
+    bool isBroken = false
+    bool isDisabled = false
+    int breakTime = na
+    float breakPrice = na
+    line basisLine = na
+    label breakLabel = na
+    label touchLabel = na
+
+f_labelSize(string sizeName) =>
+    switch sizeName
+        "tiny" => size.tiny
+        "small" => size.small
+        "normal" => size.normal
+        => size.small
+
+f_bodyHigh(int offset) =>
+    math.max(open[offset], close[offset])
+
+f_bodyLow(int offset) =>
+    math.min(open[offset], close[offset])
+
+f_breakTolerance(string methodName, float tolerance) =>
+    methodName == "Body With Tolerance" ? tolerance : 0.0
+
+f_barTimeMs() =>
+    int(math.max(nz(time - time[1], timeframe.in_seconds(timeframe.period) * 1000), 1))
+
+f_countBarsBetween(int startTime, int endTime) =>
+    int barsBetween = 0
+    if endTime > startTime
+        int offset = 0
+        while offset <= bar_index and time[offset] >= startTime
+            int barTime = time[offset]
+            if barTime <= endTime and barTime > startTime
+                barsBetween += 1
+            offset += 1
+    barsBetween
+
+method priceAt(TrendlineState this, int targetTime) =>
+    this.y1 + this.slope * float(targetTime - this.t1)
+
+method deleteVisuals(TrendlineState this) =>
+    if not na(this.basisLine)
+        line.delete(this.basisLine)
+        this.basisLine := na
+    if not na(this.breakLabel)
+        label.delete(this.breakLabel)
+        this.breakLabel := na
+    if not na(this.touchLabel)
+        label.delete(this.touchLabel)
+        this.touchLabel := na
+    int(na)
+
+method disable(TrendlineState this) =>
+    this.isDisabled := true
+    this.deleteVisuals()
+    int(na)
+
+f_activeOpacity(int touches, int floorOpacity) =>
+    float strength = math.min(math.max(touches - 2, 0) / 4.0, 1.0)
+    int(math.round(28 - strength * (28 - floorOpacity)))
+
+method respectsBodies(TrendlineState this, float tolerance) =>
+    bool result = true
+    if this.t2 > this.t1
+        int offset = 0
+        while offset <= bar_index and time[offset] >= this.t1
+            int barTime = time[offset]
+            if barTime < this.t2 and barTime > this.t1
+                float linePrice = this.priceAt(barTime)
+                float bodyTop = f_bodyHigh(offset)
+                float bodyBottom = f_bodyLow(offset)
+                if this.isUpper and linePrice < bodyTop - tolerance
+                    result := false
+                    break
+                if not this.isUpper and linePrice > bodyBottom + tolerance
+                    result := false
+                    break
+            offset += 1
+    result
+
+method isBreakViolationAt(TrendlineState this, int targetTime, int offset, string methodName, float tolerance) =>
+    float linePrice = this.priceAt(targetTime)
+    float priceSource = this.isUpper ? f_bodyHigh(offset) : f_bodyLow(offset)
+    float breakTolerance = f_breakTolerance(methodName, tolerance)
+    this.isUpper ? priceSource > linePrice + breakTolerance : priceSource < linePrice - breakTolerance
+
+method hasBreakViolation(TrendlineState this, int startTime, int endTime, string methodName, float tolerance) =>
+    bool violated = false
+    if endTime >= startTime
+        int offset = 0
+        while offset <= bar_index and time[offset] >= startTime
+            int targetTime = time[offset]
+            if targetTime <= endTime and targetTime >= startTime and this.isBreakViolationAt(targetTime, offset, methodName, tolerance)
+                violated := true
+                break
+            offset += 1
+    violated
+
+method registerTouch(TrendlineState this, PivotPoint pivot, string methodName, float tolerance, int requiredTouches) =>
+    bool touched = false
+    if not this.isBroken and not this.isDisabled and pivot.pivotTime > this.t2 and pivot.pivotTime > this.lastTouchTime
+        if this.hasBreakViolation(this.lastTouchTime + 1, pivot.pivotTime - 1, methodName, tolerance)
+            this.disable()
+        else
+            float projectedPrice = this.priceAt(pivot.pivotTime)
+            if math.abs(pivot.price - projectedPrice) <= tolerance
+                this.touches += 1
+                this.lastTouchTime := pivot.pivotTime
+                this.isActive := this.touches >= requiredTouches
+                touched := true
+    touched
+
+method updateVisual(TrendlineState this, color bullishColor, color bearishColor, bool drawCandidates, bool drawBroken, int activeWidth, int candidateAlpha, int activeFloorAlpha, int brokenAlpha, bool drawTouchMarkers, string markerSize) =>
+    bool shouldDraw = not this.isDisabled and (this.isBroken ? drawBroken : (this.isActive or drawCandidates))
+    if not shouldDraw
+        this.deleteVisuals()
+    else
+        color baseColor = this.isUpper ? bearishColor : bullishColor
+        int activeAlpha = f_activeOpacity(this.touches, activeFloorAlpha)
+        color plotColor = this.isBroken ? color.new(baseColor, brokenAlpha) : this.isActive ? color.new(baseColor, activeAlpha) : color.new(baseColor, candidateAlpha)
+        int plotWidth = this.isBroken ? 1 : this.isActive ? activeWidth : 1
+        plotStyle = this.isBroken ? line.style_dashed : this.isActive ? line.style_solid : line.style_dotted
+        int x2Value = this.isBroken ? this.breakTime : this.t2
+        float y2Value = this.isBroken ? this.breakPrice : this.y2
+
+        if na(this.basisLine)
+            this.basisLine := line.new(this.t1, this.y1, x2Value, y2Value, xloc=xloc.bar_time, extend=this.isBroken ? extend.none : extend.right, color=plotColor, style=plotStyle, width=plotWidth)
+        else
+            line.set_xy1(this.basisLine, this.t1, this.y1)
+            line.set_xy2(this.basisLine, x2Value, y2Value)
+            line.set_extend(this.basisLine, this.isBroken ? extend.none : extend.right)
+            line.set_color(this.basisLine, plotColor)
+            line.set_style(this.basisLine, plotStyle)
+            line.set_width(this.basisLine, plotWidth)
+
+        if this.isActive and drawTouchMarkers and not this.isBroken
+            int markerTime = time + f_barTimeMs()
+            string touchText = str.tostring(this.touches) + "T"
+            float markerY = this.priceAt(time)
+            if na(this.touchLabel)
+                this.touchLabel := label.new(markerTime, markerY, touchText, xloc=xloc.bar_time, style=label.style_none, textcolor=color.new(baseColor, math.min(activeAlpha + 8, 85)), size=f_labelSize(markerSize), textalign=text.align_left)
+            else
+                label.set_x(this.touchLabel, markerTime)
+                label.set_y(this.touchLabel, markerY)
+                label.set_text(this.touchLabel, touchText)
+                label.set_textcolor(this.touchLabel, color.new(baseColor, math.min(activeAlpha + 8, 85)))
+        else if not na(this.touchLabel)
+            label.delete(this.touchLabel)
+            this.touchLabel := na
+
+    int(na)
+
+method maybeBreak(TrendlineState this, string methodName, float tolerance, color bullishColor, color bearishColor, string textSize) =>
+    bool didBreak = false
+    if this.isActive and not this.isBroken and not this.isDisabled and barstate.isconfirmed and time > this.t2 and not na(time[1])
+        bool crossed = this.isBreakViolationAt(time, 0, methodName, tolerance)
+        if crossed
+            this.isBroken := true
+            this.breakTime := time
+            this.breakPrice := this.priceAt(time)
+            string breakText = this.isUpper ? "Bull Break" : "Bear Break"
+            color textColor = this.isUpper ? bullishColor : bearishColor
+            if not na(this.breakLabel)
+                label.delete(this.breakLabel)
+            this.breakLabel := label.new(time, this.breakPrice, breakText, xloc=xloc.bar_time, style=label.style_none, textcolor=textColor, size=f_labelSize(textSize), textalign=text.align_center)
+            didBreak := true
+    didBreak
+
+method rememberPivot(array<PivotPoint> this, PivotPoint pivot, int maxCount) =>
+    this.push(pivot)
+    if this.size() > maxCount
+        this.shift()
+    this
+
+method hasAnchors(array<TrendlineState> this, int leftTime, int rightTime) =>
+    bool exists = false
+    for tl in this
+        if tl.t1 == leftTime and tl.t2 == rightTime
+            exists := true
+            break
+    exists
+
+method enqueueLine(array<TrendlineState> this, TrendlineState trendline, int maxCount) =>
+    this.push(trendline)
+    if this.size() > maxCount
+        TrendlineState removed = this.shift()
+        removed.deleteVisuals()
+    this
+
+method processPivotTouch(array<TrendlineState> this, PivotPoint pivot, string methodName, float tolerance, int requiredTouches) =>
+    for tl in this
+        tl.registerTouch(pivot, methodName, tolerance, requiredTouches)
+    int(na)
+
+method buildCandidates(array<TrendlineState> this, array<PivotPoint> pivots, PivotPoint newest, bool isUpper, int minGap, string methodName, float tolerance, int requiredTouches, bool strictBodyFilter, int maxCount, int maxPerPivot) =>
+    int pivotCount = pivots.size()
+    int builtCount = 0
+    if pivotCount > 1
+        for step = 1 to pivotCount - 1
+            PivotPoint older = pivots.get(pivotCount - 1 - step)
+            int barsApart = f_countBarsBetween(older.pivotTime, newest.pivotTime)
+            int timeApart = newest.pivotTime - older.pivotTime
+            bool directionalMove = isUpper ? newest.price < older.price : newest.price > older.price
+            if directionalMove and barsApart >= minGap and not this.hasAnchors(older.pivotTime, newest.pivotTime) and builtCount < maxPerPivot
+                TrendlineState candidate = TrendlineState.new(t1=older.pivotTime, y1=older.price, t2=newest.pivotTime, y2=newest.price, slope=(newest.price - older.price) / float(timeApart), isUpper=isUpper, touches=2, lastTouchTime=newest.pivotTime, isActive=requiredTouches <= 2)
+                bool accepted = strictBodyFilter ? candidate.respectsBodies(tolerance) : true
+                accepted := accepted and not candidate.hasBreakViolation(older.pivotTime + 1, newest.pivotTime - 1, methodName, tolerance)
+                if accepted
+                    this.enqueueLine(candidate, maxCount)
+                    builtCount += 1
+    int(na)
+
+method refreshAll(array<TrendlineState> this, color bullishColor, color bearishColor, bool drawCandidates, bool drawBroken, int activeWidth, int candidateAlpha, int activeFloorAlpha, int brokenAlpha, bool drawTouchMarkers, string markerSize) =>
+    for tl in this
+        tl.updateVisual(bullishColor, bearishColor, drawCandidates, drawBroken, activeWidth, candidateAlpha, activeFloorAlpha, brokenAlpha, drawTouchMarkers, markerSize)
+    int(na)
+
+method breakScan(array<TrendlineState> this, string methodName, float tolerance, color bullishColor, color bearishColor, string textSize) =>
+    bool triggered = false
+    for tl in this
+        if tl.maybeBreak(methodName, tolerance, bullishColor, bearishColor, textSize)
+            triggered := true
+    triggered
+
+float highSource = sourceMode == "Wick" ? high : math.max(open, close)
+float lowSource = sourceMode == "Wick" ? low : math.min(open, close)
+float pivotHighPrice = ta.pivothigh(highSource, pivotLength, pivotLength)
+float pivotLowPrice = ta.pivotlow(lowSource, pivotLength, pivotLength)
+float touchTolerance = math.max(ta.atr(atrLength) * touchAtrMult, syminfo.mintick * 2.0)
+
+var array<PivotPoint> highPivots = array.new<PivotPoint>()
+var array<PivotPoint> lowPivots = array.new<PivotPoint>()
+var array<TrendlineState> upperLines = array.new<TrendlineState>()
+var array<TrendlineState> lowerLines = array.new<TrendlineState>()
+
+if not na(pivotHighPrice)
+    PivotPoint highPivot = PivotPoint.new(pivotTime=time[pivotLength], price=pivotHighPrice)
+    upperLines.processPivotTouch(highPivot, breakMethod, touchTolerance, minTouches)
+    highPivots.rememberPivot(highPivot, pivotMemory)
+    upperLines.buildCandidates(highPivots, highPivot, true, minBarsBetweenPivots, breakMethod, touchTolerance, minTouches, enforceBodyRule, maxTrackedLines, maxNewLinesPerPivot)
+
+if not na(pivotLowPrice)
+    PivotPoint lowPivot = PivotPoint.new(pivotTime=time[pivotLength], price=pivotLowPrice)
+    lowerLines.processPivotTouch(lowPivot, breakMethod, touchTolerance, minTouches)
+    lowPivots.rememberPivot(lowPivot, pivotMemory)
+    lowerLines.buildCandidates(lowPivots, lowPivot, false, minBarsBetweenPivots, breakMethod, touchTolerance, minTouches, enforceBodyRule, maxTrackedLines, maxNewLinesPerPivot)
+
+bool bullishBreak = upperLines.breakScan(breakMethod, touchTolerance, bullColor, bearColor, labelSize)
+bool bearishBreak = lowerLines.breakScan(breakMethod, touchTolerance, bullColor, bearColor, labelSize)
+
+upperLines.refreshAll(bullColor, bearColor, showCandidates, showBrokenLines, lineWidth, candidateOpacity, activeOpacityFloor, brokenOpacity, showTouchMarkers, labelSize)
+lowerLines.refreshAll(bullColor, bearColor, showCandidates, showBrokenLines, lineWidth, candidateOpacity, activeOpacityFloor, brokenOpacity, showTouchMarkers, labelSize)
+
+alertcondition(bullishBreak, "Bullish Trendline Break", "Bullish trendline break confirmed on close.")
+alertcondition(bearishBreak, "Bearish Trendline Break", "Bearish trendline break confirmed on close.")

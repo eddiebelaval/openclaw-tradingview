@@ -1,0 +1,548 @@
+//@version=6
+// ═══════════════════════════════════════════════════════════════════════════════
+//  APEX Market Dynamics — Profiles & Levels  [v2.3]
+//  Volume Profile (POC/VAH/VAL) · MTF S/R · ATR Range · Liquidity Zones
+// ═══════════════════════════════════════════════════════════════════════════════
+indicator("APEX Market Dynamics — Profiles & Levels v2.3", overlay = true,
+  max_bars_back    = 500,
+  max_lines_count  = 200,
+  max_boxes_count  = 300,
+  max_labels_count = 200)
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  INPUTS
+// ─────────────────────────────────────────────────────────────────────────────
+
+grp_vp     = "● VOLUME PROFILE"
+i_vp_on    = input.bool(true,   "Enable",                             group = grp_vp)
+i_vp_len   = input.int(100,     "Lookback Bars",                      group = grp_vp, minval = 20, maxval = 500)
+i_vp_bins  = input.int(20,      "Number of Bins",                     group = grp_vp, minval = 5,  maxval = 40)
+i_vp_width = input.int(30,      "Profile Width (bars)",               group = grp_vp, minval = 5,  maxval = 80,
+  tooltip = "Width of histogram bars in chart bars. Keep small to avoid overlapping price action.")
+i_vp_va    = input.bool(true,   "Highlight Value Area (70%)",         group = grp_vp,
+  tooltip = "Value Area = price range containing 70% of volume.\nVAH = resistance from below. VAL = support from above.")
+c_vp_main  = input.color(color.new(#546e7a, 65), "Bar Color",         group = grp_vp)
+c_vp_poc   = input.color(color.new(#ff9800, 30), "POC Color",         group = grp_vp)
+c_vp_va    = input.color(color.new(#00bcd4, 60), "Value Area Color",  group = grp_vp)
+
+grp_lz     = "● LIQUIDITY ZONES"
+i_lz_on    = input.bool(true,   "Enable",                             group = grp_lz,
+  tooltip = "Identifies price levels where unusually high volume clustered.\nBull delta (more buy-side volume) → teal zone.\nBear delta (more sell-side volume) → red zone.\nHigh volume at a level = strong order concentration = likely reaction.")
+i_lz_len   = input.int(100,     "Lookback Bars",                      group = grp_lz, minval = 20, maxval = 500)
+i_lz_bins  = input.int(30,      "Price Bins",                         group = grp_lz, minval = 10, maxval = 60,
+  tooltip = "More bins = finer granularity. Fewer = broader zones.")
+i_lz_mult  = input.float(1.5,   "Volume Threshold (x avg)",           group = grp_lz, minval = 1.0, maxval = 6.0, step = 0.25,
+  tooltip = "A bin must have this many times the average per-bin volume to qualify as a liquidity zone.")
+i_lz_max   = input.int(8,       "Max Zones",                          group = grp_lz, minval = 2, maxval = 20)
+c_lz_bull  = input.color(color.new(#c6ff00, 75), "Bull Delta Zone",   group = grp_lz)
+c_lz_bear  = input.color(color.new(#ea80fc, 75), "Bear Delta Zone",   group = grp_lz)
+c_lz_neut  = input.color(color.new(#9e9e9e, 82), "Neutral Zone",      group = grp_lz)
+
+grp_mtf    = "● MTF SUPPORT / RESISTANCE"
+i_mtf_on   = input.bool(true,     "Enable",                           group = grp_mtf)
+i_htf1     = input.timeframe("D",   "Timeframe 1",                    group = grp_mtf)
+i_htf2     = input.timeframe("240", "Timeframe 2",                    group = grp_mtf)
+i_mtf_piv  = input.int(5,         "Pivot Strength",                   group = grp_mtf, minval = 2, maxval = 20,
+  tooltip = "Bars each side required to confirm an HTF pivot.\nHigher = fewer but stronger levels.")
+i_mtf_max  = input.int(3,         "Max Levels per TF",                group = grp_mtf, minval = 1, maxval = 6)
+i_mtf_back = input.int(200,       "Line Lookback (bars)",             group = grp_mtf, minval = 20, maxval = 500)
+c_htf1_col = input.color(color.new(#ffeb3b, 20), "TF1 Color",         group = grp_mtf)
+c_htf2_col = input.color(color.new(#ce93d8, 20), "TF2 Color",         group = grp_mtf)
+
+grp_pr     = "● ATR PREDICTIVE RANGE"
+i_pr_on    = input.bool(true,   "Enable",                             group = grp_pr,
+  tooltip = "Volatility-based range projection. NOT a trade signal.\nShows how far price could realistically move in N bars.")
+i_pr_atr   = input.int(14,      "ATR Length",                         group = grp_pr, minval = 5, maxval = 50)
+i_pr_mult  = input.float(1.5,   "ATR Multiplier",                     group = grp_pr, minval = 0.5, maxval = 5.0, step = 0.1)
+i_pr_fwd   = input.int(20,      "Bars Forward",                       group = grp_pr, minval = 5, maxval = 100)
+c_pr_hi    = input.color(color.new(#69f0ae, 70), "High Range",        group = grp_pr)
+c_pr_lo    = input.color(color.new(#ef5350, 70), "Low Range",         group = grp_pr)
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  GLOBAL SERIES  — all ta.* and request.security() at global scope
+// ─────────────────────────────────────────────────────────────────────────────
+
+vp_hi_ser  = ta.highest(high, i_vp_len)
+vp_lo_ser  = ta.lowest(low,   i_vp_len)
+lz_hi_ser  = ta.highest(high, i_lz_len)
+lz_lo_ser  = ta.lowest(low,   i_lz_len)
+lz_vol_avg = ta.sma(volume, 20)
+atr_ser    = ta.atr(i_pr_atr)
+
+htf1_ph = request.security(syminfo.tickerid, i_htf1,
+  ta.pivothigh(high, i_mtf_piv, i_mtf_piv), lookahead = barmerge.lookahead_off)
+htf1_pl = request.security(syminfo.tickerid, i_htf1,
+  ta.pivotlow(low,   i_mtf_piv, i_mtf_piv), lookahead = barmerge.lookahead_off)
+htf2_ph = request.security(syminfo.tickerid, i_htf2,
+  ta.pivothigh(high, i_mtf_piv, i_mtf_piv), lookahead = barmerge.lookahead_off)
+htf2_pl = request.security(syminfo.tickerid, i_htf2,
+  ta.pivotlow(low,   i_mtf_piv, i_mtf_piv), lookahead = barmerge.lookahead_off)
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  GLOBAL UDFs
+// ─────────────────────────────────────────────────────────────────────────────
+
+f_push_level(arr, val) =>
+    n = array.size(arr)
+    if n == 0 or array.get(arr, n - 1) != val
+        array.push(arr, val)
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  PERSISTENT STATE
+// ─────────────────────────────────────────────────────────────────────────────
+
+var array<box>   vp_boxes   = array.new<box>()
+var array<float> vp_bin_vol = array.new<float>()
+var label        vp_poc_lbl = na
+var label        vp_vah_lbl = na
+var label        vp_val_lbl = na
+var line         vp_poc_ln  = na
+var line         vp_vah_ln  = na
+var line         vp_val_ln  = na
+
+var array<box>   lz_boxes   = array.new<box>()
+var array<label> lz_labels  = array.new<label>()
+
+var array<float> htf1_lvls  = array.new<float>()
+var array<float> htf2_lvls  = array.new<float>()
+var array<line>  mtf_lines  = array.new<line>()
+var array<label> mtf_labels = array.new<label>()
+
+var box  pr_hi_box  = na
+var box  pr_lo_box  = na
+var line pr_hi_line = na
+var line pr_lo_line = na
+var line pr_mid_ln  = na
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  MTF LEVEL COLLECTION — every bar, deduped
+// ─────────────────────────────────────────────────────────────────────────────
+
+if i_mtf_on
+    if not na(htf1_ph)
+        f_push_level(htf1_lvls, htf1_ph)
+        if array.size(htf1_lvls) > i_mtf_max * 4
+            array.shift(htf1_lvls)
+    if not na(htf1_pl)
+        f_push_level(htf1_lvls, htf1_pl)
+        if array.size(htf1_lvls) > i_mtf_max * 4
+            array.shift(htf1_lvls)
+    if not na(htf2_ph)
+        f_push_level(htf2_lvls, htf2_ph)
+        if array.size(htf2_lvls) > i_mtf_max * 4
+            array.shift(htf2_lvls)
+    if not na(htf2_pl)
+        f_push_level(htf2_lvls, htf2_pl)
+        if array.size(htf2_lvls) > i_mtf_max * 4
+            array.shift(htf2_lvls)
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  VOLUME PROFILE
+// ─────────────────────────────────────────────────────────────────────────────
+
+if i_vp_on and barstate.islast
+    vp_hi  = vp_hi_ser
+    vp_lo  = vp_lo_ser
+    vp_rng = vp_hi - vp_lo
+
+    if vp_rng > 0
+        array.clear(vp_bin_vol)
+        for x = 0 to i_vp_bins - 1
+            array.push(vp_bin_vol, 0.0)
+
+        bin_sz = vp_rng / i_vp_bins
+        for i = 0 to i_vp_len - 1
+            idx = math.max(0, math.min(i_vp_bins - 1, int(math.floor((close[i] - vp_lo) / bin_sz))))
+            array.set(vp_bin_vol, idx, array.get(vp_bin_vol, idx) + volume[i])
+
+        max_vol   = array.max(vp_bin_vol)
+        poc_idx   = array.indexof(vp_bin_vol, max_vol)
+        total_vol = array.sum(vp_bin_vol)
+        va_target = total_vol * 0.70
+        va_lo  = poc_idx
+        va_hi  = poc_idx
+        va_acc = array.get(vp_bin_vol, poc_idx)
+        while va_acc < va_target
+            can_dn = va_lo > 0
+            can_up = va_hi < i_vp_bins - 1
+            vol_dn = can_dn ? array.get(vp_bin_vol, va_lo - 1) : 0.0
+            vol_up = can_up ? array.get(vp_bin_vol, va_hi + 1) : 0.0
+            if not can_dn and not can_up
+                break
+            if vol_dn >= vol_up and can_dn
+                va_lo  -= 1
+                va_acc += vol_dn
+            else if can_up
+                va_hi  += 1
+                va_acc += vol_up
+            else
+                break
+
+        while array.size(vp_boxes) > 0
+            box.delete(array.pop(vp_boxes))
+        if not na(vp_poc_ln)
+            line.delete(vp_poc_ln)
+        if not na(vp_vah_ln)
+            line.delete(vp_vah_ln)
+        if not na(vp_val_ln)
+            line.delete(vp_val_ln)
+        if not na(vp_poc_lbl)
+            label.delete(vp_poc_lbl)
+        if not na(vp_vah_lbl)
+            label.delete(vp_vah_lbl)
+        if not na(vp_val_lbl)
+            label.delete(vp_val_lbl)
+
+        anchor = bar_index - i_vp_len
+        bin_sz2 = vp_rng / i_vp_bins
+        for i = 0 to i_vp_bins - 1
+            bv      = array.get(vp_bin_vol, i)
+            blo     = vp_lo + i * bin_sz2
+            bhi     = blo + bin_sz2
+            bw      = math.max(1, math.round(bv / max_vol * i_vp_width))
+            is_poc  = i == poc_idx
+            is_va   = i_vp_va and i >= va_lo and i <= va_hi
+            bar_col = is_poc ? c_vp_poc : is_va ? c_vp_va : c_vp_main
+            b = box.new(anchor, bhi, anchor + bw, blo,
+              bgcolor      = bar_col,
+              border_color = na)
+            array.push(vp_boxes, b)
+
+        poc_price = vp_lo + poc_idx * bin_sz2 + bin_sz2 * 0.5
+        vah_price = vp_lo + va_hi  * bin_sz2 + bin_sz2
+        val_price = vp_lo + va_lo  * bin_sz2
+        lbl_x     = bar_index + 3
+
+        vp_poc_ln  := line.new(anchor, poc_price, bar_index, poc_price,
+          xloc  = xloc.bar_index,
+          color = color.new(#ff9800, 40),
+          style = line.style_dotted,
+          width = 1)
+        vp_poc_lbl := label.new(lbl_x, poc_price, "POC " + str.tostring(poc_price, format.mintick),
+          xloc      = xloc.bar_index,
+          yloc      = yloc.price,
+          style     = label.style_label_left,
+          size      = size.tiny,
+          color     = color.new(#ff9800, 25),
+          textcolor = color.white,
+          tooltip   = "Point of Control\nHighest volume price. Acts as a magnet for price.")
+
+        if i_vp_va
+            vp_vah_ln := line.new(anchor, vah_price, bar_index, vah_price,
+              xloc  = xloc.bar_index,
+              color = color.new(#00bcd4, 55),
+              style = line.style_dotted,
+              width = 1)
+            vp_val_ln := line.new(anchor, val_price, bar_index, val_price,
+              xloc  = xloc.bar_index,
+              color = color.new(#00bcd4, 55),
+              style = line.style_dotted,
+              width = 1)
+            vp_vah_lbl := label.new(lbl_x, vah_price, "VAH " + str.tostring(vah_price, format.mintick),
+              xloc      = xloc.bar_index,
+              yloc      = yloc.price,
+              style     = label.style_label_left,
+              size      = size.tiny,
+              color     = color.new(#00bcd4, 25),
+              textcolor = color.white,
+              tooltip   = "Value Area High\nTop of 70% volume zone. Resistance from below.")
+            vp_val_lbl := label.new(lbl_x, val_price, "VAL " + str.tostring(val_price, format.mintick),
+              xloc      = xloc.bar_index,
+              yloc      = yloc.price,
+              style     = label.style_label_left,
+              size      = size.tiny,
+              color     = color.new(#00bcd4, 25),
+              textcolor = color.white,
+              tooltip   = "Value Area Low\nBottom of 70% volume zone. Support from above.")
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  LIQUIDITY ZONES
+//
+//  Algorithm:
+//  1. Divide price range into i_lz_bins bins over last i_lz_len bars
+//  2. Accumulate total volume AND bull volume (close > open) per bin
+//  3. Flag bins where volume > avg_per_bin × i_lz_mult
+//  4. Sort qualifying bins by volume descending, display top i_lz_max
+//  5. Delta = (bull_vol - bear_vol) / total_vol → colors zone teal/red/grey
+//  6. Volume rank label: same LOUD/HIGH/MED/LOW scale as Structure script
+// ─────────────────────────────────────────────────────────────────────────────
+
+if i_lz_on and barstate.islast
+    lz_hi  = lz_hi_ser
+    lz_lo  = lz_lo_ser
+    lz_rng = lz_hi - lz_lo
+
+    if lz_rng > 0
+        // Build per-bin accumulators
+        lz_bin_tot  = array.new<float>(i_lz_bins, 0.0)
+        lz_bin_bull = array.new<float>(i_lz_bins, 0.0)
+        lz_bin_sz   = lz_rng / i_lz_bins
+
+        for i = 0 to i_lz_len - 1
+            b_idx = math.max(0, math.min(i_lz_bins - 1, int(math.floor((close[i] - lz_lo) / lz_bin_sz))))
+            array.set(lz_bin_tot,  b_idx, array.get(lz_bin_tot,  b_idx) + volume[i])
+            if close[i] > open[i]
+                array.set(lz_bin_bull, b_idx, array.get(lz_bin_bull, b_idx) + volume[i])
+
+        // Average volume per bin (using simple total / bins)
+        lz_total     = array.sum(lz_bin_tot)
+        lz_avg_bin   = lz_total / i_lz_bins
+        lz_threshold = lz_avg_bin * i_lz_mult
+
+        // Collect qualifying bins — store [bin_index, total_vol]
+        lz_qual_idx = array.new<int>()
+        lz_qual_vol = array.new<float>()
+        for i = 0 to i_lz_bins - 1
+            bv = array.get(lz_bin_tot, i)
+            if bv >= lz_threshold
+                array.push(lz_qual_idx, i)
+                array.push(lz_qual_vol, bv)
+
+        // Sort descending by volume (simple insertion sort — small array)
+        n_q = array.size(lz_qual_idx)
+        for i = 1 to n_q - 1
+            j = i
+            while j > 0 and array.get(lz_qual_vol, j) > array.get(lz_qual_vol, j - 1)
+                tmp_v = array.get(lz_qual_vol, j)
+                tmp_i = array.get(lz_qual_idx, j)
+                array.set(lz_qual_vol, j,     array.get(lz_qual_vol, j - 1))
+                array.set(lz_qual_idx, j,     array.get(lz_qual_idx, j - 1))
+                array.set(lz_qual_vol, j - 1, tmp_v)
+                array.set(lz_qual_idx, j - 1, tmp_i)
+                j -= 1
+
+        // Delete old drawings
+        while array.size(lz_boxes) > 0
+            box.delete(array.pop(lz_boxes))
+        while array.size(lz_labels) > 0
+            label.delete(array.pop(lz_labels))
+
+        // Draw top i_lz_max zones
+        n_draw = math.min(n_q, i_lz_max)
+        for i = 0 to n_draw - 1
+            bin_i  = array.get(lz_qual_idx, i)
+            tot_v  = array.get(lz_qual_vol, i)
+            bul_v  = array.get(lz_bin_bull, bin_i)
+            ber_v  = tot_v - bul_v
+            delta  = tot_v > 0 ? (bul_v - ber_v) / tot_v : 0.0
+            blo    = lz_lo + bin_i * lz_bin_sz
+            bhi    = blo + lz_bin_sz
+            mid_p  = (bhi + blo) / 2.0
+            // Color by delta: > 0.15 = bull, < -0.15 = bear, else neutral
+            zc     = delta > 0.15 ? c_lz_bull : delta < -0.15 ? c_lz_bear : c_lz_neut
+            zbc    = delta > 0.15 ? color.new(#00bcd4, 50) : delta < -0.15 ? color.new(#ef5350, 50) : color.new(#9e9e9e, 60)
+            // Volume rank label relative to lz_vol_avg
+            vr     = tot_v / (lz_vol_avg * i_lz_len / i_lz_bins)
+            v_rank = vr > 3.0 ? "LOUD" : vr > 1.5 ? "HIGH" : vr > 0.5 ? "MED" : "LOW"
+            d_pct  = math.round(delta * 100)
+            d_str  = d_pct > 0 ? "+" + str.tostring(d_pct) + "%" : str.tostring(d_pct) + "%"
+            dir_lbl = delta > 0.15 ? "BULL" : delta < -0.15 ? "BEAR" : "NEUT"
+
+            bx = box.new(bar_index - 15, bhi, bar_index + 3, blo,
+              bgcolor      = zc,
+              border_color = zbc,
+              border_width = 1)
+            lb = label.new(bar_index + 5, mid_p, "LZ " + dir_lbl + " " + v_rank,
+              xloc      = xloc.bar_index,
+              yloc      = yloc.price,
+              style     = label.style_label_left,
+              size      = size.tiny,
+              color     = color.new(color.black, 100),
+              textcolor = zbc,
+              tooltip   = "Liquidity Zone\nDelta: " + d_str + " (" + dir_lbl + ")\nVol rank: " + v_rank + "\nLevel: " + str.tostring(mid_p, format.mintick) + "\nHigh order concentration — likely to see a price reaction here.")
+            array.push(lz_boxes,  bx)
+            array.push(lz_labels, lb)
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  MTF SUPPORT / RESISTANCE
+// ─────────────────────────────────────────────────────────────────────────────
+
+if i_mtf_on and barstate.islast
+    while array.size(mtf_lines) > 0
+        line.delete(array.pop(mtf_lines))
+    while array.size(mtf_labels) > 0
+        label.delete(array.pop(mtf_labels))
+
+    sb   = bar_index - i_mtf_back
+    eb   = bar_index
+    lblx = bar_index + 3
+
+    n1    = array.size(htf1_lvls)
+    from1 = math.max(0, n1 - i_mtf_max)
+    for i = from1 to n1 - 1
+        lvl = array.get(htf1_lvls, i)
+        age = n1 - 1 - i
+        wid = age == 0 ? 2 : 1
+        sr  = close >= lvl ? "Sup" : "Res"
+        tip = i_htf1 + " " + (close >= lvl ? "Support" : "Resistance") + "\n" + (age == 0 ? "Most recent - highest significance." : "Older pivot - still relevant.")
+        ln  = line.new(sb, lvl, eb, lvl,
+          xloc  = xloc.bar_index,
+          color = c_htf1_col,
+          style = line.style_dashed,
+          width = wid)
+        lbl = label.new(lblx, lvl, i_htf1 + " " + sr,
+          xloc      = xloc.bar_index,
+          yloc      = yloc.price,
+          style     = label.style_label_left,
+          size      = size.tiny,
+          color     = color.new(#ffeb3b, 40),
+          textcolor = color.white,
+          tooltip   = tip)
+        array.push(mtf_lines,  ln)
+        array.push(mtf_labels, lbl)
+
+    n2    = array.size(htf2_lvls)
+    from2 = math.max(0, n2 - i_mtf_max)
+    for i = from2 to n2 - 1
+        lvl = array.get(htf2_lvls, i)
+        age = n2 - 1 - i
+        wid = age == 0 ? 2 : 1
+        sr  = close >= lvl ? "Sup" : "Res"
+        tip = i_htf2 + " " + (close >= lvl ? "Support" : "Resistance") + "\n" + (age == 0 ? "Most recent - highest significance." : "Older pivot - still relevant.")
+        ln  = line.new(sb, lvl, eb, lvl,
+          xloc  = xloc.bar_index,
+          color = c_htf2_col,
+          style = line.style_dotted,
+          width = wid)
+        lbl = label.new(lblx, lvl, i_htf2 + " " + sr,
+          xloc      = xloc.bar_index,
+          yloc      = yloc.price,
+          style     = label.style_label_left,
+          size      = size.tiny,
+          color     = color.new(#ce93d8, 40),
+          textcolor = color.white,
+          tooltip   = tip)
+        array.push(mtf_lines,  ln)
+        array.push(mtf_labels, lbl)
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  ATR PREDICTIVE RANGE
+// ─────────────────────────────────────────────────────────────────────────────
+
+pr_hi_top = high + atr_ser * i_pr_mult
+pr_hi_bot = high + atr_ser * i_pr_mult * 0.5
+pr_lo_bot = low  - atr_ser * i_pr_mult
+pr_lo_top = low  - atr_ser * i_pr_mult * 0.5
+pr_mid    = (high + low) / 2.0
+pr_lb     = bar_index + 1
+pr_rb     = bar_index + i_pr_fwd
+
+if i_pr_on
+    if na(pr_hi_box)
+        pr_hi_box := box.new(pr_lb, pr_hi_top, pr_rb, pr_hi_bot,
+          bgcolor      = c_pr_hi,
+          border_color = color.new(#69f0ae, 50),
+          border_width = 1,
+          text         = "  ATR Hi",
+          text_halign  = text.align_left,
+          text_valign  = text.align_top,
+          text_size    = size.tiny,
+          text_color   = color.new(#69f0ae, 30))
+        pr_lo_box := box.new(pr_lb, pr_lo_top, pr_rb, pr_lo_bot,
+          bgcolor      = c_pr_lo,
+          border_color = color.new(#ef5350, 50),
+          border_width = 1,
+          text         = "  ATR Lo",
+          text_halign  = text.align_left,
+          text_valign  = text.align_bottom,
+          text_size    = size.tiny,
+          text_color   = color.new(#ef5350, 30))
+        pr_hi_line := line.new(pr_lb, pr_hi_top, pr_rb, pr_hi_top,
+          xloc  = xloc.bar_index,
+          color = color.new(#69f0ae, 30),
+          style = line.style_dotted,
+          width = 1)
+        pr_lo_line := line.new(pr_lb, pr_lo_bot, pr_rb, pr_lo_bot,
+          xloc  = xloc.bar_index,
+          color = color.new(#ef5350, 30),
+          style = line.style_dotted,
+          width = 1)
+        pr_mid_ln := line.new(pr_lb, pr_mid, pr_rb, pr_mid,
+          xloc  = xloc.bar_index,
+          color = color.new(#9e9e9e, 60),
+          style = line.style_solid,
+          width = 1)
+    else
+        box.set_left(pr_hi_box,   pr_lb)
+        box.set_top(pr_hi_box,    pr_hi_top)
+        box.set_right(pr_hi_box,  pr_rb)
+        box.set_bottom(pr_hi_box, pr_hi_bot)
+        box.set_left(pr_lo_box,   pr_lb)
+        box.set_top(pr_lo_box,    pr_lo_top)
+        box.set_right(pr_lo_box,  pr_rb)
+        box.set_bottom(pr_lo_box, pr_lo_bot)
+        line.set_xy1(pr_hi_line,  pr_lb, pr_hi_top)
+        line.set_xy2(pr_hi_line,  pr_rb, pr_hi_top)
+        line.set_xy1(pr_lo_line,  pr_lb, pr_lo_bot)
+        line.set_xy2(pr_lo_line,  pr_rb, pr_lo_bot)
+        line.set_xy1(pr_mid_ln,   pr_lb, pr_mid)
+        line.set_xy2(pr_mid_ln,   pr_rb, pr_mid)
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  LEGEND  — Bottom Right
+// ─────────────────────────────────────────────────────────────────────────────
+
+var table leg = na
+if barstate.islast
+    if na(leg)
+        leg := table.new(position.bottom_right, 3, 12,
+          bgcolor      = color.new(#0a0a14, 5),
+          border_color = color.new(#ffffff, 70),
+          border_width = 1,
+          frame_color  = color.new(#ffffff, 60),
+          frame_width  = 1)
+
+    // Header
+    table.cell(leg, 0, 0, "  PROFILES & LEVELS LEGEND  ",
+      text_color = color.new(#e0e0e0, 0), text_size = size.small,
+      bgcolor    = color.new(#1a237e, 0))
+    table.merge_cells(leg, 0, 0, 2, 0)
+
+    // Column headers
+    table.cell(leg, 0, 1, " Color ",   text_color = color.new(#90a4ae, 0), text_size = size.tiny, bgcolor = color.new(#111122, 0))
+    table.cell(leg, 1, 1, " Feature ", text_color = color.new(#90a4ae, 0), text_size = size.tiny, bgcolor = color.new(#111122, 0))
+    table.cell(leg, 2, 1, " Meaning ", text_color = color.new(#90a4ae, 0), text_size = size.tiny, bgcolor = color.new(#111122, 0))
+
+    // ── Volume Profile
+    table.cell(leg, 0, 2, "  ", bgcolor = color.new(#ff9800, 20), text_size = size.tiny)
+    table.cell(leg, 1, 2, " POC ",  text_color = color.new(#ff9800, 0),  text_size = size.tiny, bgcolor = color.new(#0a0a14, 5))
+    table.cell(leg, 2, 2, " Orange — highest volume price, acts as price magnet ", text_color = color.new(#b0bec5, 0), text_size = size.tiny, bgcolor = color.new(#0a0a14, 5))
+
+    table.cell(leg, 0, 3, "  ", bgcolor = color.new(#00bcd4, 25), text_size = size.tiny)
+    table.cell(leg, 1, 3, " VAH / VAL ", text_color = color.new(#00bcd4, 0),  text_size = size.tiny, bgcolor = color.new(#0a0a14, 5))
+    table.cell(leg, 2, 3, " Cyan — 70% value area edges (VAH resistance, VAL support) ", text_color = color.new(#b0bec5, 0), text_size = size.tiny, bgcolor = color.new(#0a0a14, 5))
+
+    // ── Liquidity Zones
+    table.cell(leg, 0, 4, "  ", bgcolor = color.new(#c6ff00, 30), text_size = size.tiny)
+    table.cell(leg, 1, 4, " LZ BULL ",  text_color = color.new(#c6ff00, 0),  text_size = size.tiny, bgcolor = color.new(#0a0a14, 5))
+    table.cell(leg, 2, 4, " Lime — buy-side volume dominant at this level ", text_color = color.new(#b0bec5, 0), text_size = size.tiny, bgcolor = color.new(#0a0a14, 5))
+
+    table.cell(leg, 0, 5, "  ", bgcolor = color.new(#ea80fc, 30), text_size = size.tiny)
+    table.cell(leg, 1, 5, " LZ BEAR ",  text_color = color.new(#ea80fc, 0),  text_size = size.tiny, bgcolor = color.new(#0a0a14, 5))
+    table.cell(leg, 2, 5, " Magenta — sell-side volume dominant at this level ", text_color = color.new(#b0bec5, 0), text_size = size.tiny, bgcolor = color.new(#0a0a14, 5))
+
+    table.cell(leg, 0, 6, "  ", bgcolor = color.new(#9e9e9e, 35), text_size = size.tiny)
+    table.cell(leg, 1, 6, " LZ NEUT ",  text_color = color.new(#9e9e9e, 0),  text_size = size.tiny, bgcolor = color.new(#0a0a14, 5))
+    table.cell(leg, 2, 6, " Grey — balanced buying/selling at this level ", text_color = color.new(#b0bec5, 0), text_size = size.tiny, bgcolor = color.new(#0a0a14, 5))
+
+    table.cell(leg, 0, 7, "  ", bgcolor = color.new(#546e7a, 40), text_size = size.tiny)
+    table.cell(leg, 1, 7, " LZ Rank ",  text_color = color.new(#b0bec5, 0),  text_size = size.tiny, bgcolor = color.new(#0a0a14, 5))
+    table.cell(leg, 2, 7, " LOUD >3x | HIGH 1.5-3x | MED 0.5-1.5x | LOW <0.5x avg ", text_color = color.new(#b0bec5, 0), text_size = size.tiny, bgcolor = color.new(#0a0a14, 5))
+
+    // ── MTF S/R
+    table.cell(leg, 0, 8, "  ", bgcolor = color.new(#ffeb3b, 25), text_size = size.tiny)
+    table.cell(leg, 1, 8, " TF1 S/R ",  text_color = color.new(#ffeb3b, 0),  text_size = size.tiny, bgcolor = color.new(#0a0a14, 5))
+    table.cell(leg, 2, 8, " Yellow dashed — higher TF1 pivots (thicker = most recent) ", text_color = color.new(#b0bec5, 0), text_size = size.tiny, bgcolor = color.new(#0a0a14, 5))
+
+    table.cell(leg, 0, 9, "  ", bgcolor = color.new(#ce93d8, 25), text_size = size.tiny)
+    table.cell(leg, 1, 9, " TF2 S/R ",  text_color = color.new(#ce93d8, 0),  text_size = size.tiny, bgcolor = color.new(#0a0a14, 5))
+    table.cell(leg, 2, 9, " Purple dotted — higher TF2 pivots (thicker = most recent) ", text_color = color.new(#b0bec5, 0), text_size = size.tiny, bgcolor = color.new(#0a0a14, 5))
+
+    // ── ATR Range
+    table.cell(leg, 0, 10, "  ", bgcolor = color.new(#69f0ae, 30), text_size = size.tiny)
+    table.cell(leg, 1, 10, " ATR Hi ",   text_color = color.new(#69f0ae, 0),  text_size = size.tiny, bgcolor = color.new(#0a0a14, 5))
+    table.cell(leg, 2, 10, " Green box ahead of price — volatility high projection ", text_color = color.new(#b0bec5, 0), text_size = size.tiny, bgcolor = color.new(#0a0a14, 5))
+
+    table.cell(leg, 0, 11, "  ", bgcolor = color.new(#ef5350, 30), text_size = size.tiny)
+    table.cell(leg, 1, 11, " ATR Lo ",   text_color = color.new(#ef5350, 0),  text_size = size.tiny, bgcolor = color.new(#0a0a14, 5))
+    table.cell(leg, 2, 11, " Red box ahead of price — volatility low projection ", text_color = color.new(#b0bec5, 0), text_size = size.tiny, bgcolor = color.new(#0a0a14, 5))

@@ -1,0 +1,255 @@
+// This work is licensed under Creative Commons Attribution-NonCommercial-ShareAlike 4.0 International  
+// https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © UAlgo
+//@version=6
+indicator("Gann Fan [UAlgo]", overlay = true, max_lines_count = 500, max_labels_count = 500)
+
+groupStructure = "Structure"
+pivotLen = input.int(6, "Pivot Strength", minval = 2, maxval = 30, group = groupStructure)
+maxStoredPivots = input.int(120, "Max Stored Pivots", minval = 20, maxval = 400, group = groupStructure)
+trendMode = input.string("Auto", "Fan Direction", options = ["Auto", "Bullish", "Bearish"], group = groupStructure)
+
+groupStyle = "Style"
+baseLineWidth = input.int(1, "Base Line Width", minval = 1, maxval = 4, group = groupStyle)
+mainLineWidth = input.int(2, "1x1 Line Width", minval = 1, maxval = 6, group = groupStyle)
+glowWidth = input.int(5, "Glow Width", minval = 2, maxval = 16, group = groupStyle)
+showGlow = input.bool(true, "Show Glow", group = groupStyle)
+showZones = input.bool(true, "Show Fan Zones", group = groupStyle)
+showLabels = input.bool(true, "Show Angle Labels", group = groupStyle)
+labelShiftBars = input.int(28, "Label Shift (Bars)", minval = 3, maxval = 300, group = groupStyle)
+labelSizeOpt = input.string("Small", "Label Size", options = ["Tiny", "Small", "Normal"], group = groupStyle)
+showAnchorLabel = input.bool(true, "Show Anchor Label", group = groupStyle)
+
+color bullZone = color.rgb(35, 177, 166)
+color bearZone = color.rgb(236, 90, 112)
+color anchorText = color.rgb(230, 238, 250)
+color mainBull = color.rgb(0, 214, 193)
+color mainBear = color.rgb(255, 92, 120)
+color bullGlow = color.rgb(0, 214, 193)
+color bearGlow = color.rgb(255, 92, 120)
+
+type SwingPoint
+    int idx = na
+    float price = na
+    bool isHigh = false
+
+type FanAnchor
+    int idx1 = na
+    float p1 = na
+    int idx2 = na
+    float p2 = na
+    bool bullish = true
+    bool valid = false
+
+method isNa(SwingPoint point) =>
+    na(point.idx) or na(point.price)
+
+method pushAlternating(array<SwingPoint> points, SwingPoint candidate, int maxCount) =>
+    int n = points.size()
+    if n == 0
+        points.push(candidate)
+    else
+        SwingPoint last = points.get(n - 1)
+        if last.isHigh == candidate.isHigh
+            bool moreExtreme = (candidate.isHigh and candidate.price >= last.price) or (not candidate.isHigh and candidate.price <= last.price)
+            if moreExtreme
+                points.set(n - 1, candidate)
+        else
+            points.push(candidate)
+    while points.size() > maxCount
+        points.shift()
+    points
+
+method lastPivot(array<SwingPoint> points, bool wantHigh) =>
+    SwingPoint result = SwingPoint.new()
+    int i = points.size() - 1
+    while i >= 0
+        SwingPoint candidate = points.get(i)
+        if candidate.isHigh == wantHigh
+            result := candidate
+            break
+        i -= 1
+    result
+
+method lastPivotAfter(array<SwingPoint> points, bool wantHigh, int fromIdx) =>
+    SwingPoint result = SwingPoint.new()
+    int i = points.size() - 1
+    while i >= 0
+        SwingPoint candidate = points.get(i)
+        if candidate.isHigh == wantHigh and candidate.idx > fromIdx
+            result := candidate
+            break
+        i -= 1
+    result
+
+method slope(FanAnchor anchor) =>
+    int dx = anchor.idx2 - anchor.idx1
+    dx == 0 ? na : (anchor.p2 - anchor.p1) / dx
+
+method priceAt(FanAnchor anchor, float ratio, int x) =>
+    float m = anchor.slope()
+    na(m) ? na : anchor.p1 + m * ratio * (x - anchor.idx1)
+
+method isValid(FanAnchor anchor) =>
+    anchor.valid and not na(anchor.idx1) and not na(anchor.idx2) and anchor.idx2 > anchor.idx1
+
+method clearLines(array<line> refs) =>
+    while refs.size() > 0
+        line ln = refs.pop()
+        if not na(ln)
+            line.delete(ln)
+    refs
+
+method clearLabels(array<label> refs) =>
+    while refs.size() > 0
+        label lb = refs.pop()
+        if not na(lb)
+            label.delete(lb)
+    refs
+
+method clearFills(array<linefill> refs) =>
+    while refs.size() > 0
+        refs.pop()
+    refs
+
+string labelSize = labelSizeOpt == "Tiny" ? size.tiny : labelSizeOpt == "Small" ? size.small : size.normal
+
+var array<float> fanRatios = array.from(0.125, 0.25, 0.333333, 0.5, 1.0, 2.0, 3.0, 4.0, 8.0)
+var array<string> fanNames = array.from("1x8", "1x4", "1x3", "1x2", "1x1", "2x1", "3x1", "4x1", "8x1")
+
+var array<color> bullColors = array.from(
+     color.rgb(75, 92, 119),
+     color.rgb(85, 109, 139),
+     color.rgb(88, 126, 151),
+     color.rgb(111, 152, 168),
+     mainBull,
+     color.rgb(63, 218, 150),
+     color.rgb(89, 224, 130),
+     color.rgb(116, 229, 116),
+     color.rgb(152, 237, 103)
+ )
+var array<color> bearColors = array.from(
+     color.rgb(130, 81, 96),
+     color.rgb(149, 80, 100),
+     color.rgb(166, 85, 104),
+     color.rgb(183, 88, 106),
+     mainBear,
+     color.rgb(238, 110, 90),
+     color.rgb(241, 129, 80),
+     color.rgb(245, 149, 73),
+     color.rgb(248, 170, 67)
+ )
+
+var array<SwingPoint> swings = array.new<SwingPoint>()
+var array<line> fanLines = array.new<line>()
+var array<line> fanGlowLines = array.new<line>()
+var array<label> fanLabels = array.new<label>()
+var array<linefill> fanFills = array.new<linefill>()
+var label anchorLabel = na
+
+float ph = ta.pivothigh(high, pivotLen, pivotLen)
+float pl = ta.pivotlow(low, pivotLen, pivotLen)
+
+if not na(ph)
+    SwingPoint p = SwingPoint.new(bar_index - pivotLen, ph, true)
+    swings.pushAlternating(p, maxStoredPivots)
+
+if not na(pl)
+    SwingPoint p = SwingPoint.new(bar_index - pivotLen, pl, false)
+    swings.pushAlternating(p, maxStoredPivots)
+
+FanAnchor active = FanAnchor.new()
+
+if swings.size() >= 2
+    SwingPoint lastHigh = swings.lastPivot(true)
+    SwingPoint lastLow = swings.lastPivot(false)
+    bool autoBull = not lastLow.isNa() and (lastHigh.isNa() or lastLow.idx > lastHigh.idx)
+    bool useBull = trendMode == "Bullish" ? true : trendMode == "Bearish" ? false : autoBull
+
+    if useBull and not lastLow.isNa()
+        SwingPoint ctrlHigh = swings.lastPivotAfter(true, lastLow.idx)
+        int x2 = ctrlHigh.isNa() ? bar_index : ctrlHigh.idx
+        float y2 = ctrlHigh.isNa() ? high : ctrlHigh.price
+        bool ok = x2 > lastLow.idx
+        active := FanAnchor.new(lastLow.idx, lastLow.price, x2, y2, true, ok)
+
+    if not useBull and not lastHigh.isNa()
+        SwingPoint ctrlLow = swings.lastPivotAfter(false, lastHigh.idx)
+        int x2 = ctrlLow.isNa() ? bar_index : ctrlLow.idx
+        float y2 = ctrlLow.isNa() ? low : ctrlLow.price
+        bool ok = x2 > lastHigh.idx
+        active := FanAnchor.new(lastHigh.idx, lastHigh.price, x2, y2, false, ok)
+
+if barstate.islast
+    fanLines.clearLines()
+    fanGlowLines.clearLines()
+    fanLabels.clearLabels()
+    fanFills.clearFills()
+    if not na(anchorLabel)
+        label.delete(anchorLabel)
+        anchorLabel := na
+
+    if active.isValid()
+        int n = fanRatios.size()
+        for i = 0 to n - 1
+            float ratio = fanRatios.get(i)
+            string angleName = fanNames.get(i)
+            color lineColor = active.bullish ? bullColors.get(i) : bearColors.get(i)
+            float y2 = active.priceAt(ratio, active.idx2)
+            int width = angleName == "1x1" ? mainLineWidth : baseLineWidth
+
+            if showGlow
+                color glowColor = active.bullish ? color.new(bullGlow, angleName == "1x1" ? 72 : 82) : color.new(bearGlow, angleName == "1x1" ? 72 : 82)
+                int gWidth = angleName == "1x1" ? glowWidth + 1 : glowWidth
+                line gLine = line.new(
+                     active.idx1, active.p1,
+                     active.idx2, y2,
+                     xloc = xloc.bar_index,
+                     extend = extend.right,
+                     color = glowColor,
+                     width = gWidth
+                 )
+                fanGlowLines.push(gLine)
+
+            line fanLine = line.new(
+                 active.idx1, active.p1,
+                 active.idx2, y2,
+                 xloc = xloc.bar_index,
+                 extend = extend.right,
+                 color = lineColor,
+                 width = width
+             )
+            fanLines.push(fanLine)
+
+            if showLabels
+                int xLabel = math.min(bar_index + labelShiftBars, bar_index + 500)
+                float yLabel = active.priceAt(ratio, xLabel)
+                label lb = label.new(
+                     xLabel, yLabel, angleName,
+                     xloc = xloc.bar_index,
+                     yloc = yloc.price,
+                     style = label.style_none,
+                     textcolor = lineColor,
+                     size = labelSize
+                 )
+                fanLabels.push(lb)
+
+        if showZones and fanLines.size() > 1
+            for i = 0 to fanLines.size() - 2
+                line l1 = fanLines.get(i)
+                line l2 = fanLines.get(i + 1)
+                int zoneAlpha = i % 2 == 0 ? 91 : 95
+                color zoneColor = active.bullish ? color.new(bullZone, zoneAlpha) : color.new(bearZone, zoneAlpha)
+                linefill lf = linefill.new(l1, l2, zoneColor)
+                fanFills.push(lf)
+
+        if showAnchorLabel
+            string dirText = active.bullish ? "Bullish Gann Fan" : "Bearish Gann Fan"
+            anchorLabel := label.new(
+                 active.idx1, active.p1, dirText,
+                 xloc = xloc.bar_index,
+                 yloc = yloc.price,
+                 style = label.style_none,
+                 textcolor = anchorText,
+                 size = size.tiny
+             )

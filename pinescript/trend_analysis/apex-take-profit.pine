@@ -1,0 +1,609 @@
+//@version=6
+indicator("APEX — 36-Module Confluence System", 
+     shorttitle="APEX", 
+     overlay=true, 
+     max_lines_count=500, 
+     max_labels_count=500,
+     max_boxes_count=200)
+
+// ============================================================
+// ─── USER INPUTS ────────────────────────────────────────────
+// ============================================================
+grp_system   = "⚙ APEX SYSTEM SETTINGS"
+min_score    = input.int(75, "Min Confluence % to Signal", 50, 100, group=grp_system)
+risk_pct     = input.float(1.0, "Risk % Per Trade", 0.5, 5.0, step=0.5, group=grp_system)
+account_size = input.float(100000, "Account Size ($)", group=grp_system)
+show_labels  = input.bool(true, "Show Signal Labels", group=grp_system)
+show_zones   = input.bool(true, "Show S&D Zones", group=grp_system)
+show_targets = input.bool(true, "Show TP/SL Levels", group=grp_system)
+show_table   = input.bool(true, "Show Confluence Table", group=grp_system)
+show_smc     = input.bool(true, "Show SMC Structure", group=grp_system)
+atr_mult_sl  = input.float(1.5, "ATR Multiplier (Stop Loss)", 1.0, 3.0, step=0.25, group=grp_system)
+tp1_rr       = input.float(2.2, "TP1 Risk:Reward", 1.5, 5.0, step=0.1, group=grp_system)
+tp2_rr       = input.float(4.5, "TP2 Risk:Reward", 2.0, 10.0, step=0.5, group=grp_system)
+
+grp_l1 = "◈ LAYER 1 — TECHNICAL (EMA/RSI/MACD/VWAP)"
+ema_fast     = input.int(9,   "EMA Fast", group=grp_l1)
+ema_mid      = input.int(21,  "EMA Mid",  group=grp_l1)
+ema_slow     = input.int(50,  "EMA Slow", group=grp_l1)
+ema_trend    = input.int(200, "EMA Trend",group=grp_l1)
+rsi_len      = input.int(14,  "RSI Length",group=grp_l1)
+rsi_ob       = input.int(70,  "RSI Overbought",group=grp_l1)
+rsi_os       = input.int(30,  "RSI Oversold",  group=grp_l1)
+macd_fast    = input.int(12,  "MACD Fast",group=grp_l1)
+macd_slow    = input.int(26,  "MACD Slow",group=grp_l1)
+macd_sig     = input.int(9,   "MACD Signal",group=grp_l1)
+atr_len      = input.int(14,  "ATR Length",group=grp_l1)
+vol_ma_len   = input.int(20,  "Volume MA",group=grp_l1)
+
+grp_l2 = "◈ LAYER 2 — INSTITUTIONAL (SMC/S&D/Pivots)"
+sd_left      = input.int(10,  "S&D Zone Lookback Left",  group=grp_l2)
+sd_right     = input.int(3,   "S&D Zone Lookback Right", group=grp_l2)
+struct_len   = input.int(10,  "Structure Lookback",       group=grp_l2)
+pivot_type   = input.string("Traditional", "Pivot Type", 
+     options=["Traditional","Fibonacci","Camarilla"], group=grp_l2)
+
+grp_l3 = "◈ LAYER 3 — AI / ML SIGNALS"
+ml_sensitivity = input.float(0.7, "ML Sensitivity (0-1)", 0.1, 1.0, step=0.1, group=grp_l3)
+use_altdata    = input.bool(true, "Use Alt-Data Proxy (Vol+Price Velocity)", group=grp_l3)
+
+// ============================================================
+// ─── LAYER 1: TECHNICAL FOUNDATION ─────────────────────────
+// ============================================================
+
+// EMA Stack
+ema9   = ta.ema(close, ema_fast)
+ema21  = ta.ema(close, ema_mid)
+ema50  = ta.ema(close, ema_slow)
+ema200 = ta.ema(close, ema_trend)
+
+bull_ema_stack = ema9 > ema21 and ema21 > ema50 and ema50 > ema200
+bear_ema_stack = ema9 < ema21 and ema21 < ema50 and ema50 < ema200
+ema_aligned    = bull_ema_stack or bear_ema_stack
+ema_score      = bull_ema_stack ? 3 : bear_ema_stack ? 3 : 
+                 (ema9 > ema50 and ema50 > ema200) ? 2 : 
+                 (ema9 < ema50 and ema50 < ema200) ? 2 : 1
+
+// RSI + Divergence
+rsi = ta.rsi(close, rsi_len)
+rsi_bull_zone = rsi > 40 and rsi < 65
+rsi_bear_zone = rsi > 45 and rsi < 70
+
+// Bullish divergence: price lower low, RSI higher low
+price_ll = low < ta.lowest(low, 5)[1]
+rsi_hl   = rsi > ta.lowest(rsi, 5)[1]
+bull_div = price_ll and rsi_hl and rsi < 50
+
+// Bearish divergence: price higher high, RSI lower high
+price_hh = high > ta.highest(high, 5)[1]
+rsi_lh   = rsi < ta.highest(rsi, 5)[1]
+bear_div = price_hh and rsi_lh and rsi > 50
+
+rsi_score = bull_div ? 3 : bear_div ? 3 : rsi_bull_zone ? 2 : rsi_bear_zone ? 2 : 1
+
+// MACD
+[macd_line, macd_signal_line, macd_hist] = ta.macd(close, macd_fast, macd_slow, macd_sig)
+macd_bull  = macd_line > macd_signal_line and macd_hist > 0
+macd_bear  = macd_line < macd_signal_line and macd_hist < 0
+macd_cross_up        = ta.crossover(macd_line, macd_signal_line)
+macd_cross_down      = ta.crossunder(macd_line, macd_signal_line)
+macd_zero_cross_up   = ta.crossover(macd_line, 0)
+macd_zero_cross_down = ta.crossunder(macd_line, 0)
+macd_score = (macd_cross_up or macd_zero_cross_up) ? 3 : 
+             (macd_cross_down or macd_zero_cross_down) ? 3 : 
+             macd_bull ? 2 : macd_bear ? 2 : 1
+
+// ATR + Volatility
+atr     = ta.atr(atr_len)
+atr_pct = atr / close * 100
+
+// ── FIX 1 & 2: Pre-compute SMA values at global scope ───────
+// (prevents "ta.sma() inside conditional expression" errors)
+atr_sma_10 = ta.sma(atr, 10)
+atr_sma_30 = ta.sma(atr, 30)
+
+// VWAP
+vwap_val     = ta.vwap(hlc3)
+above_vwap   = close > vwap_val
+below_vwap   = close < vwap_val
+vwap_reclaim = ta.crossover(close, vwap_val)
+vwap_break   = ta.crossunder(close, vwap_val)
+vwap_score   = vwap_reclaim ? 3 : vwap_break ? 3 : 
+               (above_vwap and close > ema50) ? 2 : 
+               (below_vwap and close < ema50) ? 2 : 1
+
+// Volume Analysis
+vol_ma    = ta.sma(volume, vol_ma_len)
+vol_surge = volume > vol_ma * 1.8
+vol_above = volume > vol_ma
+vol_score = vol_surge ? 3 : vol_above ? 2 : 1
+
+// Candle Confirmation
+body       = math.abs(close - open)
+upper_wick = high - math.max(close, open)
+lower_wick = math.min(close, open) - low
+full_range = high - low
+body_ratio = full_range > 0 ? body / full_range : 0
+
+bull_pin    = lower_wick > body * 2 and close > open and body_ratio < 0.4
+bear_pin    = upper_wick > body * 2 and close < open and body_ratio < 0.4
+bull_engulf = close > open and close > open[1] and open < close[1]
+bear_engulf = close < open and close < open[1] and open > close[1]
+candle_score = (bull_pin and above_vwap) or (bull_engulf and above_vwap) ? 3 : 
+               (bear_pin and below_vwap) or (bear_engulf and below_vwap) ? 3 : 
+               close > open ? 2 : close < open ? 2 : 1
+
+// ============================================================
+// ─── LAYER 2: INSTITUTIONAL INTELLIGENCE ───────────────────
+// ============================================================
+
+// Market Structure: Higher Highs / Higher Lows / BOS / CHoCH
+swing_high = ta.pivothigh(high, struct_len, struct_len)
+swing_low  = ta.pivotlow(low,  struct_len, struct_len)
+
+var float last_sh = na
+var float last_sl = na
+var float prev_sh = na
+var float prev_sl = na
+
+if not na(swing_high)
+    prev_sh := last_sh
+    last_sh := swing_high
+
+if not na(swing_low)
+    prev_sl := last_sl
+    last_sl := swing_low
+
+// Bullish structure: Higher High + Higher Low
+bull_structure = not na(last_sh) and not na(prev_sh) and not na(last_sl) and not na(prev_sl) and
+                 last_sh > prev_sh and last_sl > prev_sl
+
+// Bearish structure: Lower High + Lower Low
+bear_structure = not na(last_sh) and not na(prev_sh) and not na(last_sl) and not na(prev_sl) and
+                 last_sh < prev_sh and last_sl < prev_sl
+
+// Break of Structure
+bos_bull = not na(last_sh) and close > last_sh and close[1] <= last_sh
+bos_bear = not na(last_sl) and close < last_sl and close[1] >= last_sl
+
+// Change of Character (reversal signal)
+choch_bull = bear_structure and bos_bull
+choch_bear = bull_structure and bos_bear
+
+struct_score = (bull_structure and above_vwap) ? 3 : (bear_structure and below_vwap) ? 3 :
+               bull_structure ? 2 : bear_structure ? 2 : 1
+
+// Supply & Demand Zones
+bar_range       = high - low
+avg_range       = ta.sma(bar_range, 20)
+is_base_candle  = bar_range < avg_range * 0.5
+is_impulse_bull = close > open and bar_range > avg_range * 1.8 and volume > vol_ma * 1.5
+is_impulse_bear = close < open and bar_range > avg_range * 1.8 and volume > vol_ma * 1.5
+
+demand_zone_top = float(na)
+demand_zone_bot = float(na)
+supply_zone_top = float(na)
+supply_zone_bot = float(na)
+
+if is_impulse_bull and is_base_candle[1]
+    demand_zone_top := high[1]
+    demand_zone_bot := low[1]
+
+if is_impulse_bear and is_base_candle[1]
+    supply_zone_top := high[1]
+    supply_zone_bot := low[1]
+
+in_demand_zone = not na(demand_zone_top) and close >= demand_zone_bot and close <= demand_zone_top * 1.002
+in_supply_zone = not na(supply_zone_top) and close <= supply_zone_top and close >= supply_zone_bot * 0.998
+
+sd_score = (in_demand_zone and bull_pin) ? 3 : (in_supply_zone and bear_pin) ? 3 :
+           in_demand_zone ? 2 : in_supply_zone ? 2 : 1
+
+// Pivot Points (Traditional)
+pivot_p  = (high[1] + low[1] + close[1]) / 3
+pivot_r1 = 2 * pivot_p - low[1]
+pivot_s1 = 2 * pivot_p - high[1]
+pivot_r2 = pivot_p + (high[1] - low[1])
+pivot_s2 = pivot_p - (high[1] - low[1])
+pivot_r3 = high[1] + 2 * (pivot_p - low[1])
+pivot_s3 = low[1]  - 2 * (high[1] - pivot_p)
+
+near_pivot  = math.abs(close - pivot_p)  < atr * 0.3
+near_r1     = math.abs(close - pivot_r1) < atr * 0.3
+near_s1     = math.abs(close - pivot_s1) < atr * 0.3
+pivot_score = near_pivot or near_r1 or near_s1 ? 3 : 2
+
+// Trend Engine (5-factor composite)
+trend_ema   = bull_ema_stack ? 1 : bear_ema_stack ? -1 : 0
+trend_vwap  = above_vwap ? 1 : -1
+trend_rsi   = rsi > 55 ? 1 : rsi < 45 ? -1 : 0
+trend_macd  = macd_bull ? 1 : macd_bear ? -1 : 0
+trend_strct = bull_structure ? 1 : bear_structure ? -1 : 0
+trend_composite = trend_ema + trend_vwap + trend_rsi + trend_macd + trend_strct
+
+trend_super_bull = trend_composite >= 4
+trend_bull       = trend_composite >= 2 and trend_composite < 4
+trend_neutral    = trend_composite > -2 and trend_composite < 2
+trend_bear       = trend_composite <= -2 and trend_composite > -4
+trend_super_bear = trend_composite <= -4
+
+trend_score = trend_super_bull ? 3 : trend_super_bear ? 3 : trend_bull ? 2 : trend_bear ? 2 : 1
+
+// Volatility Regime (ATR percentile)
+atr_highest     = ta.highest(atr, 252)
+atr_lowest      = ta.lowest(atr,  252)
+atr_rank        = (atr - atr_lowest) / (atr_highest - atr_lowest) * 100
+low_vol_regime  = atr_rank < 30
+high_vol_regime = atr_rank > 70
+norm_vol_regime = atr_rank >= 30 and atr_rank <= 70
+vol_reg_score   = norm_vol_regime ? 3 : low_vol_regime ? 2 : 2
+
+// Intermarket Proxy
+price_vel_5     = (close - close[5])  / close[5]  * 100
+price_vel_20    = (close - close[20]) / close[20] * 100
+momentum_accel  = price_vel_5 > 0 and price_vel_5 > price_vel_20 * 0.5
+momentum_decel  = price_vel_5 < 0 and price_vel_5 < price_vel_20 * 0.5
+inter_score     = momentum_accel ? 3 : momentum_decel ? 3 : 2
+
+// Seasonality (session timing)
+session_ny_open  = hour >= 9  and hour < 11
+session_ny_power = hour >= 14 and hour < 16
+session_london   = hour >= 3  and hour < 8
+session_overlap  = hour >= 8  and hour < 9
+good_session     = session_ny_open or session_ny_power or session_overlap
+season_score     = session_ny_open ? 3 : session_overlap ? 3 : good_session ? 2 : 1
+
+// Order Flow Proxy
+buying_pressure   = (close - low)  / (high - low > 0 ? high - low : 1)
+selling_pressure  = (high - close) / (high - low > 0 ? high - low : 1)
+ob_imbalance_bull = buying_pressure  > 0.65 and volume > vol_ma
+ob_imbalance_bear = selling_pressure > 0.65 and volume > vol_ma
+ob_score = ob_imbalance_bull ? 3 : ob_imbalance_bear ? 3 : 
+           buying_pressure > 0.5 ? 2 : selling_pressure > 0.5 ? 2 : 1
+
+// ============================================================
+// ─── LAYER 3: PREDICTIVE AI ENGINE ──────────────────────────
+// ============================================================
+
+// ML Ensemble Proxy
+ml_bull_signals = (bull_ema_stack ? 1:0) + (rsi_bull_zone ? 1:0) + (macd_bull ? 1:0) + 
+                  (above_vwap ? 1:0) + (bull_structure ? 1:0) + (vol_above ? 1:0) + (bull_div ? 2:0)
+ml_bear_signals = (bear_ema_stack ? 1:0) + (rsi_bear_zone ? 1:0) + (macd_bear ? 1:0) + 
+                  (below_vwap ? 1:0) + (bear_structure ? 1:0) + (vol_above ? 1:0) + (bear_div ? 2:0)
+
+ml_bull_pct = ml_bull_signals / 9.0 * 100
+ml_bear_pct = ml_bear_signals / 9.0 * 100
+
+ml_score = (ml_bull_pct > 70 or ml_bear_pct > 70) ? 3 : 
+           (ml_bull_pct > 50 or ml_bear_pct > 50) ? 2 : 1
+
+// ── FIX 1 & 2 APPLIED: Use pre-computed global SMA variables ─
+// Alternative Data Proxy — now uses atr_sma_10 (global)
+alt_data_bull = vol_surge and close > open and atr > atr_sma_10 * 1.1
+alt_data_bear = vol_surge and close < open and atr > atr_sma_10 * 1.1
+alt_score     = alt_data_bull ? 3 : alt_data_bear ? 3 : vol_above ? 2 : 1
+
+// Microstructure
+micro_score = vol_surge and body_ratio > 0.6 ? 3 : vol_above ? 2 : 1
+
+// Sector Rotation Proxy
+rel_strength = (close - open) / open * 100
+rs_strong    = rel_strength > 0.15
+rs_weak      = rel_strength < -0.15
+sector_score = rs_strong ? 3 : rs_weak ? 3 : 2
+
+// Execution AI
+spread_proxy = (high - low) / close * 100
+tight_spread = spread_proxy < atr_pct * 1.2
+exec_score   = tight_spread and good_session ? 3 : tight_spread ? 2 : 1
+
+// Options Surface Proxy — now uses atr_sma_30 (global)
+iv_proxy_high = atr_pct > atr_sma_30 / close * 100 * 1.3
+iv_proxy_low  = atr_pct < atr_sma_30 / close * 100 * 0.7
+opts_score    = iv_proxy_low ? 3 : iv_proxy_high ? 2 : 2
+
+// GEX Proxy
+round_num_500  = math.round(close / 500) * 500
+dist_to_round  = math.abs(close - round_num_500)
+near_round_500 = dist_to_round < atr * 2
+gex_score      = near_round_500 ? 3 : 2
+
+// Fed/Macro Proxy
+macro_trend_bull = ema200 > ema200[20] and trend_composite > 0
+macro_trend_bear = ema200 < ema200[20] and trend_composite < 0
+fed_score        = macro_trend_bull ? 3 : macro_trend_bear ? 3 : 2
+
+// Predictive Price Targets
+fib_range    = ta.highest(high, 50) - ta.lowest(low, 50)
+fib_382      = ta.highest(high, 50) - fib_range * 0.382
+fib_618      = ta.highest(high, 50) - fib_range * 0.618
+near_fib     = math.abs(close - fib_382) < atr or math.abs(close - fib_618) < atr
+target_score = near_fib ? 3 : 2
+
+// Risk Regime
+in_drawdown    = close < ema200
+risk_ok        = atr_rank < 80
+risk_reg_score = (risk_ok and not in_drawdown) ? 3 : risk_ok ? 2 : 1
+
+// On-Chain Proxy
+onchain_score = vol_surge and close > ema50 ? 3 : vol_above ? 2 : 1
+
+// COT Proxy
+cot_bull  = close > open and body_ratio > 0.6 and close > ema50
+cot_bear  = close < open and body_ratio > 0.6 and close < ema50
+cot_score = cot_bull ? 3 : cot_bear ? 3 : 2
+
+// Breadth Proxy
+breadth_bull  = ema9 > ema50 and ema50 > ema200 and rsi > 50
+breadth_bear  = ema9 < ema50 and ema50 < ema200 and rsi < 50
+breadth_score = breadth_bull ? 3 : breadth_bear ? 3 : 2
+
+// News Feed Clear
+news_clear = not (hour == 8 and minute < 30) and not (hour == 9 and minute < 45)
+news_score = news_clear ? 3 : 1
+
+// Neuro-Psych Gate (constant — Pine can't compute human psychology)
+neuro_score = 2
+
+// ============================================================
+// ─── MASTER CONFLUENCE CALCULATOR ───────────────────────────
+// ============================================================
+
+// Layer 1 scores (14 modules × 3 = 42 max)
+l1_total = ema_score + rsi_score + macd_score + vwap_score + candle_score + 
+           vol_score + struct_score + ob_score + pivot_score + trend_score + 
+           vol_reg_score + season_score + news_score + neuro_score
+l1_pct   = l1_total / 42.0 * 100
+
+// Layer 2 scores (12 modules × 3 = 36 max)
+l2_total = sd_score + inter_score + gex_score + cot_score + 
+           breadth_score + 2 + sd_score + cot_score + 
+           breadth_score + inter_score + season_score + vol_reg_score
+l2_pct   = l2_total / 36.0 * 100
+
+// Layer 3 scores (10 modules × 3 = 30 max)
+l3_total = ml_score + alt_score + micro_score + fed_score + onchain_score + 
+           sector_score + exec_score + opts_score + target_score + risk_reg_score
+l3_pct   = l3_total / 30.0 * 100
+
+// Master score (weighted: L1=35%, L2=30%, L3=35%)
+master_pct = math.round(l1_pct * 0.35 + l2_pct * 0.30 + l3_pct * 0.35)
+
+// ============================================================
+// ─── SIGNAL DIRECTION LOGIC ─────────────────────────────────
+// ============================================================
+bull_direction = trend_composite >= 2 and above_vwap and (ema9 > ema50)
+bear_direction = trend_composite <= -2 and below_vwap and (ema9 < ema50)
+
+apex_long  = master_pct >= min_score and bull_direction and not bull_direction[1]
+apex_short = master_pct >= min_score and bear_direction and not bear_direction[1]
+
+// Signal grades
+grade_apex = master_pct >= 90
+grade_a    = master_pct >= 85 and master_pct < 90
+grade_b    = master_pct >= 75 and master_pct < 85
+grade_c    = master_pct >= 65 and master_pct < 75
+
+signal_grade = grade_apex ? "APEX" : grade_a ? "A" : grade_b ? "B" : grade_c ? "C" : "—"
+
+// ============================================================
+// ─── ENTRY / STOP / TARGET CALCULATIONS ─────────────────────
+// ============================================================
+stop_dist   = atr * atr_mult_sl
+entry_long  = close
+sl_long     = close - stop_dist
+tp1_long    = close + stop_dist * tp1_rr
+tp2_long    = close + stop_dist * tp2_rr
+
+entry_short = close
+sl_short    = close + stop_dist
+tp1_short   = close - stop_dist * tp1_rr
+tp2_short   = close - stop_dist * tp2_rr
+
+risk_per_trade = account_size * (risk_pct / 100)
+
+// ============================================================
+// ─── PLOTS: EMA STACK ───────────────────────────────────────
+// ============================================================
+plot(ema9,     "EMA 9",   color=color.new(#00e676, 20), linewidth=1)
+plot(ema21,    "EMA 21",  color=color.new(#69f0ae, 30), linewidth=1)
+plot(ema50,    "EMA 50",  color=color.new(#ffab00, 20), linewidth=2)
+plot(ema200,   "EMA 200", color=color.new(#ff5252, 20), linewidth=2)
+plot(vwap_val, "VWAP",    color=color.new(#00d4e8, 20), linewidth=2, style=plot.style_circles)
+
+// ============================================================
+// ─── PLOTS: SIGNALS ─────────────────────────────────────────
+// ============================================================
+plotshape(apex_long  and show_labels, title="APEX LONG",
+     style=shape.triangleup,   location=location.belowbar,
+     color=color.new(#00e676, 0), size=size.normal, text="▲APEX", textcolor=color.white)
+plotshape(apex_short and show_labels, title="APEX SHORT",
+     style=shape.triangledown, location=location.abovebar,
+     color=color.new(#ff3355, 0), size=size.normal, text="▼APEX", textcolor=color.white)
+
+plotshape(bos_bull and not apex_long and show_smc,
+     title="BOS Bull", style=shape.triangleup, location=location.belowbar,
+     color=color.new(#00e676, 60), size=size.tiny, text="BOS")
+plotshape(bos_bear and not apex_short and show_smc,
+     title="BOS Bear", style=shape.triangledown, location=location.abovebar,
+     color=color.new(#ff3355, 60), size=size.tiny, text="BOS")
+
+plotshape(choch_bull and show_smc, title="CHoCH Bull",
+     style=shape.xcross, location=location.belowbar,
+     color=color.new(#00d4e8, 0), size=size.small, text="CHoCH")
+plotshape(choch_bear and show_smc, title="CHoCH Bear",
+     style=shape.xcross, location=location.abovebar,
+     color=color.new(#e040fb, 0), size=size.small, text="CHoCH")
+
+plotshape(bull_div, title="Bull Divergence", style=shape.diamond,
+     location=location.belowbar, color=color.new(#00e676, 30), size=size.tiny, text="DIV↑")
+plotshape(bear_div, title="Bear Divergence", style=shape.diamond,
+     location=location.abovebar, color=color.new(#ff3355, 30), size=size.tiny, text="DIV↓")
+
+// ============================================================
+// ─── SUPPLY & DEMAND ZONE BACKGROUND ────────────────────────
+// ============================================================
+bgcolor(in_demand_zone and show_zones ? color.new(#00e676, 92) : na, title="Demand Zone BG")
+bgcolor(in_supply_zone and show_zones ? color.new(#ff3355, 92) : na, title="Supply Zone BG")
+
+// ============================================================
+// ─── TP / SL LEVELS ON CHART ────────────────────────────────
+// ============================================================
+var line sl_line  = na
+var line tp1_line = na
+var line tp2_line = na
+
+if apex_long and show_targets
+    sl_line  := line.new(bar_index, sl_long,  bar_index + 20, sl_long,  color=color.new(#ff3355, 0), width=1, style=line.style_dashed)
+    tp1_line := line.new(bar_index, tp1_long, bar_index + 20, tp1_long, color=color.new(#00e676, 0), width=1, style=line.style_dashed)
+    tp2_line := line.new(bar_index, tp2_long, bar_index + 20, tp2_long, color=color.new(#00e676, 0), width=2, style=line.style_dotted)
+
+if apex_short and show_targets
+    sl_line  := line.new(bar_index, sl_short,  bar_index + 20, sl_short,  color=color.new(#ff3355, 0), width=1, style=line.style_dashed)
+    tp1_line := line.new(bar_index, tp1_short, bar_index + 20, tp1_short, color=color.new(#00e676, 0), width=1, style=line.style_dashed)
+    tp2_line := line.new(bar_index, tp2_short, bar_index + 20, tp2_short, color=color.new(#00e676, 0), width=2, style=line.style_dotted)
+
+// ============================================================
+// ─── ALERTS ─────────────────────────────────────────────────
+// ── FIX 3 & 4: alertcondition requires const string messages ─
+// Dynamic series strings (signal_grade concatenation) are not 
+// allowed. Each grade gets its own dedicated alert condition.
+// ============================================================
+
+// LONG alerts — one per grade
+alertcondition(apex_long and grade_apex, "APEX LONG — APEX GRADE",
+     "APEX SIGNAL — LONG | Grade: APEX | Check chart for Entry/Stop/Target")
+alertcondition(apex_long and grade_a, "APEX LONG — A GRADE",
+     "APEX SIGNAL — LONG | Grade: A | Check chart for Entry/Stop/Target")
+alertcondition(apex_long and grade_b, "APEX LONG — B GRADE",
+     "APEX SIGNAL — LONG | Grade: B | Check chart for Entry/Stop/Target")
+alertcondition(apex_long and grade_c, "APEX LONG — C GRADE",
+     "APEX SIGNAL — LONG | Grade: C | Check chart for Entry/Stop/Target")
+
+// SHORT alerts — one per grade
+alertcondition(apex_short and grade_apex, "APEX SHORT — APEX GRADE",
+     "APEX SIGNAL — SHORT | Grade: APEX | Check chart for Entry/Stop/Target")
+alertcondition(apex_short and grade_a, "APEX SHORT — A GRADE",
+     "APEX SIGNAL — SHORT | Grade: A | Check chart for Entry/Stop/Target")
+alertcondition(apex_short and grade_b, "APEX SHORT — B GRADE",
+     "APEX SIGNAL — SHORT | Grade: B | Check chart for Entry/Stop/Target")
+alertcondition(apex_short and grade_c, "APEX SHORT — C GRADE",
+     "APEX SIGNAL — SHORT | Grade: C | Check chart for Entry/Stop/Target")
+
+// Structure & divergence alerts
+alertcondition(bull_div,     "Bullish Divergence",        "Bull Divergence detected — check APEX table")
+alertcondition(bear_div,     "Bearish Divergence",        "Bear Divergence detected — check APEX table")
+alertcondition(bos_bull,     "Break of Structure — Bull", "BOS Bullish confirmed")
+alertcondition(bos_bear,     "Break of Structure — Bear", "BOS Bearish confirmed")
+alertcondition(vwap_reclaim, "VWAP Reclaim",              "Price reclaimed VWAP — watch for continuation")
+
+// ============================================================
+// ─── CONFLUENCE TABLE ───────────────────────────────────────
+// ── FIX 5: score_col and txt_col must be defined at global  ─
+// scope — local functions inside `if` blocks are not allowed  ─
+// in Pine Script v6.                                          ─
+// ============================================================
+
+// Global helper functions (defined BEFORE the if block)
+score_col(s) =>
+    s >= 3 ? color.new(#00e676, 0) : s >= 2 ? color.new(#ffab00, 0) : color.new(#ff3355, 0)
+
+status_txt(s) =>
+    s >= 3 ? "✓ STRONG" : s >= 2 ? "~ FAIR" : "✗ WEAK"
+
+// Render table only on last bar
+if show_table and barstate.islast
+    var table t = table.new(position.top_right, 4, 42,
+         bgcolor      = color.new(#050810, 5),
+         border_width = 1,
+         border_color = color.new(#1a2d42, 0),
+         frame_color  = color.new(#243d58, 0),
+         frame_width  = 1)
+
+    hdr_color    = color.new(#111c2e, 0)
+    hdr_txt      = color.new(#00d4e8, 0)
+    bg_row       = color.new(#0c1420, 0)
+    bg_layer_hdr = color.new(#0a1520, 0)
+
+    // ── Header row ──
+    table.cell(t, 0, 0, "APEX 36-MODULE SCORER", text_color=hdr_txt,              bgcolor=hdr_color, text_size=size.small)
+    table.cell(t, 1, 0, "SCORE",                 text_color=hdr_txt,              bgcolor=hdr_color, text_size=size.small)
+    table.cell(t, 2, 0, "MAX",                   text_color=hdr_txt,              bgcolor=hdr_color, text_size=size.small)
+    table.cell(t, 3, 0, "STATUS",                text_color=hdr_txt,              bgcolor=hdr_color, text_size=size.small)
+
+    // ── Master score row ──
+    master_color = master_pct >= 75 ? color.new(#00e676, 0) : master_pct >= 60 ? color.new(#ffab00, 0) : color.new(#ff3355, 0)
+    grade_bg     = grade_apex ? color.new(#002912, 0) : grade_a ? color.new(#002912, 0) : grade_b ? color.new(#2a1800, 0) : color.new(#2a0010, 0)
+    table.cell(t, 0, 1, "◈ MASTER CONFLUENCE",            text_color=master_color, bgcolor=grade_bg, text_size=size.small)
+    table.cell(t, 1, 1, str.tostring(master_pct) + "%",   text_color=master_color, bgcolor=grade_bg, text_size=size.small)
+    table.cell(t, 2, 1, "100%",                           text_color=color.new(#3a5570, 0), bgcolor=grade_bg)
+    table.cell(t, 3, 1, signal_grade,                     text_color=master_color, bgcolor=grade_bg, text_size=size.small)
+
+    // ── Layer 1 header ──
+    table.cell(t, 0, 2, "─ LAYER 1: TECHNICAL ─",         text_color=color.new(#2979ff, 0), bgcolor=bg_layer_hdr)
+    table.cell(t, 1, 2, str.tostring(math.round(l1_pct)) + "%", text_color=color.new(#2979ff, 0), bgcolor=bg_layer_hdr)
+    table.cell(t, 2, 2, "",                               bgcolor=bg_layer_hdr)
+    table.cell(t, 3, 2, "",                               bgcolor=bg_layer_hdr)
+
+    // ── Layer 1 modules ──
+    l1_names  = array.from("EMA Stack","RSI Divergence","MACD","VWAP","Candle Pattern","Volume","Mkt Structure","Order Book","Pivot Levels","Trend Engine","Vol Regime","Session/Season","News Clear","Neuro-Psych")
+    l1_scores = array.from(ema_score, rsi_score, macd_score, vwap_score, candle_score, vol_score, struct_score, ob_score, pivot_score, trend_score, vol_reg_score, season_score, news_score, neuro_score)
+
+    for i = 0 to 13
+        row = i + 3
+        sc  = array.get(l1_scores, i)
+        table.cell(t, 0, row, array.get(l1_names, i), text_color=color.new(#7a95b0, 0), bgcolor=bg_row, text_size=size.tiny)
+        table.cell(t, 1, row, str.tostring(sc),        text_color=score_col(sc),          bgcolor=bg_row, text_size=size.tiny)
+        table.cell(t, 2, row, "3",                     text_color=color.new(#3a5570, 0),  bgcolor=bg_row, text_size=size.tiny)
+        table.cell(t, 3, row, status_txt(sc),          text_color=score_col(sc),          bgcolor=bg_row, text_size=size.tiny)
+
+    // ── Layer 2 header ──
+    table.cell(t, 0, 17, "─ LAYER 2: INSTITUTIONAL ─",    text_color=color.new(#ffab00, 0), bgcolor=bg_layer_hdr)
+    table.cell(t, 1, 17, str.tostring(math.round(l2_pct)) + "%", text_color=color.new(#ffab00, 0), bgcolor=bg_layer_hdr)
+    table.cell(t, 2, 17, "",                              bgcolor=bg_layer_hdr)
+    table.cell(t, 3, 17, "",                              bgcolor=bg_layer_hdr)
+
+    // ── Layer 2 modules ──
+    l2_names  = array.from("GEX Proxy","Options Flow","COT Proxy","Intermarket","S&D Zones","Vol Regime","Breadth","Footprint","Pattern Backtest","Seasonality","ESI Proxy","Smart Money")
+    l2_scores = array.from(gex_score, opts_score, cot_score, inter_score, sd_score, vol_reg_score, breadth_score, ob_score, ml_score, season_score, sector_score, micro_score)
+
+    for i = 0 to 11
+        row = i + 18
+        sc  = array.get(l2_scores, i)
+        table.cell(t, 0, row, array.get(l2_names, i), text_color=color.new(#7a95b0, 0), bgcolor=bg_row, text_size=size.tiny)
+        table.cell(t, 1, row, str.tostring(sc),        text_color=score_col(sc),          bgcolor=bg_row, text_size=size.tiny)
+        table.cell(t, 2, row, "3",                     text_color=color.new(#3a5570, 0),  bgcolor=bg_row, text_size=size.tiny)
+        table.cell(t, 3, row, status_txt(sc),          text_color=score_col(sc),          bgcolor=bg_row, text_size=size.tiny)
+
+    // ── Layer 3 header ──
+    table.cell(t, 0, 30, "─ LAYER 3: PREDICTIVE AI ─",    text_color=color.new(#b040fb, 0), bgcolor=bg_layer_hdr)
+    table.cell(t, 1, 30, str.tostring(math.round(l3_pct)) + "%", text_color=color.new(#b040fb, 0), bgcolor=bg_layer_hdr)
+    table.cell(t, 2, 30, "",                              bgcolor=bg_layer_hdr)
+    table.cell(t, 3, 30, "",                              bgcolor=bg_layer_hdr)
+
+    // ── Layer 3 modules ──
+    l3_names  = array.from("ML Ensemble","Alt Data","Microstructure","Fed/Macro","On-Chain","Sector Rotation","Execution AI","Options Surface","Price Targets","Risk Regime")
+    l3_scores = array.from(ml_score, alt_score, micro_score, fed_score, onchain_score, sector_score, exec_score, opts_score, target_score, risk_reg_score)
+
+    for i = 0 to 9
+        row = i + 31
+        sc  = array.get(l3_scores, i)
+        table.cell(t, 0, row, array.get(l3_names, i), text_color=color.new(#7a95b0, 0), bgcolor=bg_row, text_size=size.tiny)
+        table.cell(t, 1, row, str.tostring(sc),        text_color=score_col(sc),          bgcolor=bg_row, text_size=size.tiny)
+        table.cell(t, 2, row, "3",                     text_color=color.new(#3a5570, 0),  bgcolor=bg_row, text_size=size.tiny)
+        table.cell(t, 3, row, status_txt(sc),          text_color=score_col(sc),          bgcolor=bg_row, text_size=size.tiny)
+
+    // ── Direction summary row ──
+    dir_color = bull_direction ? color.new(#00e676, 0) : bear_direction ? color.new(#ff3355, 0) : color.new(#ffab00, 0)
+    dir_text  = bull_direction ? "▲ LONG" : bear_direction ? "▼ SHORT" : "▬ NEUTRAL"
+    table.cell(t, 0, 41, "SIGNAL DIRECTION",                       text_color=color.new(#c8d8e8, 0), bgcolor=hdr_color)
+    table.cell(t, 1, 41, dir_text,                                 text_color=dir_color,              bgcolor=hdr_color)
+    table.cell(t, 2, 41, "ATR:",                                   text_color=color.new(#3a5570, 0),  bgcolor=hdr_color)
+    table.cell(t, 3, 41, str.tostring(math.round(atr * 100) / 100),text_color=color.new(#7a95b0, 0),  bgcolor=hdr_color)
+
+// ============================================================
+// ─── BACKGROUND SESSION COLORS ──────────────────────────────
+// ============================================================
+bgcolor(session_ny_open  ? color.new(#00e676, 97) : na, title="NY Open Session")
+bgcolor(session_overlap  ? color.new(#00d4e8, 97) : na, title="London/NY Overlap")
+bgcolor(high_vol_regime  ? color.new(#ff3355, 98) : na, title="High Vol Regime Warning")

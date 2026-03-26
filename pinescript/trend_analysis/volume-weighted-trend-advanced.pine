@@ -1,0 +1,415 @@
+// © muhammadasifgabole
+// This source code is subject to the terms of the Mozilla Public License 2.0
+// https://mozilla.org/MPL/2.0/
+
+//@version=6
+strategy(
+     title              = 'Volume Weighted Trend Advanced',
+     shorttitle         = 'VWT Advanced',
+     overlay            = true,
+     max_labels_count   = 500,
+     max_lines_count    = 500,
+     initial_capital    = 10000,
+     default_qty_type   = strategy.percent_of_equity,
+     default_qty_value  = 2,
+     commission_type    = strategy.commission.percent,
+     commission_value   = 0.1,
+     slippage           = 2,
+     calc_on_every_tick = false)
+
+// ═══════════════════════════════════════════════════════════════════
+//  HOW IT WORKS
+//  This strategy builds on a Volume Weighted Moving Average (VWMA)
+//  with adaptive ATR bands. Four optional confirmation filters —
+//  Choppiness Index, ADX, Volume, and Multi-Timeframe alignment —
+//  gate every signal through a quality score (0–100%). Confirmed
+//  signals trigger strategy entries with ATR-based stop-loss and
+//  take-profit levels. An adaptive multiplier automatically widens
+//  bands in volatile regimes and tightens them in compressed ones.
+// ═══════════════════════════════════════════════════════════════════
+
+// ── Groups ──────────────────────────────────────────────────────
+var string G1 = '══ Core ══'
+var string G2 = '══ Adaptive Engine ══'
+var string G3 = '══ Filters ══'
+var string G4 = '══ Multi-Timeframe ══'
+var string G5 = '══ Risk Management ══'
+var string G6 = '══ Visuals ══'
+var string G7 = '══ Alerts ══'
+
+// ── Core ────────────────────────────────────────────────────────
+//  All lengths declared as input.int → guaranteed simple int
+//  (Pine built-ins require simple int, not series int)
+src          = input.source(close, 'Source', group=G1)
+vwma_len     = input.int  (34,  'VWMA Length',          minval=5, maxval=500, group=G1,
+     tooltip='Main VWMA period. Shorter = faster signals, longer = fewer but stronger signals.')
+vwma_fast_len= input.int  (21,  'Fast VWMA Length',     minval=5, maxval=200, group=G1,
+     tooltip='Secondary shorter VWMA used for adaptive blending. Recommended ~60% of main VWMA Length.')
+atr_mult_inp = input.float(1.5, 'ATR Multiplier',       minval=0.1, step=0.1, group=G1,
+     tooltip='Band width multiplier. Higher = wider bands, fewer signals.')
+
+// ── Adaptive Engine ─────────────────────────────────────────────
+use_adaptive  = input.bool (true,  'Adaptive ATR Multiplier', group=G2,
+     tooltip='Automatically scales band width based on current volatility. Wide in volatile markets, tight in quiet ones.')
+adapt_lookback= input.int  (100,  'Volatility Lookback',      minval=20, maxval=500, group=G2)
+adapt_min     = input.float(0.5,  'Min ATR Multiplier',       minval=0.1, step=0.1,  group=G2)
+adapt_max     = input.float(3.5,  'Max ATR Multiplier',       minval=0.5, step=0.1,  group=G2)
+use_blend     = input.bool (false, 'VWMA Blend (Choppiness)', group=G2,
+     tooltip='Blends toward the Fast VWMA in trending markets for earlier signals.')
+chop_len      = input.int  (14,   'Choppiness Length',        minval=5, maxval=100,  group=G2)
+
+// ── Filters ─────────────────────────────────────────────────────
+use_chop      = input.bool (true,  'Choppiness Filter', group=G3,
+     tooltip='Blocks signals when Choppiness Index > threshold (ranging market). 61.8 is the Fibonacci level used as the trend/range boundary.')
+chop_thresh   = input.float(61.8, 'Choppiness Threshold', minval=30.0, maxval=90.0, step=0.1, group=G3)
+use_adx       = input.bool (false, 'ADX Filter', group=G3,
+     tooltip='Requires ADX to be above the minimum level, confirming a trending environment.')
+adx_len       = input.int  (14,   'ADX Length',        minval=3,            group=G3)
+adx_thresh    = input.int  (20,   'ADX Min Threshold', minval=5, maxval=60, group=G3)
+use_vol       = input.bool (true,  'Volume Filter', group=G3,
+     tooltip='Only fires signals when volume is above its moving average, filtering thin-air breakouts.')
+vol_ma_len    = input.int  (20,   'Volume MA Length',       minval=5, group=G3)
+vol_mult      = input.float(1.0,  'Volume Threshold (×MA)', minval=0.1, step=0.1, group=G3)
+
+// ── Multi-Timeframe ─────────────────────────────────────────────
+use_mtf       = input.bool     (false, 'MTF Trend Filter', group=G4,
+     tooltip='Only allows longs when the higher-timeframe VWMA trend is also bullish, and shorts when bearish.')
+mtf_tf        = input.timeframe('D',   'Higher Timeframe',   group=G4)
+mtf_len       = input.int      (34,    'MTF VWMA Length',    minval=5, group=G4)
+show_mtf      = input.bool     (true,  'Show MTF VWMA Line', group=G4)
+
+// ── Risk Management ─────────────────────────────────────────────
+use_sl        = input.bool (true,  'Enable Stop-Loss',   group=G5)
+use_tp        = input.bool (true,  'Enable Take-Profit',  group=G5)
+sl_mult       = input.float(1.5,  'Stop-Loss ATR ×',    minval=0.1, step=0.1, group=G5,
+     tooltip='Stop-loss distance as a multiple of ATR from entry price.')
+tp_mult       = input.float(3.0,  'Take-Profit ATR ×',  minval=0.1, step=0.1, group=G5,
+     tooltip='Take-profit distance as a multiple of ATR from entry price. Default gives 1:2 R:R.')
+show_rl       = input.bool (true,  'Show SL / TP Lines', group=G5)
+show_rr       = input.bool (true,  'Show R:R on Labels', group=G5)
+
+// ── Visuals ─────────────────────────────────────────────────────
+color_preset  = input.string('Custom', 'Color Preset',
+     options=['Classic','Aqua','Cosmic','Cyber','Neon','Custom'], group=G6)
+bull_inp      = input.color(#00ffaa, 'Bullish Color', group=G6)
+bear_inp      = input.color(#ff0000, 'Bearish Color', group=G6)
+show_glow     = input.bool(true,  'Glow Effect',       group=G6)
+show_ribbons  = input.bool(true,  'Band Ribbons',      group=G6)
+band_tp       = input.int (90,    'Band Transparency', minval=0, maxval=100, group=G6)
+show_barcolor = input.bool(true,  'Bar Coloring',      group=G6)
+show_labels   = input.bool(true,  'Signal Labels',     group=G6)
+show_stats    = input.bool(true,  'Stats Table',       group=G6)
+show_spikes   = input.bool(false, 'Volume Spike Markers', group=G6)
+spike_mult    = input.float(2.5,  'Spike Threshold ×',  minval=1.1, step=0.1, group=G6)
+tbl_pos_inp   = input.string('Bottom Right', 'Table Position',
+     options=['Top Left','Top Right','Bottom Left','Bottom Right','Middle Right'], group=G6)
+
+// ── Alerts ──────────────────────────────────────────────────────
+alert_all_filters = input.bool(true, 'Alert Only When All Filters Pass', group=G7)
+
+// ── Color Resolution ────────────────────────────────────────────
+[bull_col, bear_col] = switch color_preset
+    'Classic' => [#00ff00, #ff0000]
+    'Aqua'    => [#00d4ff, #ff8c00]
+    'Cosmic'  => [#49ffce, #9932cc]
+    'Cyber'   => [#00cccc, #ff6600]
+    'Neon'    => [#ffff00, #ff00ff]
+    =>           [bull_inp, bear_inp]
+
+// ── Choppiness Index ────────────────────────────────────────────
+//  chop_len = input.int → simple int → safe for all builtins ✓
+chop_atr1  = ta.atr(1)
+chop_sum   = math.sum(chop_atr1, chop_len)
+chop_hi    = ta.highest(high, chop_len)
+chop_lo    = ta.lowest (low,  chop_len)
+chop_range = chop_hi - chop_lo
+chop_val   = chop_range > 0.0 ?
+     100.0 * math.log10(chop_sum / chop_range) / math.log10(chop_len) : 50.0
+chop_ok    = chop_val < chop_thresh
+
+// ── VWMA Blend ──────────────────────────────────────────────────
+//  Both lengths = input.int → simple int → safe for ta.vwma() ✓
+vwma_slow  = ta.vwma(src, vwma_len)
+vwma_fast  = ta.vwma(src, vwma_fast_len)
+chop_norm  = math.max(0.0, math.min(1.0, (chop_val - 30.0) / 60.0))
+blend_w    = use_blend ? chop_norm : 1.0
+basis      = blend_w * vwma_slow + (1.0 - blend_w) * vwma_fast
+
+// ── ATR ─────────────────────────────────────────────────────────
+//  vwma_len = input.int → simple int ✓
+raw_atr = ta.atr(vwma_len)
+
+// ── Adaptive ATR Multiplier ──────────────────────────────────────
+//  adapt_lookback = input.int → simple int ✓
+atr_hi    = ta.highest(raw_atr, adapt_lookback)
+atr_lo    = ta.lowest (raw_atr, adapt_lookback)
+atr_rng   = atr_hi - atr_lo
+vol_pct   = atr_rng > 0.0 ? (raw_atr - atr_lo) / atr_rng : 0.5
+eff_mult  = use_adaptive ?
+     adapt_min + vol_pct * (adapt_max - adapt_min) : atr_mult_inp
+
+// ── Volatility Regime ────────────────────────────────────────────
+//  atr_sma always computed outside ternary ✓
+atr_sma    = ta.sma(raw_atr, adapt_lookback)
+vol_regime = raw_atr > atr_sma * 1.2 ? 'HIGH' :
+             raw_atr < atr_sma * 0.8 ? 'LOW'  : 'NORMAL'
+
+// ── Bands ───────────────────────────────────────────────────────
+upper = basis + raw_atr * eff_mult
+lower = basis - raw_atr * eff_mult
+
+// ── ADX ─────────────────────────────────────────────────────────
+//  adx_len = input.int → simple int ✓
+[_dip, _dim, adx_val] = ta.dmi(adx_len, adx_len)
+adx_ok = adx_val >= adx_thresh
+
+// ── Volume ──────────────────────────────────────────────────────
+//  vol_ma_len = input.int → simple int; always computed ✓
+vol_ma    = ta.sma(volume, vol_ma_len)
+vol_ok    = volume >= vol_ma * vol_mult
+vol_spike = volume >= vol_ma * spike_mult
+
+// ── MTF ─────────────────────────────────────────────────────────
+//  mtf_len = input.int → simple int ✓
+mtf_close = request.security(syminfo.tickerid, mtf_tf, close,                   lookahead=barmerge.lookahead_off)
+mtf_vwma  = request.security(syminfo.tickerid, mtf_tf, ta.vwma(close, mtf_len), lookahead=barmerge.lookahead_off)
+mtf_atr   = request.security(syminfo.tickerid, mtf_tf, ta.atr(mtf_len),         lookahead=barmerge.lookahead_off)
+mtf_upper = mtf_vwma + mtf_atr * eff_mult
+mtf_lower = mtf_vwma - mtf_atr * eff_mult
+
+var int mtf_dir = 0
+if mtf_close > mtf_upper
+    mtf_dir := 1
+else if mtf_close < mtf_lower
+    mtf_dir := -1
+
+// ── Trend Logic ─────────────────────────────────────────────────
+var int trend = 0
+if src > upper
+    trend := 1
+else if src < lower
+    trend := -1
+
+to_bull = trend == 1  and trend[1] != 1
+to_bear = trend == -1 and trend[1] != -1
+
+// ── Filter Gate ─────────────────────────────────────────────────
+f_chop     = not use_chop or chop_ok
+f_adx      = not use_adx  or adx_ok
+f_vol      = not use_vol  or vol_ok
+f_mtf_bull = not use_mtf  or mtf_dir == 1
+f_mtf_bear = not use_mtf  or mtf_dir == -1
+
+mtf_aligned = (trend == 1 and mtf_dir == 1) or (trend == -1 and mtf_dir == -1)
+
+q_score = (f_chop ? 25 : 0) + (f_adx ? 25 : 0) + (f_vol ? 25 : 0) +
+          ((f_mtf_bull and trend == 1) or (f_mtf_bear and trend == -1) ? 25 : 0)
+
+gate_bull = f_chop and f_adx and f_vol and f_mtf_bull
+gate_bear = f_chop and f_adx and f_vol and f_mtf_bear
+sig_bull  = to_bull and gate_bull
+sig_bear  = to_bear and gate_bear
+
+color t_col = trend == 1 ? bull_col : bear_col
+
+// ── SL / TP Prices ──────────────────────────────────────────────
+//  Computed as plain floats — never passed as na to strategy.exit ✓
+sl_dist  = raw_atr * sl_mult
+tp_dist  = raw_atr * tp_mult
+long_sl  = close - sl_dist
+long_tp  = close + tp_dist
+short_sl = close + sl_dist
+short_tp = close - tp_dist
+
+// ── Strategy Entries & Exits ────────────────────────────────────
+//  Each exit case in its own if-block — no na ever in stop/limit ✓
+if sig_bull
+    strategy.close('Short', comment='Flip ▲')
+    strategy.entry('Long',  strategy.long,  comment='▲ LONG')
+    if use_sl and use_tp
+        strategy.exit('Long SL/TP', from_entry='Long', stop=long_sl,  limit=long_tp)
+    else if use_sl
+        strategy.exit('Long SL',    from_entry='Long', stop=long_sl)
+    else if use_tp
+        strategy.exit('Long TP',    from_entry='Long', limit=long_tp)
+
+if sig_bear
+    strategy.close('Long',  comment='Flip ▼')
+    strategy.entry('Short', strategy.short, comment='▼ SHORT')
+    if use_sl and use_tp
+        strategy.exit('Short SL/TP', from_entry='Short', stop=short_sl, limit=short_tp)
+    else if use_sl
+        strategy.exit('Short SL',    from_entry='Short', stop=short_sl)
+    else if use_tp
+        strategy.exit('Short TP',    from_entry='Short', limit=short_tp)
+
+// ── Risk Lines ──────────────────────────────────────────────────
+var line line_sl = na
+var line line_tp = na
+
+if show_rl and (sig_bull or sig_bear)
+    line.delete(line_sl)
+    line.delete(line_tp)
+    sl_px    = trend == 1 ? long_sl  : short_sl
+    tp_px    = trend == 1 ? long_tp  : short_tp
+    line_sl := line.new(bar_index, sl_px, bar_index + 1, sl_px,
+         extend=extend.right, color=color.new(color.red,  20), style=line.style_dashed, width=1)
+    line_tp := line.new(bar_index, tp_px, bar_index + 1, tp_px,
+         extend=extend.right, color=color.new(color.lime, 20), style=line.style_dashed, width=1)
+
+// ── Plots ───────────────────────────────────────────────────────
+
+// MTF line
+mtf_col  = mtf_dir == 1 ? color.new(bull_col, 40) : color.new(bear_col, 40)
+plot(use_mtf and show_mtf ? mtf_vwma : na, 'MTF VWMA',
+     color=mtf_col, linewidth=2, style=plot.style_circles)
+
+// Glow + VWMA
+plot(show_glow ? basis : na, 'Glow Outer', color.new(t_col, 85), 10)
+plot(show_glow ? basis : na, 'Glow Mid',   color.new(t_col, 65),  6)
+plot(show_glow ? basis : na, 'Glow Inner', color.new(t_col, 35),  3)
+vwma_p  = plot(basis, 'VWMA', color.new(t_col, 0), 2)
+
+// Bands
+upper_p = plot(upper,                   'Upper Band', color=color.new(t_col, band_tp))
+upper_m = plot(math.avg(upper, basis),  'Upper Mid',  color=color.new(t_col, 95))
+lower_p = plot(lower,                   'Lower Band', color=color.new(t_col, band_tp))
+lower_m = plot(math.avg(lower, basis),  'Lower Mid',  color=color.new(t_col, 95))
+
+// Ribbon fills — color(na) for disabled state, never bare na ✓
+r_out = show_ribbons ? color.new(t_col, 90) : color(na)
+r_in  = show_ribbons ? color.new(t_col, 78) : color(na)
+fill(upper_p, upper_m, r_out, 'Upper Outer')
+fill(upper_m, vwma_p,  r_in,  'Upper Inner')
+fill(lower_p, lower_m, r_out, 'Lower Outer')
+fill(lower_m, vwma_p,  r_in,  'Lower Inner')
+
+// Bar color — color(na) for disabled, pre-built to avoid type errors ✓
+bc_alpha = (gate_bull and trend == 1) or (gate_bear and trend == -1) ? 10 : 40
+b_bull   = color.new(bull_col, bc_alpha)
+b_bear   = color.new(bear_col, bc_alpha)
+b_col    = trend == 1 ? b_bull : b_bear
+barcolor(show_barcolor ? b_col : color(na), title='Bar Color')
+
+// Signal shapes — unconfirmed (faded) and confirmed (solid)
+plotshape(to_bull and not sig_bull, 'Raw Bull',
+     shape.triangleup,   location.belowbar, color.new(bull_col, 65), size=size.small)
+plotshape(to_bear and not sig_bear, 'Raw Bear',
+     shape.triangledown, location.abovebar, color.new(bear_col, 65), size=size.small)
+plotshape(sig_bull, 'Confirmed Bull', shape.triangleup,   location.belowbar, bull_col, size=size.normal)
+plotshape(sig_bear, 'Confirmed Bear', shape.triangledown, location.abovebar, bear_col, size=size.normal)
+
+// Volume spike markers — bool(na) for disabled, never bare na ✓
+spk_b = show_spikes and vol_spike and close >= open
+spk_s = show_spikes and vol_spike and close <  open
+plotchar(spk_b ? true : bool(na), 'Vol Spike Bull', '▲', location.belowbar, color.new(bull_col, 0), size=size.tiny)
+plotchar(spk_s ? true : bool(na), 'Vol Spike Bear', '▼', location.abovebar, color.new(bear_col, 0), size=size.tiny)
+
+// ── Labels ──────────────────────────────────────────────────────
+rr = tp_mult / sl_mult
+
+if show_labels and sig_bull
+    lbl = '▲ LONG\nEntry: ' + str.tostring(close,             format.mintick) +
+          '\nSL: '  + str.tostring(close - raw_atr * sl_mult,  format.mintick) +
+          '\nTP: '  + str.tostring(close + raw_atr * tp_mult,  format.mintick) +
+          (show_rr ? '\nR:R 1:' + str.tostring(rr, '#.##') : '') +
+          '\nQ: '   + str.tostring(q_score) + '%'
+    label.new(bar_index, low * 0.9985, lbl,
+         color=color.new(bull_col, 15), textcolor=color.white,
+         style=label.style_label_up, size=size.small)
+
+if show_labels and sig_bear
+    lbl = '▼ SHORT\nEntry: ' + str.tostring(close,             format.mintick) +
+          '\nSL: '  + str.tostring(close + raw_atr * sl_mult,  format.mintick) +
+          '\nTP: '  + str.tostring(close - raw_atr * tp_mult,  format.mintick) +
+          (show_rr ? '\nR:R 1:' + str.tostring(rr, '#.##') : '') +
+          '\nQ: '   + str.tostring(q_score) + '%'
+    label.new(bar_index, high * 1.0015, lbl,
+         color=color.new(bear_col, 15), textcolor=color.white,
+         style=label.style_label_down, size=size.small)
+
+// ── Stats Table ─────────────────────────────────────────────────
+tbl_pos = switch tbl_pos_inp
+    'Top Left'     => position.top_left
+    'Top Right'    => position.top_right
+    'Bottom Left'  => position.bottom_left
+    'Middle Right' => position.middle_right
+    =>                position.bottom_right
+
+var table tbl = table.new(tbl_pos, 2, 10,
+     bgcolor=color.new(color.black, 70),
+     border_color=color.new(color.gray, 50), border_width=1,
+     frame_color =color.new(color.gray, 40), frame_width =1)
+
+if show_stats and barstate.islast
+    tc = color.new(color.white, 0)
+    hc = color.new(color.gray,  0)
+
+    table.cell(tbl, 0, 0, 'VWT ADVANCED',
+         text_color=color.new(t_col, 0), text_size=size.small,
+         bgcolor=color.new(color.black, 55))
+    table.cell(tbl, 1, 0, '',
+         text_color=tc, text_size=size.small,
+         bgcolor=color.new(color.black, 55))
+
+    table.cell(tbl, 0, 1, 'Trend',      text_color=hc, text_size=size.tiny)
+    table.cell(tbl, 1, 1,
+         trend == 1 ? '▲ BULL' : trend == -1 ? '▼ BEAR' : '◆ NEUTRAL',
+         text_color=trend == 1 ? color.new(bull_col, 0) : color.new(bear_col, 0),
+         text_size=size.tiny)
+
+    table.cell(tbl, 0, 2, 'Quality',    text_color=hc, text_size=size.tiny)
+    qc = q_score >= 75 ? color.lime : q_score >= 50 ? color.yellow : color.red
+    table.cell(tbl, 1, 2, str.tostring(q_score) + '%', text_color=qc, text_size=size.tiny)
+
+    table.cell(tbl, 0, 3, 'Vol Regime', text_color=hc, text_size=size.tiny)
+    vrc = vol_regime == 'HIGH' ? color.red : vol_regime == 'LOW' ? color.green : color.gray
+    table.cell(tbl, 1, 3, vol_regime,   text_color=vrc, text_size=size.tiny)
+
+    table.cell(tbl, 0, 4, 'Choppiness', text_color=hc, text_size=size.tiny)
+    table.cell(tbl, 1, 4,
+         str.tostring(math.round(chop_val, 1)) + (chop_ok ? ' ✓' : ' ✗'),
+         text_color=chop_ok ? color.lime : color.red, text_size=size.tiny)
+
+    table.cell(tbl, 0, 5, 'ADX',        text_color=hc, text_size=size.tiny)
+    table.cell(tbl, 1, 5,
+         str.tostring(math.round(adx_val, 1)) + (adx_ok ? ' ✓' : ' ✗'),
+         text_color=adx_ok ? color.lime : color.red, text_size=size.tiny)
+
+    table.cell(tbl, 0, 6, 'Volume',     text_color=hc, text_size=size.tiny)
+    table.cell(tbl, 1, 6, vol_ok ? '✓ OK' : '✗ Weak',
+         text_color=vol_ok ? color.lime : color.red, text_size=size.tiny)
+
+    table.cell(tbl, 0, 7, 'MTF Align',  text_color=hc, text_size=size.tiny)
+    mtf_txt = use_mtf ? (mtf_aligned ? '✓ Aligned' : '✗ Diverge') : 'Off'
+    mtf_tc  = use_mtf ? (mtf_aligned ? color.lime  : color.red)   : color.gray
+    table.cell(tbl, 1, 7, mtf_txt, text_color=mtf_tc, text_size=size.tiny)
+
+    table.cell(tbl, 0, 8, 'ATR Mult',   text_color=hc, text_size=size.tiny)
+    table.cell(tbl, 1, 8, str.tostring(math.round(eff_mult, 2)),
+         text_color=tc, text_size=size.tiny)
+
+    table.cell(tbl, 0, 9, 'VWMA Blend', text_color=hc, text_size=size.tiny)
+    table.cell(tbl, 1, 9,
+         str.tostring(math.round(blend_w * 100.0, 0)) + '%',
+         text_color=tc, text_size=size.tiny)
+
+// ── Alerts ──────────────────────────────────────────────────────
+bull_alert = alert_all_filters ? sig_bull : to_bull
+bear_alert = alert_all_filters ? sig_bear : to_bear
+
+alertcondition(bull_alert,
+     title='VWT Bullish Signal',
+     message='VWT Advanced: BULLISH on {{exchange}}:{{ticker}} | {{interval}} | {{close}}')
+alertcondition(bear_alert,
+     title='VWT Bearish Signal',
+     message='VWT Advanced: BEARISH on {{exchange}}:{{ticker}} | {{interval}} | {{close}}')
+alertcondition(bull_alert or bear_alert,
+     title='VWT Trend Changed',
+     message='VWT Advanced: Trend changed on {{exchange}}:{{ticker}} | {{interval}} | {{close}}')
+alertcondition(sig_bull,
+     title='VWT Confirmed Bull',
+     message='VWT Advanced: HIGH-QUALITY BULL on {{exchange}}:{{ticker}} | {{interval}} | {{close}}')
+alertcondition(sig_bear,
+     title='VWT Confirmed Bear',
+     message='VWT Advanced: HIGH-QUALITY BEAR on {{exchange}}:{{ticker}} | {{interval}} | {{close}}')

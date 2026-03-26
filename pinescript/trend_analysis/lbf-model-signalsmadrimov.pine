@@ -1,0 +1,408 @@
+//@version=5
+indicator("LBF Model signals(Madrimov)", overlay=true, max_boxes_count=500, max_lines_count=500, max_labels_count=500)
+
+// ═══════════════════════════════════════════════════════════════════
+// INPUT SETTINGS
+// ═══════════════════════════════════════════════════════════════════
+
+// Timeframe Lock
+show_on_15min = input.bool(true, "Show Only on 15min Chart", group="Timeframe Lock")
+show_on_4h_for_testing = input.bool(false, "Allow on 4H for Testing", group="Timeframe Lock")
+
+// EMA Filter
+use_ema_filter = input.bool(true, "Use EMA 100 Filter", group="Trend Filter", tooltip="Only take LONG trades above EMA 100")
+ema_length = input.int(100, "EMA Length", minval=1, group="Trend Filter")
+show_ema = input.bool(true, "Show EMA on Chart", group="Trend Filter")
+ema_color = input.color(color.blue, "EMA Color", group="Trend Filter")
+
+// BUGATTI - Liquidity Settings
+liqLen = input.int(7, title='Detection Length', minval=3, maxval=13, group="Liquidity (Bugatti)")
+liqMar = 10 / input.float(6.9, 'Margin', minval=4, maxval=9, step=0.1, group="Liquidity (Bugatti)")
+liqBuy = input.bool(true, 'Show Buyside Liquidity', group="Liquidity (Bugatti)")
+marBuy = input.float(2.3, 'Buyside Margin', minval=1.5, maxval=10, step=.1, group="Liquidity (Bugatti)")
+cLIQ_B = input.color(color.new(#4caf50, 0), 'Buyside Color', group="Liquidity (Bugatti)")
+liqSel = input.bool(true, 'Show Sellside Liquidity', group="Liquidity (Bugatti)")
+marSel = input.float(2.3, 'Sellside Margin', minval=1.5, maxval=10, step=.1, group="Liquidity (Bugatti)")
+cLIQ_S = input.color(color.new(#f23645, 0), 'Sellside Color', group="Liquidity (Bugatti)")
+visLiq = input.int(3, '# Visible Levels', minval=1, maxval=50, group="Liquidity (Bugatti)")
+
+// FERRARI - FVG Settings
+showFairValueGapsInput = input(true, 'Show Fair Value Gaps', group="FVG (Ferrari)")
+fairValueGapsThresholdInput = input(true, 'Auto Threshold', group="FVG (Ferrari)")
+fairValueGapsBullColorInput = input.color(color.new(#00ff68, 70), 'Bullish FVG', group="FVG (Ferrari)")
+fairValueGapsBearColorInput = input.color(color.new(#ff0008, 70), 'Bearish FVG', group="FVG (Ferrari)")
+fairValueGapsExtendInput = input.int(20, 'Extend FVG (bars)', group="FVG (Ferrari)", minval=0)
+
+// Entry & Risk Settings
+show_entry_signals = input.bool(true, "Show Entry Signals", group="Entry Settings")
+manual_entry_mode = input.bool(false, "Manual Entry Mode (Show Setup Only)", group="Entry Settings", tooltip="When ON, shows label but you decide entry. When OFF, auto entry on FVG retest")
+risk_reward_ratio = input.float(3.0, "Risk:Reward Ratio", minval=1.0, maxval=10.0, step=0.1, group="Entry Settings")
+show_sl_tp = input.bool(true, "Show SL/TP Lines", group="Entry Settings")
+
+// Break Settings
+show_break_lines = input.bool(false, "Show Break Lines", group="Structure")
+break_color = input.color(color.new(color.orange, 50), "Break Color", group="Structure")
+
+// Visual Settings
+entry_color = input.color(color.green, "Entry Color", group="Visual")
+sl_color = input.color(color.red, "Stop Loss Color", group="Visual")
+tp_color = input.color(color.green, "Take Profit Color", group="Visual")
+
+// Performance Table Settings
+show_stats_table = input.bool(true, "Show Performance Stats", group="Performance Table")
+table_position = input.string("top_right", "Table Position", options=["top_left", "top_center", "top_right", "middle_left", "middle_center", "middle_right", "bottom_left", "bottom_center", "bottom_right"], group="Performance Table")
+
+// ═══════════════════════════════════════════════════════════════════
+// PERFORMANCE TRACKING VARIABLES
+// ═══════════════════════════════════════════════════════════════════
+
+var int total_signals = 0
+var int tp_hits = 0
+var int sl_hits = 0
+var int active_trades = 0
+
+// ═══════════════════════════════════════════════════════════════════
+// EMA CALCULATION
+// ═══════════════════════════════════════════════════════════════════
+
+ema_100 = ta.ema(close, ema_length)
+price_above_ema = close > ema_100
+
+// Plot EMA
+plot(show_ema ? ema_100 : na, "EMA 100", color=ema_color, linewidth=2)
+
+// ═══════════════════════════════════════════════════════════════════
+// TIMEFRAME CHECK
+// ═══════════════════════════════════════════════════════════════════
+
+is_15min = timeframe.period == "15"
+is_4h = timeframe.period == "240"
+allowed_timeframe = (show_on_15min and is_15min) or (show_on_4h_for_testing and is_4h)
+
+// ═══════════════════════════════════════════════════════════════════
+// REQUEST 4H DATA
+// ═══════════════════════════════════════════════════════════════════
+
+[h4_open, h4_high, h4_low, h4_close] = request.security(syminfo.tickerid, "240", [open, high, low, close], lookahead=barmerge.lookahead_off)
+h4_is_bull = h4_close > h4_open
+h4_is_bear = h4_close < h4_open
+
+// Track 4H candle changes
+var float prev_h4_close = na
+h4_new_candle = na(prev_h4_close) or h4_close != prev_h4_close
+prev_h4_close := h4_close
+
+// ═══════════════════════════════════════════════════════════════════
+// 4H CANDLE VERTICAL MARKERS
+// ═══════════════════════════════════════════════════════════════════
+
+var line h4_start_line = na
+var line h4_end_line = na
+var label h4_label = na
+
+if allowed_timeframe and h4_new_candle
+    h4_start_line := line.new(bar_index, low * 0.95, bar_index, high * 1.05, color=color.new(color.green, 90), width=1, style=line.style_dotted)
+    h4_label := label.new(bar_index, high * 1.05, "4H", color=color.new(color.green, 90), textcolor=color.new(color.green, 60), style=label.style_label_down, size=size.tiny)
+
+if allowed_timeframe
+    if not na(h4_end_line)
+        line.delete(h4_end_line)
+    h4_end_line := line.new(bar_index, low * 0.95, bar_index, high * 1.05, color=color.new(color.green, 95), width=1, style=line.style_dotted)
+
+// ═══════════════════════════════════════════════════════════════════
+// FERRARI - FAIR VALUE GAP (FVG) DETECTION
+// ═══════════════════════════════════════════════════════════════════
+
+type fairValueGap
+    float top
+    float bottom
+    int bias
+    box topBox
+    box bottomBox
+
+var array<fairValueGap> fairValueGaps = array.new<fairValueGap>()
+
+fairValueGapBox(leftTime, rightTime, topPrice, bottomPrice, boxColor) => box.new(chart.point.new(leftTime, na, topPrice), chart.point.new(rightTime + fairValueGapsExtendInput * (time - time[1]), na, bottomPrice), xloc=xloc.bar_time, border_color=boxColor, bgcolor=boxColor)
+
+deleteFairValueGaps() =>
+    for [index, eachFairValueGap] in fairValueGaps
+        if (low < eachFairValueGap.bottom and eachFairValueGap.bias == 1) or (high > eachFairValueGap.top and eachFairValueGap.bias == -1)
+            eachFairValueGap.topBox.delete()
+            eachFairValueGap.bottomBox.delete()
+            fairValueGaps.remove(index)
+
+drawFairValueGaps() =>
+    lastClose = close[1]
+    lastOpen = open[1]
+    lastTime = time[1]
+    currentHigh = high
+    currentLow = low
+    currentTime = time
+    last2High = high[2]
+    last2Low = low[2]
+
+    barDeltaPercent = (lastClose - lastOpen) / (lastOpen * 100)
+    threshold = fairValueGapsThresholdInput ? ta.cum(math.abs(barDeltaPercent)) / bar_index * 2 : 0
+
+    bullishFairValueGap = currentLow > last2High and lastClose > last2High and barDeltaPercent > threshold
+    bearishFairValueGap = currentHigh < last2Low and lastClose < last2Low and -barDeltaPercent > threshold
+
+    if bullishFairValueGap and allowed_timeframe and showFairValueGapsInput
+        fairValueGaps.unshift(fairValueGap.new(currentLow, last2High, 1, fairValueGapBox(lastTime, currentTime, currentLow, math.avg(currentLow, last2High), fairValueGapsBullColorInput), fairValueGapBox(lastTime, currentTime, math.avg(currentLow, last2High), last2High, fairValueGapsBullColorInput)))
+    
+    if bearishFairValueGap and allowed_timeframe and showFairValueGapsInput
+        fairValueGaps.unshift(fairValueGap.new(currentHigh, last2Low, -1, fairValueGapBox(lastTime, currentTime, currentHigh, math.avg(currentHigh, last2Low), fairValueGapsBearColorInput), fairValueGapBox(lastTime, currentTime, math.avg(currentHigh, last2Low), last2Low, fairValueGapsBearColorInput)))
+
+if showFairValueGapsInput
+    deleteFairValueGaps()
+    drawFairValueGaps()
+
+// ═══════════════════════════════════════════════════════════════════
+// SIMPLE 4H LIQUIDITY
+// ═══════════════════════════════════════════════════════════════════
+
+var float last_4h_high = na
+var float last_4h_low = na
+var int last_4h_bar = na
+
+var bool bull_liq_swept = false
+var bool bear_liq_swept = false
+var float swept_buy_level = na
+var float swept_sell_level = na
+
+if h4_new_candle
+    last_4h_high := h4_high[1]
+    last_4h_low := h4_low[1]
+    last_4h_bar := bar_index
+
+var line liq_high_line = na
+var line liq_low_line = na
+var label liq_high_label = na
+var label liq_low_label = na
+
+if h4_new_candle and allowed_timeframe and (liqBuy or liqSel)
+    if not na(liq_high_line)
+        line.delete(liq_high_line)
+        line.delete(liq_low_line)
+        label.delete(liq_high_label)
+        label.delete(liq_low_label)
+    
+    if liqBuy and not na(last_4h_high)
+        liq_high_line := line.new(last_4h_bar, last_4h_high, bar_index + 20, last_4h_high, color=cLIQ_B, width=1)
+        liq_high_label := label.new(bar_index, last_4h_high, "Liq", color=color.new(cLIQ_B, 70), textcolor=cLIQ_B, style=label.style_label_down, size=size.tiny)
+    
+    if liqSel and not na(last_4h_low)
+        liq_low_line := line.new(last_4h_bar, last_4h_low, bar_index + 20, last_4h_low, color=cLIQ_S, width=1)
+        liq_low_label := label.new(bar_index, last_4h_low, "Liq", color=color.new(cLIQ_S, 70), textcolor=cLIQ_S, style=label.style_label_up, size=size.tiny)
+
+if not na(last_4h_low) and low <= last_4h_low and close > last_4h_low
+    bull_liq_swept := true
+    swept_sell_level := last_4h_low
+
+if not na(last_4h_high) and high >= last_4h_high and close < last_4h_high
+    bear_liq_swept := true
+    swept_buy_level := last_4h_high
+
+// ═══════════════════════════════════════════════════════════════════
+// BREAK OF STRUCTURE
+// ═══════════════════════════════════════════════════════════════════
+
+swing_high = ta.highest(high, 20)
+swing_low = ta.lowest(low, 20)
+
+var float break_level = na
+var bool bullish_break = na
+var int break_bar = na
+
+if close > swing_high[1] and close[1] <= swing_high[1] and allowed_timeframe and show_break_lines
+    break_level := swing_high[1]
+    bullish_break := true
+    break_bar := bar_index
+    line.new(bar_index - 1, break_level, bar_index + 20, break_level, color=break_color, width=1, style=line.style_dashed)
+    label.new(bar_index, break_level, "Brk", color=color.new(color.orange, 70), textcolor=color.orange, style=label.style_label_left, size=size.tiny)
+
+if close < swing_low[1] and close[1] >= swing_low[1] and allowed_timeframe and show_break_lines
+    break_level := swing_low[1]
+    bullish_break := false
+    break_bar := bar_index
+    line.new(bar_index - 1, break_level, bar_index + 20, break_level, color=break_color, width=1, style=line.style_dashed)
+    label.new(bar_index, break_level, "Brk", color=color.new(color.orange, 70), textcolor=color.orange, style=label.style_label_left, size=size.tiny)
+
+// ═══════════════════════════════════════════════════════════════════
+// ENTRY LOGIC - LONG ONLY WITH EMA FILTER
+// ═══════════════════════════════════════════════════════════════════
+
+var bool setup_active_bull = false
+var float entry_price = na
+var float stop_loss = na
+var float take_profit = na
+
+var line current_sl_line = na
+var line current_tp_line = na
+var label current_sl_label = na
+var label current_tp_label = na
+
+has_bullish_fvg = fairValueGaps.size() > 0 ? fairValueGaps.get(0).bias == 1 : false
+
+// BULLISH SETUP - WITH EMA 100 FILTER
+// Only activate setup if price is above EMA 100 (or filter is disabled)
+bool ema_allows_long = use_ema_filter ? price_above_ema : true
+
+if bull_liq_swept and h4_is_bull and ema_allows_long
+    setup_active_bull := true
+    
+    if fairValueGaps.size() > 1
+        for i = fairValueGaps.size() - 1 to 1
+            fairValueGap fvg = fairValueGaps.get(i)
+            fvg.topBox.delete()
+            fvg.bottomBox.delete()
+            fairValueGaps.remove(i)
+
+// Entry: Price retests FVG zone
+bool bull_entry = false
+
+if setup_active_bull and fairValueGaps.size() > 0
+    fairValueGap latest_fvg = fairValueGaps.get(0)
+    if latest_fvg.bias == 1
+        float fvg_top = latest_fvg.top
+        float fvg_bottom = latest_fvg.bottom
+        
+        // DOUBLE CHECK: Still above EMA at entry time
+        bool still_above_ema = use_ema_filter ? price_above_ema : true
+        
+        if low <= fvg_top and close >= fvg_bottom and still_above_ema
+            bull_entry := true
+
+// Execute entry
+if allowed_timeframe and show_entry_signals
+    if bull_entry and not na(swept_sell_level)
+        if not na(current_sl_line)
+            line.delete(current_sl_line)
+        if not na(current_tp_line)
+            line.delete(current_tp_line)
+        if not na(current_sl_label)
+            label.delete(current_sl_label)
+        if not na(current_tp_label)
+            label.delete(current_tp_label)
+        
+        if fairValueGaps.size() > 0
+            for i = fairValueGaps.size() - 1 to 0
+                fairValueGap fvg = fairValueGaps.get(i)
+                fvg.topBox.delete()
+                fvg.bottomBox.delete()
+                fairValueGaps.remove(i)
+        
+        entry_price := close
+        stop_loss := swept_sell_level
+        risk = entry_price - stop_loss
+        
+        if risk > 0
+            take_profit := entry_price + (risk * risk_reward_ratio)
+            
+            if manual_entry_mode
+                label.new(bar_index, low, "LONG", color=color.new(color.green, 0), textcolor=color.white, style=label.style_label_up, size=size.small, tooltip="Long Setup\nEntry: " + str.tostring(entry_price) + "\nSL: " + str.tostring(stop_loss) + "\nTP: " + str.tostring(take_profit) + "\nRisk: " + str.tostring(risk))
+            else
+                label.new(bar_index, low, "L", color=color.new(color.green, 0), textcolor=color.white, style=label.style_label_up, size=size.small, tooltip="Long Entry\nRR: 1:" + str.tostring(risk_reward_ratio))
+            
+            if show_sl_tp
+                current_sl_line := line.new(bar_index, stop_loss, bar_index + 30, stop_loss, color=sl_color, width=1, style=line.style_solid)
+                current_sl_label := label.new(bar_index + 1, stop_loss, "SL", color=sl_color, textcolor=color.white, style=label.style_label_left, size=size.tiny)
+                
+                current_tp_line := line.new(bar_index, take_profit, bar_index + 30, take_profit, color=tp_color, width=1, style=line.style_solid)
+                current_tp_label := label.new(bar_index + 1, take_profit, "TP", color=tp_color, textcolor=color.white, style=label.style_label_left, size=size.tiny)
+        
+        setup_active_bull := false
+        bull_liq_swept := false
+        
+        // Track performance
+        total_signals += 1
+        active_trades += 1
+
+// ═══════════════════════════════════════════════════════════════════
+// TRADE OUTCOME TRACKING
+// ═══════════════════════════════════════════════════════════════════
+
+var bool trade_active = false
+
+if not manual_entry_mode
+    if bull_entry
+        trade_active := true
+
+    if trade_active and not na(entry_price)
+        if high >= take_profit
+            label.new(bar_index, high, "TP ✓", color=color.new(color.green, 0), textcolor=color.white, style=label.style_label_down, size=size.small)
+            trade_active := false
+            tp_hits += 1
+            active_trades -= 1
+            if not na(current_sl_line)
+                line.delete(current_sl_line)
+            if not na(current_tp_line)
+                line.delete(current_tp_line)
+            if not na(current_sl_label)
+                label.delete(current_sl_label)
+            if not na(current_tp_label)
+                label.delete(current_tp_label)
+        else if low <= stop_loss
+            label.new(bar_index, low, "SL ✗", color=color.new(color.red, 0), textcolor=color.white, style=label.style_label_up, size=size.small)
+            trade_active := false
+            sl_hits += 1
+            active_trades -= 1
+            if not na(current_sl_line)
+                line.delete(current_sl_line)
+            if not na(current_tp_line)
+                line.delete(current_tp_line)
+            if not na(current_sl_label)
+                label.delete(current_sl_label)
+            if not na(current_tp_label)
+                label.delete(current_tp_label)
+
+// ═══════════════════════════════════════════════════════════════════
+// PERFORMANCE STATS TABLE
+// ═══════════════════════════════════════════════════════════════════
+
+if show_stats_table and barstate.islast
+    // Calculate stats
+    int completed_trades = tp_hits + sl_hits
+    float win_rate = completed_trades > 0 ? (tp_hits / completed_trades) * 100 : 0
+    float loss_rate = completed_trades > 0 ? (sl_hits / completed_trades) * 100 : 0
+    
+    // Create table
+    var table stats_table = table.new(position = table_position == "top_left" ? position.top_left :table_position == "top_center" ? position.top_center :table_position == "top_right" ? position.top_right :table_position == "middle_left" ? position.middle_left :table_position == "middle_center" ? position.middle_center :table_position == "middle_right" ? position.middle_right :table_position == "bottom_left" ? position.bottom_left :table_position == "bottom_center" ? position.bottom_center :position.bottom_right,columns = 2,rows = 7,bgcolor = color.new(color.black, 10),border_width = 2,border_color = color.new(color.blue, 50),frame_width = 1,frame_color = color.new(color.blue, 70))
+    
+    // Header
+    table.cell(stats_table, 0, 0, "📊 Performance Stats", text_color = color.white, text_size = size.normal, bgcolor = color.new(color.blue, 30),text_halign = text.align_center), table.merge_cells(stats_table, 0, 0, 1, 0)
+    
+    // Total Signals
+    table.cell(stats_table, 0, 1, "Total Signals", text_color = color.new(color.white, 20), text_size = size.small,bgcolor = color.new(color.gray, 80),text_halign = text.align_left)
+    table.cell(stats_table, 1, 1, str.tostring(total_signals), text_color = color.white, text_size = size.small,bgcolor = color.new(color.gray, 80),text_halign = text.align_right)
+    
+    // TP Hits
+    table.cell(stats_table, 0, 2, "TP Hits ✓", text_color = color.new(color.white, 20), text_size = size.small,bgcolor = color.new(color.green, 85),text_halign = text.align_left)
+    table.cell(stats_table, 1, 2, str.tostring(tp_hits), text_color = color.green, text_size = size.small,bgcolor = color.new(color.green, 85),text_halign = text.align_right)
+    
+    // SL Hits
+    table.cell(stats_table, 0, 3, "SL Hits ✗", text_color = color.new(color.white, 20), text_size = size.small,bgcolor = color.new(color.red, 85),text_halign = text.align_left)
+    table.cell(stats_table, 1, 3, str.tostring(sl_hits), text_color = color.red, text_size = size.small,bgcolor = color.new(color.red, 85),text_halign = text.align_right)
+    
+    // Active Trades
+    table.cell(stats_table, 0, 4, "Active", text_color = color.new(color.white, 20), text_size = size.small,bgcolor = color.new(color.orange, 85),text_halign = text.align_left)
+    table.cell(stats_table, 1, 4, str.tostring(active_trades), text_color = color.orange, text_size = size.small,bgcolor = color.new(color.orange, 85),text_halign = text.align_right)
+    
+    // Win Rate
+    table.cell(stats_table, 0, 5, "Win Rate", text_color = color.new(color.white, 20), text_size = size.small,bgcolor = color.new(color.blue, 80),text_halign = text.align_left)
+    table.cell(stats_table, 1, 5, str.tostring(win_rate, "#.##") + "%", text_color = win_rate >= 50 ? color.green : color.red,  text_size = size.small, bgcolor = color.new(color.blue, 80),text_halign = text.align_right)
+    
+    // Loss Rate
+    table.cell(stats_table, 0, 6, "Loss Rate", text_color = color.new(color.white, 20), text_size = size.small, bgcolor = color.new(color.blue, 80),text_halign = text.align_left)
+    table.cell(stats_table, 1, 6, str.tostring(loss_rate, "#.##") + "%", text_color = color.new(color.white, 30), text_size = size.small, bgcolor = color.new(color.blue, 80),text_halign = text.align_right)
+
+// ═══════════════════════════════════════════════════════════════════
+// ALERTS
+// ═══════════════════════════════════════════════════════════════════
+
+alertcondition(bull_entry, title="Bullish Entry Signal", message="4H Setup: Bullish Entry on {{ticker}}")
+alertcondition(bull_liq_swept, title="Sellside Liquidity Swept", message="Sellside liquidity swept on {{ticker}}")
+
+plotshape(not allowed_timeframe, title="Wrong Timeframe Warning", location=location.top, color=color.red, style=shape.labeldown, text="⚠️ 15min Only", textcolor=color.white, size=size.normal)
+
+plot(na, "Indicator Active", display=display.none)

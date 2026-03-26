@@ -1,0 +1,225 @@
+//copyright by Hammywong
+//@version=5 
+indicator("Smart Liquidity & Trend Engine V6.4 (Dual Momentum)", overlay=true, max_boxes_count=200)
+
+// ==========================================
+// ⚙️ 核心参数面板
+// ==========================================
+fractalPeriods = input.int(2, "Fractal Periods", minval=2, group="1. Fractal Engine")
+htfRes         = input.timeframe("60", "HTF Resolution", group="1. Fractal Engine")
+
+atrPeriod      = input.int(14, "ATR Period", group="2. Cluster Engine")
+clusterMult    = input.float(0.4, "Zone Width (ATR Mult)", group="2. Cluster Engine")
+minPoints      = input.int(3, "Min Fractals to form Cluster", group="2. Cluster Engine")
+
+maxZones       = input.int(20, "Max Zones Limit", group="3. Strength Engine")
+decayFactor    = input.float(200.0, "Time Decay Factor", group="3. Strength Engine")
+
+minPenetration = input.float(0.1, "Min Sweep Depth (ATR Mult)", group="4. Sweep Engine")
+wickBodyRatio  = input.float(1.5, "Min Wick/Body Ratio", group="4. Sweep Engine")
+
+useMSS         = input.bool(false, "Require Micro MSS", group="5. Structure Engine") 
+showEma        = input.bool(true, "Trend Filter (EMA 50/200)", group="6. Trend Engine")
+emaSlopeLen    = input.int(10, "EMA Slope Lookback", group="6. Trend Engine")
+
+// 全局计算
+atr = ta.atr(atrPeriod)
+tolerance = atr * clusterMult
+sweepDepth = atr * minPenetration
+
+// ==========================================
+// 🧱 Engine 1: Fractal Engine
+// ==========================================
+float ltfTop = ta.pivothigh(high, fractalPeriods, fractalPeriods)
+float ltfBot = ta.pivotlow(low, fractalPeriods, fractalPeriods)
+
+float htfTop = request.security(syminfo.tickerid, htfRes, ta.pivothigh(high, fractalPeriods, fractalPeriods))
+float htfBot = request.security(syminfo.tickerid, htfRes, ta.pivotlow(low, fractalPeriods, fractalPeriods))
+
+// ==========================================
+// 🧱 Engine 2 & 3: Cluster & Strength Engine
+// ==========================================
+var float[] zPrices  = array.new_float(0)
+var float[] zSum     = array.new_float(0)
+var int[]   zCounts  = array.new_int(0)
+var int[]   zBirth   = array.new_int(0)
+var bool[]  arrIsTop = array.new_bool(0)
+var box[]   zBoxes   = array.new_box(0)
+
+get_zone_score(index) => array.get(zCounts, index) * math.exp(-(bar_index - array.get(zBirth, index)) / decayFactor)
+
+prune_zones() =>
+    if array.size(zPrices) > maxZones
+        float minScore = 999999.0
+        int minIndex = -1
+        for i = 0 to array.size(zPrices) - 1
+            if get_zone_score(i) < minScore
+                minScore := get_zone_score(i)
+                minIndex := i
+        if minIndex != -1
+            box.delete(array.get(zBoxes, minIndex))
+            array.remove(zPrices, minIndex)
+            array.remove(zSum, minIndex)
+            array.remove(zCounts, minIndex)
+            array.remove(zBirth, minIndex)
+            array.remove(arrIsTop, minIndex)
+            array.remove(zBoxes, minIndex)
+
+manage_zones(fPrice, isTop, isHTF) =>
+    found = false
+    weight = isHTF ? 3 : 1 
+    
+    if array.size(zPrices) > 0
+        for i = 0 to array.size(zPrices) - 1
+            if math.abs(fPrice - array.get(zPrices, i)) <= tolerance and array.get(arrIsTop, i) == isTop
+                newCount = array.get(zCounts, i) + weight
+                newSum   = array.get(zSum, i) + (fPrice * weight)
+                newAvg   = newSum / newCount
+                
+                array.set(zCounts, i, newCount)
+                array.set(zSum, i, newSum)
+                array.set(zPrices, i, newAvg) 
+                
+                b = array.get(zBoxes, i)
+                box.set_top(b, newAvg + (tolerance/2))
+                box.set_bottom(b, newAvg - (tolerance/2))
+                
+                score = get_zone_score(i)
+                color bgc = color.new(color.gray, 90)
+                if score >= 5.0      
+                    bgc := isTop ? color.new(color.maroon, 50) : color.new(color.teal, 50)
+                else if score >= 2.5 
+                    bgc := isTop ? color.new(color.maroon, 70) : color.new(color.teal, 70)
+                else if score >= 1.0 
+                    bgc := isTop ? color.new(color.maroon, 85) : color.new(color.teal, 85)
+                
+                if newCount >= minPoints
+                    box.set_bgcolor(b, bgc)
+                    box.set_border_color(b, isTop ? color.red : color.lime)
+                    box.set_border_style(b, line.style_solid)
+                
+                found := true
+                break
+    
+    if not found
+        array.push(zPrices, fPrice)
+        array.push(zSum, fPrice * weight)
+        array.push(zCounts, weight)
+        array.push(zBirth, bar_index)
+        array.push(arrIsTop, isTop)
+        
+        newBox = box.new(left=bar_index - fractalPeriods, top=fPrice + (tolerance/2), right=bar_index + 10, bottom=fPrice - (tolerance/2), bgcolor=color.new(color.gray, 90), border_style=line.style_dotted)
+        array.push(zBoxes, newBox)
+        prune_zones()
+
+if not na(ltfTop)
+    manage_zones(ltfTop, true, false)
+if not na(ltfBot)
+    manage_zones(ltfBot, false, false)
+if not na(htfTop)
+    manage_zones(htfTop, true, true)
+if not na(htfBot)
+    manage_zones(htfBot, false, true)
+
+// ==========================================
+// 🧱 Engine 4 & 5: Sweep & Structure Engine
+// ==========================================
+bool isBullSweep = false
+bool isBearSweep = false
+
+body = math.abs(close - open)
+lowerWick = math.min(open, close) - low
+upperWick = high - math.max(open, close)
+bullWickValid = lowerWick > body * wickBodyRatio
+bearWickValid = upperWick > body * wickBodyRatio
+
+bullMSS = useMSS ? (close > high[1]) : true
+bearMSS = useMSS ? (close < low[1]) : true
+
+float closestBullZoneDist = 999999.0
+float closestBearZoneDist = 999999.0
+
+if array.size(zPrices) > 0
+    for i = array.size(zPrices) - 1 to 0
+        if array.get(zCounts, i) >= minPoints
+            zAvg = array.get(zPrices, i)
+            zTop = zAvg + (tolerance/2)
+            zBot = zAvg - (tolerance/2)
+            isZoneTop = array.get(arrIsTop, i) 
+            
+            if (isZoneTop and close > zTop) or (not isZoneTop and close < zBot)
+                box.delete(array.get(zBoxes, i))
+                array.remove(zPrices, i)
+                array.remove(zSum, i)
+                array.remove(zCounts, i)
+                array.remove(zBirth, i)
+                array.remove(arrIsTop, i) 
+                array.remove(zBoxes, i)
+                continue
+            
+            if not isZoneTop and low <= (zBot - sweepDepth) and close > zBot and bullWickValid and bullMSS
+                dist = math.abs(close - zBot)
+                if dist < closestBullZoneDist
+                    closestBullZoneDist := dist
+                    isBullSweep := true
+                    
+            if isZoneTop and high >= (zTop + sweepDepth) and close < zTop and bearWickValid and bearMSS
+                dist = math.abs(close - zTop)
+                if dist < closestBearZoneDist
+                    closestBearZoneDist := dist
+                    isBearSweep := true
+
+if array.size(zBoxes) > 0
+    for i = 0 to array.size(zBoxes) - 1
+        if array.get(zCounts, i) >= minPoints
+            box.set_right(array.get(zBoxes, i), bar_index + 5)
+
+// ==========================================
+// 🧱 Engine 6: Dual Trend & Signal Engine (动能共振引擎)
+// ==========================================
+ema50  = ta.ema(close, 50)
+ema200 = ta.ema(close, 200)
+
+// EMA 200 (宏观动能)
+ema200Up = ema200 > ema200[emaSlopeLen]
+ema200Dn = ema200 < ema200[emaSlopeLen]
+colorEma200 = ema200Up ? color.lime : ema200Dn ? color.red : color.gray
+
+// EMA 50 (中短期动能) —— 你的绝妙想法！
+ema50Up = ema50 > ema50[emaSlopeLen]
+ema50Dn = ema50 < ema50[emaSlopeLen]
+colorEma50 = ema50Up ? color.lime : ema50Dn ? color.red : color.gray
+
+// 共振变色瞬间警报
+turnGreen = ema200Up and ema50Up and not (ema200Up[1] and ema50Up[1])
+turnRed   = ema200Dn and ema50Dn and not (ema200Dn[1] and ema50Dn[1])
+
+// 严格的顺势条件：只有双线同色，且多头50>200，空头50<200，才算有效趋势
+isUptrend   = close > ema200 and ema50 > ema200 and ema200Up and ema50Up
+isDowntrend = close < ema200 and ema50 < ema200 and ema200Dn and ema50Dn
+
+validLong  = showEma ? (isBullSweep and isUptrend) : isBullSweep
+validShort = showEma ? (isBearSweep and isDowntrend) : isBearSweep
+
+// --- 绘图 ---
+// 1. 动能共振双均线
+plot(showEma ? ema50 : na, color=colorEma50, linewidth=2, title="EMA 50 (Short-Term Momentum)")
+plot(showEma ? ema200 : na, color=colorEma200, linewidth=3, title="EMA 200 (Macro Trend)")
+
+// 2. 共振背景提示
+plotshape(turnGreen, "Dual Trend GREEN", shape.triangleup, location.bottom, color.lime, size=size.normal)
+plotshape(turnRed, "Dual Trend RED", shape.triangledown, location.top, color.red, size=size.normal)
+bgcolor(turnGreen ? color.new(color.lime, 90) : na, title="Green Trend Background")
+bgcolor(turnRed ? color.new(color.red, 90) : na, title="Red Trend Background")
+
+// 3. POI 信号点
+plotshape(validLong, "Sweep Entry (Long)", shape.circle, location.belowbar, color.lime, text="POI", textcolor=color.white, size=size.tiny)
+plotshape(validShort, "Sweep Entry (Short)", shape.circle, location.abovebar, color.red, text="POI", textcolor=color.white, size=size.tiny)
+
+// ==========================================
+// 🚨 警报系统 (Alerts)
+// ==========================================
+alertcondition(turnGreen, title="🟢 Dual Trend GREEN (Bullish)", message="双均线动能共振变绿！大势正式确立转多。")
+alertcondition(turnRed, title="🔴 Dual Trend RED (Bearish)", message="双均线动能共振变红！大势正式确立转空。")
+alertcondition(validLong, title="🔼 Bullish Sweep in Uptrend", message="潜在做多 POI 确认！")
+alertcondition(validShort, title="🔽 Bearish Sweep in Downtrend", message="潜在做空 POI 确认！")

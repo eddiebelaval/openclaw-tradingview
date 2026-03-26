@@ -1,0 +1,111 @@
+//@version=5
+indicator("Bitcoin CME GAP [SAKANE]", shorttitle="GAP", overlay=true, max_boxes_count=500)
+// === 入力 === //
+maxBars    = input.int(100, title="Maximum number of bars displayed", minval=1)
+minGapPct  = input.float(0.5, title="Minimum gap size (%)", minval=0.0, step=0.1)
+gapUpColor   = input.color(color.new(color.green, 80), title="Gap Up Color")
+gapDownColor = input.color(color.new(color.red, 80), title="Gap Down Color")
+rayColor     = input.color(color.new(color.yellow, 0), title="CME Close Ray Color")
+adjustPremium = input.bool(true, title="Adjust to Chart Price (Premium Removal)")
+// === 型定義 === //
+type Gap
+    box id
+    float close_level     // 表示用（チャート価格基準）
+    float cme_close_level // 充填判定用（CME価格基準）
+    float top
+    float bottom
+    bool active
+    int start_bar
+    bool is_up
+// === 状態管理 === //
+var gap_array = array.new<Gap>()
+// === 全 request.security() はグローバルスコープ === //
+// gaps_on: CME休場時はna（有効な足だけ追跡するため）
+float cme_close_on  = request.security("BTC1!", timeframe.period, close,      gaps=barmerge.gaps_on)
+float cme_open_on   = request.security("BTC1!", timeframe.period, open,       gaps=barmerge.gaps_on)
+int   cme_tc_on     = request.security("BTC1!", timeframe.period, time_close, gaps=barmerge.gaps_on)
+// gaps_off: ギャップ充填判定用（常に値がある）
+float cme_high_off  = request.security("BTC1!", timeframe.period, high,  gaps=barmerge.gaps_off)
+float cme_low_off   = request.security("BTC1!", timeframe.period, low,   gaps=barmerge.gaps_off)
+// === フラグ === //
+bool is_btc1   = str.contains(syminfo.tickerid, "BTC1!")
+bool skip      = timeframe.in_seconds() > 86400
+bool cme_valid = not na(cme_close_on)
+// === CME最終足の追跡 === //
+var float last_cme_close   = na   // CME金曜終値（価格）
+var int   last_cme_tc      = na   // CME金曜終値のtime_close（時刻）
+var float last_chart_close = na   // CME金曜終値と同時刻のチャート終値
+var line  ref_ray          = na   // CME休場中の基準価格レイ
+// === CME休場→再開の検出 === //
+// new_weekの代わりに「CMEが24時間以上閉まった後に再開した瞬間」を検出
+// これにより、CME再開時（日曜23:00 UTC = 月曜08:00 JST）の正確な足でギャップを描画
+var bool cme_was_closed = false
+// CMEが閉まったらフラグを立てる
+if not cme_valid
+    cme_was_closed := true
+// CME再開検出: 24時間以上のギャップ = 週末（日次メンテナンス1時間は無視）
+// BTC1!チャートの場合: 週末バーが存在しないため、前の足との時間差で検出
+// その他のチャート: CMEデータが復帰したタイミングで検出
+bool btc1_weekend = is_btc1 and (time - nz(time_close[1], time)) > 24 * 60 * 60 * 1000
+bool other_weekend = cme_was_closed and cme_valid and not na(last_cme_tc) and ((time - last_cme_tc) > 24 * 60 * 60 * 1000)
+bool is_weekend_reopen = btc1_weekend or other_weekend
+// === ギャップ検出 === //
+// CME再開の瞬間にギャップを描画（日足でもイントラデイでも共通）
+if not skip and is_weekend_reopen and not na(last_cme_close)
+    // ギャップ計算（常にCMEデータ基準）
+    float g_open = cme_open_on       // CME月曜始値
+    float g_prev = last_cme_close    // CME金曜終値
+    float g_diff = g_open - g_prev
+    float gap_pct = math.abs(g_diff) / g_prev * 100
+    if gap_pct >= minGapPct
+        bool  g_up  = g_open > g_prev
+        color g_col = g_up ? gapUpColor : gapDownColor
+        // 価格の決定
+        // adjustPremium ON: 両辺ともチャート価格（金曜=CME終値時間のチャート価格、月曜=チャート始値）
+        // adjustPremium OFF / BTC1!: 両辺ともCME価格
+        bool use_cme_raw = is_btc1 or not adjustPremium
+        float adj_prev = use_cme_raw ? g_prev : nz(last_chart_close, g_prev)
+        float adj_open = use_cme_raw ? g_open : open
+        float adj_top    = math.max(adj_prev, adj_open)
+        float adj_bottom = math.min(adj_prev, adj_open)
+        // ボックス左端 = CMEの金曜最終足の終了時刻
+        int g_left = na(last_cme_tc) ? time : last_cme_tc
+        box g_box  = box.new(g_left, adj_top, time, adj_bottom, border_color=na, bgcolor=g_col, xloc=xloc.bar_time)
+        array.push(gap_array, Gap.new(g_box, adj_prev, g_prev, adj_top, adj_bottom, true, bar_index, g_up))
+// CME再開後にフラグをリセット（週末/日次メンテナンス問わず）
+if cme_was_closed and cme_valid
+    cme_was_closed := false
+// === 追跡値の更新（CMEが有効な足で実行） === //
+if not skip and cme_valid
+    last_cme_close   := cme_close_on
+    last_cme_tc      := cme_tc_on
+    last_chart_close := close
+    // CMEが開いたらレイを削除
+    if not na(ref_ray)
+        line.delete(ref_ray)
+        ref_ray := na
+// === CME休場中 & BTC1!以外 → 基準価格の水平レイを表示 === //
+if not skip and not is_btc1 and not cme_valid and not na(last_cme_tc) and (not na(last_chart_close) or not na(last_cme_close))
+    float ref_price = adjustPremium ? last_chart_close : last_cme_close
+    if na(ref_ray)
+        ref_ray := line.new(last_cme_tc, ref_price, time, ref_price, xloc=xloc.bar_time, extend=extend.right, color=rayColor, style=line.style_dashed, width=1)
+    else
+        line.set_x2(ref_ray, time)
+// === ギャップ充填判定 === //
+// 常にBTC1!の価格（cme_high_off / cme_low_off）で判定する。
+// BTC1!でギャップが閉じれば、他のチャートでも閉じる。
+float chk_hi = cme_high_off
+float chk_lo = cme_low_off
+if not skip and array.size(gap_array) > 0
+    for i = array.size(gap_array) - 1 to 0
+        Gap g = array.get(gap_array, i)
+        if g.active
+            // ボックスを現在の足の終了時刻まで延長
+            box.set_right(g.id, time_close)
+            // 充填チェック（CME価格基準）
+            if not na(chk_hi) and not na(chk_lo)
+                bool filled  = g.is_up ? (chk_lo <= g.cme_close_level) : (chk_hi >= g.cme_close_level)
+                bool expired = (bar_index - g.start_bar) >= maxBars
+                if filled or expired
+                    g.active := false
+                    array.set(gap_array, i, g)

@@ -1,0 +1,219 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © BOSWaves
+
+import TradingView/ta/12 as ta 
+
+//@version=6
+indicator("Adaptive Trend Sabre [BOSWaves]", overlay=true, max_lines_count=500)
+
+// ┌────────────────────────────── BOSWaves ─ Constants ──────────────────────────────┐
+// └──────────────────────────────────────────────────────────────────────────────────┘
+const string GT = "Trend Engine"
+const string GL = "Snap Levels"
+const string GS = "Signals"
+const string GV = "Appearance"
+
+// ┌────────────────────────────── BOSWaves ─ Inputs ─────────────────────────────────┐
+// └──────────────────────────────────────────────────────────────────────────────────┘
+ma_type       = input.string("HMA", "MA Type", options=["EMA", "SMA", "WMA", "HMA", "DEMA", "TEMA", "VWMA", "ALMA", "LSMA"], group=GT, tooltip="Moving average used as the trend backbone")
+ma_len        = input.int(34,    "MA Length", maxval=200, group=GT, tooltip="Core smooth trend line — higher = smoother curve")
+trail_factor  = input.float(3.25, "Trail Distance (ATR)", step=0.25, group=GT, tooltip="How far the trailing stop sits from the MA")
+
+snap_thresh   = input.float(2.0, "Snap Threshold (ATR)",   minval=0.5, maxval=5.0,  step=0.25, group=GL, tooltip="How stretched the band must get before a level is created on release")
+level_buffer  = input.float(0.25,"Level Break Buffer (ATR)",minval=0.1, maxval=1.0,  step=0.05, group=GL, tooltip="How far past the line price must close to break it")
+max_levels    = input.int(8,     "Maximum Levels",          minval=2,   maxval=20,   group=GL)
+
+show_retests  = input.bool(true, "Show Retests",   group=GS)
+retest_cd     = input.int(5,     "Retest Cooldown", minval=2, maxval=20, group=GS, tooltip="Minimum bars between retest signals")
+
+color_up = input.color(#00ff00, "Bullish", group=GV)
+color_dn = input.color(#ff0000, "Bearish", group=GV)
+
+// ┌────────────────────────────── BOSWaves ─ MA Switch ──────────────────────────────┐
+// └──────────────────────────────────────────────────────────────────────────────────┘
+f_ma(type, float _src, int _len) =>
+    switch type
+        "EMA"  => ta.ema(_src, _len)
+        "SMA"  => ta.sma(_src, _len)
+        "WMA"  => ta.wma(_src, _len)
+        "HMA"  => ta.hma(_src, _len)
+        "DEMA" => ta.dema(_src, _len)
+        "VWMA" => ta.vwma(_src, _len)
+        "ALMA" => ta.alma(_src, _len, 0.85, 6)
+        "LSMA" => ta.linreg(_src, _len, 0)
+        => ta.ema(_src, _len)
+
+float ma = f_ma(ma_type, close, ma_len)
+
+// ┌────────────────────────────── BOSWaves ─ ATR & Tension ──────────────────────────┐
+// └──────────────────────────────────────────────────────────────────────────────────┘
+float atr_val     = ta.atr(14)
+float tension     = (close - ma) / atr_val
+float tension_abs = math.abs(tension)
+
+// ┌────────────────────────────── BOSWaves ─ Trailing Stop ──────────────────────────┐
+// └──────────────────────────────────────────────────────────────────────────────────┘
+var int   trend = 1
+var float trail = na
+
+float raw_up = ma - atr_val * trail_factor
+float raw_dn = ma + atr_val * trail_factor
+
+if na(trail)
+    trail := close > ma ? raw_up : raw_dn
+    trend := close > ma ? 1 : -1
+
+if trend == 1
+    trail := math.max(raw_up, nz(trail[1]))
+    if close < trail
+        trend := -1
+        trail := raw_dn
+else
+    trail := math.min(raw_dn, nz(trail[1]))
+    if close > trail
+        trend := 1
+        trail := raw_up
+
+bool bull_signal = trend == 1 and trend[1] == -1
+bool bear_signal = trend == -1 and trend[1] == 1
+
+// ┌────────────────────────────── BOSWaves ─ Colors ─────────────────────────────────┐
+// └──────────────────────────────────────────────────────────────────────────────────┘
+color trend_col = trend == 1 ? color_up : color_dn
+float fill_int  = math.min(tension_abs / 3.0, 1.0)
+int   fill_t    = int(95 - fill_int * 40)
+
+// ┌────────────────────────────── BOSWaves ─ Snap Levels ────────────────────────────┐
+// └──────────────────────────────────────────────────────────────────────────────────┘
+type SnapLevel
+    float price
+    bool  is_resistance
+    int   origin_bar
+    line  ln
+
+var SnapLevel[] levels = array.new<SnapLevel>()
+
+var bool  was_snap_up  = false
+var bool  was_snap_dn  = false
+var float snap_high    = na
+var float snap_low     = na
+var int   snap_high_bar = na
+var int   snap_low_bar  = na
+
+bool is_snapped_up = tension > snap_thresh
+bool is_snapped_dn = tension < -snap_thresh
+
+// Track extremes while stretched
+if is_snapped_up
+    was_snap_up := true
+    if na(snap_high) or high > snap_high
+        snap_high     := high
+        snap_high_bar := bar_index
+
+if is_snapped_dn
+    was_snap_dn := true
+    if na(snap_low) or low < snap_low
+        snap_low     := low
+        snap_low_bar := bar_index
+
+// Release detection
+bool released_high = was_snap_up and not is_snapped_up and tension < snap_thresh * 0.5
+bool released_low  = was_snap_dn and not is_snapped_dn and tension > -snap_thresh * 0.5
+
+// Create resistance on release
+if released_high and not na(snap_high)
+    if levels.size() >= max_levels
+        SnapLevel old = levels.shift()
+        line ol = old.ln
+        line.delete(ol)
+    line new_ln = line.new(snap_high_bar, snap_high, bar_index + 50, snap_high,
+         color=color.new(color_dn, 30), width=4, style=line.style_dotted)
+    levels.push(SnapLevel.new(snap_high, true, snap_high_bar, new_ln))
+    was_snap_up   := false
+    snap_high     := na
+    snap_high_bar := na
+
+// Create support on release
+if released_low and not na(snap_low)
+    if levels.size() >= max_levels
+        SnapLevel old = levels.shift()
+        line ol = old.ln
+        line.delete(ol)
+    line new_ln = line.new(snap_low_bar, snap_low, bar_index + 50, snap_low,
+         color=color.new(color_up, 30), width=4, style=line.style_dotted)
+    levels.push(SnapLevel.new(snap_low, false, snap_low_bar, new_ln))
+    was_snap_dn  := false
+    snap_low     := na
+    snap_low_bar := na
+
+// Update: extend or remove broken levels
+if levels.size() > 0
+    int i = levels.size() - 1
+    while i >= 0
+        SnapLevel lvl = levels.get(i)
+        float buf = atr_val * level_buffer
+        bool broken = lvl.is_resistance ? close > lvl.price + buf : close < lvl.price - buf
+        if broken
+            line dl = lvl.ln
+            line.delete(dl)
+            levels.remove(i)
+        else
+            line ul = lvl.ln
+            line.set_x2(ul, bar_index + 50)
+        i -= 1
+
+// ┌────────────────────────────── BOSWaves ─ Retest Detection ───────────────────────┐
+// └──────────────────────────────────────────────────────────────────────────────────┘
+var int last_retest = 0
+bool retest_ok  = bar_index - last_retest > retest_cd
+bool bull_retest = false
+bool bear_retest = false
+
+if show_retests and retest_ok
+
+    // ── Trail line retests ──
+    if trend == 1 and low <= trail and close > trail
+        bull_retest := true
+
+    if trend == -1 and high >= trail and close < trail
+        bear_retest := true
+
+    // ── Snap level retests ──
+    if levels.size() > 0
+        for j = 0 to levels.size() - 1
+            SnapLevel lvl = levels.get(j)
+            if not lvl.is_resistance and low <= lvl.price and close > lvl.price and trend == 1
+                bull_retest := true
+            if lvl.is_resistance and high >= lvl.price and close < lvl.price and trend == -1
+                bear_retest := true
+
+if bull_retest or bear_retest
+    last_retest := bar_index
+
+// ┌────────────────────────────── BOSWaves ─ Plot ───────────────────────────────────┐
+// └──────────────────────────────────────────────────────────────────────────────────┘
+p_ma = plot(ma, "Trend MA", color=color.new(trend_col, 30), linewidth=1)
+
+p_trail = plot(trend != trend[1] ? na : trail, "Trail", color=trend_col, style=plot.style_linebr, linewidth=2)
+
+fill(p_ma, p_trail, ma, trail,
+     color.new(trend_col, fill_t),
+     color.new(trend_col, 97),
+     "Elastic Cloud")
+
+plotshape(bull_signal ? trail : na, "Buy",       shape.diamond, location.absolute, color_up,                 size=size.tiny)
+plotshape(bull_signal ? trail : na, "Buy Glow",  shape.diamond, location.absolute, color.new(color_up, 60),  size=size.small)
+plotshape(bear_signal ? trail : na, "Sell",      shape.diamond, location.absolute, color_dn,                 size=size.tiny)
+plotshape(bear_signal ? trail : na, "Sell Glow", shape.diamond, location.absolute, color.new(color_dn, 60),  size=size.small)
+
+plotchar(bull_retest ? low - atr_val * 0.5 : na,  "Bull Retest", "✦", location.absolute, color_up, size=size.tiny)
+plotchar(bear_retest ? high + atr_val * 0.5 : na, "Bear Retest", "✦", location.absolute, color_dn, size=size.tiny)
+
+plotcandle(open, high, low, close, color=trend_col, wickcolor=trend_col, bordercolor=trend_col)
+
+// ┌────────────────────────────── BOSWaves ─ Alerts ─────────────────────────────────┐
+// └──────────────────────────────────────────────────────────────────────────────────┘
+alertcondition(bull_signal, "MA Bull", "Adaptive Trend Band bullish {{ticker}}")
+alertcondition(bear_signal, "MA Bear", "Adaptive Trend Band bearish {{ticker}}")
+alertcondition(bull_retest, "Bull Retest", "Bullish retest {{ticker}}")
+alertcondition(bear_retest, "Bear Retest", "Bearish retest {{ticker}}")

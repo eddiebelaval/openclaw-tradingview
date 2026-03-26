@@ -1,0 +1,223 @@
+//@version=6
+indicator("VL: Macro Regime Swing", shorttitle="VL: Macro Regime Swing", overlay=true)
+
+// █████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████
+//                                                      INPUTS
+// █████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████
+
+group_ma = "Trend Engine (Entries)"
+ma_fast_len  = input.int(20, "Fast MA Length", group=group_ma)
+ma_slow_len  = input.int(50, "Slow MA Length", group=group_ma)
+
+group_exit = "Exit Engine (Trailing Stop)"
+ma_exit_len  = input.int(10, "Exit MA Length", group=group_exit, tooltip="A tighter MA (like 9 or 10) locks in momentum profits faster.")
+
+group_vol = "HTF Volume (OBV)"
+obv_ma_len   = input.int(20, "OBV MA Length", group=group_vol)
+
+group_macro = "Macro Regime Filter (Historical Range)"
+use_macro    = input.bool(true, "Enable Macro Filter?", group=group_macro)
+macro_len    = input.int(60, "Historical Range Lookback (Days)", group=group_macro)
+chop_confirm = input.int(7, "Days Required to Lock Zone", group=group_macro)
+max_zone_pct = input.float(200.0, "Max Allowed Zone Height (%)", step=10.0, group=group_macro)
+
+group_conf = "Trade Management"
+tp_pct       = input.float(5.0, "Take Profit Target (%)", step=0.5, group=group_conf)
+
+group_ui = "Appearance"
+show_dash    = input.bool(true, "Show Dashboard", group=group_ui)
+
+// VectorPro Brand Colors
+c_cyan   = color.new(#00E5FF, 0)
+c_pink   = color.new(#FF2E63, 0)
+c_silver = color.new(#B2B5BE, 0)
+c_tp     = color.new(#00E676, 0)
+c_exit_line = color.new(color.yellow, 40)
+
+// Softened Label Backgrounds (15% transparency for elegance)
+c_cyan_lbl = color.new(#00E5FF, 15)
+c_pink_lbl = color.new(#FF2E63, 15)
+
+// Graceful Architectural Step Lines
+c_macro_faint  = color.new(#9C27B0, 85) 
+c_macro_active = color.new(#9C27B0, 30) 
+
+// █████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████
+//                                                      CALCULATIONS
+// █████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████
+
+// Core MAs
+ma_fast = ta.ema(close, ma_fast_len)
+ma_slow = ta.ema(close, ma_slow_len)
+ma_exit = ta.ema(close, ma_exit_len)
+
+// OBV
+obv_val = ta.obv 
+obv_ma  = ta.ema(obv_val, obv_ma_len)
+
+// --- MACRO REGIME DETECTION ENGINE ---
+mac_top = ta.highest(high, macro_len)
+mac_bot = ta.lowest(low, macro_len)
+
+mac_bot := mac_bot <= 0.001 ? low : mac_bot
+
+hi_bars = math.abs(nz(ta.highestbars(high, macro_len)))
+lo_bars = math.abs(nz(ta.lowestbars(low, macro_len)))
+
+is_macro_chop = (hi_bars >= chop_confirm) and (lo_bars >= chop_confirm) and (bar_index > macro_len)
+
+zone_height_pct = mac_bot > 0 ? ((mac_top - mac_bot) / mac_bot) * 100 : 999999
+if zone_height_pct > max_zone_pct
+    is_macro_chop := false
+
+macro_block = use_macro ? is_macro_chop : false
+
+// --- STRICT CONFIRMATION LOGIC ---
+is_green = close > open
+is_red   = close < open
+
+struct_bull = ma_fast > ma_slow
+struct_bear = ma_fast < ma_slow
+
+break_high = close > high[1]
+break_low  = close < low[1]
+
+act_bull = close > ma_fast and is_green and break_high
+act_bear = close < ma_fast and is_red and break_low
+
+vol_bull = obv_val > obv_ma
+vol_bear = obv_val < obv_ma
+
+// Triggers 
+trig_long  = struct_bull and act_bull and vol_bull and not macro_block and barstate.isconfirmed
+trig_short = struct_bear and act_bear and vol_bear and not macro_block and barstate.isconfirmed
+
+// Exit Triggers (Now driven entirely by the decoupled Exit MA)
+exit_long  = close < ma_exit and barstate.isconfirmed
+exit_short = close > ma_exit and barstate.isconfirmed
+
+// █████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████
+//                                                      STATE & TRADE MANAGEMENT
+// █████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████
+
+var int trade_state = 0 
+var float entry_price = na
+var bool tp1_hit = false
+
+bool fire_long = false
+bool fire_short = false
+bool fire_exit_long = false
+bool fire_exit_short = false
+bool fire_tp1 = false
+
+if trade_state == 0
+    if trig_long
+        trade_state := 1
+        entry_price := close
+        tp1_hit := false
+        fire_long := true
+    else if trig_short
+        trade_state := -1
+        entry_price := close
+        tp1_hit := false
+        fire_short := true
+
+else if trade_state == 1
+    if not tp1_hit and high >= entry_price * (1 + (tp_pct/100))
+        tp1_hit := true
+        fire_tp1 := true
+
+    if exit_long or trig_short
+        trade_state := 0
+        fire_exit_long := true
+        if trig_short
+            trade_state := -1
+            entry_price := close
+            tp1_hit := false
+            fire_short := true
+
+else if trade_state == -1
+    if not tp1_hit and low <= entry_price * (1 - (tp_pct/100))
+        tp1_hit := true
+        fire_tp1 := true
+
+    if exit_short or trig_long
+        trade_state := 0
+        fire_exit_short := true
+        if trig_long
+            trade_state := 1
+            entry_price := close
+            tp1_hit := false
+            fire_long := true
+
+// █████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████
+//                                                      PLOTTING & VISUALS
+// █████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████
+
+// --- GRACEFUL MACRO REGIME STEP LINES ---
+plot(use_macro ? mac_top : na, "Macro Ceiling", is_macro_chop ? c_macro_active : c_macro_faint, 1, plot.style_stepline)
+plot(use_macro ? mac_bot : na, "Macro Floor", is_macro_chop ? c_macro_active : c_macro_faint, 1, plot.style_stepline)
+
+// MAs
+plot(ma_fast, "Fast Entry MA", c_cyan, 2)
+plot(ma_slow, "Slow Trend MA", color.new(#FF6D00,0), 2)
+plot(ma_exit, "Momentum Exit MA", c_exit_line, 1, plot.style_circles) // FIXED: Uses circles to render a perfect dotted line
+
+// --- SLEEK VECTORPRO LABELS ---
+plotshape(series=fire_long, title="Buy Entry", style=shape.labelup, location=location.belowbar, color=c_cyan_lbl, text="BUY", textcolor=color.black, size=size.small)
+plotshape(series=fire_short, title="Sell Entry", style=shape.labeldown, location=location.abovebar, color=c_pink_lbl, text="SELL", textcolor=color.white, size=size.small)
+
+plotshape(series=fire_exit_long, title="Exit Long", style=shape.circle, location=location.abovebar, color=c_silver, text="EXIT", textcolor=color.white, size=size.tiny)
+plotshape(series=fire_exit_short, title="Exit Short", style=shape.circle, location=location.belowbar, color=c_silver, text="EXIT", textcolor=color.white, size=size.tiny)
+
+plotshape(series=fire_tp1 and trade_state == 1, title="TP Long", style=shape.flag, location=location.abovebar, color=c_tp, text="TP", textcolor=color.white, size=size.small)
+plotshape(series=fire_tp1 and trade_state == -1, title="TP Short", style=shape.flag, location=location.belowbar, color=c_tp, text="TP", textcolor=color.white, size=size.small)
+
+barcolor(trade_state == 1 ? color.new(c_cyan, 75) : trade_state == -1 ? color.new(c_pink, 75) : na)
+barcolor(is_macro_chop and trade_state == 0 ? color.new(color.white, 70) : na, title="Macro Trap Warning") 
+
+// --- DASHBOARD ---
+add_row(tbl, row, left_txt, right_txt, right_col) =>
+    table.cell(tbl, 0, row, left_txt, text_color=color.white, bgcolor=color.new(color.black, 40), text_halign=text.align_left, text_size=size.small) 
+    table.cell(tbl, 1, row, right_txt, text_color=right_col, bgcolor=row % 2 == 0 ? color.new(color.rgb(30, 30, 35), 20) : color.new(color.rgb(40, 40, 45), 20), text_halign=text.align_center, text_size=size.small)
+
+var table dash = table.new(position.top_right, 2, 7, bgcolor=color.new(color.black, 0), border_width=1, border_color=color.new(color.gray, 50))
+
+if show_dash and barstate.islast 
+    table.cell(dash, 0, 0, "VL: Macro Regime Swing", text_color=color.white, bgcolor=color.new(#00101A, 0), width=3, text_halign=text.align_center)
+    table.cell(dash, 1, 0, "Status", text_color=color.white, bgcolor=color.new(#00101A, 0), width=4, text_halign=text.align_center)
+    
+    str_stat = trade_state == 1 ? "IN LONG" : trade_state == -1 ? "IN SHORT" : "FLAT"
+    col_stat = trade_state == 1 ? c_cyan : trade_state == -1 ? c_pink : color.silver
+    add_row(dash, 1, "Current Trade:", str_stat, col_stat)
+
+    str_tp = trade_state == 0 ? "N/A" : tp1_hit ? "PROFIT SECURED" : "WAITING TARGET"
+    col_tp = tp1_hit ? c_tp : color.silver
+    add_row(dash, 2, "Partial Profit:", str_tp, col_tp)
+
+    str_box = is_macro_chop ? "TRAPPED (Blocked)" : "TRENDING"
+    col_box = is_macro_chop ? color.new(#9C27B0, 0) : c_cyan
+    add_row(dash, 3, "Macro Range Status:", str_box, col_box)
+
+    str_trend = struct_bull ? "BULLISH" : struct_bear ? "BEARISH" : "RANGING"
+    col_trend = struct_bull ? c_cyan : struct_bear ? c_pink : color.silver
+    add_row(dash, 4, "Price Trend:", str_trend, col_trend)
+
+    str_obv = vol_bull ? "RISING" : vol_bear ? "FALLING" : "FLAT" 
+    col_obv = vol_bull ? c_cyan : vol_bear ? c_pink : color.silver
+    add_row(dash, 5, "HTF OBV:", str_obv, col_obv)
+
+    add_row(dash, 6, "Entry Price:", na(entry_price) or trade_state == 0 ? "N/A" : str.tostring(entry_price, format.mintick), col_stat)
+
+// █████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████
+//                                                      ALERTS
+// █████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████
+
+if fire_long
+    alert("VL Macro: New Long Entry on " + syminfo.ticker, alert.freq_once_per_bar_close)
+if fire_short
+    alert("VL Macro: New Short Entry on " + syminfo.ticker, alert.freq_once_per_bar_close)
+if fire_exit_long or fire_exit_short
+    alert("VL Macro: Exit Position on " + syminfo.ticker, alert.freq_once_per_bar_close)
+if fire_tp1
+    alert("VL Macro: TP Hit (Secure 50%) on " + syminfo.ticker, alert.freq_once_per_bar_close)

@@ -1,0 +1,192 @@
+//@version=5
+indicator("Supply & Demand Zones + Triple EMA Pro", overlay = true, max_boxes_count = 500)
+
+// ── Inputs ───────────────────────────────────────────────
+leftBars            = input.int(5, "Pivot Left Bars", minval = 1)
+rightBars           = input.int(3, "Pivot Right Bars", minval = 1)
+zoneExtend          = input.int(50, "Extend boxes right (bars)", minval = 10)
+showLabels          = input.bool(true, "Show S/D labels")
+
+showEMA21           = input.bool(true, "Show EMA 21")
+showEMA50           = input.bool(true, "Show EMA 50")
+showEMA200          = input.bool(true, "Show EMA 200")
+colorBarsByEMA      = input.bool(true, "Color candles by EMA bias")
+
+useEMABiasFilter    = input.bool(true, "Filter zones by EMA bias")
+requireDisplacement = input.bool(true, "Require displacement")
+atrLength           = input.int(14, "ATR Length", minval = 1)
+impulseATRMult      = input.float(1.2, "Minimum impulse size (ATR multiple)", minval = 0.1, step = 0.1)
+lookAheadBars       = input.int(4, "Displacement look-ahead bars", minval = 1, maxval = 10)
+maxBaseCandles      = input.int(6, "Max candles to find base candle", minval = 1, maxval = 20)
+
+// ── EMA calculations ─────────────────────────────────────
+ema21  = ta.ema(close, 21)
+ema50  = ta.ema(close, 50)
+ema200 = ta.ema(close, 200)
+
+plot(showEMA21 ? ema21 : na, title = "EMA 21", color = color.green, linewidth = 2)
+plot(showEMA50 ? ema50 : na, title = "EMA 50", color = color.orange, linewidth = 2)
+plot(showEMA200 ? ema200 : na, title = "EMA 200", color = color.blue, linewidth = 2)
+
+// ── ATR ───────────────────────────────────────────────────
+atr = ta.atr(atrLength)
+
+// ── EMA bias logic ───────────────────────────────────────
+bullStack = ema21 > ema50 and ema50 > ema200
+bearStack = ema21 < ema50 and ema50 < ema200
+
+barCol = colorBarsByEMA ? (
+     bullStack ? color.lime :
+     bearStack ? color.red :
+     color.gray
+ ) : na
+
+barcolor(barCol)
+
+// ── Swing detection ──────────────────────────────────────
+ph = ta.pivothigh(leftBars, rightBars)
+pl = ta.pivotlow(leftBars, rightBars)
+
+// ── Zone storage ─────────────────────────────────────────
+var box[] supplyBoxes = array.new_box()
+var box[] demandBoxes = array.new_box()
+
+// ── Helpers ──────────────────────────────────────────────
+f_isBull(idx) =>
+    close[idx] > open[idx]
+
+f_isBear(idx) =>
+    close[idx] < open[idx]
+
+f_findLastBullish(startIdx, maxLookback) =>
+    int found = na
+    for x = startIdx to startIdx + maxLookback - 1
+        if f_isBull(x)
+            found := x
+            break
+    found
+
+f_findLastBearish(startIdx, maxLookback) =>
+    int found = na
+    for x = startIdx to startIdx + maxLookback - 1
+        if f_isBear(x)
+            found := x
+            break
+    found
+
+f_highestFromOffset(startIdx, barsCount) =>
+    float hh = high[startIdx]
+    for x = startIdx to startIdx - barsCount + 1
+        if x >= 0
+            hh := math.max(hh, high[x])
+    hh
+
+f_lowestFromOffset(startIdx, barsCount) =>
+    float ll = low[startIdx]
+    for x = startIdx to startIdx - barsCount + 1
+        if x >= 0
+            ll := math.min(ll, low[x])
+    ll
+
+// ── Supply zone logic ────────────────────────────────────
+// Pivot high confirmed at [rightBars]
+// We want:
+// 1. bearish displacement after pivot
+// 2. zone from last bullish candle near pivot
+// 3. optional EMA bearish filter
+if not na(ph)
+    pivotIdx = rightBars
+
+    // Measure move away after pivot confirmation using most recent bars between pivot and now
+    moveLow = f_lowestFromOffset(pivotIdx, lookAheadBars)
+    bearishImpulse = high[pivotIdx] - moveLow
+    hasBearDisplacement = bearishImpulse >= atr[pivotIdx] * impulseATRMult
+
+    supplyBiasOk = not useEMABiasFilter or bearStack[pivotIdx]
+
+    baseIdx = f_findLastBullish(pivotIdx, maxBaseCandles)
+    validBase = not na(baseIdx)
+
+    if validBase and supplyBiasOk and (not requireDisplacement or hasBearDisplacement)
+        zoneTop    = high[baseIdx]
+        zoneBottom = math.min(open[baseIdx], close[baseIdx])
+
+        b = box.new(
+             left = bar_index[baseIdx],
+             top = zoneTop,
+             right = bar_index + zoneExtend,
+             bottom = zoneBottom,
+             bgcolor = color.new(color.red, 85),
+             border_color = color.red,
+             border_width = 1,
+             extend = extend.right)
+        array.push(supplyBoxes, b)
+
+        if showLabels
+            label.new(
+                 bar_index[baseIdx],
+                 zoneTop,
+                 "S",
+                 color = color.red,
+                 style = label.style_label_down,
+                 textcolor = color.white,
+                 size = size.tiny)
+
+// ── Demand zone logic ────────────────────────────────────
+// Pivot low confirmed at [rightBars]
+// We want:
+// 1. bullish displacement after pivot
+// 2. zone from last bearish candle near pivot
+// 3. optional EMA bullish filter
+if not na(pl)
+    pivotIdx = rightBars
+
+    moveHigh = f_highestFromOffset(pivotIdx, lookAheadBars)
+    bullishImpulse = moveHigh - low[pivotIdx]
+    hasBullDisplacement = bullishImpulse >= atr[pivotIdx] * impulseATRMult
+
+    demandBiasOk = not useEMABiasFilter or bullStack[pivotIdx]
+
+    baseIdx = f_findLastBearish(pivotIdx, maxBaseCandles)
+    validBase = not na(baseIdx)
+
+    if validBase and demandBiasOk and (not requireDisplacement or hasBullDisplacement)
+        zoneTop    = math.max(open[baseIdx], close[baseIdx])
+        zoneBottom = low[baseIdx]
+
+        b = box.new(
+             left = bar_index[baseIdx],
+             top = zoneTop,
+             right = bar_index + zoneExtend,
+             bottom = zoneBottom,
+             bgcolor = color.new(color.green, 85),
+             border_color = color.green,
+             border_width = 1,
+             extend = extend.right)
+        array.push(demandBoxes, b)
+
+        if showLabels
+            label.new(
+                 bar_index[baseIdx],
+                 zoneBottom,
+                 "D",
+                 color = color.green,
+                 style = label.style_label_up,
+                 textcolor = color.white,
+                 size = size.tiny)
+
+// ── Mitigation - supply zones ────────────────────────────
+if array.size(supplyBoxes) > 0
+    for i = array.size(supplyBoxes) - 1 to 0
+        b = array.get(supplyBoxes, i)
+        if high > box.get_top(b)
+            box.delete(b)
+            array.remove(supplyBoxes, i)
+
+// ── Mitigation - demand zones ────────────────────────────
+if array.size(demandBoxes) > 0
+    for i = array.size(demandBoxes) - 1 to 0
+        b = array.get(demandBoxes, i)
+        if low < box.get_bottom(b)
+            box.delete(b)
+            array.remove(demandBoxes, i)

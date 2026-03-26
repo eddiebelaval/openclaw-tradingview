@@ -1,0 +1,464 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © officialjackofalltrades
+//@version=6
+indicator("Smart Money Tracker [JOAT]", shorttitle="SMT [JOAT]", overlay=true, max_boxes_count=100, max_lines_count=100, max_labels_count=100)
+
+// ────────────────────────────────────────────────────────────────────────────────
+// INPUTS 
+// ────────────────────────────────────────────────────────────────────────────────
+
+// Order Block Settings
+obGroup = "Order Block Settings"
+showOrderBlocks = input.bool(true, "Show Order Blocks", group=obGroup)
+obLookback = input.int(10, "Order Block Lookback", minval=3, group=obGroup)
+obStrength = input.float(0.5, "Minimum Strength %", minval=0.1, step=0.1, group=obGroup)
+
+// Fair Value Gap Settings
+fvgGroup = "Fair Value Gap Settings"
+showFVG = input.bool(true, "Show Fair Value Gaps", group=fvgGroup)
+fvgMinSize = input.float(0.3, "Minimum FVG Size %", minval=0.1, step=0.1, group=fvgGroup)
+fvgMaxBoxes = input.int(20, "Max FVG Boxes", minval=5, maxval=50, group=fvgGroup)
+
+// Liquidity Settings
+liqGroup = "Liquidity Settings"
+showLiquidity = input.bool(true, "Show Liquidity Zones", group=liqGroup)
+liqLookback = input.int(20, "Liquidity Lookback", minval=10, group=liqGroup)
+showSweeps = input.bool(true, "Show Liquidity Sweeps", group=liqGroup)
+
+// Market Structure Settings
+msGroup = "Market Structure Settings"
+showStructure = input.bool(true, "Show Market Structure", group=msGroup)
+swingLength = input.int(10, "Swing Length", minval=5, group=msGroup)
+showBOS = input.bool(true, "Show Break of Structure", group=msGroup)
+showCHOCH = input.bool(true, "Show Change of Character", group=msGroup)
+
+// ────────────────────────────────────────────────────────────────────────────────
+// TIMEFRAME ADAPTIVE SETTINGS
+// ────────────────────────────────────────────────────────────────────────────────
+
+// Get current timeframe in minutes
+tfMinutes = timeframe.in_seconds() / 60
+
+// Adaptive limits based on timeframe (RELAXED for better visibility)
+maxFVGsAdaptive = tfMinutes >= 240 ? 12 : tfMinutes >= 120 ? 15 : tfMinutes >= 60 ? 18 : 25
+maxOBsAdaptive = tfMinutes >= 240 ? 10 : tfMinutes >= 120 ? 12 : tfMinutes >= 60 ? 15 : 20
+minFVGSizeAdaptive = tfMinutes >= 240 ? fvgMinSize * 1.5 : tfMinutes >= 120 ? fvgMinSize * 1.2 : fvgMinSize
+minOBStrengthAdaptive = tfMinutes >= 240 ? obStrength * 1.3 : tfMinutes >= 120 ? obStrength * 1.1 : obStrength
+
+// Spacing for labels to prevent overlap (RELAXED)
+minBarsBetweenLabels = tfMinutes >= 240 ? 15 : tfMinutes >= 120 ? 12 : tfMinutes >= 60 ? 10 : 8
+var int lastSweepLabelBar = 0
+var int lastLiqLabelBar = 0
+var int lastBreakerLabelBar = 0
+
+// ────────────────────────────────────────────────────────────────────────────────
+// COLOR DEFINITIONS
+// ────────────────────────────────────────────────────────────────────────────────
+
+bullOBColor = color.rgb(76, 175, 80)
+bearOBColor = color.rgb(244, 67, 54)
+bullFVGColor = color.rgb(129, 199, 132)
+bearFVGColor = color.rgb(229, 115, 115)
+liqBullColor = color.rgb(0, 188, 212)
+liqBearColor = color.rgb(255, 87, 34)
+bosColor = color.rgb(255, 235, 59)
+chochColor = color.rgb(255, 152, 0)
+sweepColor = color.rgb(171, 71, 188)
+
+// ────────────────────────────────────────────────────────────────────────────────
+// ENHANCED ORDER BLOCK DETECTION WITH VOLUME CONFIRMATION
+// ────────────────────────────────────────────────────────────────────────────────
+
+var box[] bullishOBs = array.new<box>()
+var box[] bearishOBs = array.new<box>()
+var line[] obLines = array.new<line>()
+
+// Volume analysis for order block confirmation
+volMA = ta.sma(volume, 20)
+highVolume = volume > volMA * 1.5
+
+// Enhanced Bullish Order Block: Strong down move followed by reversal up with volume
+isBullishOB = close[2] < open[2] and close[1] < open[1] and close > open and 
+              (close - low[1]) / low[1] * 100 > minOBStrengthAdaptive and
+              (highVolume or highVolume[1])
+
+// Enhanced Bearish Order Block: Strong up move followed by reversal down with volume
+isBearishOB = close[2] > open[2] and close[1] > open[1] and close < open and 
+              (high[1] - close) / close * 100 > minOBStrengthAdaptive and
+              (highVolume or highVolume[1])
+
+// Breaker Block Detection (Failed Order Blocks)
+var float lastBullOBHigh = na
+var float lastBearOBLow = na
+var int lastBullOBBar = na
+var int lastBearOBBar = na
+
+if showOrderBlocks and isBullishOB
+    // Calculate OB strength based on volume and price action
+    obStrengthScore = math.min(100, ((close - low[1]) / low[1] * 100) * (volume / volMA))
+    obColor = obStrengthScore > 2 ? color.new(bullOBColor, 70) : color.new(bullOBColor, 85)
+    
+    obBox = box.new(bar_index - 1, low[1], bar_index + obLookback, high[1], 
+                    border_color=color.new(bullOBColor, 40), 
+                    bgcolor=obColor, 
+                    border_width=2, 
+                    text="Bull OB\n" + str.tostring(obStrengthScore, "#.#") + "%", 
+                    text_color=bullOBColor, 
+                    text_size=size.small,
+                    text_halign=text.align_left)
+    array.push(bullishOBs, obBox)
+    
+    lastBullOBHigh := high[1]
+    lastBullOBBar := bar_index - 1
+    
+    if array.size(bullishOBs) > maxOBsAdaptive
+        box.delete(array.shift(bullishOBs))
+
+if showOrderBlocks and isBearishOB
+    // Calculate OB strength based on volume and price action
+    obStrengthScore = math.min(100, ((high[1] - close) / close * 100) * (volume / volMA))
+    obColor = obStrengthScore > 2 ? color.new(bearOBColor, 70) : color.new(bearOBColor, 85)
+    
+    obBox = box.new(bar_index - 1, low[1], bar_index + obLookback, high[1], 
+                    border_color=color.new(bearOBColor, 40), 
+                    bgcolor=obColor, 
+                    border_width=2, 
+                    text="Bear OB\n" + str.tostring(obStrengthScore, "#.#") + "%", 
+                    text_color=bearOBColor, 
+                    text_size=size.small,
+                    text_halign=text.align_left)
+    array.push(bearishOBs, obBox)
+    
+    lastBearOBLow := low[1]
+    lastBearOBBar := bar_index - 1
+    
+    if array.size(bearishOBs) > maxOBsAdaptive
+        box.delete(array.shift(bearishOBs))
+
+// Breaker Block Detection (OB that failed and reversed) with anti-overlap
+breakerBull = not na(lastBearOBLow) and close > lastBearOBLow and close[1] <= lastBearOBLow
+breakerBear = not na(lastBullOBHigh) and close < lastBullOBHigh and close[1] >= lastBullOBHigh
+
+if breakerBull and (bar_index - lastBreakerLabelBar) >= minBarsBetweenLabels
+    label.new(bar_index, low, "Breaker", style=label.style_label_up, 
+             color=color.new(color.yellow, 0), textcolor=color.black, size=size.small)
+    lastBreakerLabelBar := bar_index
+
+if breakerBear and (bar_index - lastBreakerLabelBar) >= minBarsBetweenLabels
+    label.new(bar_index, high, "Breaker", style=label.style_label_down, 
+             color=color.new(color.yellow, 0), textcolor=color.black, size=size.small)
+    lastBreakerLabelBar := bar_index
+
+// ────────────────────────────────────────────────────────────────────────────────
+// ENHANCED FAIR VALUE GAP DETECTION WITH MITIGATION TRACKING
+// ────────────────────────────────────────────────────────────────────────────────
+
+var box[] bullFVGs = array.new<box>()
+var box[] bearFVGs = array.new<box>()
+var float[] bullFVGTops = array.new<float>()
+var float[] bullFVGBottoms = array.new<float>()
+var float[] bearFVGTops = array.new<float>()
+var float[] bearFVGBottoms = array.new<float>()
+
+// Bullish FVG: Gap between high[2] and low (imbalance)
+bullFVG = low > high[2] and close[1] > high[2]
+fvgBullSize = (low - high[2]) / high[2] * 100
+
+// Bearish FVG: Gap between low[2] and high (imbalance)
+bearFVG = high < low[2] and close[1] < low[2]
+fvgBearSize = (low[2] - high) / high * 100
+
+if showFVG and bullFVG and fvgBullSize > minFVGSizeAdaptive
+    fvgTop = low
+    fvgBottom = high[2]
+    fvgMid = (fvgTop + fvgBottom) / 2
+    
+    // Gradient color based on FVG size
+    fvgColor = fvgBullSize > 1.0 ? color.new(bullFVGColor, 85) : color.new(bullFVGColor, 92)
+    
+    fvgBox = box.new(bar_index - 2, fvgBottom, bar_index + 20, fvgTop, 
+                     border_color=color.new(bullFVGColor, 50), 
+                     bgcolor=fvgColor, 
+                     border_width=1, 
+                     text="FVG " + str.tostring(fvgBullSize, "#.##") + "%",
+                     text_color=bullFVGColor,
+                     text_size=size.tiny)
+    array.push(bullFVGs, fvgBox)
+    array.push(bullFVGTops, fvgTop)
+    array.push(bullFVGBottoms, fvgBottom)
+    
+    // Draw midpoint line
+    line.new(bar_index - 2, fvgMid, bar_index + 20, fvgMid, 
+            color=color.new(bullFVGColor, 60), width=1, style=line.style_dotted)
+    
+    if array.size(bullFVGs) > maxFVGsAdaptive
+        box.delete(array.shift(bullFVGs))
+        array.shift(bullFVGTops)
+        array.shift(bullFVGBottoms)
+
+if showFVG and bearFVG and fvgBearSize > minFVGSizeAdaptive
+    fvgTop = low[2]
+    fvgBottom = high
+    fvgMid = (fvgTop + fvgBottom) / 2
+    
+    // Gradient color based on FVG size
+    fvgColor = fvgBearSize > 1.0 ? color.new(bearFVGColor, 85) : color.new(bearFVGColor, 92)
+    
+    fvgBox = box.new(bar_index - 2, fvgBottom, bar_index + 20, fvgTop, 
+                     border_color=color.new(bearFVGColor, 50), 
+                     bgcolor=fvgColor, 
+                     border_width=1, 
+                     text="FVG " + str.tostring(fvgBearSize, "#.##") + "%",
+                     text_color=bearFVGColor,
+                     text_size=size.tiny)
+    array.push(bearFVGs, fvgBox)
+    array.push(bearFVGTops, fvgTop)
+    array.push(bearFVGBottoms, fvgBottom)
+    
+    // Draw midpoint line
+    line.new(bar_index - 2, fvgMid, bar_index + 20, fvgMid, 
+            color=color.new(bearFVGColor, 60), width=1, style=line.style_dotted)
+    
+    if array.size(bearFVGs) > maxFVGsAdaptive
+        box.delete(array.shift(bearFVGs))
+        array.shift(bearFVGTops)
+        array.shift(bearFVGBottoms)
+
+// FVG Mitigation Detection - REPLACED X MARKS WITH FILL INDICATORS
+fvgMitigatedBull = false
+fvgMitigatedBear = false
+
+if array.size(bullFVGBottoms) > 0
+    for i = 0 to array.size(bullFVGBottoms) - 1
+        if low <= array.get(bullFVGBottoms, i)
+            fvgMitigatedBull := true
+            break
+
+if array.size(bearFVGTops) > 0
+    for i = 0 to array.size(bearFVGTops) - 1
+        if high >= array.get(bearFVGTops, i)
+            fvgMitigatedBear := true
+            break
+
+// Show FVG fill with small dots instead of X marks
+plotshape(fvgMitigatedBull ? low : na, "FVG Filled Bull", shape.circle, 
+         location.belowbar, color.new(bullFVGColor, 0), size=size.tiny)
+plotshape(fvgMitigatedBear ? high : na, "FVG Filled Bear", shape.circle, 
+         location.abovebar, color.new(bearFVGColor, 0), size=size.tiny)
+
+// ────────────────────────────────────────────────────────────────────────────────
+// ENHANCED LIQUIDITY ZONES WITH POOL STRENGTH ANALYSIS
+// ────────────────────────────────────────────────────────────────────────────────
+
+recentHigh = ta.highest(high, liqLookback)
+recentLow = ta.lowest(low, liqLookback)
+
+// Count equal highs/lows for liquidity pool strength
+var int equalHighCount = 0
+var int equalLowCount = 0
+var float lastEqualHigh = na
+var float lastEqualLow = na
+
+// Equal Highs (Liquidity Pool) with strength tracking
+equalHighs = high == recentHigh and high[1] == recentHigh
+
+if equalHighs
+    if high == lastEqualHigh
+        equalHighCount += 1
+    else
+        equalHighCount := 2
+        lastEqualHigh := high
+else if high != lastEqualHigh
+    equalHighCount := 0
+
+// Equal Lows (Liquidity Pool) with strength tracking
+equalLows = low == recentLow and low[1] == recentLow
+
+if equalLows
+    if low == lastEqualLow
+        equalLowCount += 1
+    else
+        equalLowCount := 2
+        lastEqualLow := low
+else if low != lastEqualLow
+    equalLowCount := 0
+
+// Draw liquidity pools with strength indication and anti-overlap
+if showLiquidity and equalHighs and (bar_index - lastLiqLabelBar) >= minBarsBetweenLabels
+    liqStrength = math.min(equalHighCount, 5)
+    liqColor = color.from_gradient(liqStrength, 2, 5, color.new(liqBearColor, 50), color.new(liqBearColor, 0))
+    
+    line.new(bar_index - 1, high, bar_index + 10, high, 
+             color=liqColor, width=2 + liqStrength, style=line.style_dashed)
+    label.new(bar_index, high, "Liq x" + str.tostring(liqStrength), 
+             style=label.style_label_down, color=liqColor, 
+             textcolor=color.white, size=size.small)
+    lastLiqLabelBar := bar_index
+
+if showLiquidity and equalLows and (bar_index - lastLiqLabelBar) >= minBarsBetweenLabels
+    liqStrength = math.min(equalLowCount, 5)
+    liqColor = color.from_gradient(liqStrength, 2, 5, color.new(liqBullColor, 50), color.new(liqBullColor, 0))
+    
+    line.new(bar_index - 1, low, bar_index + 10, low, 
+             color=liqColor, width=2 + liqStrength, style=line.style_dashed)
+    label.new(bar_index, low, "Liq x" + str.tostring(liqStrength), 
+             style=label.style_label_up, color=liqColor, 
+             textcolor=color.white, size=size.small)
+    lastLiqLabelBar := bar_index
+
+// Enhanced Liquidity Sweeps with volume confirmation and anti-overlap
+sweepHigh = high > recentHigh[1] and close < recentHigh[1]
+sweepLow = low < recentLow[1] and close > recentLow[1]
+
+// Volume-confirmed sweeps (stronger signal)
+volConfirmedSweepHigh = sweepHigh and volume > volMA * 1.5
+volConfirmedSweepLow = sweepLow and volume > volMA * 1.5
+
+if showSweeps and sweepHigh and (bar_index - lastSweepLabelBar) >= minBarsBetweenLabels
+    sweepLabel = volConfirmedSweepHigh ? "SWEEP\nVol Conf" : "Sweep"
+    sweepSize = volConfirmedSweepHigh ? size.normal : size.small
+    label.new(bar_index, high, sweepLabel, 
+             style=label.style_label_down, color=sweepColor, 
+             textcolor=color.white, size=sweepSize)
+    lastSweepLabelBar := bar_index
+
+if showSweeps and sweepLow and (bar_index - lastSweepLabelBar) >= minBarsBetweenLabels
+    sweepLabel = volConfirmedSweepLow ? "SWEEP\nVol Conf" : "Sweep"
+    sweepSize = volConfirmedSweepLow ? size.normal : size.small
+    label.new(bar_index, low, sweepLabel, 
+             style=label.style_label_up, color=sweepColor, 
+             textcolor=color.white, size=sweepSize)
+    lastSweepLabelBar := bar_index
+
+// Displacement Detection (Strong institutional move) with anti-overlap
+atr = ta.atr(14)
+displacement = math.abs(close - open) > atr * 2 and volume > volMA * 2
+var int lastDispLabelBar = 0
+
+if displacement and (bar_index - lastDispLabelBar) >= minBarsBetweenLabels
+    displacementColor = close > open ? color.new(bullOBColor, 0) : color.new(bearOBColor, 0)
+    label.new(bar_index, high, "DISP", style=label.style_label_down, 
+             color=displacementColor, textcolor=color.white, size=size.small)
+    lastDispLabelBar := bar_index
+
+// ────────────────────────────────────────────────────────────────────────────────
+// MARKET STRUCTURE (BOS & CHOCH)
+// ────────────────────────────────────────────────────────────────────────────────
+
+var float lastSwingHigh = na
+var float lastSwingLow = na
+var int lastSwingHighBar = na
+var int lastSwingLowBar = na
+var int currentTrend = 0  // 1 = uptrend, -1 = downtrend
+
+swingHigh = ta.pivothigh(high, swingLength, swingLength)
+swingLow = ta.pivotlow(low, swingLength, swingLength)
+
+if not na(swingHigh) and showStructure
+    if not na(lastSwingHigh)
+        // Break of Structure (BOS) - continuation
+        if swingHigh > lastSwingHigh and currentTrend == 1 and showBOS
+            line.new(lastSwingHighBar, lastSwingHigh, bar_index - swingLength, swingHigh, 
+                     color=bosColor, width=2, style=line.style_solid)
+            label.new(bar_index - swingLength, swingHigh, "BOS", 
+                     style=label.style_label_down, color=bosColor, 
+                     textcolor=color.black, size=size.small)
+        
+        // Change of Character (CHOCH) - reversal
+        if swingHigh > lastSwingHigh and currentTrend == -1 and showCHOCH
+            line.new(lastSwingHighBar, lastSwingHigh, bar_index - swingLength, swingHigh, 
+                     color=chochColor, width=2, style=line.style_dashed)
+            label.new(bar_index - swingLength, swingHigh, "CHOCH", 
+                     style=label.style_label_down, color=chochColor, 
+                     textcolor=color.white, size=size.small)
+            currentTrend := 1
+    
+    lastSwingHigh := swingHigh
+    lastSwingHighBar := bar_index - swingLength
+
+if not na(swingLow) and showStructure
+    if not na(lastSwingLow)
+        // Break of Structure (BOS) - continuation
+        if swingLow < lastSwingLow and currentTrend == -1 and showBOS
+            line.new(lastSwingLowBar, lastSwingLow, bar_index - swingLength, swingLow, 
+                     color=bosColor, width=2, style=line.style_solid)
+            label.new(bar_index - swingLength, swingLow, "BOS", 
+                     style=label.style_label_up, color=bosColor, 
+                     textcolor=color.black, size=size.small)
+        
+        // Change of Character (CHOCH) - reversal
+        if swingLow < lastSwingLow and currentTrend == 1 and showCHOCH
+            line.new(lastSwingLowBar, lastSwingLow, bar_index - swingLength, swingLow, 
+                     color=chochColor, width=2, style=line.style_dashed)
+            label.new(bar_index - swingLength, swingLow, "CHOCH", 
+                     style=label.style_label_up, color=chochColor, 
+                     textcolor=color.white, size=size.small)
+            currentTrend := -1
+    
+    lastSwingLow := swingLow
+    lastSwingLowBar := bar_index - swingLength
+
+// ────────────────────────────────────────────────────────────────────────────────
+// ENHANCED INFORMATION TABLE
+// ────────────────────────────────────────────────────────────────────────────────
+
+var table infoTable = table.new(position.top_right, 2, 8, 
+                                 bgcolor=color.new(color.black, 85), 
+                                 frame_color=color.new(color.gray, 50), 
+                                 frame_width=1, 
+                                 border_width=1, 
+                                 border_color=color.new(color.gray, 50))
+
+if barstate.islast
+    table.cell(infoTable, 0, 0, "Smart Money", bgcolor=color.new(color.gray, 70), text_color=color.white, text_size=size.small)
+    table.cell(infoTable, 1, 0, "Status", bgcolor=color.new(color.gray, 70), text_color=color.white, text_size=size.small)
+    
+    trendText = currentTrend == 1 ? "Bullish" : currentTrend == -1 ? "Bearish" : "Neutral"
+    trendColor = currentTrend == 1 ? color.new(bullOBColor, 30) : 
+                 currentTrend == -1 ? color.new(bearOBColor, 30) : color.new(color.gray, 70)
+    
+    table.cell(infoTable, 0, 1, "Trend", text_color=color.white, text_size=size.small)
+    table.cell(infoTable, 1, 1, trendText, bgcolor=trendColor, text_color=color.white, text_size=size.small)
+    
+    table.cell(infoTable, 0, 2, "Bull OBs", text_color=bullOBColor, text_size=size.small)
+    table.cell(infoTable, 1, 2, str.tostring(array.size(bullishOBs)), text_color=color.white, text_size=size.small)
+    
+    table.cell(infoTable, 0, 3, "Bear OBs", text_color=bearOBColor, text_size=size.small)
+    table.cell(infoTable, 1, 3, str.tostring(array.size(bearishOBs)), text_color=color.white, text_size=size.small)
+    
+    table.cell(infoTable, 0, 4, "FVGs", text_color=color.yellow, text_size=size.small)
+    table.cell(infoTable, 1, 4, str.tostring(array.size(bullFVGs) + array.size(bearFVGs)), text_color=color.white, text_size=size.small)
+    
+    table.cell(infoTable, 0, 5, "Liq Pools", text_color=color.aqua, text_size=size.small)
+    liqPoolText = str.tostring(equalHighCount) + " / " + str.tostring(equalLowCount)
+    table.cell(infoTable, 1, 5, liqPoolText, text_color=color.white, text_size=size.small)
+    
+    table.cell(infoTable, 0, 6, "Volume", text_color=color.white, text_size=size.small)
+    volStatus = highVolume ? "HIGH" : "NORMAL"
+    volColor = highVolume ? color.new(color.yellow, 30) : color.new(color.gray, 70)
+    table.cell(infoTable, 1, 6, volStatus, bgcolor=volColor, text_color=color.white, text_size=size.small)
+    
+    table.cell(infoTable, 0, 7, "Displacement", text_color=color.orange, text_size=size.small)
+    dispStatus = displacement ? "ACTIVE" : "None"
+    dispColor = displacement ? color.new(color.orange, 30) : color.new(color.gray, 70)
+    table.cell(infoTable, 1, 7, dispStatus, bgcolor=dispColor, text_color=color.white, text_size=size.small)
+
+// ────────────────────────────────────────────────────────────────────────────────
+// ENHANCED ALERTS
+// ────────────────────────────────────────────────────────────────────────────────
+
+alertcondition(isBullishOB, "Bullish Order Block", "Bullish Order Block Detected")
+alertcondition(isBearishOB, "Bearish Order Block", "Bearish Order Block Detected")
+alertcondition(breakerBull, "Bullish Breaker Block", "Bearish OB failed - Breaker Block formed")
+alertcondition(breakerBear, "Bearish Breaker Block", "Bullish OB failed - Breaker Block formed")
+alertcondition(bullFVG and fvgBullSize > fvgMinSize, "Bullish FVG", "Bullish Fair Value Gap Detected")
+alertcondition(bearFVG and fvgBearSize > fvgMinSize, "Bearish FVG", "Bearish Fair Value Gap Detected")
+alertcondition(fvgMitigatedBull, "Bullish FVG Mitigated", "Bullish FVG has been filled")
+alertcondition(fvgMitigatedBear, "Bearish FVG Mitigated", "Bearish FVG has been filled")
+alertcondition(sweepHigh, "Liquidity Sweep High", "Liquidity swept at highs")
+alertcondition(sweepLow, "Liquidity Sweep Low", "Liquidity swept at lows")
+alertcondition(volConfirmedSweepHigh, "Volume Confirmed Sweep High", "Strong liquidity sweep at highs with volume")
+alertcondition(volConfirmedSweepLow, "Volume Confirmed Sweep Low", "Strong liquidity sweep at lows with volume")
+alertcondition(displacement, "Displacement Move", "Strong institutional displacement detected")
+alertcondition(equalHighs and equalHighCount >= 3, "Strong Liquidity Pool High", "Multiple equal highs - strong liquidity")
+alertcondition(equalLows and equalLowCount >= 3, "Strong Liquidity Pool Low", "Multiple equal lows - strong liquidity")

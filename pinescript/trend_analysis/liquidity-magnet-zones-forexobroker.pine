@@ -1,0 +1,533 @@
+//@version=6
+indicator("Liquidity Magnet Zones [forexobroker]",
+     shorttitle="LMZ",
+     overlay=true,
+     max_boxes_count=500,
+     max_labels_count=200,
+     max_lines_count=200)
+
+// ══════════════════════════════════════════════════════════════════════════════
+// Liquidity Magnet Zones [forexobroker]
+// Version 1.0
+//
+// Identifies untapped liquidity pools above swing highs (buyside) and below
+// swing lows (sellside), scores each zone's "magnetic pull" probability
+// (0-100), and tracks zone lifecycle from Fresh → Tested → Swept.
+//
+// Methodology:
+//   Swing highs/lows detected via ta.pivothigh/ta.pivotlow. Liquidity zones
+//   are drawn at these levels. A Magnetic Strength Score is calculated from
+//   4 factors: touch count, recency, structural prominence, and volume
+//   confirmation. Equal highs/lows (clusters) amplify the score. Zones
+//   transition through lifecycle states with distinct visual treatments.
+//
+// (c) forexobroker | Open-source | Educational use
+// ══════════════════════════════════════════════════════════════════════════════
+
+// ┌──────────────────────────────────────────────────────────────────────────┐
+// │ INPUTS                                                                  │
+// └──────────────────────────────────────────────────────────────────────────┘
+
+// Detection
+swingLength    = input.int(5, "Swing Length", minval=2, maxval=50, group="Detection", tooltip="Number of bars left and right to confirm a swing point. Lower = more zones, higher = fewer but stronger zones")
+zoneBufferPct  = input.float(0.05, "Zone Buffer %", minval=0.01, maxval=1.0, step=0.01, group="Detection", tooltip="Height of each zone as a percentage of the level price. Controls how thick the drawn zones appear")
+equalThreshPct = input.float(0.1, "Equal Highs/Lows Threshold %", minval=0.01, maxval=0.5, step=0.01, group="Detection", tooltip="Maximum price difference to consider two swing points as equal highs/lows. Tighter = stricter matching")
+
+// Display
+maxZones       = input.int(30, "Max Active Zones", minval=5, maxval=100, group="Display", tooltip="Maximum number of active zones per side (buyside + sellside). Oldest zones are removed when exceeded")
+showLabels     = input.bool(true, "Show Score Labels", group="Display", tooltip="Display magnet score labels next to each zone")
+showStats      = input.bool(true, "Show Stats Dashboard", group="Display", tooltip="Display the liquidity statistics table")
+showSwept      = input.bool(true, "Show Swept Zones", group="Display", tooltip="Keep swept zones visible on the chart (grayed out)")
+sweptFadeBars  = input.int(50, "Swept Zone Lifespan", minval=10, maxval=200, group="Display", tooltip="Number of bars to keep swept zones visible before removing them")
+tablePos       = input.string("top_right", "Table Position", options=["top_left", "top_center", "top_right", "bottom_left", "bottom_center", "bottom_right"], group="Display")
+textSizeInput  = input.string("small", "Text Size", options=["tiny", "small", "normal"], group="Display")
+
+// Colors
+buysideColor   = input.color(#26A69A, "Buyside Color", group="Colors", tooltip="Color for liquidity zones above swing highs")
+sellsideColor  = input.color(#EF5350, "Sellside Color", group="Colors", tooltip="Color for liquidity zones below swing lows")
+sweptColorIn   = input.color(#787B86, "Swept Color", group="Colors", tooltip="Color for swept (invalidated) zones")
+equalColor     = input.color(#FF9800, "Equal H/L Color", group="Colors", tooltip="Highlight color for equal highs/lows detection")
+
+// Alerts
+approachMult   = input.float(1.5, "Approach Distance (ATR x)", minval=0.5, maxval=5.0, step=0.5, group="Alerts", tooltip="Alert when price is within this many ATRs of a high-score zone")
+
+// ┌──────────────────────────────────────────────────────────────────────────┐
+// │ THEME-AWARE COLORS                                                      │
+// └──────────────────────────────────────────────────────────────────────────┘
+headerBg   = color.new(chart.fg_color, 85)
+headerText = chart.fg_color
+cellBg     = color.new(chart.bg_color, 20)
+borderCol  = color.new(chart.fg_color, 75)
+mutedText  = color.new(chart.fg_color, 50)
+
+// ┌──────────────────────────────────────────────────────────────────────────┐
+// │ USER-DEFINED TYPE                                                       │
+// └──────────────────────────────────────────────────────────────────────────┘
+type LiqZone
+    float   price
+    float   zone_top
+    float   zone_bot
+    int     origin_bar
+    int     touch_count
+    int     last_touch_bar
+    string  side
+    string  state
+    float   magnet_score
+    float   prominence
+    float   rel_volume
+    box     zone_box
+    label   score_label
+
+// ┌──────────────────────────────────────────────────────────────────────────┐
+// │ PERSISTENT STATE                                                        │
+// └──────────────────────────────────────────────────────────────────────────┘
+var array<LiqZone> buy_zones  = array.new<LiqZone>()
+var array<LiqZone> sell_zones = array.new<LiqZone>()
+var int totalSweeps  = 0
+var int totalCreated = 0
+
+// ┌──────────────────────────────────────────────────────────────────────────┐
+// │ HELPER FUNCTIONS                                                        │
+// └──────────────────────────────────────────────────────────────────────────┘
+getTablePos(pos) =>
+    switch pos
+        "top_left"      => position.top_left
+        "top_center"    => position.top_center
+        "top_right"     => position.top_right
+        "bottom_left"   => position.bottom_left
+        "bottom_center" => position.bottom_center
+        "bottom_right"  => position.bottom_right
+        => position.top_right
+
+getTextSize(s) =>
+    switch s
+        "tiny"   => size.tiny
+        "small"  => size.small
+        "normal" => size.normal
+        => size.small
+
+isNearLevel(price1, price2, threshPct) =>
+    math.abs(price1 - price2) <= price2 * (threshPct / 100.0)
+
+calcTouchScore(touches) =>
+    touches >= 5 ? 100.0 : touches >= 3 ? 75.0 : touches >= 2 ? 50.0 : 20.0
+
+calcRecencyScore(age) =>
+    age < 50 ? 100.0 : age < 150 ? 70.0 : age < 300 ? 40.0 : 20.0
+
+calcMagnetScore(touches, age, prom, relVol) =>
+    tScore = calcTouchScore(touches)
+    rScore = calcRecencyScore(age)
+    pScore = math.min(100.0, prom * 100.0)
+    vScore = math.min(100.0, relVol * 50.0)
+    tScore * 0.35 + rScore * 0.25 + pScore * 0.25 + vScore * 0.15
+
+getZoneTransp(score) =>
+    score >= 80 ? 65 : score >= 60 ? 75 : score >= 40 ? 82 : 88
+
+findExistingZone(zones, priceLevel, threshPct) =>
+    result = -1
+    if array.size(zones) > 0
+        for i = 0 to array.size(zones) - 1
+            z = array.get(zones, i)
+            if z.state != "swept" and isNearLevel(z.price, priceLevel, threshPct)
+                result := i
+                break
+    result
+
+// ┌──────────────────────────────────────────────────────────────────────────┐
+// │ CALCULATIONS                                                            │
+// └──────────────────────────────────────────────────────────────────────────┘
+atrVal     = ta.atr(14)
+avgVol     = ta.sma(volume, 20)
+swing_hi   = ta.pivothigh(high, swingLength, swingLength)
+swing_lo   = ta.pivotlow(low, swingLength, swingLength)
+
+// Prominence: how far the swing extends beyond its neighbors (normalized by ATR)
+hi_prom = not na(swing_hi) and not na(atrVal) and atrVal > 0 ? (swing_hi - math.max(high[swingLength + 1], high[swingLength - 1])) / atrVal : 0.0
+lo_prom = not na(swing_lo) and not na(atrVal) and atrVal > 0 ? (math.min(low[swingLength + 1], low[swingLength - 1]) - swing_lo) / atrVal : 0.0
+
+// Relative volume at swing point
+vol_at_swing = nz(volume[swingLength])
+rel_vol = avgVol > 0 ? vol_at_swing / avgVol : 1.0
+
+// ┌──────────────────────────────────────────────────────────────────────────┐
+// │ ZONE CREATION                                                           │
+// └──────────────────────────────────────────────────────────────────────────┘
+if barstate.isconfirmed
+    // --- Buyside liquidity (above swing highs) ---
+    if not na(swing_hi)
+        pivot_bar = bar_index - swingLength
+        buffer = swing_hi * (zoneBufferPct / 100.0)
+        existIdx = findExistingZone(buy_zones, swing_hi, equalThreshPct)
+
+        if existIdx >= 0
+            // Equal highs detected — update existing zone
+            ez = array.get(buy_zones, existIdx)
+            ez.touch_count += 1
+            ez.last_touch_bar := bar_index
+            ez.prominence := math.max(ez.prominence, hi_prom)
+            ez.rel_volume := math.max(ez.rel_volume, rel_vol)
+            age = bar_index - ez.origin_bar
+            ez.magnet_score := calcMagnetScore(ez.touch_count, age, ez.prominence, ez.rel_volume)
+            // Update visuals
+            transp = getZoneTransp(ez.magnet_score)
+            box.set_bgcolor(ez.zone_box, color.new(buysideColor, transp))
+            box.set_border_color(ez.zone_box, color.new(equalColor, transp - 20))
+            box.set_border_width(ez.zone_box, 2)
+            box.set_right(ez.zone_box, bar_index + 10)
+            if showLabels and not na(ez.score_label)
+                label.set_text(ez.score_label, str.tostring(ez.magnet_score, "#") + " EQH")
+                label.set_x(ez.score_label, bar_index + 10)
+                label.set_color(ez.score_label, color.new(equalColor, 30))
+            array.set(buy_zones, existIdx, ez)
+        else
+            // New buyside zone
+            initScore = calcMagnetScore(1, 0, hi_prom, rel_vol)
+            transp = getZoneTransp(initScore)
+            zBox = box.new(pivot_bar, swing_hi + buffer, bar_index + 10, swing_hi,
+                 bgcolor=color.new(buysideColor, transp),
+                 border_color=color.new(buysideColor, transp - 15),
+                 border_width=1, border_style=line.style_dashed)
+            zLabel = showLabels ? label.new(bar_index + 10, swing_hi + buffer, str.tostring(initScore, "#"),
+                 color=color.new(buysideColor, 40),
+                 textcolor=color.white, size=size.tiny,
+                 style=label.style_label_left,
+                 tooltip="Buyside liquidity | Score: " + str.tostring(initScore, "#.#")) : na
+            newZone = LiqZone.new(swing_hi, swing_hi + buffer, swing_hi, pivot_bar, 1, bar_index, "buyside", "fresh", initScore, hi_prom, rel_vol, zBox, zLabel)
+            array.push(buy_zones, newZone)
+            totalCreated += 1
+
+            // Cap array size
+            if array.size(buy_zones) > maxZones
+                old = array.shift(buy_zones)
+                box.delete(old.zone_box)
+                label.delete(old.score_label)
+
+    // --- Sellside liquidity (below swing lows) ---
+    if not na(swing_lo)
+        pivot_bar = bar_index - swingLength
+        buffer = swing_lo * (zoneBufferPct / 100.0)
+        existIdx = findExistingZone(sell_zones, swing_lo, equalThreshPct)
+
+        if existIdx >= 0
+            // Equal lows detected — update existing zone
+            ez = array.get(sell_zones, existIdx)
+            ez.touch_count += 1
+            ez.last_touch_bar := bar_index
+            ez.prominence := math.max(ez.prominence, lo_prom)
+            ez.rel_volume := math.max(ez.rel_volume, rel_vol)
+            age = bar_index - ez.origin_bar
+            ez.magnet_score := calcMagnetScore(ez.touch_count, age, ez.prominence, ez.rel_volume)
+            transp = getZoneTransp(ez.magnet_score)
+            box.set_bgcolor(ez.zone_box, color.new(sellsideColor, transp))
+            box.set_border_color(ez.zone_box, color.new(equalColor, transp - 20))
+            box.set_border_width(ez.zone_box, 2)
+            box.set_right(ez.zone_box, bar_index + 10)
+            if showLabels and not na(ez.score_label)
+                label.set_text(ez.score_label, str.tostring(ez.magnet_score, "#") + " EQL")
+                label.set_x(ez.score_label, bar_index + 10)
+                label.set_color(ez.score_label, color.new(equalColor, 30))
+            array.set(sell_zones, existIdx, ez)
+        else
+            // New sellside zone
+            initScore = calcMagnetScore(1, 0, lo_prom, rel_vol)
+            transp = getZoneTransp(initScore)
+            zBox = box.new(pivot_bar, swing_lo, bar_index + 10, swing_lo - buffer,
+                 bgcolor=color.new(sellsideColor, transp),
+                 border_color=color.new(sellsideColor, transp - 15),
+                 border_width=1, border_style=line.style_dashed)
+            zLabel = showLabels ? label.new(bar_index + 10, swing_lo - buffer, str.tostring(initScore, "#"),
+                 color=color.new(sellsideColor, 40),
+                 textcolor=color.white, size=size.tiny,
+                 style=label.style_label_left,
+                 tooltip="Sellside liquidity | Score: " + str.tostring(initScore, "#.#")) : na
+            newZone = LiqZone.new(swing_lo, swing_lo, swing_lo - buffer, pivot_bar, 1, bar_index, "sellside", "fresh", initScore, lo_prom, rel_vol, zBox, zLabel)
+            array.push(sell_zones, newZone)
+            totalCreated += 1
+
+            if array.size(sell_zones) > maxZones
+                old = array.shift(sell_zones)
+                box.delete(old.zone_box)
+                label.delete(old.score_label)
+
+// ┌──────────────────────────────────────────────────────────────────────────┐
+// │ ZONE LIFECYCLE UPDATE                                                   │
+// └──────────────────────────────────────────────────────────────────────────┘
+var bool buySweepSignal  = false
+var bool sellSweepSignal = false
+var bool buyApproach     = false
+var bool sellApproach    = false
+buySweepSignal  := false
+sellSweepSignal := false
+buyApproach     := false
+sellApproach    := false
+
+var float nearestBuyLevel  = na
+var float nearestSellLevel = na
+var float nearestBuyScore  = na
+var float nearestSellScore = na
+var float nearestBuyDist   = na
+var float nearestSellDist  = na
+nearestBuyLevel  := na
+nearestSellLevel := na
+nearestBuyScore  := na
+nearestSellScore := na
+nearestBuyDist   := na
+nearestSellDist  := na
+
+if barstate.isconfirmed
+    // --- Update buyside zones ---
+    i = 0
+    while i < array.size(buy_zones)
+        z = array.get(buy_zones, i)
+        age = bar_index - z.origin_bar
+        removed = false
+
+        if z.state != "swept"
+            // Check for sweep (price exceeded the level)
+            if high > z.price
+                z.state := "swept"
+                z.last_touch_bar := bar_index
+                totalSweeps += 1
+                buySweepSignal := true
+                if showSwept
+                    box.set_bgcolor(z.zone_box, color.new(sweptColorIn, 90))
+                    box.set_border_color(z.zone_box, color.new(sweptColorIn, 70))
+                    box.set_border_style(z.zone_box, line.style_dotted)
+                    box.set_right(z.zone_box, bar_index)
+                    if showLabels and not na(z.score_label)
+                        label.set_text(z.score_label, "SWEPT")
+                        label.set_color(z.score_label, color.new(sweptColorIn, 30))
+                        label.set_x(z.score_label, bar_index)
+                else
+                    box.delete(z.zone_box)
+                    label.delete(z.score_label)
+                    array.remove(buy_zones, i)
+                    removed := true
+            else
+                // Check for test (price approached but didn't exceed)
+                approachDist = nz(atrVal) * 0.5
+                if high >= z.price - approachDist and z.state == "fresh"
+                    z.state := "tested"
+                    z.touch_count += 1
+                    z.last_touch_bar := bar_index
+
+                // Update score (recency decays)
+                z.magnet_score := calcMagnetScore(z.touch_count, age, z.prominence, z.rel_volume)
+                transp = getZoneTransp(z.magnet_score)
+                box.set_bgcolor(z.zone_box, color.new(buysideColor, transp))
+                bStyle = z.state == "tested" ? line.style_solid : line.style_dashed
+                bWidth = z.state == "tested" ? 2 : 1
+                bColor = z.touch_count >= 2 ? color.new(equalColor, transp - 20) : color.new(buysideColor, transp - 15)
+                box.set_border_style(z.zone_box, bStyle)
+                box.set_border_width(z.zone_box, bWidth)
+                box.set_border_color(z.zone_box, bColor)
+                box.set_right(z.zone_box, bar_index + 10)
+                if showLabels and not na(z.score_label)
+                    scoreTxt = z.touch_count >= 2 ? str.tostring(z.magnet_score, "#") + " EQH" : str.tostring(z.magnet_score, "#")
+                    label.set_text(z.score_label, scoreTxt)
+                    label.set_x(z.score_label, bar_index + 10)
+
+                // Track nearest
+                dist = z.price - close
+                if dist > 0 and (na(nearestBuyDist) or dist < nearestBuyDist)
+                    nearestBuyLevel := z.price
+                    nearestBuyScore := z.magnet_score
+                    nearestBuyDist  := dist
+
+                // Approach detection
+                if not na(atrVal) and dist > 0 and dist < atrVal * approachMult and z.magnet_score >= 50
+                    buyApproach := true
+
+            if not removed
+                array.set(buy_zones, i, z)
+        else
+            // Swept zone cleanup
+            if bar_index - z.last_touch_bar > sweptFadeBars
+                box.delete(z.zone_box)
+                label.delete(z.score_label)
+                array.remove(buy_zones, i)
+                removed := true
+
+        if not removed
+            i += 1
+
+    // --- Update sellside zones ---
+    i := 0
+    while i < array.size(sell_zones)
+        z = array.get(sell_zones, i)
+        age = bar_index - z.origin_bar
+        removed = false
+
+        if z.state != "swept"
+            // Check for sweep
+            if low < z.price
+                z.state := "swept"
+                z.last_touch_bar := bar_index
+                totalSweeps += 1
+                sellSweepSignal := true
+                if showSwept
+                    box.set_bgcolor(z.zone_box, color.new(sweptColorIn, 90))
+                    box.set_border_color(z.zone_box, color.new(sweptColorIn, 70))
+                    box.set_border_style(z.zone_box, line.style_dotted)
+                    box.set_right(z.zone_box, bar_index)
+                    if showLabels and not na(z.score_label)
+                        label.set_text(z.score_label, "SWEPT")
+                        label.set_color(z.score_label, color.new(sweptColorIn, 30))
+                        label.set_x(z.score_label, bar_index)
+                else
+                    box.delete(z.zone_box)
+                    label.delete(z.score_label)
+                    array.remove(sell_zones, i)
+                    removed := true
+            else
+                approachDist = nz(atrVal) * 0.5
+                if low <= z.price + approachDist and z.state == "fresh"
+                    z.state := "tested"
+                    z.touch_count += 1
+                    z.last_touch_bar := bar_index
+
+                z.magnet_score := calcMagnetScore(z.touch_count, age, z.prominence, z.rel_volume)
+                transp = getZoneTransp(z.magnet_score)
+                box.set_bgcolor(z.zone_box, color.new(sellsideColor, transp))
+                bStyle = z.state == "tested" ? line.style_solid : line.style_dashed
+                bWidth = z.state == "tested" ? 2 : 1
+                bColor = z.touch_count >= 2 ? color.new(equalColor, transp - 20) : color.new(sellsideColor, transp - 15)
+                box.set_border_style(z.zone_box, bStyle)
+                box.set_border_width(z.zone_box, bWidth)
+                box.set_border_color(z.zone_box, bColor)
+                box.set_right(z.zone_box, bar_index + 10)
+                if showLabels and not na(z.score_label)
+                    scoreTxt = z.touch_count >= 2 ? str.tostring(z.magnet_score, "#") + " EQL" : str.tostring(z.magnet_score, "#")
+                    label.set_text(z.score_label, scoreTxt)
+                    label.set_x(z.score_label, bar_index + 10)
+
+                dist = close - z.price
+                if dist > 0 and (na(nearestSellDist) or dist < nearestSellDist)
+                    nearestSellLevel := z.price
+                    nearestSellScore := z.magnet_score
+                    nearestSellDist  := dist
+
+                if not na(atrVal) and dist > 0 and dist < atrVal * approachMult and z.magnet_score >= 50
+                    sellApproach := true
+
+            if not removed
+                array.set(sell_zones, i, z)
+        else
+            if bar_index - z.last_touch_bar > sweptFadeBars
+                box.delete(z.zone_box)
+                label.delete(z.score_label)
+                array.remove(sell_zones, i)
+                removed := true
+
+        if not removed
+            i += 1
+
+// ┌──────────────────────────────────────────────────────────────────────────┐
+// │ SWEEP SIGNALS                                                           │
+// └──────────────────────────────────────────────────────────────────────────┘
+plotshape(buySweepSignal, "Buyside Sweep", shape.triangledown, location.abovebar, color.new(buysideColor, 0), size=size.small)
+plotshape(sellSweepSignal, "Sellside Sweep", shape.triangleup, location.belowbar, color.new(sellsideColor, 0), size=size.small)
+
+// ┌──────────────────────────────────────────────────────────────────────────┐
+// │ STATS DASHBOARD                                                         │
+// └──────────────────────────────────────────────────────────────────────────┘
+var table statsTable = table.new(getTablePos(tablePos), 2, 7,
+     bgcolor=cellBg,
+     border_width=1,
+     border_color=borderCol,
+     frame_width=2,
+     frame_color=borderCol)
+
+if barstate.islast and showStats
+    sz = getTextSize(textSizeInput)
+
+    // Count active zones
+    activeBuy  = 0
+    activeSell = 0
+    totalScore = 0.0
+    totalActive = 0
+    if array.size(buy_zones) > 0
+        for i = 0 to array.size(buy_zones) - 1
+            z = array.get(buy_zones, i)
+            if z.state != "swept"
+                activeBuy += 1
+                totalScore += z.magnet_score
+                totalActive += 1
+    if array.size(sell_zones) > 0
+        for i = 0 to array.size(sell_zones) - 1
+            z = array.get(sell_zones, i)
+            if z.state != "swept"
+                activeSell += 1
+                totalScore += z.magnet_score
+                totalActive += 1
+
+    avgScore = totalActive > 0 ? totalScore / totalActive : 0.0
+    sweepRate = totalCreated > 0 ? (totalSweeps / totalCreated) * 100.0 : 0.0
+
+    // Title
+    table.cell(statsTable, 0, 0, "LIQUIDITY MAGNETS", bgcolor=color.new(#1565C0, 15), text_color=headerText, text_size=sz, text_halign=text.align_center)
+    table.cell(statsTable, 1, 0, "forexobroker", bgcolor=color.new(#1565C0, 15), text_color=mutedText, text_size=size.tiny, text_halign=text.align_center)
+
+    // Stats rows
+    table.cell(statsTable, 0, 1, "Buyside Zones", bgcolor=headerBg, text_color=headerText, text_size=sz, text_halign=text.align_left)
+    table.cell(statsTable, 1, 1, str.tostring(activeBuy), bgcolor=headerBg, text_color=color.new(buysideColor, 0), text_size=sz, text_halign=text.align_center)
+
+    table.cell(statsTable, 0, 2, "Sellside Zones", bgcolor=headerBg, text_color=headerText, text_size=sz, text_halign=text.align_left)
+    table.cell(statsTable, 1, 2, str.tostring(activeSell), bgcolor=headerBg, text_color=color.new(sellsideColor, 0), text_size=sz, text_halign=text.align_center)
+
+    table.cell(statsTable, 0, 3, "Total Sweeps", bgcolor=headerBg, text_color=headerText, text_size=sz, text_halign=text.align_left)
+    table.cell(statsTable, 1, 3, str.tostring(totalSweeps), bgcolor=headerBg, text_color=headerText, text_size=sz, text_halign=text.align_center)
+
+    table.cell(statsTable, 0, 4, "Avg Magnet Score", bgcolor=headerBg, text_color=headerText, text_size=sz, text_halign=text.align_left)
+    scoreColor = avgScore >= 60 ? buysideColor : avgScore >= 40 ? color.new(#FF9800, 0) : sellsideColor
+    table.cell(statsTable, 1, 4, str.tostring(avgScore, "#.#"), bgcolor=headerBg, text_color=scoreColor, text_size=sz, text_halign=text.align_center)
+
+    table.cell(statsTable, 0, 5, "Sweep Rate", bgcolor=headerBg, text_color=headerText, text_size=sz, text_halign=text.align_left)
+    table.cell(statsTable, 1, 5, str.tostring(sweepRate, "#.#") + "%", bgcolor=headerBg, text_color=headerText, text_size=sz, text_halign=text.align_center)
+
+    // Nearest magnet (computed here for barstate.islast accuracy)
+    nearBuyP  = float(na)
+    nearSellP = float(na)
+    nearBuyD  = float(na)
+    nearSellD = float(na)
+    if array.size(buy_zones) > 0
+        for i = 0 to array.size(buy_zones) - 1
+            z = array.get(buy_zones, i)
+            if z.state != "swept"
+                d = z.price - close
+                if d > 0 and (na(nearBuyD) or d < nearBuyD)
+                    nearBuyP := z.price
+                    nearBuyD := d
+    if array.size(sell_zones) > 0
+        for i = 0 to array.size(sell_zones) - 1
+            z = array.get(sell_zones, i)
+            if z.state != "swept"
+                d = close - z.price
+                if d > 0 and (na(nearSellD) or d < nearSellD)
+                    nearSellP := z.price
+                    nearSellD := d
+    nearBuyTxt  = not na(nearBuyP) ? str.tostring(nearBuyP, format.mintick) : "—"
+    nearSellTxt = not na(nearSellP) ? str.tostring(nearSellP, format.mintick) : "—"
+    table.cell(statsTable, 0, 6, "Nearest ▲/▼", bgcolor=headerBg, text_color=headerText, text_size=sz, text_halign=text.align_left)
+    table.cell(statsTable, 1, 6, nearBuyTxt + " / " + nearSellTxt, bgcolor=headerBg, text_color=headerText, text_size=size.tiny, text_halign=text.align_center)
+
+// ┌──────────────────────────────────────────────────────────────────────────┐
+// │ DATA WINDOW PLOTS                                                       │
+// └──────────────────────────────────────────────────────────────────────────┘
+plot(nearestBuyLevel, "Nearest Buyside Level", display=display.data_window)
+plot(nearestSellLevel, "Nearest Sellside Level", display=display.data_window)
+plot(nearestBuyScore, "Nearest Buyside Score", display=display.data_window)
+plot(nearestSellScore, "Nearest Sellside Score", display=display.data_window)
+plot(array.size(buy_zones) + array.size(sell_zones), "Total Zones", display=display.data_window)
+
+// ┌──────────────────────────────────────────────────────────────────────────┐
+// │ ALERTS                                                                  │
+// └──────────────────────────────────────────────────────────────────────────┘
+alertcondition(buySweepSignal, "Buyside Liquidity Swept", "Buyside liquidity has been swept — price broke above a swing high zone")
+alertcondition(sellSweepSignal, "Sellside Liquidity Swept", "Sellside liquidity has been swept — price broke below a swing low zone")
+alertcondition(buySweepSignal or sellSweepSignal, "Any Liquidity Sweep", "A liquidity zone has been swept")
+alertcondition(buyApproach, "Approaching Buyside Liquidity", "Price is approaching a high-score buyside liquidity zone")
+alertcondition(sellApproach, "Approaching Sellside Liquidity", "Price is approaching a high-score sellside liquidity zone")
+// ══════════════════════════════════════════════════════════════════════════════

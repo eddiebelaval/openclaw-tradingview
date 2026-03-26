@@ -1,0 +1,445 @@
+// This Pine Script™ v6 indicator is subject to the terms of the Mozilla Public License 2.0
+// https://mozilla.org/MPL/2.0/
+// © Viprasol
+
+//@version=6
+indicator("[Viprasol] Adaptive Trend Momentum Channel", shorttitle="VP - ATMC", overlay=true, max_lines_count=500, max_labels_count=500, max_boxes_count=50)
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Constants
+// ──────────────────────────────────────────────────────────────────────────────
+const string GRP_CORE       = "Core Settings"
+const string GRP_ADAPT      = "Adaptive Engine"
+const string GRP_CHANNEL    = "Channel Settings"
+const string GRP_VOLUME     = "Volume Filter"
+const string GRP_DIVERGENCE = "Divergence Detection"
+const string GRP_LEVELS     = "Reversal Levels"
+const string GRP_RISK       = "Risk Management"
+const string GRP_MTF        = "Multi-Timeframe Dashboard"
+const string GRP_VISUALS    = "Visual Settings"
+const string GRP_ALERTS     = "Alert Settings"
+
+const color  BULL_DEFAULT   = #26a69a
+const color  BEAR_DEFAULT   = #ef5350
+const color  NEUTRAL_CLR    = #787b86
+const int    MAX_PIVOT_BARS = 50
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Inputs — Core
+// ──────────────────────────────────────────────────────────────────────────────
+priceSourceInput = input.source(close, "Price Source", group=GRP_CORE, tooltip="The price data used for all calculations. Close is recommended for most use cases.")
+basePeriodInput  = input.int(18, "Base Smoothing Period", minval=4, maxval=200, group=GRP_CORE, tooltip="Primary period for the fast-reacting double-smoothed average. Lower = more responsive, higher = smoother.")
+momentumSmoothInput = input.int(5, "Momentum Smoothing", minval=2, maxval=30, group=GRP_CORE, tooltip="Smoothing applied to the raw momentum reading. Reduces noise in the trend strength signal.")
+atrPeriodInput   = input.int(14, "Volatility Period (ATR)", minval=5, maxval=50, group=GRP_CORE, tooltip="Period for Average True Range calculation. Used to normalize momentum and define channel width.")
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Inputs — Adaptive Engine
+// ──────────────────────────────────────────────────────────────────────────────
+useAdaptiveInput  = input.bool(true, "Enable Adaptive Period", group=GRP_ADAPT, tooltip="When enabled, the smoothing period automatically adjusts based on market efficiency. Shorter in trends, longer in chop.")
+adaptMinInput     = input.int(8, "Adaptive Min Period", minval=4, maxval=50, group=GRP_ADAPT, tooltip="Minimum period when market is trending strongly.")
+adaptMaxInput     = input.int(40, "Adaptive Max Period", minval=20, maxval=200, group=GRP_ADAPT, tooltip="Maximum period when market is choppy/ranging.")
+efficiencyLenInput = input.int(10, "Efficiency Lookback", minval=5, maxval=50, group=GRP_ADAPT, tooltip="Lookback for Kaufman Efficiency Ratio. Measures how efficiently price moves in one direction.")
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Inputs — Channel
+// ──────────────────────────────────────────────────────────────────────────────
+channelPaddingInput = input.float(0.5, "Channel Padding (ATR mult)", minval=0.1, maxval=2.0, step=0.1, group=GRP_CHANNEL, tooltip="Expands the outer channel edge beyond the slow average. Larger = wider channel. Measured in ATR units.")
+showChannelFillInput = input.bool(true, "Show Channel Fill", group=GRP_CHANNEL)
+showGlowInput       = input.bool(true, "Show Momentum Glow", group=GRP_CHANNEL, tooltip="Displays a glowing aura around the fast line that pulses with momentum strength.")
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Inputs — Volume Filter
+// ──────────────────────────────────────────────────────────────────────────────
+useVolumeFilterInput = input.bool(true, "Enable Volume Filter", group=GRP_VOLUME, tooltip="When enabled, trend flip signals only fire when volume confirms the move. Reduces false signals in thin markets.")
+volumePeriodInput    = input.int(20, "Volume Average Period", minval=5, maxval=100, group=GRP_VOLUME, tooltip="Lookback period for the volume moving average.")
+volumeThreshInput    = input.float(1.0, "Volume Threshold (x Average)", minval=0.5, maxval=3.0, step=0.1, group=GRP_VOLUME, tooltip="Signal requires volume >= this multiple of the average volume. 1.0 = at least average volume.")
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Inputs — Divergence
+// ──────────────────────────────────────────────────────────────────────────────
+showDivergenceInput  = input.bool(true, "Detect Divergences", group=GRP_DIVERGENCE, tooltip="Scans for disagreements between price direction and momentum strength — early warning of potential reversals.")
+divPivotLenInput     = input.int(5, "Pivot Lookback", minval=3, maxval=20, group=GRP_DIVERGENCE, tooltip="Bars to look left/right when identifying pivot highs and lows for divergence analysis.")
+divMaxBarsInput      = input.int(60, "Max Bars Between Pivots", minval=15, maxval=150, group=GRP_DIVERGENCE, tooltip="Maximum distance between two pivots for a valid divergence signal.")
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Inputs — Reversal Levels
+// ──────────────────────────────────────────────────────────────────────────────
+showReversalLevelsInput = input.bool(true, "Show Reversal Levels", group=GRP_LEVELS, tooltip="Marks key price levels where trend flips occurred. Monitors for retests of these levels.")
+maxReversalLevelsInput  = input.int(8, "Max Active Levels", minval=2, maxval=50, group=GRP_LEVELS, tooltip="Maximum number of reversal levels displayed simultaneously.")
+levelInvalidationInput  = input.float(2.5, "Level Invalidation (ATR mult)", minval=1.0, maxval=5.0, step=0.5, group=GRP_LEVELS, tooltip="A reversal level is removed when price moves this many ATRs beyond it.")
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Inputs — Risk Management
+// ──────────────────────────────────────────────────────────────────────────────
+showRiskOverlayInput = input.bool(false, "Show Risk Overlay (SL/TP)", group=GRP_RISK, tooltip="Displays stop-loss and take-profit lines when a new trend signal fires.")
+riskRewardInput      = input.float(2.0, "Target Risk:Reward", minval=1.0, maxval=5.0, step=0.5, group=GRP_RISK, tooltip="Take-profit distance as a multiple of stop-loss distance.")
+stopMethodInput      = input.string("Channel Edge", "Stop-Loss Method", options=["Channel Edge", "ATR Multiple", "Swing High/Low"], group=GRP_RISK, tooltip="Channel Edge: uses the outer channel boundary. ATR Multiple: fixed ATR distance. Swing High/Low: recent swing point.")
+stopAtrMultInput     = input.float(1.5, "Stop ATR Multiple", minval=0.5, maxval=4.0, step=0.5, group=GRP_RISK, tooltip="Only used when Stop-Loss Method is 'ATR Multiple'. Distance in ATR units from entry.")
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Inputs — Multi-Timeframe Dashboard
+// ──────────────────────────────────────────────────────────────────────────────
+showDashboardInput   = input.bool(true, "Show MTF Dashboard", group=GRP_MTF, tooltip="Displays a multi-timeframe panel showing trend direction and momentum strength across multiple timeframes.")
+dashPositionInput    = input.string("Top Right", "Dashboard Position", options=["Top Right", "Top Left", "Bottom Right", "Bottom Left"], group=GRP_MTF)
+dashTf1Input         = input.timeframe("15", "Timeframe 1", group=GRP_MTF)
+dashTf2Input         = input.timeframe("60", "Timeframe 2", group=GRP_MTF)
+dashTf3Input         = input.timeframe("240", "Timeframe 3", group=GRP_MTF)
+dashTf4Input         = input.timeframe("D", "Timeframe 4", group=GRP_MTF)
+dashTf5Input         = input.timeframe("W", "Timeframe 5", group=GRP_MTF)
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Inputs — Visuals
+// ──────────────────────────────────────────────────────────────────────────────
+bullColorInput   = input.color(BULL_DEFAULT, "Bullish Color", inline="colors", group=GRP_VISUALS)
+bearColorInput   = input.color(BEAR_DEFAULT, "Bearish Color", inline="colors", group=GRP_VISUALS)
+paintCandlesInput = input.bool(true, "Color Candles by Trend", group=GRP_VISUALS)
+showSignalLabelsInput = input.bool(true, "Show Signal Labels", group=GRP_VISUALS)
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Inputs — Alerts
+// ──────────────────────────────────────────────────────────────────────────────
+alertFilterVolumeInput = input.bool(true, "Require Volume for Alerts", group=GRP_ALERTS, tooltip="When enabled, trend flip alerts only fire when volume filter is also satisfied.")
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Functions
+// ──────────────────────────────────────────────────────────────────────────────
+
+// Manual EMA that accepts series int length (built-in ta.ema requires simple int)
+seriesEma(float src, int period) =>
+    float alpha = 2.0 / (period + 1)
+    var float result = na
+    result := na(result) ? src : alpha * src + (1.0 - alpha) * result
+    result
+
+// Manual Double-smoothed average using series-compatible EMA
+seriesDoubleSmooth(float src, int period) =>
+    float firstPass = seriesEma(src, period)
+    2.0 * firstPass - seriesEma(firstPass, period)
+
+// Kaufman Efficiency Ratio — measures how directional vs noisy price movement is
+computeEfficiency(float src, int len) =>
+    float netChange = math.abs(src - src[len])
+    float totalPath = math.sum(math.abs(src - src[1]), len)
+    totalPath != 0 ? netChange / totalPath : 0.0
+
+// Pivot detection for divergence
+detectPivotHigh(src, leftBars, rightBars) =>
+    ta.pivothigh(src, leftBars, rightBars)
+
+detectPivotLow(src, leftBars, rightBars) =>
+    ta.pivotlow(src, leftBars, rightBars)
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Core Calculations
+// ──────────────────────────────────────────────────────────────────────────────
+
+// Adaptive period engine — compute efficiency and derive adaptive period
+float priceEfficiency = computeEfficiency(priceSourceInput, efficiencyLenInput)
+int activePeriod = useAdaptiveInput ? math.max(adaptMinInput, math.min(math.round(adaptMaxInput - priceEfficiency * (adaptMaxInput - adaptMinInput)), adaptMaxInput)) : basePeriodInput
+
+// Fast line (double-smoothed, adaptive period) — uses series-compatible EMA
+float fastTrendLine = seriesDoubleSmooth(priceSourceInput, activePeriod)
+
+// Slow line (1.5x the active period) — uses series-compatible EMA
+int slowAdaptivePeriod = math.round(activePeriod * 1.5)
+float slowTrendLine = seriesEma(priceSourceInput, slowAdaptivePeriod)
+
+// Volatility (fixed period — can use built-in)
+float currentVolatility = ta.atr(atrPeriodInput)
+
+// Momentum calculation
+float rawTrendMomentum = currentVolatility > 0 ? (fastTrendLine - slowTrendLine) / currentVolatility : 0.0
+float trendMomentum = ta.ema(rawTrendMomentum, momentumSmoothInput)
+float absMomentum = math.abs(trendMomentum)
+float peakMomentum = ta.highest(absMomentum, 80)
+float momentumStrength = peakMomentum > 0 ? math.min(absMomentum / peakMomentum, 1.0) : 0.0
+int trendDirection = trendMomentum > 0 ? 1 : -1
+bool  trendFlip = trendDirection != trendDirection[1]
+
+// Volume confirmation
+float avgVolume = ta.sma(volume, volumePeriodInput)
+bool  volumeConfirmed = not useVolumeFilterInput or (volume >= avgVolume * volumeThreshInput)
+bool  confirmedFlip = trendFlip and volumeConfirmed
+
+// Confirmed trend direction (only updates on volume-confirmed flips)
+var int confirmedDirection = 0
+if confirmedFlip
+    confirmedDirection := trendDirection
+else if confirmedDirection == 0
+    confirmedDirection := trendDirection
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Channel Construction
+// ──────────────────────────────────────────────────────────────────────────────
+float innerEdge = fastTrendLine
+float outerEdge = trendDirection == 1 ? slowTrendLine - currentVolatility * channelPaddingInput : slowTrendLine + currentVolatility * channelPaddingInput
+
+// Ribbon layers (graduated fill)
+float ribbonMid1 = innerEdge + (outerEdge - innerEdge) * 0.33
+float ribbonMid2 = innerEdge + (outerEdge - innerEdge) * 0.66
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Trend Coloring
+// ──────────────────────────────────────────────────────────────────────────────
+color activeBullColor = trendDirection == 1 ? color.from_gradient(momentumStrength, 0.05, 0.7, color.new(bullColorInput, 45), bullColorInput) : na
+color activeBearColor = trendDirection == -1 ? color.from_gradient(momentumStrength, 0.05, 0.7, color.new(bearColorInput, 45), bearColorInput) : na
+color trendColor = trendDirection == 1 ? nz(activeBullColor, bullColorInput) : nz(activeBearColor, bearColorInput)
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Divergence Detection
+// ──────────────────────────────────────────────────────────────────────────────
+var bool bullishDivergence = false
+var bool bearishDivergence = false
+bullishDivergence := false
+bearishDivergence := false
+
+if showDivergenceInput
+    // Price pivots
+    float priceHighPivot = detectPivotHigh(high, divPivotLenInput, divPivotLenInput)
+    float priceLowPivot  = detectPivotLow(low, divPivotLenInput, divPivotLenInput)
+    // Momentum pivots
+    float momHighPivot = detectPivotHigh(trendMomentum, divPivotLenInput, divPivotLenInput)
+    float momLowPivot  = detectPivotLow(trendMomentum, divPivotLenInput, divPivotLenInput)
+
+    // Track previous pivots
+    var float prevPriceHigh = na
+    var float prevMomHigh   = na
+    var int   prevHighBar   = na
+    var float prevPriceLow  = na
+    var float prevMomLow    = na
+    var int   prevLowBar    = na
+
+    if not na(priceHighPivot)
+        if not na(prevPriceHigh) and not na(prevMomHigh)
+            int barsSince = bar_index - divPivotLenInput - nz(prevHighBar, 0)
+            // Bearish divergence: higher high in price, lower high in momentum
+            if barsSince <= divMaxBarsInput and priceHighPivot > prevPriceHigh and not na(momHighPivot) and momHighPivot < prevMomHigh
+                bearishDivergence := true
+        prevPriceHigh := priceHighPivot
+        prevMomHigh   := momHighPivot
+        prevHighBar   := bar_index - divPivotLenInput
+
+    if not na(priceLowPivot)
+        if not na(prevPriceLow) and not na(prevMomLow)
+            int barsSince = bar_index - divPivotLenInput - nz(prevLowBar, 0)
+            // Bullish divergence: lower low in price, higher low in momentum
+            if barsSince <= divMaxBarsInput and priceLowPivot < prevPriceLow and not na(momLowPivot) and momLowPivot > prevMomLow
+                bullishDivergence := true
+        prevPriceLow := priceLowPivot
+        prevMomLow   := momLowPivot
+        prevLowBar   := bar_index - divPivotLenInput
+
+// Divergence labels
+if bullishDivergence and showDivergenceInput
+    label.new(bar_index - divPivotLenInput, low[divPivotLenInput], "Bull Div", style=label.style_label_up, color=color.new(bullColorInput, 20), textcolor=color.white, size=size.tiny)
+if bearishDivergence and showDivergenceInput
+    label.new(bar_index - divPivotLenInput, high[divPivotLenInput], "Bear Div", style=label.style_label_down, color=color.new(bearColorInput, 20), textcolor=color.white, size=size.tiny)
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Reversal Level System
+// ──────────────────────────────────────────────────────────────────────────────
+type ReversalLevel
+    float pricePoint
+    int   levelDirection
+    line  levelLine
+    bool  hasBeenRetested
+
+var ReversalLevel[] activeReversalLevels = array.new<ReversalLevel>()
+
+if confirmedFlip and showReversalLevelsInput
+    if activeReversalLevels.size() >= maxReversalLevelsInput
+        ReversalLevel oldest = activeReversalLevels.shift()
+        line.delete(oldest.levelLine)
+
+    float flipPrice = trendDirection == 1 ? low : high
+    color levelColor = color.new(trendDirection == 1 ? bullColorInput : bearColorInput, 30)
+    line  levelLine = line.new(bar_index, flipPrice, bar_index + 60, flipPrice, color=levelColor, width=1, style=line.style_dashed)
+    activeReversalLevels.push(ReversalLevel.new(flipPrice, trendDirection, levelLine, false))
+
+if activeReversalLevels.size() > 0
+    int idx = activeReversalLevels.size() - 1
+    while idx >= 0
+        ReversalLevel lvl = activeReversalLevels.get(idx)
+        bool invalidated = lvl.levelDirection == 1 ? close < lvl.pricePoint - currentVolatility * levelInvalidationInput : close > lvl.pricePoint + currentVolatility * levelInvalidationInput
+        if invalidated
+            line.delete(lvl.levelLine)
+            activeReversalLevels.remove(idx)
+        else
+            line.set_x2(lvl.levelLine, bar_index + 60)
+            bool approachingLevel = math.abs(close - lvl.pricePoint) < currentVolatility * 0.25 and math.abs(close[2] - lvl.pricePoint) > currentVolatility * 0.5
+            if approachingLevel and not lvl.hasBeenRetested
+                color retestColor = lvl.levelDirection == 1 ? bullColorInput : bearColorInput
+                float retestY = close > lvl.pricePoint ? low : high
+                retestStyle = close > lvl.pricePoint ? label.style_label_up : label.style_label_down
+                label.new(bar_index, retestY, "Retest", style=retestStyle, color=color(na), textcolor=retestColor, size=size.small)
+                lvl.hasBeenRetested := true
+        idx -= 1
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Risk Management Overlay
+// ──────────────────────────────────────────────────────────────────────────────
+var line stopLine   = na
+var line targetLine = na
+var label riskLabel = na
+
+if showRiskOverlayInput and confirmedFlip
+    // Clean up previous lines
+    line.delete(stopLine)
+    line.delete(targetLine)
+    label.delete(riskLabel)
+
+    float entryPrice = close
+    float stopDistance = switch stopMethodInput
+        "Channel Edge" => math.abs(entryPrice - outerEdge)
+        "ATR Multiple" => currentVolatility * stopAtrMultInput
+        "Swing High/Low" => trendDirection == 1 ? entryPrice - ta.lowest(low, 10) : ta.highest(high, 10) - entryPrice
+        => currentVolatility * stopAtrMultInput
+
+    float stopPrice  = trendDirection == 1 ? entryPrice - stopDistance : entryPrice + stopDistance
+    float targetPrice = trendDirection == 1 ? entryPrice + stopDistance * riskRewardInput : entryPrice - stopDistance * riskRewardInput
+
+    color stopColor   = color.new(bearColorInput, 30)
+    color targetColor = color.new(bullColorInput, 30)
+
+    stopLine   := line.new(bar_index, stopPrice, bar_index + 40, stopPrice, color=stopColor, width=2, style=line.style_dotted)
+    targetLine := line.new(bar_index, targetPrice, bar_index + 40, targetPrice, color=targetColor, width=2, style=line.style_dotted)
+    riskLabel  := label.new(bar_index + 42, entryPrice, str.tostring(riskRewardInput, "#.#") + "R", style=label.style_label_left, color=color.new(NEUTRAL_CLR, 60), textcolor=color.white, size=size.small)
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Multi-Timeframe Dashboard
+// ──────────────────────────────────────────────────────────────────────────────
+computeMtfDirection(tf) =>
+    request.security(syminfo.tickerid, tf, trendDirection, lookahead=barmerge.lookahead_off)
+
+computeMtfStrength(tf) =>
+    request.security(syminfo.tickerid, tf, momentumStrength, lookahead=barmerge.lookahead_off)
+
+if showDashboardInput and barstate.islast
+    var table dashTable = na
+    table.delete(dashTable)
+
+    tablePos = switch dashPositionInput
+        "Top Right"    => position.top_right
+        "Top Left"     => position.top_left
+        "Bottom Right" => position.bottom_right
+        "Bottom Left"  => position.bottom_left
+        => position.top_right
+
+    dashTable := table.new(tablePos, 4, 7, bgcolor=color.new(#1e222d, 10), border_color=color.new(NEUTRAL_CLR, 70), border_width=1, frame_color=color.new(NEUTRAL_CLR, 60), frame_width=2)
+
+    // Header
+    table.cell(dashTable, 0, 0, "VP-ATMC", text_color=color.white, text_size=size.small, bgcolor=color.new(#2962ff, 20))
+    table.cell(dashTable, 1, 0, "Trend", text_color=color.white, text_size=size.tiny, bgcolor=color.new(#2962ff, 20))
+    table.cell(dashTable, 2, 0, "Strength", text_color=color.white, text_size=size.tiny, bgcolor=color.new(#2962ff, 20))
+    table.cell(dashTable, 3, 0, "Volume", text_color=color.white, text_size=size.tiny, bgcolor=color.new(#2962ff, 20))
+
+    // Current timeframe row
+    string currentTfLabel = timeframe.isminutes ? str.tostring(timeframe.multiplier) + "m" : timeframe.isseconds ? str.tostring(timeframe.multiplier) + "s" : timeframe.isdaily ? "D" : timeframe.isweekly ? "W" : timeframe.ismonthly ? "M" : timeframe.period
+    string currentTrendText = trendDirection == 1 ? "BULL" : "BEAR"
+    color  currentTrendBg = trendDirection == 1 ? color.new(bullColorInput, 50) : color.new(bearColorInput, 50)
+    string currentStrengthText = str.tostring(momentumStrength * 100, "#") + "%"
+    string currentVolText = volume >= avgVolume * 1.5 ? "HIGH" : volume >= avgVolume ? "AVG" : "LOW"
+    color  currentVolBg = volume >= avgVolume * 1.5 ? color.new(bullColorInput, 60) : volume >= avgVolume ? color.new(NEUTRAL_CLR, 60) : color.new(bearColorInput, 60)
+
+    table.cell(dashTable, 0, 1, currentTfLabel + " *", text_color=color.white, text_size=size.tiny, bgcolor=color.new(NEUTRAL_CLR, 70))
+    table.cell(dashTable, 1, 1, currentTrendText, text_color=color.white, text_size=size.tiny, bgcolor=currentTrendBg)
+    table.cell(dashTable, 2, 1, currentStrengthText, text_color=color.white, text_size=size.tiny, bgcolor=currentTrendBg)
+    table.cell(dashTable, 3, 1, currentVolText, text_color=color.white, text_size=size.tiny, bgcolor=currentVolBg)
+
+    // MTF rows
+    string[] tfLabels = array.from(dashTf1Input, dashTf2Input, dashTf3Input, dashTf4Input, dashTf5Input)
+    string[] tfDisplay = array.from(dashTf1Input == "15" ? "15m" : dashTf1Input == "60" ? "1H" : dashTf1Input == "240" ? "4H" : dashTf1Input == "D" ? "D" : dashTf1Input == "W" ? "W" : dashTf1Input, dashTf2Input == "15" ? "15m" : dashTf2Input == "60" ? "1H" : dashTf2Input == "240" ? "4H" : dashTf2Input == "D" ? "D" : dashTf2Input == "W" ? "W" : dashTf2Input, dashTf3Input == "15" ? "15m" : dashTf3Input == "60" ? "1H" : dashTf3Input == "240" ? "4H" : dashTf3Input == "D" ? "D" : dashTf3Input == "W" ? "W" : dashTf3Input, dashTf4Input == "15" ? "15m" : dashTf4Input == "60" ? "1H" : dashTf4Input == "240" ? "4H" : dashTf4Input == "D" ? "D" : dashTf4Input == "W" ? "W" : dashTf4Input, dashTf5Input == "15" ? "15m" : dashTf5Input == "60" ? "1H" : dashTf5Input == "240" ? "4H" : dashTf5Input == "D" ? "D" : dashTf5Input == "W" ? "W" : dashTf5Input)
+
+    for i = 0 to 4
+        string tf = tfLabels.get(i)
+        int    mtfDir = computeMtfDirection(tf)
+        float  mtfStr = computeMtfStrength(tf)
+
+        string dirText = mtfDir == 1 ? "BULL" : "BEAR"
+        color  dirBg = mtfDir == 1 ? color.new(bullColorInput, 50) : color.new(bearColorInput, 50)
+        string strText = str.tostring(mtfStr * 100, "#") + "%"
+
+        table.cell(dashTable, 0, i + 2, tfDisplay.get(i), text_color=color.white, text_size=size.tiny, bgcolor=color.new(NEUTRAL_CLR, 70))
+        table.cell(dashTable, 1, i + 2, dirText, text_color=color.white, text_size=size.tiny, bgcolor=dirBg)
+        table.cell(dashTable, 2, i + 2, strText, text_color=color.white, text_size=size.tiny, bgcolor=dirBg)
+        table.cell(dashTable, 3, i + 2, "", text_color=color.white, text_size=size.tiny, bgcolor=color.new(NEUTRAL_CLR, 80))
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Plotting — Momentum Glow
+// ──────────────────────────────────────────────────────────────────────────────
+float glowWidth = currentVolatility * 0.07 * (0.5 + momentumStrength)
+
+glowOuter3Up   = plot(showGlowInput ? fastTrendLine + glowWidth * 3 : na, display=display.none)
+glowOuter2Up   = plot(showGlowInput ? fastTrendLine + glowWidth * 2 : na, display=display.none)
+glowInner1Up   = plot(showGlowInput ? fastTrendLine + glowWidth     : na, display=display.none)
+plotFastLine    = plot(fastTrendLine, "Fast Trend Line", trendColor, 2)
+glowInner1Down = plot(showGlowInput ? fastTrendLine - glowWidth     : na, display=display.none)
+glowOuter2Down = plot(showGlowInput ? fastTrendLine - glowWidth * 2 : na, display=display.none)
+glowOuter3Down = plot(showGlowInput ? fastTrendLine - glowWidth * 3 : na, display=display.none)
+
+fill(glowOuter3Up, glowOuter2Up, showGlowInput ? color.new(trendColor, 94) : na)
+fill(glowOuter2Up, glowInner1Up, showGlowInput ? color.new(trendColor, 88) : na)
+fill(glowInner1Up, plotFastLine, showGlowInput ? color.new(trendColor, 78) : na)
+fill(plotFastLine, glowInner1Down, showGlowInput ? color.new(trendColor, 78) : na)
+fill(glowInner1Down, glowOuter2Down, showGlowInput ? color.new(trendColor, 88) : na)
+fill(glowOuter2Down, glowOuter3Down, showGlowInput ? color.new(trendColor, 94) : na)
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Plotting — Channel
+// ──────────────────────────────────────────────────────────────────────────────
+plotInnerEdge = plot(innerEdge, display=display.none)
+plotRibbon1   = plot(ribbonMid1, display=display.none)
+plotRibbon2   = plot(ribbonMid2, display=display.none)
+plotOuterEdge = plot(outerEdge, "Outer Channel Edge", color.new(trendColor, 60), 1)
+
+fill(plotInnerEdge, plotRibbon1, color.new(trendColor, showChannelFillInput ? 75 : 100))
+fill(plotRibbon1, plotRibbon2, color.new(trendColor, showChannelFillInput ? 83 : 100))
+fill(plotRibbon2, plotOuterEdge, color.new(trendColor, showChannelFillInput ? 90 : 100))
+
+float channelBreakLine = trendFlip ? float(na) : outerEdge
+plotChannelBreak = plot(channelBreakLine, "Channel Break Line", trendColor, 2, plot.style_linebr)
+plotMidPrice     = plot(hl2, display=display.none, editable=false)
+fill(plotChannelBreak, plotMidPrice, hl2, channelBreakLine, color(na), color.new(trendColor, 82), editable=false)
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Plotting — Candles & Signals
+// ──────────────────────────────────────────────────────────────────────────────
+plotcandle(open, high, low, close, "Candles", trendColor, trendColor, bordercolor=trendColor, display=paintCandlesInput ? display.all : display.none)
+
+// Signal labels with volume status
+if confirmedFlip and trendDirection == 1 and showSignalLabelsInput
+    string signalText = useVolumeFilterInput ? "LONG\nVol OK" : "LONG"
+    label.new(bar_index, low, signalText, style=label.style_label_up, color=color.new(bullColorInput, 20), textcolor=color.white, size=size.small)
+
+if confirmedFlip and trendDirection == -1 and showSignalLabelsInput
+    string signalText = useVolumeFilterInput ? "SHORT\nVol OK" : "SHORT"
+    label.new(bar_index, high, signalText, style=label.style_label_down, color=color.new(bearColorInput, 20), textcolor=color.white, size=size.small)
+
+// Unconfirmed flip (volume filter failed)
+if trendFlip and not volumeConfirmed and useVolumeFilterInput and showSignalLabelsInput
+    string weakText = trendDirection == 1 ? "Weak Bull" : "Weak Bear"
+    float  weakY = trendDirection == 1 ? low : high
+    weakStyle = trendDirection == 1 ? label.style_label_up : label.style_label_down
+    label.new(bar_index, weakY, weakText, style=weakStyle, color=color.new(NEUTRAL_CLR, 40), textcolor=color.white, size=size.tiny)
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Alerts — Comprehensive System (8 conditions)
+// ──────────────────────────────────────────────────────────────────────────────
+bool alertBullFlip = confirmedFlip and trendDirection == 1
+bool alertBearFlip = confirmedFlip and trendDirection == -1
+bool alertPeakMomentum = momentumStrength > 0.85
+bool alertWeakMomentum = momentumStrength < 0.15 and momentumStrength[1] >= 0.15
+bool alertBullDiv = bullishDivergence
+bool alertBearDiv = bearishDivergence
+bool alertAnyFlip = confirmedFlip
+bool alertMtfAligned = barstate.isconfirmed and showDashboardInput ? (computeMtfDirection(dashTf3Input) == trendDirection and computeMtfDirection(dashTf4Input) == trendDirection) : false
+
+alertcondition(alertBullFlip, "Bullish Trend Flip", "Viprasol ATMC: Bullish trend flip confirmed on {{ticker}} at {{close}} | TF: {{interval}}")
+alertcondition(alertBearFlip, "Bearish Trend Flip", "Viprasol ATMC: Bearish trend flip confirmed on {{ticker}} at {{close}} | TF: {{interval}}")
+alertcondition(alertPeakMomentum, "Peak Momentum", "Viprasol ATMC: Peak momentum detected on {{ticker}} — possible exhaustion | Strength: >85% | TF: {{interval}}")
+alertcondition(alertWeakMomentum, "Momentum Fading", "Viprasol ATMC: Momentum fading on {{ticker}} — trend losing energy | TF: {{interval}}")
+alertcondition(alertBullDiv, "Bullish Divergence", "Viprasol ATMC: Bullish divergence detected on {{ticker}} — price vs momentum disagree | TF: {{interval}}")
+alertcondition(alertBearDiv, "Bearish Divergence", "Viprasol ATMC: Bearish divergence detected on {{ticker}} — price vs momentum disagree | TF: {{interval}}")
+alertcondition(alertAnyFlip, "Any Trend Flip", "Viprasol ATMC: Trend flip on {{ticker}} at {{close}} | TF: {{interval}}")
+alertcondition(alertMtfAligned, "MTF Alignment", "Viprasol ATMC: Multi-timeframe alignment confirmed on {{ticker}} | TF: {{interval}}")
+// ──────────────────────────────────────────────────────────────────────────────

@@ -1,0 +1,274 @@
+// SmartFlow SMC Indicator (Free Edition)
+// Smart Money Concepts: Market Structure + Liquidity Visualization
+// © SmartFlow
+//@version=6
+indicator("SmartFlow SMC (Free)", overlay=true, max_lines_count=500, max_labels_count=500)
+
+// ═══════════════════════════════════════════════════════════════
+// INPUTS
+// ═══════════════════════════════════════════════════════════════
+grp_ema = "EMA 200"
+show_ema = input.bool(true, "Show EMA 200", group=grp_ema)
+ema_len  = input.int(200, "Period", group=grp_ema)
+
+grp_sess = "Sessions"
+show_sessions = input.bool(true, "Show Sessions", group=grp_sess)
+show_tokyo    = input.bool(true, "Tokyo (09:00-15:00)", group=grp_sess)
+show_london   = input.bool(true, "London (16:00-21:00)", group=grp_sess)
+show_ny       = input.bool(true, "New York (21:00-02:00)", group=grp_sess)
+sess_tz       = input.string("Asia/Tokyo", "Timezone", options=["Asia/Tokyo","Asia/Shanghai","UTC","America/New_York","Europe/London"], group=grp_sess)
+tokyo_color   = input.color(color.new(#ffeb3b, 70), "Tokyo", group=grp_sess)
+london_color  = input.color(color.new(#2196f3, 70), "London", group=grp_sess)
+ny_color      = input.color(color.new(#ff9800, 70), "New York", group=grp_sess)
+
+grp_struct = "Structure (BoS / MSS)"
+show_structure     = input.bool(true, "Show BoS / MSS", group=grp_struct)
+struct_lookback    = input.int(5, "Swing Lookback", minval=2, maxval=20, group=grp_struct, tooltip="Number of bars left/right to confirm a swing point. Lower = more sensitive, Higher = bigger swings only.")
+bos_color          = input.color(color.new(#4caf50, 30), "BoS Color", group=grp_struct)
+mss_color          = input.color(color.new(#f44336, 30), "MSS Color", group=grp_struct)
+show_mss_candidate = input.bool(true, "Show MSS Candidate Line", group=grp_struct)
+mss_cand_color     = input.color(color.new(#ff5252, 60), "MSS Candidate Color", group=grp_struct)
+
+grp_eq = "Equal Highs / Lows"
+show_eq      = input.bool(true, "Show EQH / EQL", group=grp_eq)
+eq_tolerance = input.float(0.05, "Tolerance %", minval=0.01, maxval=1.0, step=0.01, group=grp_eq)
+eq_color     = input.color(color.new(#e040fb, 40), "Color", group=grp_eq)
+
+grp_liq = "Liquidity (BSL / SSL)"
+show_liquidity = input.bool(true, "Show BSL / SSL", group=grp_liq)
+bsl_color      = input.color(color.new(#ff5252, 70), "BSL", group=grp_liq)
+ssl_color      = input.color(color.new(#4caf50, 70), "SSL", group=grp_liq)
+
+// ═══════════════════════════════════════════════════════════════
+// EMA 200
+// ═══════════════════════════════════════════════════════════════
+ema200 = ta.ema(close, ema_len)
+is_above_ema = close > ema200
+atr_val = ta.atr(14) * 0.5
+plot(show_ema ? ema200 : na, "EMA200", color=is_above_ema ? color.new(#00bcd4,20) : color.new(#ff5252,20), linewidth=2)
+
+// ═══════════════════════════════════════════════════════════════
+// SESSIONS (color bar at bottom)
+// ═══════════════════════════════════════════════════════════════
+is_tk  = not na(time(timeframe.period, "0900-1500", sess_tz))
+is_ldn = not na(time(timeframe.period, "1600-2100", sess_tz))
+is_ny  = not na(time(timeframe.period, "2100-0200", sess_tz))
+
+color sess_color = na
+if show_sessions
+    if show_tokyo and is_tk
+        sess_color := tokyo_color
+    if show_london and is_ldn
+        sess_color := london_color
+    if show_ny and is_ny
+        sess_color := ny_color
+plotshape(show_sessions and not na(sess_color), style=shape.square, location=location.bottom, color=sess_color, size=size.tiny, title="Session")
+
+// ═══════════════════════════════════════════════════════════════
+// PIVOT DETECTION
+// ═══════════════════════════════════════════════════════════════
+int lb = struct_lookback
+float ph = ta.pivothigh(high, lb, lb)
+float pl = ta.pivotlow(low, lb, lb)
+var float pv_hi = na, var int pv_hi_bar = na
+var float pv_lo = na, var int pv_lo_bar = na
+var float pv_hi_prev = na, var int pv_hi_prev_bar = na
+var float pv_lo_prev = na, var int pv_lo_prev_bar = na
+
+if not na(ph)
+    pv_hi_prev := pv_hi, pv_hi_prev_bar := pv_hi_bar
+    pv_hi := ph, pv_hi_bar := bar_index - lb
+if not na(pl)
+    pv_lo_prev := pv_lo, pv_lo_prev_bar := pv_lo_bar
+    pv_lo := pl, pv_lo_bar := bar_index - lb
+
+// ═══════════════════════════════════════════════════════════════
+// STRUCTURE ENGINE (BoS / MSS)
+// ═══════════════════════════════════════════════════════════════
+var int   trend = 0
+var float bos_target = na, var int bos_target_bar = na
+var float mss_level = na, var int mss_level_bar = na
+var bool  bos_broken = false
+var float tracking_high = na, var int tracking_high_bar = na
+var float tracking_low = na, var int tracking_low_bar = na
+
+bool bull_bos = false, bool bear_bos = false
+bool bull_mss = false, bool bear_mss = false
+
+if trend == 0
+    trend := close > ema200 ? 1 : -1
+    bos_broken := true
+    tracking_high := high[1], tracking_high_bar := bar_index - 1
+    tracking_low := low[1], tracking_low_bar := bar_index - 1
+
+// Tracking
+if trend == 1 and bos_broken
+    if na(tracking_high) or high[1] > tracking_high
+        tracking_high := high[1], tracking_high_bar := bar_index - 1
+    if na(tracking_low) or low[1] < tracking_low
+        tracking_low := low[1], tracking_low_bar := bar_index - 1
+if trend == -1 and bos_broken
+    if na(tracking_low) or low[1] < tracking_low
+        tracking_low := low[1], tracking_low_bar := bar_index - 1
+    if na(tracking_high) or high[1] > tracking_high
+        tracking_high := high[1], tracking_high_bar := bar_index - 1
+
+// Pivot → targets
+if trend == 1
+    if not na(ph)
+        float nt = math.max(ph, nz(tracking_high, ph))
+        int nb = ph >= nz(tracking_high, ph) ? bar_index - lb : nz(tracking_high_bar, bar_index - lb)
+        bos_target := nt, bos_target_bar := nb, bos_broken := false
+        tracking_high := na, tracking_high_bar := na
+        tracking_low := low[1], tracking_low_bar := bar_index - 1
+    if not na(pl)
+        mss_level := pl, mss_level_bar := bar_index - lb
+if trend == -1
+    if not na(pl)
+        float nt = math.min(pl, nz(tracking_low, pl))
+        int nb = pl <= nz(tracking_low, pl) ? bar_index - lb : nz(tracking_low_bar, bar_index - lb)
+        bos_target := nt, bos_target_bar := nb, bos_broken := false
+        tracking_low := na, tracking_low_bar := na
+        tracking_high := high[1], tracking_high_bar := bar_index - 1
+    if not na(ph)
+        mss_level := ph, mss_level_bar := bar_index - lb
+
+// BoS detection (confirmed candle [1])
+if trend == 1 and not bos_broken and not na(bos_target) and close[1] > bos_target
+    bull_bos := true, bos_broken := true
+    tracking_high := high[1], tracking_high_bar := bar_index - 1
+    tracking_low := low[1], tracking_low_bar := bar_index - 1
+    if show_structure
+        line.new(bos_target_bar, bos_target, bar_index-1, bos_target, color=bos_color, style=line.style_dotted, width=1)
+        label.new(bar_index-1, bos_target + atr_val*2, "BoS", color=bos_color, textcolor=color.white, size=size.small, style=label.style_label_down)
+
+if trend == -1 and not bos_broken and not na(bos_target) and close[1] < bos_target
+    bear_bos := true, bos_broken := true
+    tracking_low := low[1], tracking_low_bar := bar_index - 1
+    tracking_high := high[1], tracking_high_bar := bar_index - 1
+    if show_structure
+        line.new(bos_target_bar, bos_target, bar_index-1, bos_target, color=bos_color, style=line.style_dotted, width=1)
+        label.new(bar_index-1, bos_target - atr_val*2, "BoS", color=bos_color, textcolor=color.white, size=size.small, style=label.style_label_up)
+
+// MSS detection
+if trend == 1 and not na(mss_level) and not bull_bos and close[1] < mss_level
+    bear_mss := true
+    if show_structure
+        line.new(mss_level_bar, mss_level, bar_index-1, mss_level, color=mss_color, style=line.style_solid, width=2)
+        label.new(bar_index-1, mss_level - atr_val*2, "MSS", color=mss_color, textcolor=color.white, size=size.small, style=label.style_label_up)
+    trend := -1, bos_broken := true
+    if not na(pv_lo)
+        bos_target := pv_lo, bos_target_bar := pv_lo_bar, bos_broken := false
+    if not na(pv_hi)
+        mss_level := pv_hi, mss_level_bar := pv_hi_bar
+
+if trend == -1 and not na(mss_level) and not bear_bos and not bear_mss and close[1] > mss_level
+    bull_mss := true
+    if show_structure
+        line.new(mss_level_bar, mss_level, bar_index-1, mss_level, color=mss_color, style=line.style_solid, width=2)
+        label.new(bar_index-1, mss_level + atr_val*2, "MSS", color=mss_color, textcolor=color.white, size=size.small, style=label.style_label_down)
+    trend := 1, bos_broken := true
+    if not na(pv_hi)
+        bos_target := pv_hi, bos_target_bar := pv_hi_bar, bos_broken := false
+    if not na(pv_lo)
+        mss_level := pv_lo, mss_level_bar := pv_lo_bar
+
+// MSS candidate line
+var line mss_ln = na, var label mss_lb = na
+if show_mss_candidate and not na(mss_level) and not na(mss_level_bar)
+    if not na(mss_ln)
+        line.delete(mss_ln)
+    if not na(mss_lb)
+        label.delete(mss_lb)
+    string ct = trend == 1 ? "MSS ↓" : "MSS ↑"
+    mss_ln := line.new(mss_level_bar, mss_level, bar_index+20, mss_level, color=mss_cand_color, style=line.style_dashed, width=2)
+    mss_lb := label.new(bar_index+21, mss_level, ct, color=color.new(mss_cand_color,30), textcolor=color.white, size=size.small, style=trend==1 ? label.style_label_up : label.style_label_down)
+
+// BoS target line
+var line bos_ln = na, var label bos_lb = na
+if show_structure
+    if not na(bos_ln)
+        line.delete(bos_ln)
+    if not na(bos_lb)
+        label.delete(bos_lb)
+    float bdl = na, int bdb = na
+    if not bos_broken and not na(bos_target)
+        bdl := bos_target, bdb := bos_target_bar
+    else
+        bdl := trend == 1 ? tracking_high : tracking_low
+        bdb := trend == 1 ? tracking_high_bar : tracking_low_bar
+    if not na(bdl) and not na(bdb)
+        string blt = trend == 1 ? "BoS ↑" : "BoS ↓"
+        bos_ln := line.new(bdb, bdl, bar_index+20, bdl, color=bos_color, style=line.style_dashed, width=2)
+        bos_lb := label.new(bar_index+21, bdl, blt, color=color.new(bos_color,30), textcolor=color.white, size=size.small, style=trend==1 ? label.style_label_down : label.style_label_up)
+
+// ═══════════════════════════════════════════════════════════════
+// SWEEP
+// ═══════════════════════════════════════════════════════════════
+bool bull_sweep = not na(pv_lo) and low < pv_lo and close > pv_lo and open > pv_lo
+bool bear_sweep = not na(pv_hi) and high > pv_hi and close < pv_hi and open < pv_hi
+if show_liquidity and bull_sweep
+    label.new(bar_index, low, "SW", color=color.new(#ffeb3b,20), textcolor=color.black, size=size.tiny, style=label.style_label_up)
+if show_liquidity and bear_sweep
+    label.new(bar_index, high, "SW", color=color.new(#ffeb3b,20), textcolor=color.black, size=size.tiny, style=label.style_label_down)
+
+// ═══════════════════════════════════════════════════════════════
+// BSL / SSL (latest one each)
+// ═══════════════════════════════════════════════════════════════
+var line bsl_ln = na, var label bsl_lb2 = na
+var line ssl_ln = na, var label ssl_lb2 = na
+if show_liquidity
+    if not na(ph)
+        if not na(bsl_ln)
+            line.delete(bsl_ln)
+        if not na(bsl_lb2)
+            label.delete(bsl_lb2)
+        bsl_ln := line.new(pv_hi_bar, pv_hi, bar_index+15, pv_hi, color=bsl_color, style=line.style_dotted, width=1)
+        bsl_lb2 := label.new(bar_index+16, pv_hi, "BSL", color=color.new(bsl_color,80), textcolor=color.new(color.white,30), size=size.tiny, style=label.style_label_down)
+    else if not na(bsl_ln)
+        line.set_x2(bsl_ln, bar_index+15)
+        if not na(bsl_lb2)
+            label.set_x(bsl_lb2, bar_index+16)
+    if not na(pl)
+        if not na(ssl_ln)
+            line.delete(ssl_ln)
+        if not na(ssl_lb2)
+            label.delete(ssl_lb2)
+        ssl_ln := line.new(pv_lo_bar, pv_lo, bar_index+15, pv_lo, color=ssl_color, style=line.style_dotted, width=1)
+        ssl_lb2 := label.new(bar_index+16, pv_lo, "SSL", color=color.new(ssl_color,80), textcolor=color.new(color.white,30), size=size.tiny, style=label.style_label_up)
+    else if not na(ssl_ln)
+        line.set_x2(ssl_ln, bar_index+15)
+        if not na(ssl_lb2)
+            label.set_x(ssl_lb2, bar_index+16)
+
+// ═══════════════════════════════════════════════════════════════
+// EQH / EQL
+// ═══════════════════════════════════════════════════════════════
+if show_eq and not na(ph) and not na(pv_hi_prev) and not na(pv_hi_prev_bar)
+    if math.abs(pv_hi - pv_hi_prev) <= pv_hi_prev * eq_tolerance / 100
+        line.new(pv_hi_prev_bar, pv_hi_prev, pv_hi_bar, pv_hi, color=eq_color, style=line.style_dashed, width=2)
+        label.new(pv_hi_bar, pv_hi, "EQH", color=color.new(eq_color,20), textcolor=color.white, size=size.tiny, style=label.style_label_down)
+if show_eq and not na(pl) and not na(pv_lo_prev) and not na(pv_lo_prev_bar)
+    if math.abs(pv_lo - pv_lo_prev) <= pv_lo_prev * eq_tolerance / 100
+        line.new(pv_lo_prev_bar, pv_lo_prev, pv_lo_bar, pv_lo, color=eq_color, style=line.style_dashed, width=2)
+        label.new(pv_lo_bar, pv_lo, "EQL", color=color.new(eq_color,20), textcolor=color.white, size=size.tiny, style=label.style_label_up)
+
+// ═══════════════════════════════════════════════════════════════
+// INFO TABLE
+// ═══════════════════════════════════════════════════════════════
+var table tb = table.new(position.top_right, 2, 5, bgcolor=color.new(#1e1e1e,10), border_color=color.new(#333333,0), border_width=1)
+if barstate.islast
+    color tc = trend==1 ? color.green : color.red
+    table.cell(tb,0,0,"Bias", text_color=color.gray, text_size=size.normal)
+    table.cell(tb,1,0,trend==1?"LONG ▲":"SHORT ▼", text_color=tc, text_size=size.normal)
+    table.cell(tb,0,1,"EMA200", text_color=color.gray, text_size=size.normal)
+    table.cell(tb,1,1,is_above_ema?"Above":"Below", text_color=is_above_ema?color.green:color.red, text_size=size.normal)
+    string st = is_tk?"Tokyo":is_ldn?"London":is_ny?"New York":"Off"
+    color sc = is_tk?tokyo_color:is_ldn?london_color:is_ny?ny_color:color.gray
+    table.cell(tb,0,2,"Session", text_color=color.gray, text_size=size.normal)
+    table.cell(tb,1,2,st, text_color=sc, text_size=size.normal)
+    table.cell(tb,0,3,"Structure", text_color=color.gray, text_size=size.normal)
+    table.cell(tb,1,3,trend==1?"Bullish":"Bearish", text_color=tc, text_size=size.normal)
+    // Pro upgrade hint
+    table.cell(tb,0,4,"", text_color=color.gray, text_size=size.small)
+    table.cell(tb,1,4,"★ Upgrade to Pro", text_color=color.new(#ffd600, 0), text_size=size.small)

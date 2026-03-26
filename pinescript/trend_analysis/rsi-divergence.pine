@@ -1,0 +1,370 @@
+//@version=5
+indicator("Real-Time ZigZag Divergence Engine", "RT-ZZ Div", overlay=true,
+  max_lines_count=500, max_labels_count=500, max_bars_back=5000)
+
+// ═══════════════════════════════════════════════════════════════════
+//  INPUTS
+// ═══════════════════════════════════════════════════════════════════
+string GZZ  = "── ZigZag ──"
+string zz_mode    = input.string("Percentage", "Deviation Mode", options=["Percentage", "ATR"], group=GZZ)
+float  zz_pct     = input.float(0.5, "Deviation %", minval=0.01, step=0.05, group=GZZ) / 100.0
+int    zz_atr_len = input.int(14, "ATR Length", minval=1, group=GZZ)
+float  zz_atr_mul = input.float(1.5, "ATR Multiplier", minval=0.1, step=0.1, group=GZZ)
+
+string GOSC = "── Oscillator ──"
+string osc_type   = input.string("RSI", "Type", options=["RSI", "MFI", "CCI", "Stoch %K", "Williams %R", "ROC", "CMO"], group=GOSC)
+int    osc_len    = input.int(14, "Length", minval=1, group=GOSC)
+int    osc_smooth = input.int(1, "Smoothing (EMA)", minval=1, tooltip="Post-calculation EMA. 1 = raw.", group=GOSC)
+
+string GDET = "── Detection ──"
+bool show_reg  = input.bool(true, "Regular Divergences", group=GDET)
+bool show_hid  = input.bool(false, "Hidden Divergences", group=GDET)
+bool show_live = input.bool(true, "Live (Forming) Signals", group=GDET)
+bool show_conf = input.bool(true, "Confirmed Signals", group=GDET)
+
+string GFLT = "── Filters ──"
+int   min_bars   = input.int(3, "Min Bars Between Pivots", minval=1, group=GFLT)
+float min_leg_pct = input.float(0.0, "Min Leg Size % (0=off)", minval=0.0, step=0.1, group=GFLT) / 100.0
+float max_ratio  = input.float(0.0, "Max Leg Ratio (0=off)", minval=0.0, step=0.05, group=GFLT,
+  tooltip="Exhaustion filter: current leg / prev same-dir leg must be < this value. 0 disables.")
+float min_osc_dv = input.float(0.0, "Min Osc Divergence (0=off)", minval=0.0, step=1.0, group=GFLT)
+bool  use_obos   = input.bool(false, "Require OB/OS Zone", group=GFLT)
+float ob_lvl     = input.float(70.0, "Overbought", group=GFLT)
+float os_lvl     = input.float(30.0, "Oversold", group=GFLT)
+
+string GVIS = "── Visual ──"
+bool  show_zz     = input.bool(true, "ZigZag Lines", group=GVIS)
+bool  show_legs   = input.bool(false, "Leg Measurements", group=GVIS)
+bool  show_dlines = input.bool(true, "Divergence Lines on Price", group=GVIS)
+color zz_col      = input.color(#42A5F5, "ZigZag", group=GVIS)
+color live_zz_col = input.color(#90CAF9, "ZigZag (Live Leg)", group=GVIS)
+color bull_col    = input.color(#00E676, "Bullish", group=GVIS)
+color bear_col    = input.color(#FF1744, "Bearish", group=GVIS)
+color hbull_col   = input.color(#26A69A, "Hidden Bull", group=GVIS)
+color hbear_col   = input.color(#EF5350, "Hidden Bear", group=GVIS)
+int   max_draw    = input.int(50, "Max Stored Objects", minval=10, maxval=200, group=GVIS)
+
+// ═══════════════════════════════════════════════════════════════════
+//  OSCILLATOR
+// ═══════════════════════════════════════════════════════════════════
+float osc_raw = switch osc_type
+    "RSI"          => ta.rsi(close, osc_len)
+    "MFI"          => ta.mfi(hlc3, osc_len)
+    "CCI"          => ta.cci(close, osc_len)
+    "Stoch %K"     => ta.stoch(close, high, low, osc_len)
+    "Williams %R"  => ta.wpr(osc_len)
+    "ROC"          => ta.roc(close, osc_len)
+    "CMO"          => ta.cmo(close, osc_len)
+    => ta.rsi(close, osc_len)
+
+float osc = osc_smooth > 1 ? ta.ema(osc_raw, osc_smooth) : osc_raw
+
+// ═══════════════════════════════════════════════════════════════════
+//  ZIGZAG STATE
+// ═══════════════════════════════════════════════════════════════════
+float _atr = ta.atr(zz_atr_len)
+
+// Confirmed pivot storage
+var array<float> pv_price = array.new<float>()
+var array<int>   pv_bar   = array.new<int>()
+var array<float> pv_osc   = array.new<float>()
+var array<int>   pv_type  = array.new<int>()    // 1=high, -1=low
+
+// Live tracking
+var int   dir       = 0
+var float ext_price = na
+var int   ext_bar   = 0
+var float ext_osc   = na
+
+// Drawing storage
+var line           live_zz_ln   = na
+var line           live_div_ln  = na
+var label          live_div_lbl = na
+var array<line>    zz_lines     = array.new<line>()
+var array<label>   leg_lbls     = array.new<label>()
+var array<line>    div_lines    = array.new<line>()
+var array<label>   div_lbls     = array.new<label>()
+
+// ═══════════════════════════════════════════════════════════════════
+//  HELPERS
+// ═══════════════════════════════════════════════════════════════════
+rev_from_high(float _ext) =>
+    if zz_mode == "ATR"
+        low < _ext - zz_atr_mul * _atr
+    else
+        low < _ext * (1.0 - zz_pct)
+
+rev_from_low(float _ext) =>
+    if zz_mode == "ATR"
+        high > _ext + zz_atr_mul * _atr
+    else
+        high > _ext * (1.0 + zz_pct)
+
+// Find last confirmed pivot index of given type
+find_prev_same(int _type) =>
+    int result = -1
+    int sz = array.size(pv_type)
+    if sz > 0
+        for k = sz - 1 to 0
+            if array.get(pv_type, k) == _type
+                result := k
+                break
+    result
+
+// Find second-to-last confirmed pivot of given type
+find_prev_same_2(int _type) =>
+    int result = -1
+    int sz = array.size(pv_type)
+    int found = 0
+    if sz > 0
+        for k = sz - 1 to 0
+            if array.get(pv_type, k) == _type
+                found += 1
+                if found == 2
+                    result := k
+                    break
+    result
+
+// Divergence classifier:  0=none, 1=reg bear, 2=reg bull, 3=hid bear, 4=hid bull
+classify_div(int _type, float _p1, float _o1, float _p2, float _o2) =>
+    int result = 0
+    if _type == 1
+        if show_reg and _p2 > _p1 and _o2 < _o1
+            result := 1
+        else if show_hid and _p2 < _p1 and _o2 > _o1
+            result := 3
+    else if _type == -1
+        if show_reg and _p2 < _p1 and _o2 > _o1
+            result := 2
+        else if show_hid and _p2 > _p1 and _o2 < _o1
+            result := 4
+    result
+
+// Filter gate — returns true if divergence passes all filters
+// _type: pivot type (1/-1), _b1/_b2: bars of the two pivots,
+// _o1/_o2: osc at the two pivots,
+// _leg_size: |current leg| as fraction, _prev_leg: |prev same-dir leg| as fraction (na if unavailable)
+passes_filters(int _type, int _b1, int _b2, float _o2, float _o1, float _leg_size, float _prev_leg) =>
+    bool pass = true
+    if _b2 - _b1 < min_bars
+        pass := false
+    if min_osc_dv > 0.0 and math.abs(_o2 - _o1) < min_osc_dv
+        pass := false
+    if min_leg_pct > 0.0 and _leg_size < min_leg_pct
+        pass := false
+    if max_ratio > 0.0 and not na(_prev_leg) and _prev_leg > 0.0
+        if _leg_size / _prev_leg >= max_ratio
+            pass := false
+    if use_obos
+        if _type == 1 and _o2 < ob_lvl
+            pass := false
+        if _type == -1 and _o2 > os_lvl
+            pass := false
+    pass
+
+div_color(int _d) =>
+    switch _d
+        1 => bear_col
+        2 => bull_col
+        3 => hbear_col
+        4 => hbull_col
+        => color.gray
+
+div_text(int _d) =>
+    switch _d
+        1 => "Bear Div"
+        2 => "Bull Div"
+        3 => "Hid Bear"
+        4 => "Hid Bull"
+        => ""
+
+// Cleanup helper
+cap_array_line(array<line> _arr, int _max) =>
+    while array.size(_arr) > _max
+        line.delete(array.shift(_arr))
+
+cap_array_label(array<label> _arr, int _max) =>
+    while array.size(_arr) > _max
+        label.delete(array.shift(_arr))
+
+// Compute leg size as fraction of starting price
+leg_frac(float _start, float _end) =>
+    math.abs(_end - _start) / math.max(_start, 1e-10)
+
+// ═══════════════════════════════════════════════════════════════════
+//  MAIN ZIGZAG ENGINE
+// ═══════════════════════════════════════════════════════════════════
+bool pivot_confirmed = false
+int  conf_type       = 0
+
+if bar_index > 0 and not na(osc)
+    if dir == 0
+        // ── Initialize direction from first bar movement ──
+        ext_price := high
+        ext_bar   := bar_index
+        ext_osc   := osc
+        dir       := 1
+    else if dir == 1
+        // ── Tracking UP — looking for highest high ──
+        if high > ext_price
+            ext_price := high
+            ext_bar   := bar_index
+            ext_osc   := osc
+        if rev_from_high(ext_price)
+            // Confirm HIGH pivot
+            array.push(pv_price, ext_price)
+            array.push(pv_bar,   ext_bar)
+            array.push(pv_osc,   ext_osc)
+            array.push(pv_type,  1)
+            pivot_confirmed := true
+            conf_type       := 1
+            // Begin tracking DOWN
+            dir       := -1
+            ext_price := low
+            ext_bar   := bar_index
+            ext_osc   := osc
+    else if dir == -1
+        // ── Tracking DOWN — looking for lowest low ──
+        if low < ext_price
+            ext_price := low
+            ext_bar   := bar_index
+            ext_osc   := osc
+        if rev_from_low(ext_price)
+            // Confirm LOW pivot
+            array.push(pv_price, ext_price)
+            array.push(pv_bar,   ext_bar)
+            array.push(pv_osc,   ext_osc)
+            array.push(pv_type,  -1)
+            pivot_confirmed := true
+            conf_type       := -1
+            // Begin tracking UP
+            dir       := 1
+            ext_price := high
+            ext_bar   := bar_index
+            ext_osc   := osc
+
+// ═══════════════════════════════════════════════════════════════════
+//  CONFIRMED PIVOT: DRAW ZIGZAG + CHECK DIVERGENCE
+// ═══════════════════════════════════════════════════════════════════
+if pivot_confirmed
+    int sz = array.size(pv_bar)
+
+    // ── Draw confirmed ZZ segment ──
+    if show_zz and sz >= 2
+        line zl = line.new(
+          array.get(pv_bar, sz - 2), array.get(pv_price, sz - 2),
+          array.get(pv_bar, sz - 1), array.get(pv_price, sz - 1),
+          color=zz_col, width=2)
+        array.push(zz_lines, zl)
+
+    // ── Leg measurement label ──
+    if show_legs and sz >= 2
+        float lsz  = leg_frac(array.get(pv_price, sz - 2), array.get(pv_price, sz - 1)) * 100.0
+        int   lbrs = array.get(pv_bar, sz - 1) - array.get(pv_bar, sz - 2)
+        label ll   = label.new(
+          int(math.avg(array.get(pv_bar, sz - 2), array.get(pv_bar, sz - 1))),
+          math.avg(array.get(pv_price, sz - 2), array.get(pv_price, sz - 1)),
+          str.tostring(lsz, "#.##") + "% / " + str.tostring(lbrs) + "b",
+          style=label.style_label_center, color=color.new(color.gray, 60),
+          textcolor=color.white, size=size.tiny)
+        array.push(leg_lbls, ll)
+
+    // ── Confirmed divergence check ──
+    if show_conf and sz >= 2
+        int prev_idx = find_prev_same_2(conf_type)
+        if prev_idx >= 0
+            float p1 = array.get(pv_price, prev_idx)
+            float o1 = array.get(pv_osc,   prev_idx)
+            int   b1 = array.get(pv_bar,   prev_idx)
+            float p2 = array.get(pv_price, sz - 1)
+            float o2 = array.get(pv_osc,   sz - 1)
+            int   b2 = array.get(pv_bar,   sz - 1)
+
+            int dv = classify_div(conf_type, p1, o1, p2, o2)
+            if dv != 0
+                // Compute leg metrics for filters
+                float cur_leg = sz >= 2 ? leg_frac(array.get(pv_price, sz - 2), p2) : 0.0
+                float prv_leg = na
+                if prev_idx >= 1
+                    prv_leg := leg_frac(array.get(pv_price, prev_idx - 1), p1)
+                if passes_filters(conf_type, b1, b2, o2, o1, cur_leg, prv_leg)
+                    // Signal label
+                    label dl = label.new(b2, p2, div_text(dv),
+                      style = conf_type == 1 ? label.style_label_down : label.style_label_up,
+                      color = div_color(dv), textcolor = color.white, size = size.normal)
+                    array.push(div_lbls, dl)
+                    // Price divergence line
+                    if show_dlines
+                        line dln = line.new(b1, p1, b2, p2,
+                          color=div_color(dv), width=2, style=line.style_dashed)
+                        array.push(div_lines, dln)
+
+    // ── Cleanup ──
+    cap_array_line(zz_lines,   max_draw)
+    cap_array_label(leg_lbls,  max_draw)
+    cap_array_line(div_lines,  max_draw)
+    cap_array_label(div_lbls,  max_draw)
+
+// ═══════════════════════════════════════════════════════════════════
+//  LIVE DETECTION — EVERY BAR
+// ═══════════════════════════════════════════════════════════════════
+// The live extreme (ext_price, ext_bar, ext_osc) is a candidate pivot.
+// Compare against last confirmed pivot of the same type as the current
+// tracking direction: dir==1 → candidate HIGH, dir==-1 → candidate LOW.
+
+int live_type = dir    // what type of pivot we're building toward
+
+// ── Update live ZZ line ──
+if show_zz
+    int sz = array.size(pv_bar)
+    if sz >= 1
+        int   anchor_bar   = array.get(pv_bar,   sz - 1)
+        float anchor_price = array.get(pv_price, sz - 1)
+        if na(live_zz_ln)
+            live_zz_ln := line.new(anchor_bar, anchor_price, ext_bar, ext_price,
+              color=live_zz_col, width=1, style=line.style_dotted)
+        else
+            line.set_xy1(live_zz_ln, anchor_bar, anchor_price)
+            line.set_xy2(live_zz_ln, ext_bar, ext_price)
+
+// ── Clear previous live divergence drawing ──
+if not na(live_div_ln)
+    line.delete(live_div_ln)
+    live_div_ln := na
+if not na(live_div_lbl)
+    label.delete(live_div_lbl)
+    live_div_lbl := na
+
+// ── Live divergence check ──
+if show_live and not na(osc) and dir != 0
+    int prev_idx = find_prev_same(live_type)
+    if prev_idx >= 0
+        float p1 = array.get(pv_price, prev_idx)
+        float o1 = array.get(pv_osc,   prev_idx)
+        int   b1 = array.get(pv_bar,   prev_idx)
+        float p2 = ext_price
+        float o2 = ext_osc
+        int   b2 = ext_bar
+
+        int dv = classify_div(live_type, p1, o1, p2, o2)
+        if dv != 0
+            int sz = array.size(pv_bar)
+            float cur_leg = sz >= 1 ? leg_frac(array.get(pv_price, sz - 1), p2) : 0.0
+            float prv_leg = na
+            if prev_idx >= 1
+                prv_leg := leg_frac(array.get(pv_price, prev_idx - 1), p1)
+            if passes_filters(live_type, b1, b2, o2, o1, cur_leg, prv_leg)
+                color dc = color.new(div_color(dv), 40)
+                live_div_lbl := label.new(b2, p2, "⚡ " + div_text(dv),
+                  style = live_type == 1 ? label.style_label_down : label.style_label_up,
+                  color = dc, textcolor = color.white, size = size.small)
+                if show_dlines
+                    live_div_ln := line.new(b1, p1, b2, p2,
+                      color=dc, width=1, style=line.style_dotted)
+
+// ═══════════════════════════════════════════════════════════════════
+//  PLOT OSC IN SEPARATE PANE (optional reference)
+// ═══════════════════════════════════════════════════════════════════
+plot(osc, "Oscillator", color=color.new(#B0BEC5, 80), display=display.none)
+
+// © Cmo22

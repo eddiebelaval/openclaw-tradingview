@@ -1,0 +1,420 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © BOSWaves
+
+//@version=6
+indicator("Zero Lag Kalman Structure [BOSWaves]", overlay=true, max_lines_count=500, max_labels_count=500, max_boxes_count=500)
+
+// ┌────────────────────────────── BOSWaves ─ Tooltips ───────────────────────────────┐
+// └──────────────────────────────────────────────────────────────────────────────────┘
+
+const string tt_process_noise     = "Controls how quickly the filter adapts to price changes. Lower = smoother output, higher = more reactive to recent price."
+const string tt_measurement_noise = "Controls how much the filter trusts incoming price data versus its own model. Higher = smoother but slower response."
+const string tt_zero_lag_factor   = "Strength of lag correction applied to the Kalman estimate. Higher = tighter tracking of price with less delay. Set to 0 to disable."
+const string tt_velocity_weight   = "How much the filter's internal velocity model influences the prediction step. Higher = more momentum-aware estimation."
+const string tt_ribbon_spread     = "Controls the process noise increment between each ribbon line. Higher = wider separation between fastest and slowest Kalman lines."
+const string tt_show_ribbon       = "Toggle visibility of the six-line Kalman ribbon and gradient fills."
+const string tt_show_levels       = "Toggle visibility of deviation-based support and resistance zone boxes."
+const string tt_deviation_thresh  = "ATR multiplier required for price to be considered in a deviation extreme. Higher = only larger moves create levels."
+const string tt_level_width       = "ATR multiplier that determines the thickness of each zone box above and below the extreme price point."
+const string tt_max_levels        = "Maximum number of active deviation zones on the chart. When exceeded, the oldest zone is removed automatically."
+const string tt_level_extend      = "Number of bars each zone extends forward from its creation point. Zones continue extending on each new bar."
+const string tt_show_bos          = "Toggle visibility of BOS and CHoCH labels and structure lines."
+const string tt_bos_swing_len     = "Pivot lookback length used to detect swing highs and lows for structure detection. Higher = fewer but more significant structural breaks."
+const string tt_bos_label_size    = "Size of the BOS and CHoCH text labels drawn on the chart. Set to 'none' to hide labels while keeping structure lines."
+const string tt_retest_type       = "Retest detection method. 'Levels' detects wick interaction with deviation zone boundaries. 'Kalman Line' detects price touching the main filter line after sufficient separation."
+const string tt_retest_cooldown   = "Minimum bars required between consecutive retest signals to prevent clustering. Applies to both Levels and Kalman Line retest modes."
+const string tt_bull_color        = "Color applied to bullish ribbon state, support zones, bullish BOS/CHoCH labels, and bullish retest signals."
+const string tt_bear_color        = "Color applied to bearish ribbon state, resistance zones, bearish BOS/CHoCH labels, and bearish retest signals."
+
+// ┌────────────────────────────── BOSWaves ─ Inputs ─────────────────────────────────┐
+// └──────────────────────────────────────────────────────────────────────────────────┘
+
+const string group_kalman   = "Kalman Filter"
+const string group_ribbon   = "Ribbon"
+const string group_levels   = "Deviation Levels"
+const string group_bos      = "BOS / CHoCH"
+const string group_retest   = "Retest Signals"
+const string group_visual   = "Visualization"
+
+// Kalman inputs
+process_noise      = input.float(0.01, "Process Noise (Q)", minval=0.001, maxval=0.1, step=0.001, group=group_kalman, tooltip=tt_process_noise)
+measurement_noise  = input.float(0.5, "Measurement Noise (R)", minval=0.1, maxval=2.0, step=0.1, group=group_kalman, tooltip=tt_measurement_noise)
+zero_lag_factor    = input.float(1.0, "Zero Lag Factor", minval=0.0, maxval=2.0, step=0.1, group=group_kalman, tooltip=tt_zero_lag_factor)
+velocity_weight    = input.float(0.5, "Velocity Weight", minval=0.0, maxval=1.0, step=0.1, group=group_kalman, tooltip=tt_velocity_weight)
+
+// Ribbon inputs
+ribbon_spread      = input.float(0.003, "Ribbon Spread", minval=0.001, maxval=0.01, step=0.001, group=group_ribbon, tooltip=tt_ribbon_spread)
+show_ribbon        = input.bool(true, "Show Ribbon", group=group_ribbon, tooltip=tt_show_ribbon)
+
+// Level inputs
+show_levels        = input.bool(true, "Show Deviation Levels", group=group_levels, tooltip=tt_show_levels)
+deviation_thresh   = input.float(1.5, "Deviation Threshold (ATR)", minval=0.5, maxval=4.0, step=0.1, group=group_levels, tooltip=tt_deviation_thresh)
+level_width        = input.float(0.25, "Level Width (ATR)", minval=0.1, maxval=1.0, step=0.05, group=group_levels, tooltip=tt_level_width)
+max_levels         = input.int(6, "Maximum Levels", minval=2, maxval=12, group=group_levels, tooltip=tt_max_levels)
+level_extend       = input.int(50, "Level Extend Bars", minval=20, maxval=200, group=group_levels, tooltip=tt_level_extend)
+
+// BOS / CHoCH inputs
+show_bos           = input.bool(true, "Show BOS / CHoCH", group=group_bos, tooltip=tt_show_bos)
+bos_swing_len      = input.int(5, "Swing Lookback", minval=2, maxval=20, group=group_bos, tooltip=tt_bos_swing_len)
+bos_label_size     = input.string("small", "Label Size", options=["tiny", "small", "normal", "none"], group=group_bos, tooltip=tt_bos_label_size)
+
+// Retest inputs
+retest_type        = input.string("Kalman Line", "Retest Method", options=["Levels", "Kalman Line", "None"], group=group_retest, tooltip=tt_retest_type)
+retest_cooldown    = input.int(50, "Retest Cooldown (bars)", minval=2, maxval=50, group=group_retest, tooltip=tt_retest_cooldown)
+
+bool use_level_retest  = retest_type == "Levels"
+bool use_kalman_retest = retest_type == "Kalman Line"
+
+// Visual inputs
+bull_color         = input.color(#00ff00, "Bullish Color", group=group_visual, tooltip=tt_bull_color)
+bear_color         = input.color(#ff0000, "Bearish Color", group=group_visual, tooltip=tt_bear_color)
+
+// ┌────────────────────────────── BOSWaves ─ Kalman Filter ──────────────────────────┐
+// └──────────────────────────────────────────────────────────────────────────────────┘
+
+kalman_filter(float src, float q, float r, float zl_factor, float vel_weight) =>
+    var float est = na
+    var float vel = 0.0
+    var float err_cov = 1.0
+    var float vel_cov = 1.0
+    var float zlk = na
+
+    if na(est)
+        est := src
+        vel := 0.0
+        err_cov := 1.0
+        vel_cov := 1.0
+
+    float pred_est = est + vel * vel_weight
+    float pred_cov = err_cov + q
+    float price_chg = src - nz(src[1], src)
+    float pred_vel = vel * 0.95 + price_chg * 0.05
+
+    float k_gain = pred_cov / (pred_cov + r)
+    float innov = src - pred_est
+    est := pred_est + k_gain * innov
+    err_cov := (1.0 - k_gain) * pred_cov
+
+    float vel_gain = vel_cov / (vel_cov + r * 2)
+    vel := pred_vel + vel_gain * (price_chg - pred_vel)
+    vel_cov := (1.0 - vel_gain) * vel_cov + q * 0.5
+
+    float lag_err = src - est
+    float zl_est = est + lag_err * zl_factor * k_gain
+    zlk := na(zlk[1]) ? zl_est : zlk[1] * 0.8 + zl_est * 0.2
+
+    [zlk, vel, err_cov]
+
+// ┌────────────────────────────── BOSWaves ─ Ribbon ─────────────────────────────────┐
+// └──────────────────────────────────────────────────────────────────────────────────┘
+
+[k1, vel1, cov1] = kalman_filter(close, process_noise, measurement_noise, zero_lag_factor, velocity_weight)
+[k2, vel2, cov2] = kalman_filter(close, process_noise + ribbon_spread * 1, measurement_noise, zero_lag_factor, velocity_weight)
+[k3, vel3, cov3] = kalman_filter(close, process_noise + ribbon_spread * 2, measurement_noise, zero_lag_factor, velocity_weight)
+[k4, vel4, cov4] = kalman_filter(close, process_noise + ribbon_spread * 3, measurement_noise, zero_lag_factor, velocity_weight)
+[k5, vel5, cov5] = kalman_filter(close, process_noise + ribbon_spread * 4, measurement_noise, zero_lag_factor, velocity_weight)
+[k6, vel6, cov6] = kalman_filter(close, process_noise + ribbon_spread * 5, measurement_noise, zero_lag_factor, velocity_weight)
+
+float kalman_main = k1
+float kalman_slow = k6
+
+// ┌────────────────────────────── BOSWaves ─ Trend & Color ──────────────────────────┐
+// └──────────────────────────────────────────────────────────────────────────────────┘
+
+atr_val = ta.atr(14)
+
+ribbon_diff = kalman_main - kalman_slow
+ribbon_strength = ribbon_diff / atr_val
+
+get_ribbon_color(float strength) =>
+    color.from_gradient(strength, -0.3, 0.3, bull_color, bear_color)
+
+ribbon_col = get_ribbon_color(ribbon_strength)
+
+// ┌────────────────────────────── BOSWaves ─ Deviation Levels ───────────────────────┐
+// └──────────────────────────────────────────────────────────────────────────────────┘
+
+type DeviationLevel
+    float   price_level
+    float   zone_top
+    float   zone_bottom
+    bool    is_resistance
+    int     creation_bar
+    box     zone_box
+    int     last_retest_bar
+
+var DeviationLevel[] levels = array.new<DeviationLevel>()
+
+float deviation = close - kalman_main
+float deviation_abs = math.abs(deviation)
+
+var bool was_extended_up = false
+var bool was_extended_down = false
+var float extreme_high = na
+var float extreme_low = na
+var int extreme_high_bar = na
+var int extreme_low_bar = na
+
+bool is_extended_up = deviation > atr_val * deviation_thresh
+bool is_extended_down = deviation < -atr_val * deviation_thresh
+
+if is_extended_up
+    was_extended_up := true
+    if na(extreme_high) or high > extreme_high
+        extreme_high := high
+        extreme_high_bar := bar_index
+
+if is_extended_down
+    was_extended_down := true
+    if na(extreme_low) or low < extreme_low
+        extreme_low := low
+        extreme_low_bar := bar_index
+
+bool snapped_back_from_high = was_extended_up and not is_extended_up and deviation < atr_val * deviation_thresh * 0.5
+bool snapped_back_from_low = was_extended_down and not is_extended_down and deviation > -atr_val * deviation_thresh * 0.5
+
+delete_oldest_level() =>
+    if levels.size() > 0
+        DeviationLevel oldest = levels.shift()
+        box.delete(oldest.zone_box)
+
+if snapped_back_from_high and show_levels and not na(extreme_high)
+    if levels.size() >= max_levels
+        delete_oldest_level()
+
+    float half_width = atr_val * level_width
+    float lvl_top = extreme_high + half_width
+    float lvl_bottom = extreme_high - half_width
+    int start_bar = extreme_high_bar
+    int end_bar = bar_index + level_extend
+
+    box zone = box.new(start_bar, lvl_top, end_bar, lvl_bottom, bgcolor=color.new(bear_color, 85), border_color=na)
+
+    DeviationLevel new_level = DeviationLevel.new(extreme_high, lvl_top, lvl_bottom, true, start_bar, zone, 0)
+    levels.push(new_level)
+
+    was_extended_up := false
+    extreme_high := na
+    extreme_high_bar := na
+
+if snapped_back_from_low and show_levels and not na(extreme_low)
+    if levels.size() >= max_levels
+        delete_oldest_level()
+
+    float half_width = atr_val * level_width
+    float lvl_top = extreme_low + half_width
+    float lvl_bottom = extreme_low - half_width
+    int start_bar = extreme_low_bar
+    int end_bar = bar_index + level_extend
+
+    box zone = box.new(start_bar, lvl_top, end_bar, lvl_bottom, bgcolor=color.new(bull_color, 85), border_color=na)
+
+    DeviationLevel new_level = DeviationLevel.new(extreme_low, lvl_top, lvl_bottom, false, start_bar, zone, 0)
+    levels.push(new_level)
+
+    was_extended_down := false
+    extreme_low := na
+    extreme_low_bar := na
+
+// ┌────────────────────────────── BOSWaves ─ Deviation Level Retests ────────────────┐
+// └──────────────────────────────────────────────────────────────────────────────────┘
+
+var bool level_retest_bull = false
+var bool level_retest_bear = false
+level_retest_bull := false
+level_retest_bear := false
+
+if levels.size() > 0
+    int i = levels.size() - 1
+    while i >= 0
+        DeviationLevel lvl = levels.get(i)
+
+        bool broken = lvl.is_resistance ? close > lvl.zone_top : close < lvl.zone_bottom
+
+        if broken
+            box.delete(lvl.zone_box)
+            levels.remove(i)
+        else
+            int new_end = bar_index + level_extend
+            lvl.zone_box.set_right(new_end)
+
+            if use_level_retest
+                bool cd_ok = (bar_index - lvl.last_retest_bar) >= retest_cooldown
+
+                if lvl.is_resistance and cd_ok
+                    bool wick_in = high >= lvl.zone_bottom and high <= lvl.zone_top
+                    bool close_below = close < lvl.zone_bottom
+                    if wick_in and close_below
+                        level_retest_bear := true
+                        lvl.last_retest_bar := bar_index
+                        label.new(bar_index, high, "▼",
+                             color=color.new(color.black, 100), textcolor=bear_color,
+                             style=label.style_label_down, size=size.tiny)
+
+                if not lvl.is_resistance and cd_ok
+                    bool wick_in = low <= lvl.zone_top and low >= lvl.zone_bottom
+                    bool close_above = close > lvl.zone_top
+                    if wick_in and close_above
+                        level_retest_bull := true
+                        lvl.last_retest_bar := bar_index
+                        label.new(bar_index, low, "▲",
+                             color=color.new(color.black, 100), textcolor=bull_color,
+                             style=label.style_label_up, size=size.tiny)
+
+        i -= 1
+
+// ┌────────────────────────────── BOSWaves ─ Kalman Line Retests ────────────────────┐
+// └──────────────────────────────────────────────────────────────────────────────────┘
+
+var int bars_since_retest = 0
+bars_since_retest += 1
+
+float dist_to_kalman = math.abs(close - kalman_main)
+
+var float max_dist_since_retest = 0.0
+max_dist_since_retest := math.max(max_dist_since_retest, dist_to_kalman)
+
+float touch_zone = atr_val * 0.15
+
+bool price_near_kalman = low <= kalman_main + touch_zone and high >= kalman_main - touch_zone
+bool qualified_distance = max_dist_since_retest > atr_val * 0.5
+bool cooldown_ok = bars_since_retest >= retest_cooldown
+
+bool bull_retest = use_kalman_retest and cooldown_ok and qualified_distance and price_near_kalman and close > kalman_main and kalman_main > kalman_slow
+bool bear_retest = use_kalman_retest and cooldown_ok and qualified_distance and price_near_kalman and close < kalman_main and kalman_main < kalman_slow
+
+if bull_retest
+    label.new(bar_index, low, "▲",
+         color=color.new(color.black, 100), textcolor=bull_color,
+         style=label.style_label_up, size=size.normal)
+    bars_since_retest := 0
+    max_dist_since_retest := 0.0
+
+if bear_retest
+    label.new(bar_index, high, "▼",
+         color=color.new(color.black, 100), textcolor=bear_color,
+         style=label.style_label_down, size=size.normal)
+    bars_since_retest := 0
+    max_dist_since_retest := 0.0
+
+// ┌────────────────────────────── BOSWaves ─ BOS / CHoCH ────────────────────────────┐
+// └──────────────────────────────────────────────────────────────────────────────────┘
+
+price_sh = ta.pivothigh(high, bos_swing_len, bos_swing_len)
+price_sl = ta.pivotlow(low, bos_swing_len, bos_swing_len)
+
+get_label_size(string s) =>
+    switch s
+        "tiny"   => size.tiny
+        "small"  => size.small
+        "normal" => size.normal
+
+lbl_sz = get_label_size(bos_label_size)
+
+var float last_sh         = na
+var int   last_sh_bar     = na
+var float last_sl         = na
+var int   last_sl_bar     = na
+var int   structure_trend = 0
+
+var bool bos_bull_evt   = false
+var bool bos_bear_evt   = false
+var bool choch_bull_evt = false
+var bool choch_bear_evt = false
+bos_bull_evt := false
+bos_bear_evt := false
+choch_bull_evt := false
+choch_bear_evt := false
+
+if show_bos
+    if not na(price_sh)
+        last_sh     := price_sh
+        last_sh_bar := bar_index - bos_swing_len
+
+    if not na(price_sl)
+        last_sl     := price_sl
+        last_sl_bar := bar_index - bos_swing_len
+
+    bool bull_break = not na(last_sh) and ta.crossover(close, last_sh)
+    bool bear_break = not na(last_sl) and ta.crossunder(close, last_sl)
+
+    if bull_break
+        int prev_trend = structure_trend
+        bool is_choch = prev_trend == -1
+        string txt = is_choch ? "CHoCH" : "BOS"
+        int line_w = is_choch ? 2 : 1
+        line_ls = is_choch ? line.style_dotted : line.style_dashed
+
+        line.new(last_sh_bar, last_sh, bar_index, last_sh, color=bull_color, style=line_ls, width=line_w)
+        if bos_label_size != "none"
+            label.new(math.round(math.avg(last_sh_bar, bar_index)), last_sh, txt,
+                color=color.new(color.black, 100), textcolor=bull_color,
+                style=label.style_label_down, size=lbl_sz)
+
+        if is_choch
+            choch_bull_evt := true
+        else
+            bos_bull_evt := true
+
+        structure_trend := 1
+        last_sh := na
+        last_sh_bar := na
+
+    if bear_break
+        int prev_trend = structure_trend
+        bool is_choch = prev_trend == 1
+        string txt = is_choch ? "CHoCH" : "BOS"
+        int line_w = is_choch ? 2 : 1
+        line_ls = is_choch ? line.style_dotted : line.style_dashed
+
+        line.new(last_sl_bar, last_sl, bar_index, last_sl, color=bear_color, style=line_ls, width=line_w)
+        if bos_label_size != "none"
+            label.new(math.round(math.avg(last_sl_bar, bar_index)), last_sl, txt,
+                color=color.new(color.black, 100), textcolor=bear_color,
+                style=label.style_label_up, size=lbl_sz)
+
+        if is_choch
+            choch_bear_evt := true
+        else
+            bos_bear_evt := true
+
+        structure_trend := -1
+        last_sl := na
+        last_sl_bar := na
+
+// ┌────────────────────────────── BOSWaves ─ Ribbon Plots ──────────────────────────┐
+// └──────────────────────────────────────────────────────────────────────────────────┘
+
+display_ribbon = show_ribbon ? display.all : display.none
+
+p1 = plot(k1, "Kalman 1", color=color.new(ribbon_col, 20), linewidth=2, display=display_ribbon)
+p2 = plot(k2, "Kalman 2", color=color.new(ribbon_col, 40), linewidth=1, display=display_ribbon)
+p3 = plot(k3, "Kalman 3", color=color.new(ribbon_col, 55), linewidth=1, display=display_ribbon)
+p4 = plot(k4, "Kalman 4", color=color.new(ribbon_col, 70), linewidth=1, display=display_ribbon)
+p5 = plot(k5, "Kalman 5", color=color.new(ribbon_col, 80), linewidth=1, display=display_ribbon)
+p6 = plot(k6, "Kalman 6", color=color.new(ribbon_col, 90), linewidth=1, display=display_ribbon)
+
+fill(p1, p2, color.new(ribbon_col, 60), display=display_ribbon)
+fill(p2, p3, color.new(ribbon_col, 70), display=display_ribbon)
+fill(p3, p4, color.new(ribbon_col, 80), display=display_ribbon)
+fill(p4, p5, color.new(ribbon_col, 85), display=display_ribbon)
+fill(p5, p6, color.new(ribbon_col, 90), display=display_ribbon)
+
+// ┌────────────────────────────── BOSWaves ─ Candle Coloring ───────────────────────┐
+// └──────────────────────────────────────────────────────────────────────────────────┘
+
+plotcandle(open, high, low, close, color=ribbon_col, wickcolor=ribbon_col, bordercolor=ribbon_col)
+
+// ┌────────────────────────────── BOSWaves ─ Alerts ─────────────────────────────────┐
+// └──────────────────────────────────────────────────────────────────────────────────┘
+
+alertcondition(snapped_back_from_high, "Resistance Level Created", "New resistance level {{ticker}}")
+alertcondition(snapped_back_from_low, "Support Level Created", "New support level {{ticker}}")
+
+alertcondition(bos_bull_evt or bos_bear_evt, "BOS Detected", "Break of Structure {{ticker}}")
+alertcondition(choch_bull_evt or choch_bear_evt, "CHoCH Detected", "Change of Character {{ticker}}")
+
+alertcondition(bull_retest, "Bullish Kalman Retest", "Bullish retest of Kalman line {{ticker}}")
+alertcondition(bear_retest, "Bearish Kalman Retest", "Bearish retest of Kalman line {{ticker}}")
+alertcondition(level_retest_bull, "Bullish Level Retest", "Support level retest {{ticker}}")
+alertcondition(level_retest_bear, "Bearish Level Retest", "Resistance level retest {{ticker}}")

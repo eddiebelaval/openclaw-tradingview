@@ -1,0 +1,363 @@
+//@version=6
+// This source code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © MingLLM | Updated by Quant
+indicator("Quant Master [VANGUARD] V4 Indicator - Multi-Asset Pro", shorttitle="QM_Vanguard_V4_Ind", overlay=true, max_labels_count=500, max_lines_count=500, explicit_plot_zorder=true)
+
+// --- Institutional Dark Palette ---
+color BULL_C       = #089981
+color BEAR_C       = #f23645
+color NEUT_C       = #2962ff 
+color ACCENT_C     = #5b9cf6 
+color DASH_BG      = #131722 
+color CHART_FG     = chart.fg_color
+color CHART_BG     = chart.bg_color
+
+// --- Group Constants ---
+string GRP_ADAPT   = "Engine Mode & Asset Detection"
+string GRP_TREND   = "Manual Trend Engine Overrides"
+string GRP_MOM     = "Manual Momentum & Volatility Overrides"
+string GRP_PROJ    = "Manual Forecast Overrides"
+string GRP_DASH    = "Interface Configuration"
+string GRP_HTF     = "HTF Pattern Confirmation [NEW]"
+string GRP_RISK    = "Risk Management Settings"
+string GRP_ADV     = "Advanced Filters & Visuals [ADDITION]"
+string GRP_SESS    = "Trading Session Filter"
+
+
+// --- Market Adaptive Engine ---
+bool isTSLA        = str.contains(syminfo.ticker, "TSLA")
+bool isCrypto      = syminfo.type == "crypto"
+bool isForex       = syminfo.type == "forex"
+bool isIndex       = syminfo.type == "index" or str.contains(syminfo.ticker, "SPX") or str.contains(syminfo.ticker, "US500") or str.contains(syminfo.ticker, "NQ")
+bool isHighVol     = str.contains(syminfo.ticker, "SOXL") or str.contains(syminfo.ticker, "TQQQ") or str.contains(syminfo.ticker, "BITO") or str.contains(syminfo.ticker, "NVDA") or isTSLA
+bool isGold        = str.contains(syminfo.ticker, "XAU") or str.contains(syminfo.ticker, "GOLD")
+bool isStock       = syminfo.type == "stock" and not isHighVol
+
+string detectedAsset = isTSLA ? "Tesla (Specialist)" : isCrypto ? "Digital Asset" : isForex ? "Forex/FX" : isIndex ? "Index/Futures" : isHighVol ? "High-Beta Equity" : isGold ? "Commodity/Gold" : isStock ? "Equity" : "Standard"
+
+// Auto-tuning logic constants
+float autoLen      = isTSLA ? 18    : isIndex ? 15   : isForex ? 20   : (isCrypto or isHighVol) ? 9    : isGold ? 14   : 14
+float autoOffs     = isTSLA ? 0.90  : isIndex ? 0.95 : isForex ? 0.88 : (isCrypto or isHighVol) ? 0.75 : isGold ? 0.90 : 0.85
+float autoMult     = isTSLA ? 2.8   : isIndex ? 1.5  : isForex ? 1.2  : isCrypto ? 3.2  : isHighVol ? 3.5 : isGold ? 1.8  : 2.2
+float autoSens     = isTSLA ? 2.5   : isIndex ? 1.5  : isForex ? 1.0  : isCrypto ? 3.0  : isHighVol ? 3.2 : isGold ? 1.8  : 2.0
+int   autoLookback = isTSLA ? 24    : isIndex ? 12   : isForex ? 25   : (isCrypto or isHighVol) ? 7    : isStock ? 20  : 10
+float autoTsiTh    = isTSLA ? 22.0  : isIndex ? 10.0 : isForex ? 15.0 : isStock ? 18.0 : 12.0
+
+// --- User Inputs ---
+bool  useAuto      = input.bool(true, "Master Adaptive Auto-Tuning", group=GRP_ADAPT, tooltip="When enabled, the engine automatically selects parameters based on the asset class. Disable to use manual overrides below.")
+
+// HTF Pattern Confirmation Inputs
+string htfInput    = input.timeframe("5", "Higher Timeframe Pattern Source", group=GRP_HTF, tooltip="The timeframe to detect patterns on. Recommended: 5m for 1m charts, 1h for 15m charts.")
+int fvgLookback    = input.int(10, "FVG Lookback (HTF Bars)", minval=1, group=GRP_HTF)
+float fvgSizeMult  = input.float(0.5, "FVG Sensitivity", minval=0.1, step=0.1, group=GRP_HTF)
+bool  showFVG      = input.bool(true, "Visualize Active FVGs", group=GRP_ADV)
+
+// Trend Overrides
+bool  manTrend     = input.bool(false, "Override Trend Settings", group=GRP_TREND, inline="T1")
+int   i_almaLen    = input.int(13, "Period", minval=1, group=GRP_TREND, inline="T1")
+float i_almaOffs   = input.float(0.85, "Sensitivity", minval=0.0, maxval=1.0, step=0.05, group=GRP_TREND, inline="T1")
+int   i_brkLook    = input.int(10, "Signal Lookback", minval=2, group=GRP_TREND, inline="T1")
+
+// Momentum/Vol Overrides
+bool  manMom       = input.bool(false, "Override Momentum Settings", group=GRP_MOM, inline="M1")
+float i_tsiThresh  = input.float(12.0, "TSI Threshold", minval=0.0, group=GRP_MOM, inline="M1")
+bool  useVolFilter = input.bool(true, "Volume Confirmation Filter", group=GRP_MOM)
+float i_momThresh  = input.float(0.6, "Momentum Sensitivity", minval=0.1, step=0.1, group=GRP_MOM, tooltip="Threshold for 'Spike' detection.")
+
+// Advanced Filter Inputs
+bool  useADXFilter = input.bool(false, "ADX Trend Strength Filter (OFF by default)", group=GRP_ADV)
+int   adxThreshold = input.int(20, "Min ADX for Trending Trades", minval=0, group=GRP_ADV)
+
+// Forecast Overrides
+bool  manProj      = input.bool(false, "Override Forecast Settings", group=GRP_PROJ, inline="P1")
+float i_projSens   = input.float(2.0, "Trajectory Weight", minval=0.1, group=GRP_PROJ, inline="P1")
+float i_corrMult   = input.float(2.0, "Corridor Multiplier", minval=0.5, group=GRP_PROJ, inline="P1")
+int   projMins     = input.int(15, "Forecast Horizon (Mins)", minval=5, group=GRP_PROJ)
+bool  useDecay     = input.bool(true, "Simulate Momentum Exhaustion", group=GRP_PROJ)
+
+// Final Parameter Resolution
+int   almaLen      = useAuto and not manTrend ? int(autoLen)  : i_almaLen
+float almaOffs     = useAuto and not manTrend ? autoOffs      : i_almaOffs
+int   brkLookback  = useAuto and not manTrend ? autoLookback  : i_brkLook
+float tsiReq       = useAuto and not manMom   ? autoTsiTh     : i_tsiThresh
+float momThresh    = useAuto and not manMom   ? 0.6           : i_momThresh
+float projSens     = useAuto and not manProj  ? autoSens      : i_projSens
+float corridorMult = useAuto and not manProj  ? autoMult      : i_corrMult
+
+bool  showDash     = input.bool(true, "Display Intelligence Dashboard", group=GRP_DASH)
+string dashPos     = input.string("Top Right", "Dashboard Position", options=["Top Right", "Bottom Right", "Top Left", "Bottom Left"], group=GRP_DASH)
+
+// Session Filter Inputs
+bool  useSession   = input.bool(false, "Use Specific Trading Session", group=GRP_SESS, tooltip="When enabled, signals only trigger during the specified window.")
+string sessionTime = input.session("0930-1600", "Trade Window", group=GRP_SESS)
+string sessionDays = input.string("12345", "Days (1=Sun, 7=Sat)", group=GRP_SESS, tooltip="1=Sunday, 2=Monday... 7=Saturday")
+color sessColor    = input.color(color.new(#5b9cf6, 95), "Session Highlight Color", group=GRP_SESS)
+
+
+// --- User Defined Functions ---
+f_add_row(table _t, int _r, string _l, string _v, color _c) =>
+    table.cell(_t, 0, _r, _l, text_color=color.new(CHART_FG, 50), text_size=size.tiny, text_halign=text.align_left)
+    table.cell(_t, 1, _r, _v, text_color=_c, text_size=size.tiny, text_halign=text.align_right)
+
+// HTF Pattern Functions
+detectBullish(o, h, l, c, o1, h1, l1, c1, o2, h2, l2, c2) =>
+    body = math.abs(c - o), wH = h - math.max(o, c), wL = math.min(o, c) - l, r = h - l
+    strongClose = r > 0 and c > (l + r * 0.7)
+    eng = c1 < o1 and c > o and c > h1
+    ham = r > 0 and wL > body * 1.5 and wH < body * 0.5
+    ms  = c2 < o2 and math.abs(c1 - o1) < (h1 - l1) * 0.4 and c > (o2 + c2) / 2
+    harami = c1 < o1 and o > c1 and c < o1 and c > o
+    strongClose and (eng or ham or ms or harami)
+
+detectBearish(o, h, l, c, o1, h1, l1, c1, o2, h2, l2, c2) =>
+    body = math.abs(c - o), wH = h - math.max(o, c), wL = math.min(o, c) - l, r = h - l
+    strongClose = r > 0 and c < (h - r * 0.7)
+    eng = c1 > o1 and c < o and c < l1
+    star = r > 0 and wH > body * 1.5 and wL < body * 0.5
+    es  = c2 > o2 and math.abs(c1 - o1) < (h1 - l1) * 0.4 and c < (o2 + c2) / 2
+    harami = c1 > o1 and o < c1 and c > o1 and c < o
+    strongClose and (eng or star or es or harami)
+
+// --- Core Calculations ---
+
+// 1. Vanguard Trend Engine
+float almaFast = ta.alma(close, almaLen, almaOffs, 6.0)
+float almaSlow = ta.alma(close, almaLen * 2, almaOffs, 6.0)
+bool  isBullish = almaFast > almaSlow
+
+// 2. Trend Intensity Index (TII) & ADX
+float pc   = ta.change(almaFast)
+float apc  = math.abs(pc)
+float tsi  = 100 * (ta.ema(ta.ema(pc, 13), 7) / ta.ema(ta.ema(apc, 13), 7))
+bool  strongTrend = math.abs(tsi) > tsiReq
+
+// ADX Logic
+[plus, minus, adx] = ta.dmi(14, 14)
+bool trendingRegime = not useADXFilter or adx > adxThreshold
+
+// 3. Volatility Profiling
+float atr      = ta.atr(14)
+float smaAtr   = ta.sma(atr, 50)
+float atrRatio = atr / math.max(1e-10, smaAtr)
+float smaVol   = ta.sma(volume, 20)
+float rVol     = volume / math.max(1, smaVol)
+bool  volConfirm = not useVolFilter or (isTSLA ? rVol > 1.2 : volume > smaVol)
+
+// 4. Breakout Mechanics
+float upperLevel = ta.highest(high, brkLookback)[1]
+float lowerLevel = ta.lowest(low, brkLookback)[1]
+
+// 5. RSI Analytics
+float rsiVal     = ta.rsi(close, 14)
+float rsiAvg     = ta.ema(rsiVal, 5)
+
+// --- HTF Intelligence & Multi-Hour Context ---
+[hO, hH, hL, hC, hAtr] = request.security(syminfo.tickerid, htfInput, [open[1], high[1], low[1], close[1], ta.atr(14)[1]], lookahead = barmerge.lookahead_on)
+[hO1, hH1, hL1, hC1]   = request.security(syminfo.tickerid, htfInput, [open[2], high[2], low[2], close[2]], lookahead = barmerge.lookahead_on)
+[hO2, hH2, hL2, hC2]   = request.security(syminfo.tickerid, htfInput, [open[3], high[3], low[3], close[3]], lookahead = barmerge.lookahead_on)
+
+bool isBullFvg = hH2 < hL and (hL - hH2) > hAtr * fvgSizeMult
+bool isBearFvg = hL2 > hH and (hL2 - hH) > hAtr * fvgSizeMult
+
+if showFVG and isBullFvg
+    box.new(bar_index-2, hH2, bar_index, hL, bgcolor=color.new(BULL_C, 80), border_color=na)
+if showFVG and isBearFvg
+    box.new(bar_index-2, hL2, bar_index, hH, bgcolor=color.new(BEAR_C, 80), border_color=na)
+
+bool htfBullPattern = detectBullish(hO, hH, hL, hC, hO1, hH1, hL1, hC1, hO2, hH2, hL2, hC2)
+bool htfBearPattern = detectBearish(hO, hH, hL, hC, hO1, hH1, hL1, hC1, hO2, hH2, hL2, hC2)
+
+// Multi-Hour Context (Look back ~4 hours)
+int contextLookback = math.round(240 * 60 / math.max(1, timeframe.in_seconds()))
+float macroSlope    = ta.linreg(close, contextLookback, 0) - ta.linreg(close, contextLookback, 1)
+bool macroBullish   = macroSlope > 0
+
+float phPrice = ta.pivothigh(10, 10)
+float plPrice = ta.pivotlow(10, 10)
+float resLevel = ta.valuewhen(not na(phPrice), high[10], 0)
+float supLevel = ta.valuewhen(not na(plPrice), low[10], 0)
+float majorHigh = ta.highest(high, contextLookback)
+float majorLow  = ta.lowest(low, contextLookback)
+
+// --- Turnaround & Confluence Accuracy [REBOUND FOCUS - OPTIMIZED] ---
+float high14 = ta.highest(high, 14), low14 = ta.lowest(low, 14)
+float trSum = math.sum(ta.tr(true), 14)
+float chop = 100 * math.log10(trSum / (math.max(1e-10, high14 - low14))) / math.log10(14)
+bool isChoppy = chop > 60 
+
+float barrierZone = atr * 1.8
+bool nearSupport = (math.abs(close - supLevel) < barrierZone) or (math.abs(close - majorLow) < barrierZone)
+bool nearResist  = (math.abs(close - resLevel) < barrierZone) or (math.abs(close - majorHigh) < barrierZone)
+
+float lowest20 = ta.lowest(low[1], 20), highest20 = ta.highest(high[1], 20)
+bool liqSweepBull = low < lowest20 and close > lowest20
+bool liqSweepBear = high > highest20 and close < highest20
+
+bool rsiHookUp   = ta.crossover(rsiAvg, 40)
+bool rsiHookDown = ta.crossunder(rsiAvg, 60)
+bool tsiHookUp   = ta.crossover(tsi, -tsiReq)
+bool tsiHookDown = ta.crossunder(tsi, tsiReq)
+
+float distFromFast = (close - almaFast) / close * 100
+bool isCrashing    = distFromFast < -1.2 
+
+// Refined Signal Logic with Strict Filtering
+bool turnaroundBull = (htfBullPattern or (liqSweepBull and rsiAvg < 40) or (rsiHookUp and volConfirm)) 
+     and nearSupport 
+     and rsiAvg < 50 
+     and macroBullish 
+     and not isCrashing
+
+bool turnaroundBear = (htfBearPattern or (liqSweepBear and rsiAvg > 60) or (rsiHookDown and volConfirm)) 
+     and nearResist 
+     and rsiAvg > 50
+     and not macroBullish
+
+// Session Logic
+bool inSession = not useSession or not na(time(timeframe.period, sessionTime + ":" + sessionDays))
+bgcolor(useSession and inSession ? sessColor : na, title="Session Active Highlight")
+
+bool buySig   = turnaroundBull and volConfirm and not isChoppy and close > open and trendingRegime and inSession
+bool sellSig  = turnaroundBear and volConfirm and not isChoppy and close < open and trendingRegime and inSession
+
+var int lastSignal = 0 
+bool masterBuy  = buySig and lastSignal != 1
+bool masterSell = sellSig and lastSignal != -1
+
+if masterBuy
+    lastSignal := 1
+if masterSell
+    lastSignal := -1
+
+// --- Predictive Analytics Engine ---
+int barsForward   = math.max(2, math.round((projMins * 60) / math.max(1, timeframe.in_seconds())))
+
+// 1. Multi-Bar Momentum Smoothing
+float smoothedSlope = ta.sma(ta.linreg(close, 10, 0) - ta.linreg(close, 10, 1), 3)
+float smoothedVelo  = ta.sma(ta.change(almaFast), 3)
+
+// 2. Regime & HTF Bias
+float htfBias       = htfBullPattern or macroBullish ? 0.08 : htfBearPattern or not macroBullish ? -0.08 : 0.0
+float persistence   = math.max(0.2, math.min(1.2, adx / 50)) 
+
+float volMultiplier = 1.0 + math.log10(math.max(1.0, rVol)) * 1.5
+float compositeMom  = (smoothedSlope * 0.4 + smoothedVelo * 0.6) * volMultiplier
+
+float rsiDampener  = rsiAvg > 80 ? math.max(0.05, (100 - rsiAvg) / 20) : rsiAvg < 20 ? math.max(0.05, rsiAvg / 20) : 1.0
+float effectiveMom = nz(compositeMom * projSens * rsiDampener)
+
+float bullVlty   = ta.rma(math.max(0, high - close), 14) 
+float bearVlty   = ta.rma(math.max(0, close - low), 14)
+float rsiFactor  = (rsiAvg - 50) / 50 
+float volExp     = math.log10(math.max(1, rVol)) * 1.0
+
+float upperBase  = bullVlty * corridorMult * (1 + (rsiFactor > 0 ? rsiFactor * 0.6 : 0)) * (1 + volExp)
+float lowerBase  = bearVlty * corridorMult * (1 + (rsiFactor < 0 ? math.abs(rsiFactor) * 0.6 : 0)) * (1 + volExp)
+upperBase := math.max(upperBase, atr * 0.5), lowerBase := math.max(lowerBase, atr * 0.5)
+
+var chart.point[] trajPoints = array.new<chart.point>()
+var chart.point[] upperPoints = array.new<chart.point>()
+var chart.point[] lowerPoints = array.new<chart.point>()
+var chart.point[] innerUpPoints = array.new<chart.point>()
+var chart.point[] innerLoPoints = array.new<chart.point>()
+
+var polyline v_traj = na, var polyline v_upper = na, var polyline v_lower = na
+var polyline v_innerUp = na, var polyline v_innerLo = na
+var label lbl_target = na
+
+if barstate.islast
+    polyline.delete(v_traj), polyline.delete(v_upper), polyline.delete(v_lower)
+    polyline.delete(v_innerUp), polyline.delete(v_innerLo), label.delete(lbl_target)
+    
+    array.clear(trajPoints), array.clear(upperPoints), array.clear(lowerPoints)
+    array.clear(innerUpPoints), array.clear(innerLoPoints)
+    
+    float currentProjPrice = close
+    float loopMom = effectiveMom
+    
+    array.push(trajPoints, chart.point.from_index(bar_index, close))
+    array.push(upperPoints, chart.point.from_index(bar_index, close + upperBase))
+    array.push(lowerPoints, chart.point.from_index(bar_index, close - lowerBase))
+
+    for i = 1 to barsForward
+        float nearestFloor = math.max(supLevel, majorLow)
+        float nearestCeil  = math.min(resLevel, majorHigh)
+        float activeZone   = atr * 2.5
+        float attraction   = 0.0
+        
+        if currentProjPrice < nearestFloor + activeZone
+            float proximity = (nearestFloor + activeZone - currentProjPrice) / activeZone
+            attraction := (atr * 0.15) * proximity
+            loopMom := loopMom * 0.8 + attraction
+            
+        if currentProjPrice > nearestCeil - activeZone
+            float proximity = (currentProjPrice - (nearestCeil - activeZone)) / activeZone
+            attraction := -(atr * 0.15) * proximity
+            loopMom := loopMom * 0.8 + attraction
+
+        // Mean Reversion vs Persistence Factor
+        float pullStrength = (adx < 20) ? 0.08 : (adx > 40) ? 0.01 : (0.08 - (adx-20)*0.0035)
+        float meanPull     = (almaSlow - currentProjPrice) * pullStrength
+        
+        float cycleWave  = math.sin(i * 0.4) * (atr * 0.1)
+        float stepDecay  = useDecay ? math.pow(0.98 - (persistence * 0.02), i) : 1.0
+        float drift      = htfBias * atr * (float(i) / barsForward) 
+        
+        currentProjPrice += (loopMom * stepDecay) + meanPull + drift + (cycleWave / math.sqrt(i))
+        
+        float timeExpansion = 1 + math.sqrt(i) * 0.4
+        float upExpand = upperBase * timeExpansion, loExpand = lowerBase * timeExpansion
+        
+        array.push(trajPoints, chart.point.from_index(bar_index + i, currentProjPrice))
+        array.push(upperPoints, chart.point.from_index(bar_index + i, currentProjPrice + upExpand))
+        array.push(lowerPoints, chart.point.from_index(bar_index + i, currentProjPrice - loExpand))
+        array.push(innerUpPoints, chart.point.from_index(bar_index + i, currentProjPrice + upExpand * 0.4))
+        array.push(innerLoPoints, chart.point.from_index(bar_index + i, currentProjPrice - loExpand * 0.4))
+
+    color c_proj = (currentProjPrice > close) ? BULL_C : BEAR_C
+    v_traj  := polyline.new(trajPoints, line_color=c_proj, line_style=line.style_dashed, line_width=2) 
+    v_upper := polyline.new(upperPoints, line_color=color.new(c_proj, 75), line_style=line.style_dotted, line_width=1)
+    v_lower := polyline.new(lowerPoints, line_color=color.new(c_proj, 75), line_style=line.style_dotted, line_width=1)
+    v_innerUp := polyline.new(innerUpPoints, line_color=color.new(c_proj, 85), line_style=line.style_solid, line_width=5)
+    v_innerLo := polyline.new(innerLoPoints, line_color=color.new(c_proj, 85), line_style=line.style_solid, line_width=5)
+    
+    float pctMove = ((currentProjPrice - close) / close) * 100
+    lbl_target := label.new(bar_index + barsForward, currentProjPrice, "PRO TARGET: " + str.tostring(math.round(currentProjPrice, 2)) + "\nEST MOVE: " + (pctMove > 0 ? "+" : "") + str.tostring(math.round(pctMove, 2)) + "%", 
+     color=color.new(DASH_BG, 10), textcolor=ACCENT_C, style=label.style_label_left, size=size.small)
+
+// --- Visualization ---
+float beamHeight = ta.atr(14) * 2.5
+float beamTop    = isBullish ? almaFast : almaFast + beamHeight
+float beamBtm    = isBullish ? almaFast - beamHeight : almaFast
+p_beamTop = plot(beamTop, "Beam Top", color=na, display=display.none)
+p_beamBtm = plot(beamBtm, "Beam Bottom", color=na, display=display.none)
+fill(p_beamTop, p_beamBtm, beamTop, beamBtm, isBullish ? color.new(BULL_C, 85) : color.new(BEAR_C, 85), color.new(CHART_BG, 100))
+
+p_fast = plot(almaFast, "Fast Engine", color=isBullish ? BULL_C : BEAR_C, linewidth=2)
+p_slow = plot(almaSlow, "Slow Engine", color=color.new(ACCENT_C, 70), linewidth=1)
+fill(p_fast, p_slow, color.new(isBullish ? BULL_C : BEAR_C, 90), "Vanguard Cloud")
+
+plotshape(masterBuy, "High Conf BUY", shape.triangleup, location.belowbar, BULL_C, size=size.small, text="High Conf", textcolor=color.white)
+plotshape(masterSell, "High Conf SELL", shape.triangledown, location.abovebar, BEAR_C, size=size.small, text="High Conf", textcolor=color.white)
+
+// --- Intelligence Dashboard ---
+table_pos = dashPos == "Top Right" ? position.top_right : dashPos == "Bottom Right" ? position.bottom_right : dashPos == "Top Left" ? position.top_left : position.bottom_left
+var table dash = table.new(table_pos, 2, 12, bgcolor=color.new(DASH_BG, 5), border_width=1, border_color=color.new(ACCENT_C, 80))
+
+if barstate.islast and showDash
+    float signalQual = math.min(100, math.abs(tsi) * (volConfirm ? 1.2 : 0.8))
+    
+    table.cell(dash, 0, 0, "VANGUARD PRO V4", text_color=ACCENT_C, text_size=size.small, text_halign=text.align_left)
+    table.cell(dash, 1, 0, detectedAsset, text_color=color.new(CHART_FG, 60), text_size=size.tiny, text_halign=text.align_right)
+    f_add_row(dash, 1, "Engine Mode", useAuto ? "AUTO-ADAPT" : "MANUAL-PRO", ACCENT_C)
+    f_add_row(dash, 2, "HTF Source", htfInput, ACCENT_C)
+    f_add_row(dash, 3, "Trend Intensity", str.tostring(math.round(math.abs(tsi), 1)) + "%", isBullish ? BULL_C : BEAR_C)
+    f_add_row(dash, 4, "Confidence Score", str.tostring(math.round(signalQual, 0)) + " / 100", signalQual > 75 ? BULL_C : ACCENT_C)
+    f_add_row(dash, 5, "Macro Context", macroBullish ? "ACCUMULATION" : "DISTRIBUTION", macroBullish ? BULL_C : BEAR_C)
+    f_add_row(dash, 6, "Pattern Status", htfBullPattern ? "BULL REVERSAL" : htfBearPattern ? "BEAR REVERSAL" : "NEUTRAL", htfBullPattern ? BULL_C : htfBearPattern ? BEAR_C : CHART_FG)
+    f_add_row(dash, 7, "Market State", adx > adxThreshold ? "TRENDING" : "RANGING", adx > adxThreshold ? BULL_C : NEUT_C)
+    f_add_row(dash, 8, "Asset Class", syminfo.type, CHART_FG)
+
+// --- Alerts ---
+alertcondition(masterBuy, "V4 High Conf BUY", "Bullish HTF Pattern + Vanguard Confirm")
+alertcondition(masterSell, "V4 High Conf SELL", "Bearish HTF Pattern + Vanguard Confirm")

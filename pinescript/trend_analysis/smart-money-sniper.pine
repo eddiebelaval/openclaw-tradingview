@@ -1,0 +1,598 @@
+//@version=5
+indicator("SMC Sniper v6", overlay=true, max_lines_count=500, max_labels_count=500)
+
+// ─────────────────────────────────────────────────────────────────
+//  DISPLAY MODE
+// ─────────────────────────────────────────────────────────────────
+grpMode = "Display Mode"
+simpleMode     = input.bool(false, "Simple Mode (recommended for beginners)", group=grpMode, tooltip="ON = Clean BUY/SELL signals with auto Stop Loss and Take Profit lines. One signal at a time. OFF = Advanced mode with all signal types, colors, tiers, and confluence table.")
+
+grpTrade = "Trade Management"
+atrMult_sl     = input.float(1.5, "Stop Loss (ATR multiplier)", minval=0.5, maxval=4.0, step=0.1, group=grpTrade, tooltip="How far your stop loss is placed from entry. Higher = wider stop. Default 1.5 ATR.")
+atrMult_tp     = input.float(3.0, "Take Profit (ATR multiplier)", minval=1.0, maxval=10.0, step=0.1, group=grpTrade, tooltip="How far your take profit target is from entry. Default 3.0 ATR = 2:1 reward-to-risk.")
+signalCooldown = input.int(10,    "Cooldown between signals (bars)", minval=1, maxval=100, group=grpTrade, tooltip="Minimum bars between any two signals. Prevents overtrading.")
+
+// ─────────────────────────────────────────────────────────────────
+//  ADVANCED SETTINGS
+// ─────────────────────────────────────────────────────────────────
+grpCore = "Core Settings (Advanced)"
+swingLen       = input.int(8,    "Swing Lookback",          minval=3, maxval=20, group=grpCore)
+atrLen         = input.int(14,   "ATR Length",              group=grpCore)
+stFactor       = input.float(2.5,"Supertrend Factor",       minval=1.0, maxval=5.0, step=0.1, group=grpCore)
+stAtrLen       = input.int(10,   "Supertrend ATR Length",   group=grpCore)
+adxThresh      = input.int(15,   "ADX Min Threshold",       minval=10, maxval=40, group=grpCore)
+
+grpFilt = "Filters (Advanced)"
+useDiv         = input.bool(true,  "Use RSI Divergence Filter",      group=grpFilt)
+useHTF         = input.bool(true,  "Use 4H HTF Filter",              group=grpFilt)
+useMomRev      = input.bool(true,  "Use Momentum Reversal Filter",   group=grpFilt)
+useResRej      = input.bool(true,  "Use Resistance Rejection Filter", group=grpFilt)
+showZones      = input.bool(false, "Show Rejection Sniper Zones",    group=grpFilt, tooltip="Shows support/resistance levels that REJ signals watch. Set from PREVIOUS bar.")
+
+grpRSI = "RSI Thresholds (Advanced)"
+stRsiMin       = input.int(45,   "Supertrend LONG RSI Min", minval=30, maxval=65, group=grpRSI)
+stRsiMax       = input.int(58,   "Supertrend LONG RSI Max", minval=50, maxval=80, group=grpRSI)
+longRejRsi     = input.int(35,   "LONG REJ RSI Max",        minval=20, maxval=50, group=grpRSI)
+shortRejRsiMin = input.int(65,   "SHORT REJ RSI Min",       minval=55, maxval=78, group=grpRSI)
+shortRejRsiMax = input.int(100,  "SHORT REJ RSI Max",       minval=70, maxval=100, group=grpRSI)
+
+grpTier = "Tier System (Advanced)"
+tierMode       = input.string("Tiered", "Signal Filter Mode", options=["All Signals", "Tiered", "Tier 1 Only"], group=grpTier, tooltip="All Signals = show everything. Tiered = require confluence for weaker signals. Tier 1 Only = only proven signals.")
+t2Confluence   = input.int(2,    "Tier 2 Min Confluence",   minval=1, maxval=4, group=grpTier)
+t3Confluence   = input.int(3,    "Tier 3 Min Confluence",   minval=2, maxval=5, group=grpTier)
+showTable      = input.bool(true, "Show Info Table",          group=grpTier)
+
+grpBOS = "BOS Tuning (Advanced)"
+bosTimeout     = input.int(25,   "BOS Timeout (bars)",       minval=10, maxval=50, group=grpBOS)
+bosCooldownIn  = input.int(20,   "BOS Cooldown (bars)",      minval=5, maxval=50, group=grpBOS)
+bosZoneProx    = input.float(1.5,"BOS Zone Proximity (ATR)", minval=0.5, maxval=4.0, step=0.1, group=grpBOS)
+
+// ─────────────────────────────────────────────────────────────────
+//  CORE CALCULATIONS
+// ─────────────────────────────────────────────────────────────────
+atr    = ta.atr(atrLen)
+ma200  = ta.ema(close, 200)
+ma50   = ta.ema(close, 50)
+ma20   = ta.ema(close, 20)
+rsi    = ta.rsi(close, 14)
+avgVol = ta.sma(volume, 20)
+
+[stLine, stDir] = ta.supertrend(stFactor, stAtrLen)
+stBull = stDir < 0
+stBear = stDir > 0
+
+[diPlus, diMinus, adx] = ta.dmi(14, 14)
+trendStrong = adx > adxThresh
+
+htfClose  = request.security(syminfo.tickerid, "240", close)
+htfMa50   = request.security(syminfo.tickerid, "240", ta.ema(close, 50))
+htfBull   = htfClose > htfMa50
+htfBear   = htfClose < htfMa50
+
+dailyClose = request.security(syminfo.tickerid, "D", close)
+dailyMa50  = request.security(syminfo.tickerid, "D", ta.ema(close, 50))
+dailyBull  = dailyClose > dailyMa50
+dailyBear  = dailyClose < dailyMa50
+
+highVol = volume > avgVol * 1.0
+
+highest20 = ta.highest(high, 20)
+lowest20  = ta.lowest(low,  20)
+rangeSize = (highest20 - lowest20) / lowest20 * 100
+isRanging = rangeSize < 1.2
+
+// ─────────────────────────────────────────────────────────────────
+//  CONFLUENCE SCORE
+// ─────────────────────────────────────────────────────────────────
+longConfluence  = 0
+shortConfluence = 0
+longConfluence  += stBull ? 1 : 0
+shortConfluence += stBear ? 1 : 0
+longConfluence  += trendStrong ? 1 : 0
+shortConfluence += trendStrong ? 1 : 0
+longConfluence  += htfBull ? 1 : 0
+shortConfluence += htfBear ? 1 : 0
+longConfluence  += dailyBull ? 1 : 0
+shortConfluence += dailyBear ? 1 : 0
+longConfluence  += highVol ? 1 : 0
+shortConfluence += highVol ? 1 : 0
+longConfluence  += close > ma200 ? 1 : 0
+shortConfluence += close < ma200 ? 1 : 0
+
+// ─────────────────────────────────────────────────────────────────
+//  DIVERGENCE
+// ─────────────────────────────────────────────────────────────────
+rsiHigh1   = ta.highest(rsi, swingLen)
+rsiLow1    = ta.lowest(rsi,  swingLen)
+priceHigh1 = ta.highest(high, swingLen)
+priceLow1  = ta.lowest(low,   swingLen)
+bearDiv = high >= priceHigh1 and rsi < rsiHigh1 and rsi > 60
+bullDiv = low <= priceLow1 and rsi > rsiLow1 and rsi < 40
+
+// ─────────────────────────────────────────────────────────────────
+//  CANDLE PATTERNS
+// ─────────────────────────────────────────────────────────────────
+bearEngulf = close < open and close < open[1] and open > close[1] and (open - close) > (close[1] - open[1]) * 1.2
+bullEngulf = close > open and close > open[1] and open < close[1] and (close - open) > (open[1] - close[1]) * 1.2
+
+lowerWick  = open > close ? close - low : open - low
+upperWick  = open > close ? high - open : high - close
+bodySize   = math.abs(close - open)
+hammer     = lowerWick > bodySize * 2.0 and upperWick < bodySize * 0.5 and close > open
+shootStar  = upperWick > bodySize * 2.0 and lowerWick < bodySize * 0.5 and close < open
+
+// ─────────────────────────────────────────────────────────────────
+//  MARKET STRUCTURE
+// ─────────────────────────────────────────────────────────────────
+swingHigh = ta.pivothigh(high, swingLen, swingLen)
+swingLow  = ta.pivotlow(low,  swingLen, swingLen)
+
+var float lastSwingHigh    = na
+var float lastSwingLow     = na
+var float prevSwingHigh    = na
+var float prevSwingLow     = na
+var int   lastSwingHighBar = na
+var int   lastSwingLowBar  = na
+
+if not na(swingHigh)
+    prevSwingHigh    := lastSwingHigh
+    lastSwingHigh    := swingHigh
+    lastSwingHighBar := bar_index - swingLen
+if not na(swingLow)
+    prevSwingLow    := lastSwingLow
+    lastSwingLow    := swingLow
+    lastSwingLowBar := bar_index - swingLen
+
+// ─────────────────────────────────────────────────────────────────
+//  LIQUIDITY SWEEPS
+// ─────────────────────────────────────────────────────────────────
+liquiditySweepHigh = not na(lastSwingHigh) and high > lastSwingHigh and close < lastSwingHigh and (high - lastSwingHigh) < atr * 3.0
+liquiditySweepLow = not na(lastSwingLow) and low < lastSwingLow and close > lastSwingLow and (lastSwingLow - low) < atr * 3.0
+
+var bool  sweepedHigh    = false
+var bool  sweepedLow     = false
+var float sweepHighLevel = na
+var float sweepLowLevel  = na
+var int   sweepHighBar   = na
+var int   sweepLowBar    = na
+
+if liquiditySweepHigh
+    sweepedHigh    := true
+    sweepHighLevel := lastSwingHigh
+    sweepHighBar   := bar_index
+    sweepedLow     := false
+if liquiditySweepLow
+    sweepedLow    := true
+    sweepLowLevel := lastSwingLow
+    sweepLowBar   := bar_index
+    sweepedHigh   := false
+
+// ─────────────────────────────────────────────────────────────────
+//  CHoCH / BOS
+// ─────────────────────────────────────────────────────────────────
+candleBody   = math.abs(close - open)
+candleRange  = high - low
+strongCandle = candleRange > 0 and (candleBody / candleRange) > 0.45
+
+bearishChoCH = sweepedHigh and not na(lastSwingLow) and close < lastSwingLow and bar_index > sweepHighBar + 1 and strongCandle
+bullishChoCH = sweepedLow and not na(lastSwingHigh) and close > lastSwingHigh and bar_index > sweepLowBar + 1 and strongCandle
+
+var bool  waitingForBearBOS = false
+var bool  waitingForBullBOS = false
+var float chochLowLevel     = na
+var float chochHighLevel    = na
+var int   chochBearBar      = na
+var int   chochBullBar      = na
+
+if bearishChoCH and not waitingForBearBOS
+    waitingForBearBOS := true
+    waitingForBullBOS := false
+    chochLowLevel     := low
+    chochBearBar      := bar_index
+    sweepedHigh       := false
+if bullishChoCH and not waitingForBullBOS
+    waitingForBullBOS := true
+    waitingForBearBOS := false
+    chochHighLevel    := high
+    chochBullBar      := bar_index
+    sweepedLow        := false
+if waitingForBearBOS and bar_index > chochBearBar + bosTimeout
+    waitingForBearBOS := false
+if waitingForBullBOS and bar_index > chochBullBar + bosTimeout
+    waitingForBullBOS := false
+
+bearishBOS = waitingForBearBOS and close < chochLowLevel and bar_index > chochBearBar + 1 and strongCandle
+bullishBOS = waitingForBullBOS and close > chochHighLevel and bar_index > chochBullBar + 1 and strongCandle
+
+nearDemandZone = not na(lastSwingLow) and math.abs(close - lastSwingLow) < atr * bosZoneProx
+nearSupplyZone = not na(lastSwingHigh) and math.abs(close - lastSwingHigh) < atr * bosZoneProx
+
+var int lastLongBOSBar  = 0
+var int lastShortBOSBar = 0
+
+longBOSRaw  = bullishBOS and stBull and trendStrong and highVol and rsi < 72 and not isRanging and nearDemandZone
+shortBOSRaw = bearishBOS and stBear and trendStrong and highVol and rsi > 35 and not isRanging and nearSupplyZone
+longBOS  = longBOSRaw  and (bar_index - lastLongBOSBar  >= bosCooldownIn)
+shortBOS = shortBOSRaw and (bar_index - lastShortBOSBar >= bosCooldownIn)
+if longBOS
+    lastLongBOSBar := bar_index
+if shortBOS
+    lastShortBOSBar := bar_index
+
+// ─────────────────────────────────────────────────────────────────
+//  DIVERGENCE SIGNALS
+// ─────────────────────────────────────────────────────────────────
+longDiv  = bullDiv and (bullEngulf or hammer) and trendStrong and not na(lastSwingLow) and low <= lastSwingLow * 1.005 and not isRanging
+shortDiv = bearDiv and (bearEngulf or shootStar) and trendStrong and not na(lastSwingHigh) and high >= lastSwingHigh * 0.995 and not isRanging
+
+// ─────────────────────────────────────────────────────────────────
+//  SUPERTREND FLIP
+// ─────────────────────────────────────────────────────────────────
+stFlipBull = stBull and not stBull[1] and highVol and adx > adxThresh and rsi >= stRsiMin and rsi <= stRsiMax
+stFlipBear = stBear and not stBear[1] and highVol and adx > adxThresh and rsi > 52
+
+// ─────────────────────────────────────────────────────────────────
+//  MOMENTUM
+// ─────────────────────────────────────────────────────────────────
+[macdLine, signalLine, histLine] = ta.macd(close, 12, 26, 9)
+macdBearCross = ta.crossunder(macdLine, signalLine)
+macdBullCross = ta.crossover(macdLine, signalLine)
+rsiFadingHigh = rsi < rsi[1] and rsi[1] < rsi[2] and rsi > 52
+rsiFadingLow  = rsi > rsi[1] and rsi[1] > rsi[2] and rsi < 48
+structBreakDown = close < ta.lowest(close[1], 5) and strongCandle and close < open
+structBreakUp   = close > ta.highest(close[1], 5) and strongCandle and close > open
+
+momentumShort = useMomRev and macdBearCross and rsiFadingHigh and structBreakDown and rsi > 53 and not isRanging and trendStrong
+momentumLong = useMomRev and macdBullCross and rsiFadingLow and structBreakUp and rsi < 50 and not isRanging and trendStrong and htfBull
+
+// ─────────────────────────────────────────────────────────────────
+//  REJECTION (Sniper Fix)
+// ─────────────────────────────────────────────────────────────────
+liveResHigh = ta.highest(high[1], 20)
+liveResLow  = ta.lowest(low[1], 20)
+
+rejShortCandle = upperWick > bodySize * 1.5 and close < open and (high - close) > atr * 0.3
+rejLongCandle  = lowerWick > bodySize * 1.5 and close > open and (close - low) > atr * 0.3
+
+resistanceShort = useResRej and barstate.isconfirmed and high >= liveResHigh * 0.999 and rejShortCandle and rsi > shortRejRsiMin and rsi < shortRejRsiMax and highVol and not isRanging
+supportLong     = useResRej and barstate.isconfirmed and low <= liveResLow * 1.001 and rejLongCandle and rsi < longRejRsi and highVol and not isRanging
+
+// ─────────────────────────────────────────────────────────────────
+//  TIER GATING
+// ─────────────────────────────────────────────────────────────────
+tierAllowT2Long  = tierMode == "All Signals" or (tierMode == "Tiered" and longConfluence  >= t2Confluence)
+tierAllowT2Short = tierMode == "All Signals" or (tierMode == "Tiered" and shortConfluence >= t2Confluence)
+tierAllowT3Long  = tierMode == "All Signals" or (tierMode == "Tiered" and longConfluence  >= t3Confluence)
+tierAllowT3Short = tierMode == "All Signals" or (tierMode == "Tiered" and shortConfluence >= t3Confluence)
+
+gatedLongDiv      = longDiv
+gatedShortDiv     = shortDiv
+gatedShortREJ     = resistanceShort
+gatedStFlipBull   = stFlipBull   and tierAllowT2Long
+gatedStFlipBear   = stFlipBear   and tierAllowT2Short
+gatedMomShort     = momentumShort and tierAllowT2Short
+gatedLongREJ      = supportLong  and tierAllowT2Long
+gatedLongBOS      = longBOS      and tierAllowT3Long
+gatedShortBOS     = shortBOS     and tierAllowT3Short
+gatedMomLong      = momentumLong and tierAllowT3Long
+
+// ─────────────────────────────────────────────────────────────────
+//  RAW COMPOSITES
+// ─────────────────────────────────────────────────────────────────
+rawLong  = gatedLongBOS or gatedLongDiv or gatedStFlipBull or gatedMomLong or gatedLongREJ
+rawShort = gatedShortBOS or gatedShortDiv or gatedStFlipBear or gatedMomShort or gatedShortREJ
+
+// ─────────────────────────────────────────────────────────────────
+//  TRADE STATE MANAGEMENT
+// ─────────────────────────────────────────────────────────────────
+var int   lastSignalBar  = 0
+var int   activeDir      = 0
+var float activeEntry    = na
+var float activeSL       = na
+var float activeTP       = na
+var int   activeBar      = 0
+var bool  tradeActive    = false
+
+// Check if current trade hit SL or TP
+var bool tradeClosed = false
+tradeClosed := false
+
+if tradeActive and activeDir == 1
+    if low <= activeSL or high >= activeTP
+        tradeActive := false
+        tradeClosed := true
+
+if tradeActive and activeDir == -1
+    if high >= activeSL or low <= activeTP
+        tradeActive := false
+        tradeClosed := true
+
+// Cooldown and conflict check
+cooldownOK = bar_index - lastSignalBar >= signalCooldown
+canTrade   = cooldownOK and (simpleMode ? not tradeActive : true)
+
+// Final filtered signals
+longSignal  = rawLong  and canTrade
+shortSignal = rawShort and canTrade
+
+// Determine signal type for labeling (using if/else instead of nested ternary)
+var string longType  = ""
+var string shortType = ""
+
+if longSignal
+    if gatedLongBOS
+        longType := "BOS"
+    else if gatedLongDiv
+        longType := "DIV"
+    else if gatedStFlipBull
+        longType := "ST"
+    else if gatedMomLong
+        longType := "MOM"
+    else if gatedLongREJ
+        longType := "REJ"
+    else
+        longType := ""
+else
+    longType := ""
+
+if shortSignal
+    if gatedShortBOS
+        shortType := "BOS"
+    else if gatedShortDiv
+        shortType := "DIV"
+    else if gatedStFlipBear
+        shortType := "ST"
+    else if gatedMomShort
+        shortType := "MOM"
+    else if gatedShortREJ
+        shortType := "REJ"
+    else
+        shortType := ""
+else
+    shortType := ""
+
+// Update state when signal fires
+if longSignal
+    lastSignalBar := bar_index
+    activeDir     := 1
+    activeEntry   := close
+    activeSL      := close - atr * atrMult_sl
+    activeTP      := close + atr * atrMult_tp
+    activeBar     := bar_index
+    tradeActive   := true
+
+if shortSignal
+    lastSignalBar := bar_index
+    activeDir     := -1
+    activeEntry   := close
+    activeSL      := close + atr * atrMult_sl
+    activeTP      := close - atr * atrMult_tp
+    activeBar     := bar_index
+    tradeActive   := true
+
+// ─────────────────────────────────────────────────────────────────
+//  SL / TP LINES
+// ─────────────────────────────────────────────────────────────────
+plot(tradeActive ? activeSL : na,    "Stop Loss",  color=color.new(color.red, 30),   linewidth=1, style=plot.style_linebr)
+plot(tradeActive ? activeTP : na,    "Take Profit", color=color.new(color.green, 30), linewidth=1, style=plot.style_linebr)
+plot(tradeActive ? activeEntry : na, "Entry",       color=color.new(color.white, 50), linewidth=1, style=plot.style_linebr)
+
+// TP/SL hit markers
+tpHit = tradeClosed and not tradeActive
+slHit = tradeClosed and not tradeActive
+
+// ─────────────────────────────────────────────────────────────────
+//  SIMPLE MODE PLOTS
+// ─────────────────────────────────────────────────────────────────
+plotshape(simpleMode and longSignal, title="BUY Signal",
+     location=location.belowbar, style=shape.triangleup, size=size.large,
+     color=color.new(#00E676, 0), text="BUY", textcolor=color.new(#00E676, 0))
+
+plotshape(simpleMode and shortSignal, title="SELL Signal",
+     location=location.abovebar, style=shape.triangledown, size=size.large,
+     color=color.new(#FF1744, 0), text="SELL", textcolor=color.new(#FF1744, 0))
+
+// ─────────────────────────────────────────────────────────────────
+//  ADVANCED MODE PLOTS
+// ─────────────────────────────────────────────────────────────────
+advMode = not simpleMode
+
+// BOS
+plotshape(advMode and longSignal  and longType  == "BOS", title="ADV BUY BOS",
+     location=location.belowbar, style=shape.triangleup, size=size.large,
+     color=color.new(color.lime, 0), text="BUY BOS", textcolor=color.lime)
+plotshape(advMode and shortSignal and shortType == "BOS", title="ADV SELL BOS",
+     location=location.abovebar, style=shape.triangledown, size=size.large,
+     color=color.new(color.red, 0), text="SELL BOS", textcolor=color.red)
+
+// DIV
+plotshape(advMode and longSignal  and longType  == "DIV", title="ADV BUY DIV",
+     location=location.belowbar, style=shape.triangleup, size=size.large,
+     color=color.new(color.aqua, 0), text="BUY DIV", textcolor=color.aqua)
+plotshape(advMode and shortSignal and shortType == "DIV", title="ADV SELL DIV",
+     location=location.abovebar, style=shape.triangledown, size=size.large,
+     color=color.new(color.orange, 0), text="SELL DIV", textcolor=color.orange)
+
+// ST
+plotshape(advMode and longSignal  and longType  == "ST", title="ADV BUY ST",
+     location=location.belowbar, style=shape.triangleup, size=size.normal,
+     color=color.new(color.yellow, 0), text="BUY ST", textcolor=color.yellow)
+plotshape(advMode and shortSignal and shortType == "ST", title="ADV SELL ST",
+     location=location.abovebar, style=shape.triangledown, size=size.normal,
+     color=color.new(color.yellow, 0), text="SELL ST", textcolor=color.yellow)
+
+// MOM
+plotshape(advMode and longSignal  and longType  == "MOM", title="ADV BUY MOM",
+     location=location.belowbar, style=shape.triangleup, size=size.normal,
+     color=color.new(color.fuchsia, 0), text="BUY MOM", textcolor=color.fuchsia)
+plotshape(advMode and shortSignal and shortType == "MOM", title="ADV SELL MOM",
+     location=location.abovebar, style=shape.triangledown, size=size.normal,
+     color=color.new(color.purple, 0), text="SELL MOM", textcolor=color.purple)
+
+// REJ
+plotshape(advMode and longSignal  and longType  == "REJ", title="ADV BUY REJ",
+     location=location.belowbar, style=shape.diamond, size=size.normal,
+     color=color.new(color.white, 0), text="BUY REJ", textcolor=color.white)
+plotshape(advMode and shortSignal and shortType == "REJ", title="ADV SELL REJ",
+     location=location.abovebar, style=shape.diamond, size=size.normal,
+     color=color.new(color.white, 0), text="SELL REJ", textcolor=color.white)
+
+// ─────────────────────────────────────────────────────────────────
+//  OVERLAYS
+// ─────────────────────────────────────────────────────────────────
+plot(showZones and advMode ? liveResHigh : na, "REJ Resistance Zone",
+     color=color.new(color.red, 70), linewidth=1, style=plot.style_circles)
+plot(showZones and advMode ? liveResLow : na, "REJ Support Zone",
+     color=color.new(color.green, 70), linewidth=1, style=plot.style_circles)
+
+stAlpha = simpleMode ? 80 : 60
+plot(stLine, "Supertrend",
+     color=stBull ? color.new(color.lime, stAlpha) : color.new(color.red, stAlpha),
+     linewidth=2)
+
+plot(advMode ? ma200 : na, "EMA 200", color=color.new(color.white, 75), linewidth=1)
+
+bgcolor(advMode and isRanging ? color.new(color.yellow, 93) : na, title="Ranging Warning")
+
+// ─────────────────────────────────────────────────────────────────
+//  STATUS TABLE
+// ─────────────────────────────────────────────────────────────────
+var table infoTable = table.new(position.top_right, 3, 16, bgcolor=color.new(color.black, 30), border_width=1)
+
+if barstate.islast and simpleMode
+    table.cell(infoTable, 0, 0, "SMC SNIPER",  text_color=color.gray,  text_size=size.small)
+    table.cell(infoTable, 1, 0, "v6",           text_color=color.aqua,  text_size=size.small)
+    table.cell(infoTable, 0, 1, "Status",       text_color=color.white, text_size=size.small)
+    table.cell(infoTable, 1, 1, tradeActive ? (activeDir == 1 ? "IN BUY" : "IN SELL") : "WAITING",
+         text_color=tradeActive ? (activeDir == 1 ? color.lime : color.red) : color.gray,
+         text_size=size.small)
+    table.cell(infoTable, 0, 2, "Trend",        text_color=color.white, text_size=size.small)
+    trendBull = stBull and htfBull
+    trendBear = stBear and htfBear
+    table.cell(infoTable, 1, 2, trendBull ? "BULLISH" : trendBear ? "BEARISH" : "MIXED",
+         text_color=trendBull ? color.lime : trendBear ? color.red : color.yellow,
+         text_size=size.small)
+    table.cell(infoTable, 0, 3, "Next signal",  text_color=color.white, text_size=size.small)
+    barsLeft = math.max(0, signalCooldown - (bar_index - lastSignalBar))
+    table.cell(infoTable, 1, 3, barsLeft > 0 ? str.tostring(barsLeft) + " bars" : "READY",
+         text_color=barsLeft > 0 ? color.yellow : color.lime,
+         text_size=size.small)
+
+if barstate.islast and advMode and showTable
+    // ── CONFLUENCE SECTION ──
+    table.cell(infoTable, 0, 0, "CONFLUENCE",  text_color=color.gray,  text_size=size.small)
+    table.cell(infoTable, 1, 0, "SCORE",        text_color=color.gray,  text_size=size.small)
+    table.cell(infoTable, 2, 0, "",              text_color=color.gray,  text_size=size.small)
+
+    table.cell(infoTable, 0, 1, "Long Score",   text_color=color.white, text_size=size.small)
+    table.cell(infoTable, 1, 1, str.tostring(longConfluence) + " / 6",
+         text_color=longConfluence >= t3Confluence ? color.lime : longConfluence >= t2Confluence ? color.yellow : color.red,
+         text_size=size.small)
+    table.cell(infoTable, 2, 1, longConfluence >= 4 ? "STRONG" : longConfluence >= 2 ? "OK" : "WEAK",
+         text_color=longConfluence >= 4 ? color.lime : longConfluence >= 2 ? color.yellow : color.red,
+         text_size=size.small)
+
+    table.cell(infoTable, 0, 2, "Short Score",  text_color=color.white, text_size=size.small)
+    table.cell(infoTable, 1, 2, str.tostring(shortConfluence) + " / 6",
+         text_color=shortConfluence >= t3Confluence ? color.lime : shortConfluence >= t2Confluence ? color.yellow : color.red,
+         text_size=size.small)
+    table.cell(infoTable, 2, 2, shortConfluence >= 4 ? "STRONG" : shortConfluence >= 2 ? "OK" : "WEAK",
+         text_color=shortConfluence >= 4 ? color.lime : shortConfluence >= 2 ? color.yellow : color.red,
+         text_size=size.small)
+
+    table.cell(infoTable, 0, 3, "Supertrend",   text_color=color.white, text_size=size.small)
+    table.cell(infoTable, 1, 3, stBull ? "BULL" : "BEAR",
+         text_color=stBull ? color.lime : color.red, text_size=size.small)
+    table.cell(infoTable, 2, 3, "",              text_color=color.gray,  text_size=size.small)
+
+    table.cell(infoTable, 0, 4, "4H Trend",     text_color=color.white, text_size=size.small)
+    table.cell(infoTable, 1, 4, htfBull ? "BULL" : "BEAR",
+         text_color=htfBull ? color.lime : color.red, text_size=size.small)
+    table.cell(infoTable, 2, 4, "",              text_color=color.gray,  text_size=size.small)
+
+    table.cell(infoTable, 0, 5, "Daily Trend",  text_color=color.white, text_size=size.small)
+    table.cell(infoTable, 1, 5, dailyBull ? "BULL" : "BEAR",
+         text_color=dailyBull ? color.lime : color.red, text_size=size.small)
+    table.cell(infoTable, 2, 5, "",              text_color=color.gray,  text_size=size.small)
+
+    table.cell(infoTable, 0, 6, "ADX",          text_color=color.white, text_size=size.small)
+    table.cell(infoTable, 1, 6, str.tostring(math.round(adx, 1)),
+         text_color=trendStrong ? color.lime : color.red, text_size=size.small)
+    table.cell(infoTable, 2, 6, trendStrong ? "TRENDING" : "WEAK",
+         text_color=trendStrong ? color.lime : color.red, text_size=size.small)
+
+    barsLeft2 = math.max(0, signalCooldown - (bar_index - lastSignalBar))
+    table.cell(infoTable, 0, 7, "Cooldown",     text_color=color.white, text_size=size.small)
+    table.cell(infoTable, 1, 7, barsLeft2 > 0 ? str.tostring(barsLeft2) + " bars" : "READY",
+         text_color=barsLeft2 > 0 ? color.yellow : color.lime, text_size=size.small)
+    table.cell(infoTable, 2, 7, "",              text_color=color.gray,  text_size=size.small)
+
+    // ── SIGNAL SCORECARD ──
+    table.cell(infoTable, 0, 8, "SIGNAL",       text_color=color.gray,  text_size=size.small)
+    table.cell(infoTable, 1, 8, "RATING",        text_color=color.gray,  text_size=size.small)
+    table.cell(infoTable, 2, 8, "TIER",          text_color=color.gray,  text_size=size.small)
+
+    // DIV — aqua (best performer across all TFs)
+    table.cell(infoTable, 0, 9, "DIV",
+         text_color=color.aqua, text_size=size.small)
+    table.cell(infoTable, 1, 9, "STRONG",
+         text_color=color.lime, text_size=size.small)
+    table.cell(infoTable, 2, 9, "T1",
+         text_color=color.lime, text_size=size.small)
+
+    // REJ SHORT — white (77.8% WR on 1H scalps)
+    table.cell(infoTable, 0, 10, "REJ sell",
+         text_color=color.white, text_size=size.small)
+    table.cell(infoTable, 1, 10, "STRONG",
+         text_color=color.lime, text_size=size.small)
+    table.cell(infoTable, 2, 10, "T1",
+         text_color=color.lime, text_size=size.small)
+
+    // REJ LONG — white (needs confluence)
+    table.cell(infoTable, 0, 11, "REJ buy",
+         text_color=color.white, text_size=size.small)
+    table.cell(infoTable, 1, 11, "GOOD",
+         text_color=color.yellow, text_size=size.small)
+    table.cell(infoTable, 2, 11, "T2",
+         text_color=color.yellow, text_size=size.small)
+
+    // ST — yellow (78.6% WR on 4H, decent elsewhere)
+    table.cell(infoTable, 0, 12, "ST",
+         text_color=color.yellow, text_size=size.small)
+    table.cell(infoTable, 1, 12, "GOOD",
+         text_color=color.yellow, text_size=size.small)
+    table.cell(infoTable, 2, 12, "T2",
+         text_color=color.yellow, text_size=size.small)
+
+    // MOM — fuchsia/purple (small samples, mixed)
+    table.cell(infoTable, 0, 13, "MOM",
+         text_color=color.fuchsia, text_size=size.small)
+    table.cell(infoTable, 1, 13, "OK",
+         text_color=color.orange, text_size=size.small)
+    table.cell(infoTable, 2, 13, "T2/T3",
+         text_color=color.orange, text_size=size.small)
+
+    // BOS — lime/red (filtered by tier system, rarely fires)
+    table.cell(infoTable, 0, 14, "BOS",
+         text_color=color.lime, text_size=size.small)
+    table.cell(infoTable, 1, 14, "WEAK",
+         text_color=color.red, text_size=size.small)
+    table.cell(infoTable, 2, 14, "T3",
+         text_color=color.red, text_size=size.small)
+
+    // Mode row
+    table.cell(infoTable, 0, 15, "Mode",         text_color=color.white, text_size=size.small)
+    table.cell(infoTable, 1, 15, tierMode,        text_color=color.aqua,  text_size=size.small)
+    table.cell(infoTable, 2, 15, "",              text_color=color.gray,  text_size=size.small)
+
+// ─────────────────────────────────────────────────────────────────
+//  ALERTS
+// ─────────────────────────────────────────────────────────────────
+alertcondition(longSignal,  title="BUY Signal",  message="BUY {{ticker}} @ {{close}} - SL and TP on chart. Enter on next candle open.")
+alertcondition(shortSignal, title="SELL Signal", message="SELL {{ticker}} @ {{close}} - SL and TP on chart. Enter on next candle open.")
+alertcondition(longSignal  and longType  == "DIV", title="BUY - Divergence",  message="BUY {{ticker}} @ {{close}} - Divergence signal")
+alertcondition(shortSignal and shortType == "DIV", title="SELL - Divergence", message="SELL {{ticker}} @ {{close}} - Divergence signal")
+alertcondition(longSignal  and longType  == "REJ", title="BUY - Rejection",   message="BUY {{ticker}} @ {{close}} - Support rejection")
+alertcondition(shortSignal and shortType == "REJ", title="SELL - Rejection",  message="SELL {{ticker}} @ {{close}} - Resistance rejection")
+alertcondition(longSignal  and longType  == "ST",  title="BUY - Supertrend",  message="BUY {{ticker}} @ {{close}} - Supertrend flip")
+alertcondition(shortSignal and shortType == "ST",  title="SELL - Supertrend", message="SELL {{ticker}} @ {{close}} - Supertrend flip")

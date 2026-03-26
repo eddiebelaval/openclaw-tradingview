@@ -1,0 +1,964 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © officialjackofalltrades
+//@version=6
+indicator("Institutional Structure Intelligence Engine [JOAT]", "ISI [JOAT]", overlay=true, max_boxes_count=500, max_lines_count=500, max_labels_count=500)
+
+// ─────────────────────────────────────────────────────────────────────────
+// INPUTS
+// ─────────────────────────────────────────────────────────────────────────
+
+// Structure Detection
+int swingLength = input.int(10, "Swing Length", minval=3, maxval=50, group="Structure Detection")
+bool showSwings = input.bool(true, "Show Swing Points", group="Structure Detection")
+bool showStructureLines = input.bool(true, "Show Structure Lines", group="Structure Detection")
+bool showCompressionZones = input.bool(false, "Show Compression Zones", group="Structure Detection")
+
+// Order Blocks - Advanced
+bool showOrderBlocks = input.bool(true, "Show Order Blocks", group="Order Blocks")
+bool combineOrderBlocks = input.bool(true, "Combine Overlapping OBs", group="Order Blocks")
+bool showBreakerBlocks = input.bool(true, "Show Breaker Blocks", group="Order Blocks")
+float obVolumeThreshold = input.float(1.5, "Volume Threshold", minval=1.0, step=0.1, group="Order Blocks")
+int maxOrderBlocks = input.int(3, "Max Order Blocks", minval=1, maxval=10, group="Order Blocks")
+float maxATRMult = input.float(2.5, "Max ATR Multiplier", minval=1.0, step=0.5, group="Order Blocks")
+
+// Market Structure
+bool showBOS = input.bool(false, "Show Break of Structure", group="Market Structure")
+bool showCHOCH = input.bool(true, "Show Change of Character", group="Market Structure")
+bool showFVG = input.bool(true, "Show Fair Value Gaps", group="Market Structure")
+bool showMitigationZones = input.bool(true, "Show FVG Mitigation", group="Market Structure")
+int maxFVGs = input.int(3, "Max FVGs to Display", minval=1, maxval=10, group="Market Structure")
+
+// Fibonacci & Confluence
+bool showFibZones = input.bool(false, "Show Fibonacci Zones", group="Fibonacci Confluence")
+
+// Institutional Levels
+bool showWeeklyLevels = input.bool(true, "Show Weekly High/Low", group="Institutional Levels")
+bool showDailyLevels = input.bool(true, "Show Daily High/Low", group="Institutional Levels")
+bool showGoldenZone = input.bool(true, "Show Golden Zone (0.618-0.5)", group="Institutional Levels")
+bool showPremiumDiscount = input.bool(true, "Show Premium/Discount Zones", group="Institutional Levels")
+
+// Velocity & Momentum
+bool showVelocity = input.bool(true, "Show Structure Velocity", group="Velocity Analysis")
+int velocityLength = input.int(20, "Velocity Period", minval=5, maxval=50, group="Velocity Analysis")
+
+// Display
+string tablePosition = input.string("Top Right", "Table Position", options=["Top Right", "Top Left", "Bottom Right", "Bottom Left"], group="Display")
+bool showQualityScore = input.bool(true, "Show Structure Quality Score", group="Display")
+
+// Colors - Institutional Grade Palette
+color bullStructure = input.color(color.new(#00e676, 0), "Bullish Structure", group="Colors", inline="c1")
+color bearStructure = input.color(color.new(#ff5252, 0), "Bearish Structure", group="Colors", inline="c1")
+color obBullish = input.color(color.new(#089981, 75), "Bullish OB", group="Colors", inline="c2")
+color obBearish = input.color(color.new(#f23645, 75), "Bearish OB", group="Colors", inline="c2")
+color breakerBull = input.color(color.new(#00bcd4, 80), "Bullish Breaker", group="Colors", inline="c3")
+color breakerBear = input.color(color.new(#ff9800, 80), "Bearish Breaker", group="Colors", inline="c3")
+color fvgBull = input.color(color.new(#4caf50, 85), "Bullish FVG", group="Colors", inline="c4")
+color fvgBear = input.color(color.new(#f44336, 85), "Bearish FVG", group="Colors", inline="c4")
+color weeklyLvl = input.color(color.new(#5b9cf6, 0), "Weekly", group="Colors", inline="c5")
+color dailyLvl = input.color(color.new(#ffd740, 0), "Daily", group="Colors", inline="c5")
+color goldenZone = input.color(color.new(#ffd740, 88), "Golden Zone", group="Colors", inline="c6")
+color premiumZone = input.color(color.new(#ff5252, 92), "Premium", group="Colors", inline="c6")
+color discountZone = input.color(color.new(#00e676, 92), "Discount", group="Colors", inline="c7")
+color compressionColor = input.color(color.new(#9c27b0, 85), "Compression", group="Colors", inline="c7")
+
+// ─────────────────────────────────────────────────────────────────────────
+// CUSTOM TYPES
+// ─────────────────────────────────────────────────────────────────────────
+
+type OrderBlockInfo
+    float top
+    float bottom
+    float obVolume
+    string obType
+    int startBar
+    int startTime
+    float bbVolume
+    float obLowVolume
+    float obHighVolume
+    bool breaker = false
+    int breakTime = na
+    bool disabled = false
+    bool combined = false
+    int touches = 0
+    float strength = 0.0
+
+type FVGInfo
+    float top
+    float bottom
+    int startBar
+    int startTime
+    string fvgType
+    bool mitigated = false
+    int mitigationBar = na
+
+// ─────────────────────────────────────────────────────────────────────────
+// FUNCTIONS
+// ─────────────────────────────────────────────────────────────────────────
+
+getTablePosition(pos) =>
+    switch pos
+        "Top Right" => position.top_right
+        "Top Left" => position.top_left
+        "Bottom Right" => position.bottom_right
+        "Bottom Left" => position.bottom_left
+        => position.top_right
+
+// Calculate OB area
+areaOfOB(OrderBlockInfo ob) =>
+    float timeSpan = na(ob.breakTime) ? (time - ob.startTime) : (ob.breakTime - ob.startTime)
+    float priceSpan = ob.top - ob.bottom
+    timeSpan * priceSpan
+
+// Check if OBs overlap
+doOBsOverlap(OrderBlockInfo ob1, OrderBlockInfo ob2) =>
+    bool priceOverlap = math.max(ob1.bottom, ob2.bottom) < math.min(ob1.top, ob2.top)
+    bool timeOverlap = true // Simplified for performance
+    priceOverlap and timeOverlap
+
+// ─────────────────────────────────────────────────────────────────────────
+// CORE CALCULATIONS
+// ─────────────────────────────────────────────────────────────────────────
+
+// ATR for context
+atr = ta.atr(14)
+avgVolume = ta.sma(volume, 20)
+
+// ─────────────────────────────────────────────────────────────────────────
+// SWING DETECTION WITH ARRAYS
+// ─────────────────────────────────────────────────────────────────────────
+
+var array<float> swingHighs = array.new<float>()
+var array<int> swingHighBars = array.new<int>()
+var array<float> swingLows = array.new<float>()
+var array<int> swingLowBars = array.new<int>()
+
+// Pivot detection
+pivotHigh = ta.pivothigh(high, swingLength, swingLength)
+pivotLow = ta.pivotlow(low, swingLength, swingLength)
+
+// Track swings
+var float lastSwingHigh = na
+var float lastSwingLow = na
+var int lastSwingHighBar = 0
+var int lastSwingLowBar = 0
+var bool trendBullish = true
+
+if not na(pivotHigh) and barstate.isconfirmed
+    lastSwingHigh := pivotHigh
+    lastSwingHighBar := bar_index - swingLength
+    array.unshift(swingHighs, pivotHigh)
+    array.unshift(swingHighBars, lastSwingHighBar)
+    if array.size(swingHighs) > 10
+        array.pop(swingHighs)
+        array.pop(swingHighBars)
+    
+if not na(pivotLow) and barstate.isconfirmed
+    lastSwingLow := pivotLow
+    lastSwingLowBar := bar_index - swingLength
+    array.unshift(swingLows, pivotLow)
+    array.unshift(swingLowBars, lastSwingLowBar)
+    if array.size(swingLows) > 10
+        array.pop(swingLows)
+        array.pop(swingLowBars)
+
+// ─────────────────────────────────────────────────────────────────────────
+// COMPRESSION TO EXPANSION DETECTION - STRICT FILTERING
+// ─────────────────────────────────────────────────────────────────────────
+
+// Calculate range compression with MUCH stricter thresholds
+float rangeMA = ta.sma(high - low, 50)  // Longer period for better filtering
+float currentRange = high - low
+bool compressed = currentRange < rangeMA * 0.3 and volume < avgVolume * 0.8  // Much stricter: 30% of average + low volume
+bool expanding = currentRange > rangeMA * 2.0 and volume > avgVolume * 1.3  // Stronger expansion signal
+
+// Compression zone tracking - ONLY show significant compressions
+var int compressionStart = na
+var int compressionStartTime = na
+var float compressionHigh = na
+var float compressionLow = na
+var int compressionBars = 0
+
+if compressed and na(compressionStart)
+    compressionStart := bar_index
+    compressionStartTime := time
+    compressionHigh := high
+    compressionLow := low
+    compressionBars := 1
+else if compressed and not na(compressionStart)
+    compressionHigh := math.max(compressionHigh, high)
+    compressionLow := math.min(compressionLow, low)
+    compressionBars += 1
+else if not compressed and not na(compressionStart)
+    // Only show if compression lasted at least 10 bars AND range is tight
+    if showCompressionZones and compressionBars >= 10 and (compressionHigh - compressionLow) < atr * 1.5
+        box.new(compressionStartTime, compressionHigh, time, compressionLow,
+               border_color=compressionColor, bgcolor=compressionColor,
+               xloc=xloc.bar_time, extend=extend.none,
+               text="COMPRESSION\n" + str.tostring(compressionBars) + " bars", 
+               text_color=color.white, text_size=size.tiny, text_halign=text.align_center)
+    compressionStart := na
+    compressionStartTime := na
+    compressionBars := 0
+
+// ─────────────────────────────────────────────────────────────────────────
+// VELOCITY & MOMENTUM ANALYSIS
+// ─────────────────────────────────────────────────────────────────────────
+
+// Price velocity
+priceVelocity = ta.change(close, velocityLength) / velocityLength
+velocityMA = ta.sma(math.abs(priceVelocity), velocityLength)
+velocityScore = velocityMA > 0 ? math.abs(priceVelocity) / velocityMA : 0
+
+// Volume momentum
+volumeMomentum = volume / avgVolume
+volumeAcceleration = ta.change(volumeMomentum, 5)
+
+// Structure velocity (how fast structure is forming)
+structureVelocity = array.size(swingHighs) > 1 and array.size(swingLows) > 1 ? 
+                   (bar_index - array.get(swingHighBars, 0)) + (bar_index - array.get(swingLowBars, 0)) : 0
+
+// ─────────────────────────────────────────────────────────────────────────
+// MARKET STRUCTURE SHIFT DETECTION WITH MOMENTUM
+// ─────────────────────────────────────────────────────────────────────────
+
+var bool lastTrendBullish = true
+bool bosDetected = false
+bool chochDetected = false
+float bosStrength = 0.0
+float chochStrength = 0.0
+
+// BOS - continuation with momentum
+if trendBullish and close > lastSwingHigh and not na(lastSwingHigh) and barstate.isconfirmed
+    bosDetected := true
+    bosStrength := (close - lastSwingHigh) / atr * volumeMomentum
+    lastTrendBullish := true
+    
+if not trendBullish and close < lastSwingLow and not na(lastSwingLow) and barstate.isconfirmed
+    bosDetected := true
+    bosStrength := (lastSwingLow - close) / atr * volumeMomentum
+    lastTrendBullish := false
+
+// CHOCH - reversal with momentum
+if not trendBullish and close > lastSwingHigh and not na(lastSwingHigh) and barstate.isconfirmed
+    chochDetected := true
+    chochStrength := (close - lastSwingHigh) / atr * volumeMomentum
+    trendBullish := true
+    lastTrendBullish := true
+    
+if trendBullish and close < lastSwingLow and not na(lastSwingLow) and barstate.isconfirmed
+    chochDetected := true
+    chochStrength := (lastSwingLow - close) / atr * volumeMomentum
+    trendBullish := false
+    lastTrendBullish := false
+
+// ─────────────────────────────────────────────────────────────────────────
+// ADVANCED ORDER BLOCK DETECTION WITH VOLUME PROFILING - STRICT ACCURACY
+// ─────────────────────────────────────────────────────────────────────────
+
+var array<OrderBlockInfo> bullishOBs = array.new<OrderBlockInfo>()
+var array<OrderBlockInfo> bearishOBs = array.new<OrderBlockInfo>()
+var array<box> obBoxes = array.new<box>()
+var array<label> obLabels = array.new<label>()
+
+// Detect bullish order block (down candle followed by strong up move) - STRICT CRITERIA
+bool bullishOBDetected = false
+if close[2] < open[2] and close[1] < open[1] and close > open and 
+   volume[1] > avgVolume * obVolumeThreshold and 
+   close > high[1] and 
+   (high[1] - low[1]) <= atr * maxATRMult and
+   (close - open) > atr * 0.5 and  // Strong bullish candle
+   barstate.isconfirmed
+    
+    bullishOBDetected := true
+    
+    // Create order block info
+    OrderBlockInfo newOB = OrderBlockInfo.new()
+    newOB.top := high[1]
+    newOB.bottom := low[1]
+    newOB.obVolume := volume[1] + volume + volume[2]
+    newOB.obType := "Bull"
+    newOB.startBar := bar_index[1]
+    newOB.startTime := time[1]
+    newOB.obLowVolume := volume[2]
+    newOB.obHighVolume := volume + volume[1]
+    newOB.strength := volumeMomentum * (close - open) / atr
+    
+    array.unshift(bullishOBs, newOB)
+    
+    // Limit array size
+    if array.size(bullishOBs) > 20
+        array.pop(bullishOBs)
+
+// Detect bearish order block (up candle followed by strong down move) - STRICT CRITERIA
+bool bearishOBDetected = false
+if close[2] > open[2] and close[1] > open[1] and close < open and 
+   volume[1] > avgVolume * obVolumeThreshold and 
+   close < low[1] and 
+   (high[1] - low[1]) <= atr * maxATRMult and
+   (open - close) > atr * 0.5 and  // Strong bearish candle
+   barstate.isconfirmed
+    
+    bearishOBDetected := true
+    
+    OrderBlockInfo newOB = OrderBlockInfo.new()
+    newOB.top := high[1]
+    newOB.bottom := low[1]
+    newOB.obVolume := volume[1] + volume + volume[2]
+    newOB.obType := "Bear"
+    newOB.startBar := bar_index[1]
+    newOB.startTime := time[1]
+    newOB.obLowVolume := volume + volume[1]
+    newOB.obHighVolume := volume[2]
+    newOB.strength := volumeMomentum * (open - close) / atr
+    
+    array.unshift(bearishOBs, newOB)
+    
+    // Limit array size
+    if array.size(bearishOBs) > 20
+        array.pop(bearishOBs)
+
+// Check for breaker blocks and touches
+if array.size(bullishOBs) > 0
+    for i = array.size(bullishOBs) - 1 to 0
+        ob = array.get(bullishOBs, i)
+        if not ob.disabled and not ob.breaker
+            // Check if price touched OB
+            if low <= ob.top and high >= ob.bottom
+                ob.touches += 1
+            // Check if OB broken (becomes breaker)
+            if low < ob.bottom
+                ob.breaker := true
+                ob.breakTime := time
+                ob.bbVolume := volume
+        else if ob.breaker
+            // Remove if price goes back above breaker
+            if high > ob.top
+                ob.disabled := true
+
+if array.size(bearishOBs) > 0
+    for i = array.size(bearishOBs) - 1 to 0
+        ob = array.get(bearishOBs, i)
+        if not ob.disabled and not ob.breaker
+            if low <= ob.top and high >= ob.bottom
+                ob.touches += 1
+            if high > ob.top
+                ob.breaker := true
+                ob.breakTime := time
+                ob.bbVolume := volume
+        else if ob.breaker
+            if low < ob.bottom
+                ob.disabled := true
+
+// Combine overlapping order blocks
+if combineOrderBlocks and barstate.islast
+    // Combine bullish OBs
+    if array.size(bullishOBs) > 1
+        for i = 0 to array.size(bullishOBs) - 2
+            ob1 = array.get(bullishOBs, i)
+            if ob1.disabled
+                continue
+            for j = i + 1 to array.size(bullishOBs) - 1
+                ob2 = array.get(bullishOBs, j)
+                if ob2.disabled
+                    continue
+                if doOBsOverlap(ob1, ob2)
+                    // Combine into ob1
+                    ob1.top := math.max(ob1.top, ob2.top)
+                    ob1.bottom := math.min(ob1.bottom, ob2.bottom)
+                    ob1.obVolume += ob2.obVolume
+                    ob1.obLowVolume += ob2.obLowVolume
+                    ob1.obHighVolume += ob2.obHighVolume
+                    ob1.touches += ob2.touches
+                    ob1.strength := math.max(ob1.strength, ob2.strength)
+                    ob1.combined := true
+                    ob2.disabled := true
+    
+    // Combine bearish OBs
+    if array.size(bearishOBs) > 1
+        for i = 0 to array.size(bearishOBs) - 2
+            ob1 = array.get(bearishOBs, i)
+            if ob1.disabled
+                continue
+            for j = i + 1 to array.size(bearishOBs) - 1
+                ob2 = array.get(bearishOBs, j)
+                if ob2.disabled
+                    continue
+                if doOBsOverlap(ob1, ob2)
+                    ob1.top := math.max(ob1.top, ob2.top)
+                    ob1.bottom := math.min(ob1.bottom, ob2.bottom)
+                    ob1.obVolume += ob2.obVolume
+                    ob1.obLowVolume += ob2.obLowVolume
+                    ob1.obHighVolume += ob2.obHighVolume
+                    ob1.touches += ob2.touches
+                    ob1.strength := math.max(ob1.strength, ob2.strength)
+                    ob1.combined := true
+                    ob2.disabled := true
+
+// Render order blocks - LOCKED BOXES, NO OVERLAPPING
+if showOrderBlocks and barstate.islast
+    // Clear old boxes
+    for b in obBoxes
+        box.delete(b)
+    array.clear(obBoxes)
+    for l in obLabels
+        label.delete(l)
+    array.clear(obLabels)
+    
+    // Render bullish OBs - with overlap prevention
+    int bullCount = 0
+    float lastBullTop = na
+    float lastBullBottom = na
+    if array.size(bullishOBs) > 0
+        for i = 0 to array.size(bullishOBs) - 1
+            if bullCount >= maxOrderBlocks
+                break
+            ob = array.get(bullishOBs, i)
+            if ob.disabled
+                continue
+            
+            // Check for overlap with last rendered OB
+            bool overlaps = not na(lastBullTop) and not na(lastBullBottom) and 
+                           (ob.bottom < lastBullTop and ob.top > lastBullBottom)
+            if overlaps
+                continue
+            
+            bullCount += 1
+            lastBullTop := ob.top
+            lastBullBottom := ob.bottom
+            boxColor = ob.breaker and showBreakerBlocks ? breakerBull : obBullish
+            
+            // Box text inside
+            string boxText = ob.breaker ? "BREAKER" : ob.combined ? "COMBINED OB" : "ORDER BLOCK"
+            boxText := boxText + "\n" + str.tostring(ob.touches) + " touches"
+            boxText := boxText + "\nVol: " + str.tostring(ob.obVolume, format.volume)
+            
+            // LOCKED BOX - right side at current bar time, no extend
+            newBox = box.new(ob.startTime, ob.top, time, ob.bottom,
+                           border_color=boxColor, bgcolor=boxColor,
+                           extend=extend.none, xloc=xloc.bar_time,
+                           border_width=ob.combined ? 2 : 1,
+                           text=boxText, text_color=color.white,
+                           text_size=size.tiny, text_halign=text.align_left)
+            array.push(obBoxes, newBox)
+    
+    // Render bearish OBs - with overlap prevention
+    int bearCount = 0
+    float lastBearTop = na
+    float lastBearBottom = na
+    if array.size(bearishOBs) > 0
+        for i = 0 to array.size(bearishOBs) - 1
+            if bearCount >= maxOrderBlocks
+                break
+            ob = array.get(bearishOBs, i)
+            if ob.disabled
+                continue
+            
+            // Check for overlap with last rendered OB
+            bool overlaps = not na(lastBearTop) and not na(lastBearBottom) and 
+                           (ob.bottom < lastBearTop and ob.top > lastBearBottom)
+            if overlaps
+                continue
+            
+            bearCount += 1
+            lastBearTop := ob.top
+            lastBearBottom := ob.bottom
+            boxColor = ob.breaker and showBreakerBlocks ? breakerBear : obBearish
+            
+            // Box text inside
+            string boxText = ob.breaker ? "BREAKER" : ob.combined ? "COMBINED OB" : "ORDER BLOCK"
+            boxText := boxText + "\n" + str.tostring(ob.touches) + " touches"
+            boxText := boxText + "\nVol: " + str.tostring(ob.obVolume, format.volume)
+            
+            // LOCKED BOX - right side at current bar time, no extend
+            newBox = box.new(ob.startTime, ob.top, time, ob.bottom,
+                           border_color=boxColor, bgcolor=boxColor,
+                           extend=extend.none, xloc=xloc.bar_time,
+                           border_width=ob.combined ? 2 : 1,
+                           text=boxText, text_color=color.white,
+                           text_size=size.tiny, text_halign=text.align_left)
+            array.push(obBoxes, newBox)
+
+// ─────────────────────────────────────────────────────────────────────────
+// FAIR VALUE GAP (FVG) DETECTION WITH MITIGATION - STRICT ACCURACY
+// ─────────────────────────────────────────────────────────────────────────
+
+var array<FVGInfo> bullishFVGs = array.new<FVGInfo>()
+var array<FVGInfo> bearishFVGs = array.new<FVGInfo>()
+var array<box> fvgBoxes = array.new<box>()
+var array<label> fvgLabels = array.new<label>()
+
+// Bullish FVG: Gap between 2 bars ago high and current low - STRICT CRITERIA
+bool bullishFVGDetected = low > high[2] and 
+                         (low - high[2]) > atr * 0.3 and  // Minimum gap size
+                         volume > avgVolume * 0.8 and  // Volume confirmation
+                         barstate.isconfirmed
+if bullishFVGDetected
+    FVGInfo newFVG = FVGInfo.new()
+    newFVG.top := low
+    newFVG.bottom := high[2]
+    newFVG.startBar := bar_index[2]
+    newFVG.startTime := time[2]
+    newFVG.fvgType := "Bull"
+    array.unshift(bullishFVGs, newFVG)
+    if array.size(bullishFVGs) > 20
+        array.pop(bullishFVGs)
+
+// Bearish FVG: Gap between 2 bars ago low and current high - STRICT CRITERIA
+bool bearishFVGDetected = high < low[2] and 
+                         (low[2] - high) > atr * 0.3 and  // Minimum gap size
+                         volume > avgVolume * 0.8 and  // Volume confirmation
+                         barstate.isconfirmed
+if bearishFVGDetected
+    FVGInfo newFVG = FVGInfo.new()
+    newFVG.top := low[2]
+    newFVG.bottom := high
+    newFVG.startBar := bar_index[2]
+    newFVG.startTime := time[2]
+    newFVG.fvgType := "Bear"
+    array.unshift(bearishFVGs, newFVG)
+    if array.size(bearishFVGs) > 20
+        array.pop(bearishFVGs)
+
+// Check for FVG mitigation
+if showMitigationZones
+    if array.size(bullishFVGs) > 0
+        for i = array.size(bullishFVGs) - 1 to 0
+            fvg = array.get(bullishFVGs, i)
+            if not fvg.mitigated and low <= fvg.top and high >= fvg.bottom
+                fvg.mitigated := true
+                fvg.mitigationBar := bar_index
+    
+    if array.size(bearishFVGs) > 0
+        for i = array.size(bearishFVGs) - 1 to 0
+            fvg = array.get(bearishFVGs, i)
+            if not fvg.mitigated and low <= fvg.top and high >= fvg.bottom
+                fvg.mitigated := true
+                fvg.mitigationBar := bar_index
+
+// Draw FVGs - ONLY ACTIVE ONES, NO CLUTTER, LOCKED BOXES
+if showFVG and barstate.islast
+    // Clear old boxes
+    for b in fvgBoxes
+        box.delete(b)
+    array.clear(fvgBoxes)
+    for l in fvgLabels
+        label.delete(l)
+    array.clear(fvgLabels)
+    
+    // Draw bullish FVGs (only non-mitigated) - with overlap prevention
+    int bullFVGCount = 0
+    float lastBullFVGTop = na
+    float lastBullFVGBottom = na
+    if array.size(bullishFVGs) > 0
+        for i = 0 to array.size(bullishFVGs) - 1
+            if bullFVGCount >= maxFVGs
+                break
+            fvg = array.get(bullishFVGs, i)
+            if not fvg.mitigated
+                // Check for overlap with last rendered FVG
+                bool overlaps = not na(lastBullFVGTop) and not na(lastBullFVGBottom) and 
+                               (fvg.bottom < lastBullFVGTop and fvg.top > lastBullFVGBottom)
+                if overlaps
+                    continue
+                
+                bullFVGCount += 1
+                lastBullFVGTop := fvg.top
+                lastBullFVGBottom := fvg.bottom
+                
+                // Box with text inside - LOCKED
+                string fvgText = "FAIR VALUE GAP\nBullish"
+                newBox = box.new(fvg.startTime, fvg.top, time, fvg.bottom,
+                               border_color=fvgBull, bgcolor=fvgBull,
+                               extend=extend.none, xloc=xloc.bar_time,
+                               border_width=1,
+                               text=fvgText, text_color=color.white,
+                               text_size=size.tiny, text_halign=text.align_center)
+                array.push(fvgBoxes, newBox)
+    
+    // Draw bearish FVGs (only non-mitigated) - with overlap prevention
+    int bearFVGCount = 0
+    float lastBearFVGTop = na
+    float lastBearFVGBottom = na
+    if array.size(bearishFVGs) > 0
+        for i = 0 to array.size(bearishFVGs) - 1
+            if bearFVGCount >= maxFVGs
+                break
+            fvg = array.get(bearishFVGs, i)
+            if not fvg.mitigated
+                // Check for overlap with last rendered FVG
+                bool overlaps = not na(lastBearFVGTop) and not na(lastBearFVGBottom) and 
+                               (fvg.bottom < lastBearFVGTop and fvg.top > lastBearFVGBottom)
+                if overlaps
+                    continue
+                
+                bearFVGCount += 1
+                lastBearFVGTop := fvg.top
+                lastBearFVGBottom := fvg.bottom
+                
+                // Box with text inside - LOCKED
+                string fvgText = "FAIR VALUE GAP\nBearish"
+                newBox = box.new(fvg.startTime, fvg.top, time, fvg.bottom,
+                               border_color=fvgBear, bgcolor=fvgBear,
+                               extend=extend.none, xloc=xloc.bar_time,
+                               border_width=1,
+                               text=fvgText, text_color=color.white,
+                               text_size=size.tiny, text_halign=text.align_center)
+                array.push(fvgBoxes, newBox)
+
+// ─────────────────────────────────────────────────────────────────────────
+// FIBONACCI CONFLUENCE ZONES - DISABLED TO REDUCE CLUTTER
+// ─────────────────────────────────────────────────────────────────────────
+
+// Fibonacci zones removed to prevent overlapping yellow boxes
+// User can enable via settings if needed
+
+// ─────────────────────────────────────────────────────────────────────────
+// INSTITUTIONAL LEVELS WITH PREMIUM/DISCOUNT ZONES
+// ─────────────────────────────────────────────────────────────────────────
+
+// Weekly levels
+float lastWeekHigh = request.security(syminfo.tickerid, "W", high[1], lookahead=barmerge.lookahead_on)
+float lastWeekLow = request.security(syminfo.tickerid, "W", low[1], lookahead=barmerge.lookahead_on)
+
+// Daily levels
+float yesterdayHigh = request.security(syminfo.tickerid, "D", high[1], lookahead=barmerge.lookahead_on)
+float yesterdayLow = request.security(syminfo.tickerid, "D", low[1], lookahead=barmerge.lookahead_on)
+
+// Calculate zones
+float weekRange = lastWeekHigh - lastWeekLow
+float weekMid = lastWeekLow + (weekRange * 0.5)
+float goldenTop = lastWeekLow + (weekRange * 0.618)
+float goldenBot = lastWeekLow + (weekRange * 0.5)
+float premiumTop = lastWeekHigh
+float premiumBot = lastWeekLow + (weekRange * 0.7)
+float discountTop = lastWeekLow + (weekRange * 0.3)
+float discountBot = lastWeekLow
+
+// Plot institutional levels with gradient
+plot(showWeeklyLevels ? lastWeekHigh : na, "Last Week High", 
+     color=weeklyLvl, linewidth=3, style=plot.style_line)
+plot(showWeeklyLevels ? lastWeekLow : na, "Last Week Low", 
+     color=weeklyLvl, linewidth=3, style=plot.style_line)
+plot(showDailyLevels ? yesterdayHigh : na, "Yesterday High", 
+     color=dailyLvl, linewidth=2, style=plot.style_line)
+plot(showDailyLevels ? yesterdayLow : na, "Yesterday Low", 
+     color=dailyLvl, linewidth=2, style=plot.style_line)
+
+// Golden Zone fill
+goldenTopPlot = plot(showGoldenZone ? goldenTop : na, color=color.new(color.yellow, 100), linewidth=1)
+goldenBotPlot = plot(showGoldenZone ? goldenBot : na, color=color.new(color.yellow, 100), linewidth=1)
+fill(goldenTopPlot, goldenBotPlot, color=goldenZone, title="Golden Zone")
+
+// Premium/Discount zones - MUST be at global scope
+premiumTopPlot = plot(showPremiumDiscount ? premiumTop : na, color=color.new(color.red, 100), linewidth=1, display=display.none)
+premiumBotPlot = plot(showPremiumDiscount ? premiumBot : na, color=color.new(color.red, 100), linewidth=1, display=display.none)
+fill(premiumTopPlot, premiumBotPlot, color=premiumZone, title="Premium Zone")
+
+discountTopPlot = plot(showPremiumDiscount ? discountTop : na, color=color.new(color.green, 100), linewidth=1, display=display.none)
+discountBotPlot = plot(showPremiumDiscount ? discountBot : na, color=color.new(color.green, 100), linewidth=1, display=display.none)
+fill(discountTopPlot, discountBotPlot, color=discountZone, title="Discount Zone")
+
+// ─────────────────────────────────────────────────────────────────────────
+// SWING VISUALIZATION WITH GRADIENT LINES
+// ─────────────────────────────────────────────────────────────────────────
+
+// Plot swing points with size based on strength
+plotshape(showSwings and not na(pivotHigh), "Swing High", shape.triangledown,
+         location.abovebar, color=bearStructure, size=size.small, offset=-swingLength)
+plotshape(showSwings and not na(pivotLow), "Swing Low", shape.triangleup,
+         location.belowbar, color=bullStructure, size=size.small, offset=-swingLength)
+
+// Dynamic structure lines with gradient
+var line structureLine = na
+if showStructureLines and not na(lastSwingHigh) and not na(lastSwingLow)
+    line.delete(structureLine)
+    if trendBullish
+        structureLine := line.new(lastSwingLowBar, lastSwingLow, bar_index, close,
+                                 color=bullStructure, width=3, style=line.style_solid)
+    else
+        structureLine := line.new(lastSwingHighBar, lastSwingHigh, bar_index, close,
+                                 color=bearStructure, width=3, style=line.style_solid)
+
+// ─────────────────────────────────────────────────────────────────────────
+// MARKET STRUCTURE SIGNALS - CHOCH ONLY (SMALL, DARK AESTHETIC)
+// ─────────────────────────────────────────────────────────────────────────
+
+// CHOCH with dark glowing aesthetic - SMALL SIZE
+color chochColorBull = chochStrength > 2 ? color.new(#00ff88, 0) : chochStrength > 1 ? color.new(#00e676, 0) : color.new(#4caf50, 0)
+color chochColorBear = chochStrength > 2 ? color.new(#ff4444, 0) : chochStrength > 1 ? color.new(#ff5252, 0) : color.new(#ef5350, 0)
+
+plotshape(showCHOCH and chochDetected and trendBullish, "Bullish CHOCH", shape.labelup,
+         location.belowbar, color=chochColorBull, text="CHoCH", textcolor=color.black, size=size.tiny)
+plotshape(showCHOCH and chochDetected and not trendBullish, "Bearish CHOCH", shape.labeldown,
+         location.abovebar, color=chochColorBear, text="CHoCH", textcolor=color.white, size=size.tiny)
+
+// ─────────────────────────────────────────────────────────────────────────
+// STRUCTURE QUALITY SCORE CALCULATION
+// ─────────────────────────────────────────────────────────────────────────
+
+// Calculate overall structure quality (0-100)
+float qualityScore = 0.0
+
+// Component 1: Swing clarity (20 points)
+float swingClarity = array.size(swingHighs) > 0 and array.size(swingLows) > 0 ? 20.0 : 0.0
+
+// Component 2: Order block presence (20 points)
+int totalOBs = array.size(bullishOBs) + array.size(bearishOBs)
+float obScore = math.min(totalOBs / maxOrderBlocks, 1.0) * 20.0
+
+// Component 3: Velocity score (20 points)
+float velocityComponent = math.min(velocityScore, 1.0) * 20.0
+
+// Component 4: Volume confirmation (20 points)
+float volumeComponent = math.min(volumeMomentum, 2.0) / 2.0 * 20.0
+
+// Component 5: Structure alignment (20 points)
+float alignmentScore = (bosDetected or chochDetected) ? 20.0 : 10.0
+
+qualityScore := swingClarity + obScore + velocityComponent + volumeComponent + alignmentScore
+
+// Quality rating
+string qualityRating = qualityScore >= 80 ? "EXCELLENT" : qualityScore >= 60 ? "GOOD" : qualityScore >= 40 ? "MODERATE" : qualityScore >= 20 ? "WEAK" : "POOR"
+
+color qualityColor = qualityScore >= 80 ? color.new(#00e676, 0) : qualityScore >= 60 ? color.new(#4caf50, 0) : qualityScore >= 40 ? color.new(#ffd740, 0) : qualityScore >= 20 ? color.new(#ff9800, 0) : color.new(#ff5252, 0)
+
+// ─────────────────────────────────────────────────────────────────────────
+// COMPREHENSIVE INFORMATION TABLE
+// ─────────────────────────────────────────────────────────────────────────
+
+var table structureTable = table.new(getTablePosition(tablePosition), 2, 15,
+                                     bgcolor=color.new(#1a1a2e, 5),
+                                     border_width=2,
+                                     border_color=color.new(#16213e, 0))
+
+if barstate.islast
+    // Header with gradient
+    table.cell(structureTable, 0, 0, "STRUCTURE INTELLIGENCE",
+               bgcolor=color.new(#0f3460, 0),
+               text_color=color.new(#00d9ff, 0),
+               text_size=size.normal)
+    table.cell(structureTable, 1, 0, "Value",
+               bgcolor=color.new(#0f3460, 0),
+               text_color=color.new(#00d9ff, 0),
+               text_size=size.normal)
+    
+    // Quality Score
+    if showQualityScore
+        table.cell(structureTable, 0, 1, "Quality Score",
+                   bgcolor=color.new(#16213e, 30),
+                   text_color=color.new(#e0e0e0, 0),
+                   text_size=size.small)
+        table.cell(structureTable, 1, 1, str.tostring(qualityScore, "#") + " - " + qualityRating,
+                   bgcolor=qualityColor,
+                   text_color=color.white,
+                   text_size=size.small)
+    
+    // Current Trend
+    string trendText = trendBullish ? "BULLISH ↑" : "BEARISH ↓"
+    color trendColor = trendBullish ? color.new(#00e676, 20) : color.new(#ff5252, 20)
+    table.cell(structureTable, 0, 2, "Market Trend",
+               bgcolor=color.new(#16213e, 30),
+               text_color=color.new(#e0e0e0, 0),
+               text_size=size.small)
+    table.cell(structureTable, 1, 2, trendText,
+               bgcolor=trendColor,
+               text_color=color.white,
+               text_size=size.small)
+    
+    // Last Swing High
+    table.cell(structureTable, 0, 3, "Last Swing High",
+               bgcolor=color.new(#16213e, 30),
+               text_color=color.new(#e0e0e0, 0),
+               text_size=size.small)
+    table.cell(structureTable, 1, 3, str.tostring(lastSwingHigh, format.mintick),
+               bgcolor=color.new(#16213e, 30),
+               text_color=color.new(#ff5252, 0),
+               text_size=size.small)
+    
+    // Last Swing Low
+    table.cell(structureTable, 0, 4, "Last Swing Low",
+               bgcolor=color.new(#16213e, 30),
+               text_color=color.new(#e0e0e0, 0),
+               text_size=size.small)
+    table.cell(structureTable, 1, 4, str.tostring(lastSwingLow, format.mintick),
+               bgcolor=color.new(#16213e, 30),
+               text_color=color.new(#00e676, 0),
+               text_size=size.small)
+    
+    // Weekly High
+    table.cell(structureTable, 0, 5, "Last Week High",
+               bgcolor=color.new(#16213e, 30),
+               text_color=color.new(#e0e0e0, 0),
+               text_size=size.small)
+    table.cell(structureTable, 1, 5, str.tostring(lastWeekHigh, format.mintick),
+               bgcolor=color.new(#5b9cf6, 50),
+               text_color=color.white,
+               text_size=size.small)
+    
+    // Weekly Low
+    table.cell(structureTable, 0, 6, "Last Week Low",
+               bgcolor=color.new(#16213e, 30),
+               text_color=color.new(#e0e0e0, 0),
+               text_size=size.small)
+    table.cell(structureTable, 1, 6, str.tostring(lastWeekLow, format.mintick),
+               bgcolor=color.new(#5b9cf6, 50),
+               text_color=color.white,
+               text_size=size.small)
+    
+    // Order Blocks
+    table.cell(structureTable, 0, 7, "Active OBs",
+               bgcolor=color.new(#16213e, 30),
+               text_color=color.new(#e0e0e0, 0),
+               text_size=size.small)
+    string obText = str.tostring(totalOBs) + " (" + str.tostring(array.size(bullishOBs)) + "↑ " + str.tostring(array.size(bearishOBs)) + "↓)"
+    table.cell(structureTable, 1, 7, obText,
+               bgcolor=color.new(#089981, 50),
+               text_color=color.white,
+               text_size=size.small)
+    
+    // Breaker Blocks
+    int breakerCount = 0
+    for i = 0 to array.size(bullishOBs) - 1
+        if array.get(bullishOBs, i).breaker
+            breakerCount += 1
+    for i = 0 to array.size(bearishOBs) - 1
+        if array.get(bearishOBs, i).breaker
+            breakerCount += 1
+    
+    table.cell(structureTable, 0, 8, "Breaker Blocks",
+               bgcolor=color.new(#16213e, 30),
+               text_color=color.new(#e0e0e0, 0),
+               text_size=size.small)
+    table.cell(structureTable, 1, 8, str.tostring(breakerCount),
+               bgcolor=color.new(#00bcd4, 50),
+               text_color=color.white,
+               text_size=size.small)
+    
+    // Fair Value Gaps - Count only non-mitigated with safety checks
+    int activeFVGs = 0
+    int bullActiveFVGs = 0
+    int bearActiveFVGs = 0
+    
+    if array.size(bullishFVGs) > 0
+        for i = 0 to math.min(array.size(bullishFVGs) - 1, maxFVGs - 1)
+            fvg = array.get(bullishFVGs, i)
+            if not na(fvg) and not fvg.mitigated
+                bullActiveFVGs += 1
+    
+    if array.size(bearishFVGs) > 0
+        for i = 0 to math.min(array.size(bearishFVGs) - 1, maxFVGs - 1)
+            fvg = array.get(bearishFVGs, i)
+            if not na(fvg) and not fvg.mitigated
+                bearActiveFVGs += 1
+    
+    activeFVGs := bullActiveFVGs + bearActiveFVGs
+    
+    table.cell(structureTable, 0, 9, "Active FVGs",
+               bgcolor=color.new(#16213e, 30),
+               text_color=color.new(#e0e0e0, 0),
+               text_size=size.small)
+    string fvgText = str.tostring(activeFVGs) + " (" + str.tostring(bullActiveFVGs) + "↑ " + str.tostring(bearActiveFVGs) + "↓)"
+    table.cell(structureTable, 1, 9, fvgText,
+               bgcolor=color.new(#4caf50, 50),
+               text_color=color.white,
+               text_size=size.small)
+    
+    // Structure State
+    string structureState = bosDetected ? (trendBullish ? "BOS ↑" : "BOS ↓") : 
+                           chochDetected ? "CHOCH ⚡" : 
+                           compressed ? "COMPRESSED" : 
+                           expanding ? "EXPANDING" : "RANGING"
+    color structureColor = bosDetected ? color.new(#00bcd4, 30) : 
+                          chochDetected ? color.new(#ffd740, 30) : 
+                          compressed ? color.new(#9c27b0, 30) : 
+                          expanding ? color.new(#ff9800, 30) : color.new(#90a4ae, 50)
+    table.cell(structureTable, 0, 10, "Structure State",
+               bgcolor=color.new(#16213e, 30),
+               text_color=color.new(#e0e0e0, 0),
+               text_size=size.small)
+    table.cell(structureTable, 1, 10, structureState,
+               bgcolor=structureColor,
+               text_color=color.white,
+               text_size=size.small)
+    
+    // Velocity Score
+    if showVelocity
+        table.cell(structureTable, 0, 11, "Velocity Score",
+                   bgcolor=color.new(#16213e, 30),
+                   text_color=color.new(#e0e0e0, 0),
+                   text_size=size.small)
+        string velocityText = str.tostring(velocityScore, "#.##")
+        color velocityColor = velocityScore > 1.5 ? color.new(#ff5252, 30) : 
+                             velocityScore > 1.0 ? color.new(#ffd740, 30) : color.new(#00e676, 50)
+        table.cell(structureTable, 1, 11, velocityText,
+                   bgcolor=velocityColor,
+                   text_color=color.white,
+                   text_size=size.small)
+    
+    // Volume Momentum
+    table.cell(structureTable, 0, 12, "Volume Momentum",
+               bgcolor=color.new(#16213e, 30),
+               text_color=color.new(#e0e0e0, 0),
+               text_size=size.small)
+    string volMomText = str.tostring(volumeMomentum, "#.##") + "x"
+    color volMomColor = volumeMomentum > 1.5 ? color.new(#00e676, 30) : 
+                       volumeMomentum > 1.0 ? color.new(#4caf50, 50) : color.new(#90a4ae, 50)
+    table.cell(structureTable, 1, 12, volMomText,
+               bgcolor=volMomColor,
+               text_color=color.white,
+               text_size=size.small)
+    
+    // Price Position
+    string pricePosition = close > goldenTop ? "PREMIUM" : 
+                          close < goldenBot ? "DISCOUNT" : 
+                          close >= goldenBot and close <= goldenTop ? "GOLDEN ZONE" : "EQUILIBRIUM"
+    color positionColor = pricePosition == "PREMIUM" ? color.new(#ff5252, 30) : 
+                         pricePosition == "DISCOUNT" ? color.new(#00e676, 30) : 
+                         pricePosition == "GOLDEN ZONE" ? color.new(#ffd740, 30) : color.new(#90a4ae, 50)
+    table.cell(structureTable, 0, 13, "Price Position",
+               bgcolor=color.new(#16213e, 30),
+               text_color=color.new(#e0e0e0, 0),
+               text_size=size.small)
+    table.cell(structureTable, 1, 13, pricePosition,
+               bgcolor=positionColor,
+               text_color=color.white,
+               text_size=size.small)
+    
+    // Market Phase
+    string marketPhase = compressed ? "ACCUMULATION" : expanding and trendBullish ? "MARKUP" : expanding and not trendBullish ? "MARKDOWN" : bosDetected ? "TRENDING" : "DISTRIBUTION"
+    color phaseColor = marketPhase == "MARKUP" ? color.new(#00e676, 30) : marketPhase == "MARKDOWN" ? color.new(#ff5252, 30) : marketPhase == "ACCUMULATION" ? color.new(#9c27b0, 30) : color.new(#ffd740, 50)
+    table.cell(structureTable, 0, 14, "Market Phase",
+               bgcolor=color.new(#16213e, 30),
+               text_color=color.new(#e0e0e0, 0),
+               text_size=size.small)
+    table.cell(structureTable, 1, 14, marketPhase,
+               bgcolor=phaseColor,
+               text_color=color.white,
+               text_size=size.small)
+
+// ─────────────────────────────────────────────────────────────────────────
+// ALERTS - COMPREHENSIVE
+// ─────────────────────────────────────────────────────────────────────────
+
+alertcondition(bosDetected and trendBullish, "Bullish BOS", 
+              "Bullish Break of Structure - Strength: {{plot(\"bosStrength\")}}")
+alertcondition(bosDetected and not trendBullish, "Bearish BOS", 
+              "Bearish Break of Structure - Strength: {{plot(\"bosStrength\")}}")
+alertcondition(chochDetected and trendBullish, "Bullish CHOCH", 
+              "Bullish Change of Character - Trend Reversal - Strength: {{plot(\"chochStrength\")}}")
+alertcondition(chochDetected and not trendBullish, "Bearish CHOCH", 
+              "Bearish Change of Character - Trend Reversal - Strength: {{plot(\"chochStrength\")}}")
+alertcondition(bullishOBDetected, "Bullish Order Block", 
+              "Bullish Order Block formed with high volume")
+alertcondition(bearishOBDetected, "Bearish Order Block", 
+              "Bearish Order Block formed with high volume")
+alertcondition(bullishFVGDetected, "Bullish FVG", 
+              "Bullish Fair Value Gap detected")
+alertcondition(bearishFVGDetected, "Bearish FVG", 
+              "Bearish Fair Value Gap detected")
+alertcondition(compressed, "Compression Zone", 
+              "Market entering compression - potential breakout setup")
+alertcondition(expanding, "Expansion Detected", 
+              "Market expanding from compression - momentum building")
+alertcondition(qualityScore >= 80, "Excellent Structure Quality", 
+              "Structure quality score: {{plot(\"qualityScore\")}} - EXCELLENT")

@@ -1,0 +1,581 @@
+// This Pine Script™ code is subject to the terms of the Mozilla Public License 2.0
+// https://mozilla.org/MPL/2.0/
+
+//@version=5
+indicator("Order Block Finder [DefinedEdge]",
+     shorttitle = "OB Finder",
+     overlay = true,
+     max_lines_count = 500,
+     max_labels_count = 500)
+
+// ============================================================================
+//  ORDER BLOCK FINDER [DefinedEdge]
+// ============================================================================
+
+// ─── INPUTS ─────────────────────────────────────────────────────────────────
+
+string GRP_DET = "🔷 Detection"
+int    i_swingLen    = input.int(5, "Structure Lookback", minval=2, maxval=20, group=GRP_DET)
+int    i_maxOB       = input.int(8, "Max Active OBs Per Side", minval=1, maxval=20, group=GRP_DET)
+float  i_minImpulse  = input.float(1.0, "Min Impulse (×ATR)", minval=0.1, maxval=5.0, step=0.1, group=GRP_DET)
+bool   i_requireVol  = input.bool(false, "Require Above-Avg Volume", group=GRP_DET)
+
+string GRP_VIZ = "🔷 Display"
+bool   i_showStrength = input.bool(true, "Show Strength Scoring", group=GRP_VIZ)
+bool   i_showBreakers = input.bool(true, "Show Breaker Blocks", group=GRP_VIZ)
+int    i_breakerMax   = input.int(3, "Max Breakers Per Side", minval=1, maxval=10, group=GRP_VIZ)
+bool   i_showFVG     = input.bool(true, "Highlight FVG Overlap", group=GRP_VIZ)
+bool   i_ageDecay    = input.bool(true, "Age Decay", group=GRP_VIZ)
+int    i_decayBars   = input.int(150, "Decay Start (bars)", minval=20, maxval=500, group=GRP_VIZ)
+bool   i_showDash    = input.bool(true, "Show Dashboard", group=GRP_VIZ)
+bool   i_showLabels  = input.bool(true, "Show OB Labels", group=GRP_VIZ)
+bool   i_showFill    = input.bool(true, "Show Zone Fill", group=GRP_VIZ)
+int    i_lineWidth   = input.int(2, "Zone Line Width", minval=1, maxval=4, group=GRP_VIZ)
+
+string GRP_COL = "🎨 Colors"
+color  i_bullOBCol   = input.color(color.new(#00ff88, 0), "Bullish OB", group=GRP_COL)
+color  i_bearOBCol   = input.color(color.new(#ff0040, 0), "Bearish OB", group=GRP_COL)
+color  i_bullBrkCol  = input.color(color.new(#00bcd4, 0), "Bullish Breaker", group=GRP_COL)
+color  i_bearBrkCol  = input.color(color.new(#ff9800, 0), "Bearish Breaker", group=GRP_COL)
+color  i_confluCol   = input.color(color.new(#e040fb, 0), "FVG Confluence", group=GRP_COL)
+
+string GRP_ALR = "🔔 Alerts"
+float  i_proxPct     = input.float(1.0, "Proximity Alert (%)", minval=0.1, maxval=5.0, step=0.1, group=GRP_ALR)
+bool   i_alertProx   = input.bool(true, "Proximity Alerts", group=GRP_ALR)
+bool   i_alertMit    = input.bool(true, "Mitigation Alerts", group=GRP_ALR)
+
+string GRP_HTF = "📊 Multi-Timeframe"
+bool   i_showHTF    = input.bool(false, "Show HTF Order Blocks", group=GRP_HTF)
+string i_htfTF      = input.timeframe("60", "HTF Timeframe", group=GRP_HTF)
+
+// ─── TYPES ──────────────────────────────────────────────────────────────────
+
+type OB
+    float     top
+    float     btm
+    float     mid
+    int       startBar
+    int       startTime
+    int       bias
+    int       tests
+    float     formVol
+    float     impulseSize
+    bool      hasFVG
+    bool      isBreaker
+    int       origBias
+    int       lastTestedBar
+    line      topLine
+    line      btmLine
+    linefill  fill
+    line      midLine
+    label     lbl
+
+// ─── GLOBAL VARIABLES ───────────────────────────────────────────────────────
+
+var array<OB> bullOBs = array.new<OB>()
+var array<OB> bearOBs = array.new<OB>()
+var array<OB> bullBrk = array.new<OB>()
+var array<OB> bearBrk = array.new<OB>()
+
+var bool proxAlertBull  = false
+var bool proxAlertBear  = false
+var bool mitAlertBull   = false
+var bool mitAlertBear   = false
+var bool partialMitBull = false
+var bool partialMitBear = false
+
+float atr14  = ta.atr(14)
+float volSMA = ta.sma(volume, 20)
+
+[htfO, htfH, htfL, htfC, htfV, htfATR, htfTime] = request.security(syminfo.tickerid, i_htfTF, [open, high, low, close, volume, ta.atr(14), time])
+bool htfChanged = timeframe.change(i_htfTF)
+
+// ─── STRUCTURE DETECTION ────────────────────────────────────────────────────
+
+float pivHigh = ta.pivothigh(high, i_swingLen, i_swingLen)
+float pivLow  = ta.pivotlow(low, i_swingLen, i_swingLen)
+var float lastSwingHigh = na
+var float lastSwingLow  = na
+if not na(pivHigh)
+    lastSwingHigh := pivHigh
+if not na(pivLow)
+    lastSwingLow := pivLow
+
+// ─── HELPER FUNCTIONS ───────────────────────────────────────────────────────
+
+f_calcStrength(float _volRatio, float _impulse, float _top, float _btm, int _bias) =>
+    float volScore = math.min(_volRatio / 2.0, 1.0) * 40.0
+    float impScore = math.min(_impulse / 3.0, 1.0) * 40.0
+    float proxScore = 0.0
+    if _bias == 1 and not na(lastSwingLow) and not na(atr14) and atr14 > 0
+        float dist = math.abs(_btm - lastSwingLow) / atr14
+        proxScore := dist < 2.0 ? (1.0 - dist / 2.0) * 20.0 : 0.0
+    else if _bias == -1 and not na(lastSwingHigh) and not na(atr14) and atr14 > 0
+        float dist = math.abs(_top - lastSwingHigh) / atr14
+        proxScore := dist < 2.0 ? (1.0 - dist / 2.0) * 20.0 : 0.0
+    math.round(volScore + impScore + proxScore)
+
+f_calcOpacity(int _strength, int _startBar, int _tests, bool _hasFVG) =>
+    float baseTransp = 80.0 - (_strength / 100.0) * 35.0
+    float testBonus = math.min(_tests * 5.0, 15.0)
+    float fvgBonus = _hasFVG ? 10.0 : 0.0
+    float ageTransp = 0.0
+    if i_ageDecay
+        int age = bar_index - _startBar
+        if age > i_decayBars
+            ageTransp := math.min((age - i_decayBars) / 100.0 * 20.0, 30.0)
+    math.max(math.min(baseTransp - testBonus - fvgBonus + ageTransp, 90.0), 35.0)
+
+// ─── DELETE OB HELPER ───────────────────────────────────────────────────────
+
+f_deleteOB(OB _ob) =>
+    line.delete(_ob.topLine)
+    line.delete(_ob.btmLine)
+    linefill.delete(_ob.fill)
+    line.delete(_ob.midLine)
+    label.delete(_ob.lbl)
+
+// ─── CREATE OB VISUALS ─────────────────────────────────────────────────────
+
+f_createOBVisuals(float _top, float _btm, int _time, int _bias, float _transp, color _col, bool _hasFvg, int _strength, bool _isBreaker) =>
+    int lw = _isBreaker ? 1 : i_lineWidth
+    string lstyle = _isBreaker ? line.style_dashed : line.style_solid
+    color lineCol = _isBreaker ? color.new(_col, math.max(_transp - 20, 0)) : color.new(_col, math.max(_transp - 15, 0))
+    color fillCol = i_showFill ? color.new(_col, math.min(_transp + 35, 97)) : color(na)
+    color midCol  = color.new(_col, math.min(_transp + 20, 95))
+
+    // FVG confluence override
+    if _hasFvg and not _isBreaker
+        lineCol := color.new(i_confluCol, math.max(_transp - 20, 0))
+        lw := math.max(lw, 2)
+
+    line tL = line.new(_time, _top, time, _top, xloc=xloc.bar_time, extend=extend.right, color=lineCol, style=lstyle, width=lw)
+    line bL = line.new(_time, _btm, time, _btm, xloc=xloc.bar_time, extend=extend.right, color=lineCol, style=lstyle, width=lw)
+    linefill f = linefill.new(tL, bL, fillCol)
+    line mL = line.new(_time, math.avg(_top, _btm), time, math.avg(_top, _btm), xloc=xloc.bar_time, extend=extend.right, color=midCol, style=line.style_dotted, width=1)
+
+    label lb = na
+    if i_showLabels
+        string brkTxt = _isBreaker ? (_bias == 1 ? "Bull BRK" : "Bear BRK") : ""
+        string obTxt  = _isBreaker ? brkTxt : (_bias == 1 ? "Bull OB" : "Bear OB")
+        string sTxt   = (not _isBreaker and i_showStrength) ? " [" + str.tostring(_strength) + "]" : ""
+        string fTxt   = (_hasFvg and not _isBreaker) ? " ★" : ""
+        string pTxt   = "\n" + str.tostring(_btm, format.mintick) + " - " + str.tostring(_top, format.mintick)
+        float lblY    = _bias == 1 ? _btm : _top
+        string lblSt = _bias == 1 ? label.style_label_up : label.style_label_down
+        lb := label.new(_time, lblY, obTxt + sTxt + fTxt + pTxt, xloc=xloc.bar_time, color=color(na), textcolor=color.new(_col, 20), style=lblSt, size=size.small)
+
+    [tL, bL, f, mL, lb]
+
+// ─── ORDER BLOCK DETECTION ─────────────────────────────────────────────────
+
+bool strongBullMove = close > open and not na(atr14) and (close - open) > i_minImpulse * atr14
+bool strongBearMove = open > close and not na(atr14) and (open - close) > i_minImpulse * atr14
+bool volOK = i_requireVol ? volume > volSMA : true
+
+bool bullOBFound = false
+bool bearOBFound = false
+float obTop  = na
+float obBtm  = na
+int   obBar  = na
+int   obTime = na
+float obVol  = na
+float obImp  = na
+
+if strongBullMove and volOK and barstate.isconfirmed
+    for lookback = 1 to math.min(i_swingLen * 2, 10)
+        if close[lookback] < open[lookback]
+            obTop  := high[lookback]
+            obBtm  := low[lookback]
+            obBar  := bar_index - lookback
+            obTime := time[lookback]
+            obVol  := nz(volSMA) > 0 ? volume[lookback] / volSMA : 1.0
+            obImp  := nz(atr14) > 0 ? (close - open) / atr14 : 1.0
+            bullOBFound := true
+            break
+
+if strongBearMove and volOK and barstate.isconfirmed
+    for lookback = 1 to math.min(i_swingLen * 2, 10)
+        if close[lookback] > open[lookback]
+            obTop  := high[lookback]
+            obBtm  := low[lookback]
+            obBar  := bar_index - lookback
+            obTime := time[lookback]
+            obVol  := nz(volSMA) > 0 ? volume[lookback] / volSMA : 1.0
+            obImp  := nz(atr14) > 0 ? (open - close) / atr14 : 1.0
+            bearOBFound := true
+            break
+
+// ─── FVG DETECTION ──────────────────────────────────────────────────────────
+
+bool bullFVG = low > high[2] and close[1] > high[2]
+bool bearFVG = high < low[2] and close[1] < low[2]
+float fvgBullTop = bullFVG ? low : na
+float fvgBullBtm = bullFVG ? high[2] : na
+float fvgBearTop = bearFVG ? low[2] : na
+float fvgBearBtm = bearFVG ? high : na
+
+// ─── ADD NEW BULL OBs ───────────────────────────────────────────────────────
+
+if bullOBFound and not na(obTop) and not na(obBtm) and not na(obTime)
+    bool duplicate = false
+    if bullOBs.size() > 0
+        for i = 0 to bullOBs.size() - 1
+            if math.abs(bullOBs.get(i).mid - math.avg(obTop, obBtm)) < atr14 * 1.5
+                duplicate := true
+                break
+
+    if not duplicate
+        bool hasFvg = false
+        if i_showFVG and not na(fvgBullTop)
+            hasFvg := obTop >= fvgBullBtm and obBtm <= fvgBullTop
+        int strength = f_calcStrength(obVol, obImp, obTop, obBtm, 1)
+        float transp = f_calcOpacity(strength, obBar, 0, hasFvg)
+
+        [tL, bL, f, mL, lb] = f_createOBVisuals(obTop, obBtm, obTime, 1, transp, i_bullOBCol, hasFvg, strength, false)
+        bullOBs.unshift(OB.new(obTop, obBtm, math.avg(obTop, obBtm), obBar, obTime, 1, 0, obVol, obImp, hasFvg, false, 1, 0, tL, bL, f, mL, lb))
+        while bullOBs.size() > i_maxOB
+            OB old = bullOBs.pop()
+            f_deleteOB(old)
+
+// ─── ADD NEW BEAR OBs ───────────────────────────────────────────────────────
+
+if bearOBFound and not na(obTop) and not na(obBtm) and not na(obTime)
+    bool duplicate = false
+    if bearOBs.size() > 0
+        for i = 0 to bearOBs.size() - 1
+            if math.abs(bearOBs.get(i).mid - math.avg(obTop, obBtm)) < atr14 * 1.5
+                duplicate := true
+                break
+
+    if not duplicate
+        bool hasFvg = false
+        if i_showFVG and not na(fvgBearTop)
+            hasFvg := obTop >= fvgBearBtm and obBtm <= fvgBearTop
+        int strength = f_calcStrength(obVol, obImp, obTop, obBtm, -1)
+        float transp = f_calcOpacity(strength, obBar, 0, hasFvg)
+
+        [tL, bL, f, mL, lb] = f_createOBVisuals(obTop, obBtm, obTime, -1, transp, i_bearOBCol, hasFvg, strength, false)
+        bearOBs.unshift(OB.new(obTop, obBtm, math.avg(obTop, obBtm), obBar, obTime, -1, 0, obVol, obImp, hasFvg, false, -1, 0, tL, bL, f, mL, lb))
+        while bearOBs.size() > i_maxOB
+            OB old = bearOBs.pop()
+            f_deleteOB(old)
+
+// ─── PROCESS BULL OBs ───────────────────────────────────────────────────────
+
+mitAlertBull    := false
+partialMitBull  := false
+
+if bullOBs.size() > 0
+    for i = bullOBs.size() - 1 to 0
+        OB ob = bullOBs.get(i)
+        if close < ob.btm
+            mitAlertBull := true
+            if i_showBreakers and bullBrk.size() < i_breakerMax
+                f_deleteOB(ob)
+                int brkStr = f_calcStrength(ob.formVol, ob.impulseSize, ob.top, ob.btm, -1)
+                float brkTrsp = f_calcOpacity(brkStr, ob.startBar, 0, false)
+                [tL, bL, f, mL, lb] = f_createOBVisuals(ob.top, ob.btm, ob.startTime, -1, brkTrsp, i_bearBrkCol, false, 0, true)
+                bullBrk.unshift(OB.new(ob.top, ob.btm, ob.mid, ob.startBar, ob.startTime, -1, 0, ob.formVol, ob.impulseSize, false, true, 1, 0, tL, bL, f, mL, lb))
+            else
+                f_deleteOB(ob)
+            bullOBs.remove(i)
+        else if low < ob.top and low >= ob.btm and close >= ob.btm and low[1] >= ob.top
+            partialMitBull := true
+            ob.tests += 1
+            ob.lastTestedBar := bar_index
+            int ns = f_calcStrength(ob.formVol, ob.impulseSize, ob.top, ob.btm, 1)
+            float nt = f_calcOpacity(ns, ob.startBar, ob.tests, ob.hasFVG)
+            color newLineCol = color.new(i_bullOBCol, math.max(nt - 15, 0))
+            color newFillCol = i_showFill ? color.new(i_bullOBCol, math.min(nt + 35, 97)) : color(na)
+            line.set_color(ob.topLine, newLineCol)
+            line.set_color(ob.btmLine, newLineCol)
+            linefill.set_color(ob.fill, newFillCol)
+
+// ─── PROCESS BEAR OBs ───────────────────────────────────────────────────────
+
+mitAlertBear    := false
+partialMitBear  := false
+
+if bearOBs.size() > 0
+    for i = bearOBs.size() - 1 to 0
+        OB ob = bearOBs.get(i)
+        if close > ob.top
+            mitAlertBear := true
+            if i_showBreakers and bearBrk.size() < i_breakerMax
+                f_deleteOB(ob)
+                int brkStr = f_calcStrength(ob.formVol, ob.impulseSize, ob.top, ob.btm, 1)
+                float brkTrsp = f_calcOpacity(brkStr, ob.startBar, 0, false)
+                [tL, bL, f, mL, lb] = f_createOBVisuals(ob.top, ob.btm, ob.startTime, 1, brkTrsp, i_bullBrkCol, false, 0, true)
+                bearBrk.unshift(OB.new(ob.top, ob.btm, ob.mid, ob.startBar, ob.startTime, 1, 0, ob.formVol, ob.impulseSize, false, true, -1, 0, tL, bL, f, mL, lb))
+            else
+                f_deleteOB(ob)
+            bearOBs.remove(i)
+        else if high > ob.btm and high <= ob.top and close <= ob.top and high[1] <= ob.btm
+            partialMitBear := true
+            ob.tests += 1
+            ob.lastTestedBar := bar_index
+            int ns = f_calcStrength(ob.formVol, ob.impulseSize, ob.top, ob.btm, -1)
+            float nt = f_calcOpacity(ns, ob.startBar, ob.tests, ob.hasFVG)
+            color newLineCol = color.new(i_bearOBCol, math.max(nt - 15, 0))
+            color newFillCol = i_showFill ? color.new(i_bearOBCol, math.min(nt + 35, 97)) : color(na)
+            line.set_color(ob.topLine, newLineCol)
+            line.set_color(ob.btmLine, newLineCol)
+            linefill.set_color(ob.fill, newFillCol)
+
+// ─── PROCESS BREAKERS ───────────────────────────────────────────────────────
+
+if bullBrk.size() > 0
+    for i = bullBrk.size() - 1 to 0
+        OB brk = bullBrk.get(i)
+        if close < brk.btm
+            f_deleteOB(brk)
+            bullBrk.remove(i)
+
+if bearBrk.size() > 0
+    for i = bearBrk.size() - 1 to 0
+        OB brk = bearBrk.get(i)
+        if close > brk.top
+            f_deleteOB(brk)
+            bearBrk.remove(i)
+
+while bullBrk.size() > i_breakerMax
+    OB old = bullBrk.pop()
+    f_deleteOB(old)
+while bearBrk.size() > i_breakerMax
+    OB old = bearBrk.pop()
+    f_deleteOB(old)
+
+// ─── AGE DECAY ──────────────────────────────────────────────────────────────
+
+if i_ageDecay and bullOBs.size() > 0
+    for i = bullOBs.size() - 1 to 0
+        OB ob = bullOBs.get(i)
+        int age = bar_index - ob.startBar
+        if age > i_decayBars + 200
+            f_deleteOB(ob)
+            bullOBs.remove(i)
+        else
+            int stren  = f_calcStrength(ob.formVol, ob.impulseSize, ob.top, ob.btm, 1)
+            float trsp = f_calcOpacity(stren, ob.startBar, ob.tests, ob.hasFVG)
+            color lCol = color.new(i_bullOBCol, math.max(trsp - 15, 0))
+            color fCol = i_showFill ? color.new(i_bullOBCol, math.min(trsp + 35, 97)) : color(na)
+            line.set_color(ob.topLine, lCol)
+            line.set_color(ob.btmLine, lCol)
+            linefill.set_color(ob.fill, fCol)
+
+if i_ageDecay and bearOBs.size() > 0
+    for i = bearOBs.size() - 1 to 0
+        OB ob = bearOBs.get(i)
+        int age = bar_index - ob.startBar
+        if age > i_decayBars + 200
+            f_deleteOB(ob)
+            bearOBs.remove(i)
+        else
+            int stren  = f_calcStrength(ob.formVol, ob.impulseSize, ob.top, ob.btm, -1)
+            float trsp = f_calcOpacity(stren, ob.startBar, ob.tests, ob.hasFVG)
+            color lCol = color.new(i_bearOBCol, math.max(trsp - 15, 0))
+            color fCol = i_showFill ? color.new(i_bearOBCol, math.min(trsp + 35, 97)) : color(na)
+            line.set_color(ob.topLine, lCol)
+            line.set_color(ob.btmLine, lCol)
+            linefill.set_color(ob.fill, fCol)
+
+// ─── PROXIMITY CHECK ────────────────────────────────────────────────────────
+
+proxAlertBull := false
+proxAlertBear := false
+float nearBullDist = 999999.0
+float nearBearDist = 999999.0
+
+if bullOBs.size() > 0
+    for i = 0 to bullOBs.size() - 1
+        OB ob = bullOBs.get(i)
+        if close > ob.top
+            float dist = (close - ob.top) / close * 100
+            if dist > 0 and dist < i_proxPct
+                proxAlertBull := true
+            if dist > 0 and dist < nearBullDist
+                nearBullDist := dist
+
+if bearOBs.size() > 0
+    for i = 0 to bearOBs.size() - 1
+        OB ob = bearOBs.get(i)
+        if close < ob.btm
+            float dist = (ob.btm - close) / close * 100
+            if dist > 0 and dist < i_proxPct
+                proxAlertBear := true
+            if dist > 0 and dist < nearBearDist
+                nearBearDist := dist
+
+// ─── FVG CONFLUENCE LINE HIGHLIGHTING ───────────────────────────────────────
+
+if i_showFVG and bullOBs.size() > 0
+    for i = 0 to bullOBs.size() - 1
+        OB ob = bullOBs.get(i)
+        if ob.hasFVG
+            line.set_color(ob.topLine, color.new(i_confluCol, 30))
+            line.set_color(ob.btmLine, color.new(i_confluCol, 30))
+            line.set_width(ob.topLine, math.max(i_lineWidth, 2))
+            line.set_width(ob.btmLine, math.max(i_lineWidth, 2))
+
+if i_showFVG and bearOBs.size() > 0
+    for i = 0 to bearOBs.size() - 1
+        OB ob = bearOBs.get(i)
+        if ob.hasFVG
+            line.set_color(ob.topLine, color.new(i_confluCol, 30))
+            line.set_color(ob.btmLine, color.new(i_confluCol, 30))
+            line.set_width(ob.topLine, math.max(i_lineWidth, 2))
+            line.set_width(ob.btmLine, math.max(i_lineWidth, 2))
+
+// ─── HTF ORDER BLOCKS ───────────────────────────────────────────────────────
+
+var line  htfBullTop_ln  = na
+var line  htfBullBtm_ln  = na
+var linefill htfBullFill = na
+var line  htfBullMid_ln  = na
+var label htfBullLbl     = na
+var line  htfBearTop_ln  = na
+var line  htfBearBtm_ln  = na
+var linefill htfBearFill = na
+var line  htfBearMid_ln  = na
+var label htfBearLbl     = na
+
+var float htfBullTop  = na
+var float htfBullBtm  = na
+var int   htfBullTime = na
+var float htfBearTop  = na
+var float htfBearBtm  = na
+var int   htfBearTime = na
+
+if i_showHTF
+    bool htfBullImpulse = htfC > htfO and (htfC - htfO) > i_minImpulse * htfATR
+    bool htfBearImpulse = htfO > htfC and (htfO - htfC) > i_minImpulse * htfATR
+
+    if htfBullImpulse and htfChanged
+        htfBullTop  := htfH[1]
+        htfBullBtm  := htfL[1]
+        htfBullTime := htfTime[1]
+    if htfBearImpulse and htfChanged
+        htfBearTop  := htfH[1]
+        htfBearBtm  := htfL[1]
+        htfBearTime := htfTime[1]
+    if not na(htfBullBtm) and close < htfBullBtm
+        htfBullTop := na
+        htfBullBtm := na
+    if not na(htfBearTop) and close > htfBearTop
+        htfBearTop := na
+        htfBearBtm := na
+
+    line.delete(htfBullTop_ln)
+    line.delete(htfBullBtm_ln)
+    linefill.delete(htfBullFill)
+    line.delete(htfBullMid_ln)
+    label.delete(htfBullLbl)
+    line.delete(htfBearTop_ln)
+    line.delete(htfBearBtm_ln)
+    linefill.delete(htfBearFill)
+    line.delete(htfBearMid_ln)
+    label.delete(htfBearLbl)
+
+    if not na(htfBullTop) and not na(htfBullBtm)
+        htfBullTop_ln := line.new(htfBullTime, htfBullTop, time, htfBullTop, xloc=xloc.bar_time, extend=extend.right, color=color.new(i_bullOBCol, 40), style=line.style_dashed, width=2)
+        htfBullBtm_ln := line.new(htfBullTime, htfBullBtm, time, htfBullBtm, xloc=xloc.bar_time, extend=extend.right, color=color.new(i_bullOBCol, 40), style=line.style_dashed, width=2)
+        htfBullFill   := linefill.new(htfBullTop_ln, htfBullBtm_ln, color.new(i_bullOBCol, 90))
+        htfBullMid_ln := line.new(htfBullTime, math.avg(htfBullTop, htfBullBtm), time, math.avg(htfBullTop, htfBullBtm), xloc=xloc.bar_time, extend=extend.right, color=color.new(i_bullOBCol, 60), style=line.style_dotted, width=1)
+        if i_showLabels
+            htfBullLbl := label.new(htfBullTime, htfBullBtm, "HTF Bull OB", xloc=xloc.bar_time, color=color(na), textcolor=i_bullOBCol, style=label.style_label_up, size=size.small)
+
+    if not na(htfBearTop) and not na(htfBearBtm)
+        htfBearTop_ln := line.new(htfBearTime, htfBearTop, time, htfBearTop, xloc=xloc.bar_time, extend=extend.right, color=color.new(i_bearOBCol, 40), style=line.style_dashed, width=2)
+        htfBearBtm_ln := line.new(htfBearTime, htfBearBtm, time, htfBearBtm, xloc=xloc.bar_time, extend=extend.right, color=color.new(i_bearOBCol, 40), style=line.style_dashed, width=2)
+        htfBearFill   := linefill.new(htfBearTop_ln, htfBearBtm_ln, color.new(i_bearOBCol, 90))
+        htfBearMid_ln := line.new(htfBearTime, math.avg(htfBearTop, htfBearBtm), time, math.avg(htfBearTop, htfBearBtm), xloc=xloc.bar_time, extend=extend.right, color=color.new(i_bearOBCol, 60), style=line.style_dotted, width=1)
+        if i_showLabels
+            htfBearLbl := label.new(htfBearTime, htfBearTop, "HTF Bear OB", xloc=xloc.bar_time, color=color(na), textcolor=i_bearOBCol, style=label.style_label_down, size=size.small)
+
+// ─── DASHBOARD ──────────────────────────────────────────────────────────────
+
+if i_showDash and barstate.islast
+    var table dash = table.new(position.top_right, 3, 10, bgcolor=color.new(#0d1117, 0), border_width=1, border_color=color.new(#30363d, 0))
+
+    table.cell(dash, 0, 0, "ORDER BLOCK FINDER", text_color=#00e5ff, text_size=size.normal, text_halign=text.align_left)
+    table.merge_cells(dash, 0, 0, 1, 0)
+    table.cell(dash, 2, 0, "DefinedEdge", text_color=color.new(#00e5ff, 50), text_size=size.normal, text_halign=text.align_right)
+
+    table.cell(dash, 0, 1, "Active OBs", text_color=#8b949e, text_size=size.normal, text_halign=text.align_left)
+    table.cell(dash, 1, 1, "▲ " + str.tostring(bullOBs.size()), text_color=i_bullOBCol, text_size=size.normal, text_halign=text.align_right)
+    table.cell(dash, 2, 1, "▼ " + str.tostring(bearOBs.size()), text_color=i_bearOBCol, text_size=size.normal, text_halign=text.align_right)
+
+    int nextRow = 2
+    if i_showBreakers
+        table.cell(dash, 0, nextRow, "Breakers", text_color=#8b949e, text_size=size.normal, text_halign=text.align_left)
+        table.cell(dash, 1, nextRow, "▲ " + str.tostring(bullBrk.size()), text_color=i_bullBrkCol, text_size=size.normal, text_halign=text.align_right)
+        table.cell(dash, 2, nextRow, "▼ " + str.tostring(bearBrk.size()), text_color=i_bearBrkCol, text_size=size.normal, text_halign=text.align_right)
+        nextRow += 1
+
+    float dispBull = nearBullDist < 999999 ? nearBullDist : 0.0
+    float dispBear = nearBearDist < 999999 ? nearBearDist : 0.0
+    string nbBull = dispBull > 0 ? str.tostring(dispBull, "#.##") + "%" : "—"
+    string nbBear = dispBear > 0 ? str.tostring(dispBear, "#.##") + "%" : "—"
+    bool bullClose = dispBull > 0 and dispBull < i_proxPct
+    bool bearClose = dispBear > 0 and dispBear < i_proxPct
+    table.cell(dash, 0, nextRow, "Nearest OB", text_color=#8b949e, text_size=size.normal, text_halign=text.align_left)
+    table.cell(dash, 1, nextRow, "▲ " + nbBull, text_color=bullClose ? #ff9800 : i_bullOBCol, text_size=size.normal, text_halign=text.align_right)
+    table.cell(dash, 2, nextRow, "▼ " + nbBear, text_color=bearClose ? #ff9800 : i_bearOBCol, text_size=size.normal, text_halign=text.align_right)
+    nextRow += 1
+
+    int totalActive = bullOBs.size() + bearOBs.size()
+    int testedCount = 0
+    int totalTests  = 0
+    if bullOBs.size() > 0
+        for i = 0 to bullOBs.size() - 1
+            if bullOBs.get(i).tests > 0
+                testedCount += 1
+            totalTests += bullOBs.get(i).tests
+    if bearOBs.size() > 0
+        for i = 0 to bearOBs.size() - 1
+            if bearOBs.get(i).tests > 0
+                testedCount += 1
+            totalTests += bearOBs.get(i).tests
+    float testedPct = totalActive > 0 ? (testedCount * 1.0) / (totalActive * 1.0) * 100.0 : 0.0
+    color rrCol = testedPct > 50 ? i_bullOBCol : testedPct > 0 ? #ff9800 : #8b949e
+    table.cell(dash, 0, nextRow, "Tested OBs", text_color=#8b949e, text_size=size.normal, text_halign=text.align_left)
+    table.cell(dash, 1, nextRow, str.tostring(testedCount) + "/" + str.tostring(totalActive) + " (" + str.tostring(totalTests) + " touches)", text_color=rrCol, text_size=size.normal, text_halign=text.align_right)
+    table.merge_cells(dash, 1, nextRow, 2, nextRow)
+    nextRow += 1
+
+    string biasTxt = bullOBs.size() > bearOBs.size() + 1 ? "▲ BULLISH" : bearOBs.size() > bullOBs.size() + 1 ? "▼ BEARISH" : "— NEUTRAL"
+    color biasCol  = bullOBs.size() > bearOBs.size() + 1 ? i_bullOBCol : bearOBs.size() > bullOBs.size() + 1 ? i_bearOBCol : #8b949e
+    table.cell(dash, 0, nextRow, "OB Bias", text_color=#8b949e, text_size=size.normal, text_halign=text.align_left)
+    table.cell(dash, 1, nextRow, biasTxt, text_color=biasCol, text_size=size.normal, text_halign=text.align_right)
+    table.merge_cells(dash, 1, nextRow, 2, nextRow)
+    nextRow += 1
+
+    if i_showFVG
+        int fvgCount = 0
+        if bullOBs.size() > 0
+            for i = 0 to bullOBs.size() - 1
+                if bullOBs.get(i).hasFVG
+                    fvgCount += 1
+        if bearOBs.size() > 0
+            for i = 0 to bearOBs.size() - 1
+                if bearOBs.get(i).hasFVG
+                    fvgCount += 1
+        table.cell(dash, 0, nextRow, "FVG Confluence", text_color=#8b949e, text_size=size.normal, text_halign=text.align_left)
+        table.cell(dash, 1, nextRow, fvgCount > 0 ? str.tostring(fvgCount) + " zones ★" : "None", text_color=fvgCount > 0 ? i_confluCol : #8b949e, text_size=size.normal, text_halign=text.align_right)
+        table.merge_cells(dash, 1, nextRow, 2, nextRow)
+        nextRow += 1
+
+    table.cell(dash, 0, nextRow, "Structure OBs + Strength + Breakers", text_color=color.new(#8b949e, 50), text_size=size.normal, text_halign=text.align_left)
+    table.merge_cells(dash, 0, nextRow, 2, nextRow)
+
+// ─── ALERTS ─────────────────────────────────────────────────────────────────
+
+alertcondition(bullOBFound, "Bullish OB Formed", "Bullish Order Block detected")
+alertcondition(bearOBFound, "Bearish OB Formed", "Bearish Order Block detected")
+alertcondition(mitAlertBull, "Bullish OB Mitigated", "Bullish OB fully mitigated")
+alertcondition(mitAlertBear, "Bearish OB Mitigated", "Bearish OB fully mitigated")
+alertcondition(partialMitBull, "Bullish OB Tested", "Bullish OB tested - level respected")
+alertcondition(partialMitBear, "Bearish OB Tested", "Bearish OB tested - level respected")
+alertcondition(proxAlertBull, "Approaching Bullish OB", "Price approaching Bullish Order Block")
+alertcondition(proxAlertBear, "Approaching Bearish OB", "Price approaching Bearish Order Block")

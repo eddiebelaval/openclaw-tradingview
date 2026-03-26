@@ -1,0 +1,925 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © CodaPro.ai LLC
+//
+// Smart Money Flow Engine V3.3
+// Designed by CodaPro.ai | Built by ARiS (CodaPro AI Engine)
+// Strategy logic, volume methodology, and reversal scoring by Aris
+// Code architecture, optimization, and non-repainting compliance by ARiS
+
+//@version=6
+indicator("[CodaPro] Smart Money Flow Engine V1.0",  
+          overlay=true, max_boxes_count=500, max_lines_count=500, max_labels_count=500)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// CONSTANTS
+// ═══════════════════════════════════════════════════════════════════════════════
+const string GRP_VOL     = "Volume Analysis"
+const string GRP_ZONES   = "Smart Money Zones"
+const string GRP_SIG     = "Signal Settings"
+const string GRP_REV     = "Reversal Protection"
+const string GRP_VIS     = "Visual Settings"
+const string GRP_THEME   = "Theme & Colors"
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// INPUTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// Volume Analysis
+volLength = input.int(24, "Volume MA Length", minval=1, group=GRP_VOL)
+volMultiplier = input.float(2.0, "High Volume Multiplier", minval=1.0, step=0.1, 
+                tooltip="Volume above this multiple = institutional", group=GRP_VOL)
+deltaSmoothing = input.float(15.0, "Delta Smoothing %", minval=0, maxval=50, step=0.5,
+                 tooltip="Smoothing for bull/bear volume separation", group=GRP_VOL)
+
+instSensitivity = input.float(1.3, "Institutional Sensitivity", minval=1.0, maxval=2.0, step=0.1,
+                  tooltip="Lower = more sensitive (more signals). 1.0 = very sensitive, 2.0 = strict", group=GRP_VOL)                
+
+// Smart Money Zones
+showOrderBlocks = input.bool(true, "Show Order Blocks", group=GRP_ZONES)
+obLookback = input.int(5, "Order Block Lookback", minval=1, group=GRP_ZONES)
+showFVG = input.bool(true, "Show Fair Value Gaps", group=GRP_ZONES)
+minFVGsize = input.float(0.3, "Min FVG Size %", minval=0.1, step=0.1, 
+             tooltip="Minimum gap size as % of price", group=GRP_ZONES)
+
+// Signals
+signalMode = input.string("Aggressive", "Signal Mode", 
+             options=["Conservative", "Balanced", "Aggressive"], group=GRP_SIG)
+showSignals = input.bool(true, "Show Entry Signals", group=GRP_SIG)
+cooldownBars = input.int(20, "Signal Cooldown", minval=1, group=GRP_SIG)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// REVERSAL PROTECTION WEIGHTS (Must equal 100!)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+useReversalProtection = input.bool(true, "Enable Reversal Protection", group=GRP_REV,
+                        tooltip="Blocks signals at likely reversal points")
+
+// Weights (should sum to 100)
+rsiWeight = input.int(30, "RSI Extreme Weight", minval=0, maxval=100, group=GRP_REV,
+            tooltip="Weight for RSI oversold/overbought detection")
+volClimaxWeight = input.int(25, "Volume Climax Weight", minval=0, maxval=100, group=GRP_REV,
+                  tooltip="Weight for volume spike at extremes")
+stretchWeight = input.int(20, "Price Stretch Weight", minval=0, maxval=100, group=GRP_REV,
+                tooltip="Weight for price distance from moving average")
+conseCandleWeight = input.int(25, "Consecutive Candles Weight", minval=0, maxval=100, group=GRP_REV,
+                    tooltip="Weight for exhaustion candle patterns")
+
+// Threshold
+reversalThreshold = input.int(50, "Block Threshold", minval=20, maxval=80, group=GRP_REV,
+                    tooltip="Signal blocked if reversal score >= this value")
+
+// Individual filter settings
+rsiLength = input.int(14, "RSI Length", minval=5, maxval=30, group=GRP_REV)
+rsiOversold = input.int(30, "RSI Oversold Level", minval=15, maxval=40, group=GRP_REV)
+rsiOverbought = input.int(70, "RSI Overbought Level", minval=60, maxval=85, group=GRP_REV)
+volClimaxMult = input.float(2.5, "Volume Climax Multiplier", minval=1.5, maxval=5.0, step=0.5, group=GRP_REV)
+stretchEmaLength = input.int(50, "Stretch EMA Length", minval=20, maxval=100, group=GRP_REV)
+stretchPercent = input.float(2.0, "Price Stretch %", minval=0.5, maxval=5.0, step=0.5, group=GRP_REV)
+conseCandleCount = input.int(4, "Consecutive Candles Required", minval=3, maxval=7, group=GRP_REV)
+
+// Visual
+mode = input.string("Pro", "Display Mode", options=["Lite", "Standard", "Pro"], group=GRP_VIS)
+showMoneyFlow = input.bool(true, "Show Money Flow Bars", 
+                tooltip="Side bars showing institutional flow", group=GRP_VIS)
+showDashboard = input.bool(true, "Show Dashboard", group=GRP_VIS)
+showBlockedSignals = input.bool(true, "Show Blocked Signals", group=GRP_VIS,
+                     tooltip="Show X markers where signals were blocked")
+
+// Theme
+theme = input.string("Dark", "Theme", options=["Dark", "Light"], group=GRP_THEME)
+colorPreset = input.string("CodaPro", "Color Preset", 
+              options=["CodaPro", "Institutional", "Heatmap"], group=GRP_THEME)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TRADE MANAGEMENT
+// ═══════════════════════════════════════════════════════════════════════════════
+const string GRP_TRADE = "Trade Management"
+
+enableTradeManagement = input.bool(true, "Enable Trade Management", group=GRP_TRADE,
+                        tooltip="One trade at a time with TP/SL/Max Bars")
+takeProfitPct = input.float(0.5, "Take Profit %", minval=0.1, maxval=5.0, step=0.1, group=GRP_TRADE)
+stopLossPct = input.float(0.3, "Stop Loss %", minval=0.1, maxval=5.0, step=0.1, group=GRP_TRADE)
+maxBarsInTrade = input.int(20, "Max Bars Force Exit", minval=5, maxval=100, group=GRP_TRADE)
+
+// [RSI Zone Flip - Available in CodaPro paid strategies]
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// THEME SYSTEM
+// ═══════════════════════════════════════════════════════════════════════════════
+panelBg = theme == "Dark" ? color.rgb(18, 22, 28, 90) : color.rgb(255, 255, 255, 90)
+panelFg = theme == "Dark" ? color.white : color.black
+tableBg = theme == "Dark" ? color.rgb(20, 40, 80, 90) : color.rgb(230, 235, 245, 90)
+
+var color buyColor = na
+var color sellColor = na
+var color neutralColor = na
+var color institutionalColor = na
+
+switch colorPreset
+    "CodaPro" =>
+        buyColor := #30FDCF
+        sellColor := #E117B7
+        neutralColor := #FFD700
+        institutionalColor := #9400D3
+    "Institutional" =>
+        buyColor := #00C853
+        sellColor := #D50000
+        neutralColor := #FFA000
+        institutionalColor := #304FFE
+    "Heatmap" =>
+        buyColor := #00BCD4
+        sellColor := #FF5722
+        neutralColor := #FFEB3B
+        institutionalColor := #9C27B0
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// VOLUME CALCULATIONS (Bull vs Bear Separation)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// Separate bull and bear volume
+bullVol = close > open ? volume : volume * (high - open) / (high - low)
+bearVol = close < open ? volume : volume * (open - low) / (high - low)
+
+// Smoothed averages
+avgBullVol = ta.vwma(bullVol, volLength)
+avgBearVol = ta.vwma(bearVol, volLength)
+avgTotalVol = ta.sma(volume, volLength)
+
+// Volume flat detection
+volFlat = math.abs(avgBullVol - avgBearVol) / 2
+
+// Zone detection
+bullZone = avgBullVol > avgBearVol and volFlat / avgBullVol < (1 - deltaSmoothing / 100)
+bearZone = avgBullVol < avgBearVol and volFlat / avgBearVol < (1 - deltaSmoothing / 100)
+
+// Institutional volume detection (with adjustable sensitivity)
+highVolume = volume > avgTotalVol * volMultiplier
+institutionalBuy = highVolume and close > open and bullVol > bearVol * instSensitivity
+institutionalSell = highVolume and close < open and bearVol > bullVol * instSensitivity
+
+// Net flow
+netFlow = avgBullVol - avgBearVol
+flowPercentile = ta.percentrank(netFlow, 100)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SMART MONEY CONCEPTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// Order Blocks
+isBullishOB = false
+isBearishOB = false
+
+if showOrderBlocks
+    redCandle = close < open
+    nextGreenMove = close[0] > high[1]
+    strongVolume = volume[1] > avgTotalVol
+    
+    if redCandle[1] and nextGreenMove and strongVolume[1]
+        isBullishOB := true
+    
+    greenCandle = close > open
+    nextRedMove = close[0] < low[1]
+    
+    if greenCandle[1] and nextRedMove and strongVolume[1]
+        isBearishOB := true
+
+// Fair Value Gaps (imbalance zones)
+isBullishFVG = false
+isBearishFVG = false
+
+if showFVG
+    minGapSize = close * minFVGsize / 100
+    
+    bullGap = low[0] - high[2]
+    if bullGap > minGapSize and close > close[2]
+        isBullishFVG := true
+    
+    bearGap = low[2] - high[0]
+    if bearGap > minGapSize and close < close[2]
+        isBearishFVG := true
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// REVERSAL PROTECTION SYSTEM (Weighted Scoring)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// 1. RSI Extreme Detection
+rsi = ta.rsi(close, rsiLength)
+isOversold = rsi < rsiOversold
+isOverbought = rsi > rsiOverbought
+
+// 2. Volume Climax Detection
+volClimaxSpike = volume > avgTotalVol * volClimaxMult
+volClimaxAtLow = volClimaxSpike and close < close[1] and close < ta.lowest(close, 5)[1]
+volClimaxAtHigh = volClimaxSpike and close > close[1] and close > ta.highest(close, 5)[1]
+
+// 3. Price Stretch from MA
+stretchEma = ta.ema(close, stretchEmaLength)
+distanceFromEma = ((close - stretchEma) / stretchEma) * 100
+stretchedDown = distanceFromEma < -stretchPercent
+stretchedUp = distanceFromEma > stretchPercent
+
+// 4. Consecutive Candle Exhaustion
+var int redCandleCount = 0
+var int greenCandleCount = 0
+
+if barstate.isconfirmed
+    if close < open
+        redCandleCount += 1
+        greenCandleCount := 0
+    else
+        greenCandleCount += 1
+        redCandleCount := 0
+
+exhaustedSelling = redCandleCount >= conseCandleCount
+exhaustedBuying = greenCandleCount >= conseCandleCount
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// WEIGHTED REVERSAL SCORE CALCULATION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+float bullishReversalScore = 0.0
+if isOversold
+    bullishReversalScore += rsiWeight
+if volClimaxAtLow
+    bullishReversalScore += volClimaxWeight
+if stretchedDown
+    bullishReversalScore += stretchWeight
+if exhaustedSelling
+    bullishReversalScore += conseCandleWeight
+
+float bearishReversalScore = 0.0
+if isOverbought
+    bearishReversalScore += rsiWeight
+if volClimaxAtHigh
+    bearishReversalScore += volClimaxWeight
+if stretchedUp
+    bearishReversalScore += stretchWeight
+if exhaustedBuying
+    bearishReversalScore += conseCandleWeight
+
+bullishReversal = useReversalProtection and bullishReversalScore >= reversalThreshold
+bearishReversal = useReversalProtection and bearishReversalScore >= reversalThreshold
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// RSI EXTREME LEVELS ON CHART (Last 3 Days)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+showRSIlevels = input.bool(true, "Show RSI Extreme Levels", group=GRP_REV,
+                tooltip="Draw lines where RSI hit oversold/overbought in last 3 days")
+rsiLevelLookback = input.int(3, "RSI Level Lookback (Days)", minval=1, maxval=10, group=GRP_REV)
+
+barsPerDay = 1440 / timeframe.multiplier
+rsiLookbackBars = int(barsPerDay * rsiLevelLookback)
+rsiLookbackBars := math.min(rsiLookbackBars, 500)
+
+var float lastOversoldPrice = na
+var float lastOverboughtPrice = na
+var int lastOversoldBar = na
+var int lastOverboughtBar = na
+
+if isOversold and barstate.isconfirmed
+    lastOversoldPrice := low
+    lastOversoldBar := bar_index
+
+if isOverbought and barstate.isconfirmed
+    lastOverboughtPrice := high
+    lastOverboughtBar := bar_index
+
+oversoldValid = not na(lastOversoldBar) and (bar_index - lastOversoldBar) <= rsiLookbackBars
+overboughtValid = not na(lastOverboughtBar) and (bar_index - lastOverboughtBar) <= rsiLookbackBars
+
+var line oversoldLine = na
+var line overboughtLine = na
+var label oversoldLabel = na
+var label overboughtLabel = na
+
+if showRSIlevels and barstate.islast
+    if not na(oversoldLine)
+        line.delete(oversoldLine)
+    if not na(overboughtLine)
+        line.delete(overboughtLine)
+    if not na(oversoldLabel)
+        label.delete(oversoldLabel)
+    if not na(overboughtLabel)
+        label.delete(overboughtLabel)
+    
+    int maxLookback = 300
+    int safeOversoldBar = math.max(lastOversoldBar, bar_index - maxLookback)
+    int safeOverboughtBar = math.max(lastOverboughtBar, bar_index - maxLookback)
+    
+    if oversoldValid and not na(lastOversoldPrice) and (bar_index - lastOversoldBar) <= maxLookback
+        oversoldLine := line.new(safeOversoldBar, lastOversoldPrice, bar_index + 20, lastOversoldPrice,
+                                 color=color.new(buyColor, 40), width=2, style=line.style_dashed, extend=extend.none)
+        oversoldLabel := label.new(bar_index + 22, lastOversoldPrice, "RSI OVERSOLD\n(" + str.tostring(rsi, "#.#") + ")",
+                                   style=label.style_label_left, color=color.new(buyColor, 70), textcolor=buyColor, size=size.tiny)
+    
+    if overboughtValid and not na(lastOverboughtPrice) and (bar_index - lastOverboughtBar) <= maxLookback
+        overboughtLine := line.new(safeOverboughtBar, lastOverboughtPrice, bar_index + 20, lastOverboughtPrice,
+                                   color=color.new(sellColor, 40), width=2, style=line.style_dashed, extend=extend.none)
+        overboughtLabel := label.new(bar_index + 22, lastOverboughtPrice, "RSI OVERBOUGHT\n(" + str.tostring(rsi, "#.#") + ")",
+                                     style=label.style_label_left, color=color.new(sellColor, 70), textcolor=sellColor, size=size.tiny)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SIGNAL LOGIC (Multi-Confirmation with Reversal Protection)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+minConfluence = signalMode == "Conservative" ? 4 : signalMode == "Balanced" ? 3 : 2
+
+buyConfluence = 0
+buyConfluence := buyConfluence + (bullZone ? 1 : 0)
+buyConfluence := buyConfluence + (institutionalBuy ? 1 : 0)
+buyConfluence := buyConfluence + (isBullishOB ? 1 : 0)
+buyConfluence := buyConfluence + (isBullishFVG ? 1 : 0)
+buyConfluence := buyConfluence + (flowPercentile > 70 ? 1 : 0)
+
+sellConfluence = 0
+sellConfluence := sellConfluence + (bearZone ? 1 : 0)
+sellConfluence := sellConfluence + (institutionalSell ? 1 : 0)
+sellConfluence := sellConfluence + (isBearishOB ? 1 : 0)
+sellConfluence := sellConfluence + (isBearishFVG ? 1 : 0)
+sellConfluence := sellConfluence + (flowPercentile < 30 ? 1 : 0)
+
+var int lastBuyBar = na
+var int lastSellBar = na
+
+enoughTimeBuy = na(lastBuyBar) or (bar_index - lastBuyBar) >= cooldownBars
+enoughTimeSell = na(lastSellBar) or (bar_index - lastSellBar) >= cooldownBars
+
+buyConditionMet = showSignals and buyConfluence >= minConfluence and enoughTimeBuy and barstate.isconfirmed
+sellConditionMet = showSignals and sellConfluence >= minConfluence and enoughTimeSell and barstate.isconfirmed
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SIGNAL PROCESSING
+// ═══════════════════════════════════════════════════════════════════════════════
+
+bool preBuySignal = buyConditionMet and not bearishReversal
+bool preSellSignal = sellConditionMet and not bullishReversal
+
+var bool buySignal = false
+var bool sellSignal = false
+var bool blockedBuy = false
+var bool blockedSell = false
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TRADE STATE TRACKING (One trade at a time)
+// ═══════════════════════════════════════════════════════════════════════════════
+var bool inTrade = false
+var bool isLong = false
+var bool isShort = false
+var float entryPrice = na
+var int entryBar = na
+var float takeProfitPrice = na
+var float stopLossPrice = na
+var string exitReason = ""
+var bool justExited = false
+
+buySignal := false
+sellSignal := false
+blockedBuy := false
+blockedSell := false
+justExited := false
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TRADE MANAGEMENT LOGIC
+// ═══════════════════════════════════════════════════════════════════════════════
+
+int barsInTrade = inTrade ? (bar_index - entryBar) : 0
+
+if inTrade and enableTradeManagement and barstate.isconfirmed
+    if isLong
+        if high >= takeProfitPrice
+            exitReason := "TP HIT"
+            inTrade := false
+            isLong := false
+            justExited := true
+        else if low <= stopLossPrice
+            exitReason := "SL HIT"
+            inTrade := false
+            isLong := false
+            justExited := true
+        else if barsInTrade >= maxBarsInTrade
+            exitReason := "MAX BARS"
+            inTrade := false
+            isLong := false
+            justExited := true
+    
+    if isShort
+        if low <= takeProfitPrice
+            exitReason := "TP HIT"
+            inTrade := false
+            isShort := false
+            justExited := true
+        else if high >= stopLossPrice
+            exitReason := "SL HIT"
+            inTrade := false
+            isShort := false
+            justExited := true
+        else if barsInTrade >= maxBarsInTrade
+            exitReason := "MAX BARS"
+            inTrade := false
+            isShort := false
+            justExited := true
+
+bool canTakeNewTrade = (not inTrade) or (not enableTradeManagement)
+
+if canTakeNewTrade
+    buySignal := preBuySignal
+    sellSignal := preSellSignal
+
+blockedBuy := buyConditionMet and bearishReversal
+blockedSell := sellConditionMet and bullishReversal
+
+if buySignal and enableTradeManagement and barstate.isconfirmed
+    inTrade := true
+    isLong := true
+    isShort := false
+    entryPrice := close
+    entryBar := bar_index
+    takeProfitPrice := close * (1 + takeProfitPct / 100)
+    stopLossPrice := close * (1 - stopLossPct / 100)
+    lastBuyBar := bar_index
+
+if sellSignal and enableTradeManagement and barstate.isconfirmed
+    inTrade := true
+    isShort := true
+    isLong := false
+    entryPrice := close
+    entryBar := bar_index
+    takeProfitPrice := close * (1 - takeProfitPct / 100)
+    stopLossPrice := close * (1 + stopLossPct / 100)
+    lastSellBar := bar_index
+
+if buySignal and not enableTradeManagement
+    lastBuyBar := bar_index
+if sellSignal and not enableTradeManagement
+    lastSellBar := bar_index
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// VISUAL ELEMENTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// Order Block Boxes (Pro Mode)
+if showOrderBlocks and mode == "Pro" and barstate.isconfirmed
+    if isBullishOB
+        box.new(bar_index - 1, low[1], bar_index + 5, high[1], 
+                border_color=buyColor, bgcolor=color.new(buyColor, 90), 
+                text="OB", text_color=buyColor, text_size=size.tiny)
+    
+    if isBearishOB
+        box.new(bar_index - 1, low[1], bar_index + 5, high[1], 
+                border_color=sellColor, bgcolor=color.new(sellColor, 90), 
+                text="OB", text_color=sellColor, text_size=size.tiny)
+
+// Fair Value Gap Boxes
+if showFVG and barstate.isconfirmed
+    if isBullishFVG
+        box.new(bar_index - 2, high[2], bar_index + 10, low[0], 
+                border_color=color.new(buyColor, 60), 
+                bgcolor=color.new(buyColor, 95), 
+                border_width=1, border_style=line.style_dashed)
+    
+    if isBearishFVG
+        box.new(bar_index - 2, low[2], bar_index + 10, high[0], 
+                border_color=color.new(sellColor, 60), 
+                bgcolor=color.new(sellColor, 95), 
+                border_width=1, border_style=line.style_dashed)
+
+// Institutional Volume Markers
+plotshape(institutionalBuy and barstate.isconfirmed, "Institutional Buy", shape.circle, location.belowbar, 
+          institutionalColor, size=size.tiny, force_overlay=true)
+plotshape(institutionalSell and barstate.isconfirmed, "Institutional Sell", shape.circle, location.abovebar, 
+          institutionalColor, size=size.tiny, force_overlay=true)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ENTRY SIGNALS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// BUY Signal (normal)
+if buySignal and barstate.isconfirmed
+    label.new(bar_index, low, "BUY\nRSI: " + str.tostring(rsi, "#.#"), 
+              style=label.style_label_up, 
+              color=color.new(buyColor, 85),
+              textcolor=buyColor,
+              size=size.normal)
+
+// SELL Signal (normal)
+if sellSignal and barstate.isconfirmed
+    label.new(bar_index, high, "SELL\nRSI: " + str.tostring(rsi, "#.#"), 
+              style=label.style_label_down, 
+              color=color.new(sellColor, 85),
+              textcolor=sellColor,
+              size=size.normal)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TP/SL LINES (While in trade)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+var line tpLine = na
+var line slLine = na
+var line entryLine = na
+var label tpLabel = na
+var label slLabel = na
+
+if not na(tpLine)
+    line.delete(tpLine)
+if not na(slLine)
+    line.delete(slLine)
+if not na(entryLine)
+    line.delete(entryLine)
+if not na(tpLabel)
+    label.delete(tpLabel)
+if not na(slLabel)
+    label.delete(slLabel)
+
+if inTrade and enableTradeManagement and barstate.islast
+    entryLine := line.new(entryBar, entryPrice, bar_index + 10, entryPrice,
+                          color=color.new(color.white, 50), width=1, style=line.style_dotted)
+    
+    tpLine := line.new(entryBar, takeProfitPrice, bar_index + 10, takeProfitPrice,
+                       color=color.new(#00FF00, 30), width=2, style=line.style_dashed)
+    
+    slLine := line.new(entryBar, stopLossPrice, bar_index + 10, stopLossPrice,
+                       color=color.new(#FF0000, 30), width=2, style=line.style_dashed)
+    
+    tpLabel := label.new(bar_index + 12, takeProfitPrice, "TP: " + str.tostring(takeProfitPrice, "#.##"),
+                         style=label.style_label_left, 
+                         color=color.new(#00FF00, 90),
+                         textcolor=#00FF00,
+                         size=size.tiny)
+    slLabel := label.new(bar_index + 12, stopLossPrice, "SL: " + str.tostring(stopLossPrice, "#.##"),
+                         style=label.style_label_left, 
+                         color=color.new(#FF0000, 90),
+                         textcolor=#FF0000,
+                         size=size.tiny)
+
+// Exit Label
+if justExited and enableTradeManagement
+    label.new(bar_index, close, "EXIT\n" + exitReason,
+              style=label.style_label_center, 
+              color=color.new(color.gray, 85),
+              textcolor=color.white,
+              size=size.small)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// MONEY FLOW PROFILE - INSTITUTIONAL GRADE
+// ═══════════════════════════════════════════════════════════════════════════════
+
+var float EPS = 1e-10
+
+f_safediv(float num, float den, float fallback) =>
+    math.abs(den) > EPS ? (num / den) : fallback
+
+f_colorLerp(color c1, color c2, float t) =>
+    float t_clamped = math.max(0, math.min(1, t))
+    color.rgb(
+        int(color.r(c1) * (1 - t_clamped) + color.r(c2) * t_clamped),
+        int(color.g(c1) * (1 - t_clamped) + color.g(c2) * t_clamped),
+        int(color.b(c1) * (1 - t_clamped) + color.b(c2) * t_clamped))
+
+f_gradientColor(float value, float min, float max, color c1, color c2, color c3) =>
+    float normalized = f_safediv(value - min, max - min, 0.5)
+    normalized := math.max(0, math.min(1, normalized))
+    (normalized < 0.5 ? f_colorLerp(c1, c2, normalized * 2) : f_colorLerp(c2, c3, (normalized - 0.5) * 2))
+
+f_pulse(float speed) =>
+    math.sin(bar_index * speed * 0.1) * 0.5 + 0.5
+
+var flowHistory = array.new<float>()
+
+if barstate.isconfirmed
+    array.push(flowHistory, netFlow)
+    if array.size(flowHistory) > 100
+        array.shift(flowHistory)
+
+var profileLines = array.new<line>()
+var profileLabels = array.new<label>()
+var profileBoxes = array.new<box>()
+
+if barstate.islast
+    if array.size(profileLines) > 0
+        while array.size(profileLines) > 0
+            line.delete(array.pop(profileLines))
+    if array.size(profileLabels) > 0
+        while array.size(profileLabels) > 0
+            label.delete(array.pop(profileLabels))
+    if array.size(profileBoxes) > 0
+        while array.size(profileBoxes) > 0
+            box.delete(array.pop(profileBoxes))
+
+if showMoneyFlow and mode == "Pro" and barstate.islast and array.size(flowHistory) >= 30
+    
+    maxFlow = array.max(flowHistory)
+    minFlow = array.min(flowHistory)
+    flowRange = math.abs(maxFlow - minFlow)
+    
+    if flowRange < EPS
+        flowRange := 1.0
+    
+    float avgFlow = 0.0
+    for i = 0 to array.size(flowHistory) - 1
+        avgFlow += array.get(flowHistory, i)
+    avgFlow := f_safediv(avgFlow, array.size(flowHistory), 0)
+    
+    numBuckets = 20
+    buckets = array.new<int>(numBuckets, 0)
+    
+    for i = 0 to array.size(flowHistory) - 1
+        flowVal = array.get(flowHistory, i)
+        normalized = f_safediv(flowVal - minFlow, flowRange, 0.5)
+        bucketIdx = int(math.min(math.max(normalized * (numBuckets - 1), 0), numBuckets - 1))
+        count = array.get(buckets, bucketIdx)
+        array.set(buckets, bucketIdx, count + 1)
+    
+    maxCount = array.max(buckets)
+    
+    if maxCount > 0
+        profileX = bar_index + 15
+        currentPrice = close
+        priceSpacing = currentPrice * 0.00015
+        startY = currentPrice - (numBuckets * priceSpacing / 2)
+        
+        float zeroNormalized = f_safediv(-minFlow, flowRange, 0.5)
+        int zeroBucket = int(zeroNormalized * (numBuckets - 1))
+        
+        int extremeBucket = 0
+        int extremeCount = 0
+        for i = 0 to numBuckets - 1
+            if array.get(buckets, i) > extremeCount
+                extremeCount := array.get(buckets, i)
+                extremeBucket := i
+        
+        float volumeFilterPct = 0.05
+        
+        for bucket = 0 to numBuckets - 1
+            count = array.get(buckets, bucket)
+            
+            if count > 0
+                float normCount = f_safediv(count, maxCount, 0)
+                
+                if normCount > volumeFilterPct or bucket == extremeBucket or bucket == zeroBucket
+                    barLength = int(normCount * 18)
+                    
+                    if barLength >= 1
+                        yPos = startY + (bucket * priceSpacing)
+                        bucketMid = minFlow + ((bucket + 0.5) * flowRange / numBuckets)
+
+                        color barColor = na
+                        if bucketMid > 0
+                            barColor := f_gradientColor(bucketMid, 0, maxFlow, color.rgb(0, 100, 150), color.rgb(0, 200, 200), color.rgb(0, 255, 150))
+                        else
+                            barColor := f_gradientColor(bucketMid, minFlow, 0, color.rgb(150, 0, 0), color.rgb(255, 50, 50), color.rgb(255, 150, 0))
+                        
+                        int baseTrans = 40
+                        bool isExtreme = bucket == extremeBucket
+                        float pulseEffect = isExtreme ? f_pulse(2) * 20 : 0
+                        
+                        if isExtreme
+                            baseTrans := int(20 + pulseEffect)
+                            box glowBox = box.new(profileX - 1, yPos + priceSpacing * 0.2, profileX + barLength + 1, yPos - priceSpacing * 0.2, border_color=color.new(barColor, 70), bgcolor=color.new(barColor, 85), border_width=1)
+                            array.push(profileBoxes, glowBox)
+                        
+                        box mainBar = box.new(profileX, yPos + priceSpacing * 0.4, profileX + barLength, yPos - priceSpacing * 0.4, border_color=color.new(barColor, baseTrans + 20), bgcolor=color.new(barColor, baseTrans), border_width=isExtreme ? 2 : 1)
+                        array.push(profileBoxes, mainBar)
+                        
+                        if isExtreme
+                            string extremeText = str.tostring(count)
+                            label countLabel = label.new(profileX + barLength + 2, yPos, extremeText, style=label.style_none, textcolor=barColor, size=size.tiny)
+                            array.push(profileLabels, countLabel)
+        
+        if minFlow < 0 and maxFlow > 0
+            zeroY = startY + (zeroBucket * priceSpacing)
+            
+            line zeroGlow3 = line.new(profileX - 2, zeroY, profileX + 20, zeroY, color=color.new(color.yellow, 85), width=8)
+            array.push(profileLines, zeroGlow3)
+            line zeroGlow2 = line.new(profileX - 2, zeroY, profileX + 20, zeroY, color=color.new(color.yellow, 70), width=5)
+            array.push(profileLines, zeroGlow2)
+            line zeroGlow1 = line.new(profileX - 2, zeroY, profileX + 20, zeroY, color=color.new(color.yellow, 50), width=3)
+            array.push(profileLines, zeroGlow1)
+            line zeroCore = line.new(profileX - 2, zeroY, profileX + 20, zeroY, color=color.new(color.yellow, 20), width=2, style=line.style_solid)
+            array.push(profileLines, zeroCore)
+            label zeroLabel = label.new(profileX - 3, zeroY, "ZERO", style=label.style_label_right, color=color.new(color.yellow, 60), textcolor=color.black, size=size.tiny)
+            array.push(profileLabels, zeroLabel)
+        
+        titleY = startY + (numBuckets * priceSpacing) + (priceSpacing * 2)
+        string titleText = "MONEY FLOW\n(" + str.tostring(array.size(flowHistory)) + " bars)"
+        
+        box titleGlow = box.new(profileX + 7, titleY + priceSpacing, profileX + 13, titleY - priceSpacing, border_color=na, bgcolor=color.new(institutionalColor, 90), border_width=0)
+        array.push(profileBoxes, titleGlow)
+        label titleLabel = label.new(profileX + 10, titleY, titleText, style=label.style_none, textcolor=color.new(institutionalColor, 0), size=size.small, textalign=text.align_center)
+        array.push(profileLabels, titleLabel)
+        
+        biasY = startY - (priceSpacing * 2)
+        string biasText = avgFlow > 0 ? "BULL" : "BEAR"
+        color biasColor = avgFlow > 0 ? buyColor : sellColor
+        string avgText = str.tostring(avgFlow, "#.##M")
+        
+        box biasBox = box.new(profileX + 7, biasY + priceSpacing * 0.8, profileX + 13, biasY - priceSpacing * 0.8, border_color=color.new(biasColor, 50), bgcolor=color.new(biasColor, 85), border_width=2)
+        array.push(profileBoxes, biasBox)
+        label biasLabel = label.new(profileX + 10, biasY + priceSpacing * 0.2, biasText, style=label.style_none, textcolor=biasColor, size=size.small, textalign=text.align_center)
+        array.push(profileLabels, biasLabel)
+        label avgLabel = label.new(profileX + 10, biasY - priceSpacing * 0.2, avgText, style=label.style_none, textcolor=color.new(biasColor, 30), size=size.tiny, textalign=text.align_center)
+        array.push(profileLabels, avgLabel)
+        
+        float maxBullFlow = 0.0
+        float maxBearFlow = 0.0
+        int maxBullBucket = 0
+        int maxBearBucket = 0
+        
+        for i = 0 to numBuckets - 1
+            bucketMidFlow = minFlow + ((i + 0.5) * flowRange / numBuckets)
+            if bucketMidFlow > maxBullFlow
+                maxBullFlow := bucketMidFlow
+                maxBullBucket := i
+            if bucketMidFlow < maxBearFlow
+                maxBearFlow := bucketMidFlow
+                maxBearBucket := i
+        
+        if maxBullFlow > 0
+            bullY = startY + (maxBullBucket * priceSpacing)
+            label bullMarker = label.new(profileX - 4, bullY, "^", style=label.style_none, textcolor=color.new(buyColor, 20), size=size.tiny)
+            array.push(profileLabels, bullMarker)
+        
+        if maxBearFlow < 0
+            bearY = startY + (maxBearBucket * priceSpacing)
+            label bearMarker = label.new(profileX - 4, bearY, "v", style=label.style_none, textcolor=color.new(sellColor, 20), size=size.tiny)
+            array.push(profileLabels, bearMarker)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// CANDLE COLORING (Matches Money Flow Profile Gradient)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+float flowStrength = 0.0
+if avgBullVol + avgBearVol > 0
+    flowStrength := (avgBullVol - avgBearVol) / (avgBullVol + avgBearVol)
+
+flowStrength := math.max(-1, math.min(1, flowStrength))
+
+bool confirmedBullish = bullZone and flowPercentile > 60 and netFlow > 0
+bool confirmedBearish = bearZone and flowPercentile < 40 and netFlow < 0
+bool neutralZone = not confirmedBullish and not confirmedBearish
+
+color candleColor = na
+
+if confirmedBullish
+    if flowStrength > 0.5
+        candleColor := color.rgb(0, 200, 255)
+    else if flowStrength > 0.2
+        candleColor := color.rgb(0, 150, 220)
+    else
+        candleColor := color.rgb(0, 100, 180)
+else if confirmedBearish
+    if flowStrength < -0.5
+        candleColor := color.rgb(255, 50, 50)
+    else if flowStrength < -0.2
+        candleColor := color.rgb(255, 100, 50)
+    else
+        candleColor := color.rgb(255, 150, 0)
+else
+    if flowStrength > 0.1
+        candleColor := color.rgb(255, 220, 0)
+    else if flowStrength < -0.1
+        candleColor := color.rgb(255, 170, 0)
+    else
+        candleColor := color.rgb(255, 200, 0)
+
+barcolor(candleColor, title="Money Flow Candles")
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// DASHBOARD (Top Right)
+// ═══════════════════════════════════════════════════════════════════════════════
+var table dash = table.new(position.top_right, 2, 9, bgcolor=panelBg, 
+                 border_width=1, frame_width=1)
+
+if showDashboard and barstate.islast
+    table.cell(dash, 0, 0, "Smart Money Flow V3.3", bgcolor=tableBg, text_color=panelFg)
+    table.cell(dash, 1, 0, mode, bgcolor=tableBg, text_color=panelFg)
+    
+    flowBias = netFlow > 0 ? "BULLS" : "BEARS"
+    flowColor = netFlow > 0 ? buyColor : sellColor
+    table.cell(dash, 0, 1, "Dominant Flow", text_color=panelFg, text_size=size.small)
+    table.cell(dash, 1, 1, flowBias, text_color=flowColor, text_size=size.small)
+    
+    instActivity = institutionalBuy ? "BUYING" : institutionalSell ? "SELLING" : "Quiet"
+    instColor = institutionalBuy ? buyColor : institutionalSell ? sellColor : color.gray
+    table.cell(dash, 0, 2, "Institutional", text_color=panelFg, text_size=size.small)
+    table.cell(dash, 1, 2, instActivity, text_color=instColor, text_size=size.small)
+    
+    zoneStatus = bullZone ? "Bull Zone" : bearZone ? "Bear Zone" : "Neutral"
+    zoneColor = bullZone ? buyColor : bearZone ? sellColor : color.gray
+    table.cell(dash, 0, 3, "Volume Zone", text_color=panelFg, text_size=size.small)
+    table.cell(dash, 1, 3, zoneStatus, text_color=zoneColor, text_size=size.small)
+    
+    buyStrength = buyConfluence >= minConfluence ? "STRONG" : buyConfluence >= 2 ? "Moderate" : "Weak"
+    buyStrColor = buyConfluence >= minConfluence ? buyColor : buyConfluence >= 2 ? neutralColor : color.gray
+    table.cell(dash, 0, 4, "Buy Setup", text_color=panelFg, text_size=size.small)
+    table.cell(dash, 1, 4, buyStrength + " (" + str.tostring(buyConfluence) + "/5)", text_color=buyStrColor, text_size=size.small)
+    
+    sellStrength = sellConfluence >= minConfluence ? "STRONG" : sellConfluence >= 2 ? "Moderate" : "Weak"
+    sellStrColor = sellConfluence >= minConfluence ? sellColor : sellConfluence >= 2 ? neutralColor : color.gray
+    table.cell(dash, 0, 5, "Sell Setup", text_color=panelFg, text_size=size.small)
+    table.cell(dash, 1, 5, sellStrength + " (" + str.tostring(sellConfluence) + "/5)", text_color=sellStrColor, text_size=size.small)
+    
+    flowRank = flowPercentile > 75 ? "Extreme Buy" : flowPercentile > 50 ? "Above Avg" : flowPercentile > 25 ? "Below Avg" : "Extreme Sell"
+    flowRankColor = flowPercentile > 75 ? buyColor : flowPercentile < 25 ? sellColor : color.gray
+    table.cell(dash, 0, 6, "Flow Percentile", text_color=panelFg, text_size=size.small)
+    table.cell(dash, 1, 6, flowRank + " (" + str.tostring(flowPercentile, "#") + "%)", text_color=flowRankColor, text_size=size.small)
+    
+    float higherScore = math.max(bullishReversalScore, bearishReversalScore)
+    string revStatus = bullishReversal ? "BULL REV" : bearishReversal ? "BEAR REV" : "CLEAR"
+    color revColor = bullishReversal ? buyColor : bearishReversal ? sellColor : color.gray
+    table.cell(dash, 0, 7, "Rev Protect", text_color=panelFg, text_size=size.small)
+    table.cell(dash, 1, 7, revStatus + " (" + str.tostring(higherScore, "#") + "/100)", text_color=revColor, text_size=size.small)
+    
+    string tradeStatus = not enableTradeManagement ? "DISABLED" : inTrade ? (isLong ? "LONG" : "SHORT") : "NO TRADE"
+    color tradeStatusColor = not enableTradeManagement ? color.gray : inTrade ? (isLong ? buyColor : sellColor) : color.gray
+    table.cell(dash, 0, 8, "Trade", text_color=panelFg, text_size=size.small)
+    table.cell(dash, 1, 8, tradeStatus, text_color=tradeStatusColor, text_size=size.small)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ELITE DETECTOR DASHBOARD (Bottom Right)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+eliteMomentum = ta.change(close, 20)
+eliteMomentumMax = ta.highest(math.abs(eliteMomentum), 50)
+eliteMomentumNormalized = eliteMomentumMax > 0 ? (eliteMomentum / eliteMomentumMax) * 100 : 0
+
+eliteATR = ta.atr(14)
+eliteATRsma = ta.sma(eliteATR, 20)
+eliteVolRatio = eliteATRsma > 0 ? eliteATR / eliteATRsma : 1.0
+
+eliteBBupper = ta.sma(close, 20) + (ta.stdev(close, 20) * 2)
+eliteBBlower = ta.sma(close, 20) - (ta.stdev(close, 20) * 2)
+eliteKCupper = ta.ema(close, 20) + (ta.ema(ta.tr, 20) * 1.5)
+eliteKClower = ta.ema(close, 20) - (ta.ema(ta.tr, 20) * 1.5)
+eliteSqueeze = eliteBBlower > eliteKClower and eliteBBupper < eliteKCupper
+
+eliteHTFtrend = flowPercentile > 60 ? 1 : flowPercentile < 40 ? -1 : 0
+eliteCurrentSignal = buySignal ? 1 : sellSignal ? -1 : 0
+
+if showDashboard and barstate.islast
+    var table eliteDash = table.new(position.bottom_right, 2, 9, 
+                                     bgcolor=color.new(#0a0a14, 85), 
+                                     border_width=2, 
+                                     border_color=color.new(#9400D3, 50),
+                                     frame_width=2,
+                                     frame_color=color.new(#9400D3, 30))
+    
+    table.cell(eliteDash, 0, 0, "ELITE DETECTOR", 
+               text_color=color.new(#00FFFF, 0), text_size=size.normal, bgcolor=color.new(#1a0033, 70))
+    table.cell(eliteDash, 1, 0, "STATUS", 
+               text_color=color.new(#00FFFF, 0), text_size=size.normal, bgcolor=color.new(#1a0033, 70))
+    
+    eliteMomentumStatus = eliteMomentumNormalized > 30 ? "STRONG UP" :
+                          eliteMomentumNormalized > 0 ? "Bullish" :
+                          eliteMomentumNormalized < -30 ? "STRONG DN" : "Bearish"
+    eliteMomentumColor = eliteMomentumNormalized > 0 ? #00FF88 : #FF4466
+    table.cell(eliteDash, 0, 1, "Momentum", text_color=color.new(color.white, 20), text_size=size.small)
+    table.cell(eliteDash, 1, 1, eliteMomentumStatus, text_color=eliteMomentumColor, text_size=size.small)
+    
+    eliteSqueezeStatus = eliteSqueeze ? "SQUEEZE ON" : "OFF"
+    eliteSqueezeColor = eliteSqueeze ? #FFA500 : #808080
+    table.cell(eliteDash, 0, 2, "Squeeze", text_color=color.new(color.white, 20), text_size=size.small)
+    table.cell(eliteDash, 1, 2, eliteSqueezeStatus, text_color=eliteSqueezeColor, text_size=size.small)
+    
+    eliteHTFstatus = eliteHTFtrend == 1 ? "UP" : eliteHTFtrend == -1 ? "DOWN" : "NEUTRAL"
+    eliteHTFcolor = eliteHTFtrend == 1 ? #00FF88 : eliteHTFtrend == -1 ? #FF4466 : #808080
+    table.cell(eliteDash, 0, 3, "HTF Trend", text_color=color.new(color.white, 20), text_size=size.small)
+    table.cell(eliteDash, 1, 3, eliteHTFstatus, text_color=eliteHTFcolor, text_size=size.small)
+    
+    eliteVolStatus = eliteVolRatio > 1.3 ? "HIGH" : eliteVolRatio < 0.7 ? "LOW" : "NORMAL"
+    eliteVolColor = eliteVolRatio > 1.3 ? #FFFF00 : color.white
+    table.cell(eliteDash, 0, 4, "Volatility", text_color=color.new(color.white, 20), text_size=size.small)
+    table.cell(eliteDash, 1, 4, eliteVolStatus, text_color=color.new(eliteVolColor, 20), text_size=size.small)
+    
+    eliteFlowStrength = netFlow > avgBullVol * 0.5 ? "STRONG" : netFlow > 0 ? "Positive" : netFlow < -avgBearVol * 0.5 ? "STRONG" : "Negative"
+    eliteFlowColor = netFlow > 0 ? #00FF88 : #FF4466
+    table.cell(eliteDash, 0, 5, "Flow Power", text_color=color.new(color.white, 20), text_size=size.small)
+    table.cell(eliteDash, 1, 5, eliteFlowStrength, text_color=eliteFlowColor, text_size=size.small)
+    
+    string revScoreText = "B:" + str.tostring(bullishReversalScore, "#") + " / S:" + str.tostring(bearishReversalScore, "#")
+    color revScoreColor = bullishReversal ? #00FF88 : bearishReversal ? #FF4466 : #808080
+    table.cell(eliteDash, 0, 7, "Rev Score", text_color=color.new(color.white, 20), text_size=size.small)
+    table.cell(eliteDash, 1, 7, revScoreText, text_color=revScoreColor, text_size=size.small)
+    
+    eliteSignalText = eliteCurrentSignal == 1 ? "BUY" : 
+                      eliteCurrentSignal == -1 ? "SELL" : 
+                      blockedBuy ? "BUY BLOCKED" :
+                      blockedSell ? "SELL BLOCKED" : "WAIT"
+    eliteSignalColor = eliteCurrentSignal == 1 ? #00FF88 : 
+                       eliteCurrentSignal == -1 ? #FF4466 :
+                       blockedBuy or blockedSell ? #FFA500 : #808080
+    table.cell(eliteDash, 0, 8, "Signal", text_color=color.new(color.white, 20), text_size=size.small)
+    table.cell(eliteDash, 1, 8, eliteSignalText, text_color=eliteSignalColor, text_size=size.normal)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ALERTS
+// ═══════════════════════════════════════════════════════════════════════════════
+alertcondition(buySignal, "BUY Signal", "Smart Money Flow: BUY signal fired")
+alertcondition(sellSignal, "SELL Signal", "Smart Money Flow: SELL signal fired")
+alertcondition(institutionalBuy, "Institutional Buy", "Large institutional buy detected")
+alertcondition(institutionalSell, "Institutional Sell", "Large institutional sell detected")
+alertcondition(blockedBuy, "Buy Signal Blocked", "Buy signal blocked by reversal protection")
+alertcondition(blockedSell, "Sell Signal Blocked", "Sell signal blocked by reversal protection")
+alertcondition(bullishReversal, "Bullish Reversal Detected", "Bullish reversal zone detected")
+alertcondition(bearishReversal, "Bearish Reversal Detected", "Bearish reversal zone detected")
+alertcondition(justExited, "Trade Exit", "Smart Money Flow: Trade closed")

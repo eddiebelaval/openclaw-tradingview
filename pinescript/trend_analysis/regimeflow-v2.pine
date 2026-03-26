@@ -1,0 +1,503 @@
+//@version=6
+indicator("RegimeFlow V2", shorttitle="RegFlow", overlay=true, max_bars_back=500)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// REGIMEFLOW V2 — Donchian Regime Detection + Synthetic Fear & Greed
+// ═══════════════════════════════════════════════════════════════════════════════
+// Tracks cumulative upper and lower Donchian channel touches over a rolling
+// lookback window. Upper touches add +1, lower touches subtract -1.
+// Net score indicates directional pressure: positive = more upper touches
+// (distribution), negative = more lower touches (accumulation).
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// ─────────────────────────────────────────────────────────────────────────────
+// INPUTS
+// ─────────────────────────────────────────────────────────────────────────────
+
+string G_DC = "═══ DONCHIAN CHANNEL ═══"
+i_dcLength    = input.int(20, "Donchian Length", minval=5, maxval=100, group=G_DC, tooltip="Period for Donchian channel calculation")
+i_showBands   = input.bool(true, "Show Donchian Bands", group=G_DC)
+
+string G_COUNT = "═══ COUNTER ═══"
+i_lookback    = input.int(180, "Lookback Period (bars)", minval=10, maxval=500, group=G_COUNT, tooltip="Rolling window for counting touches. 180 bars = ~7.5 days on 1H.")
+i_touchMargin = input.float(0.1, "Touch Margin (%)", minval=0.0, maxval=1.0, step=0.05, group=G_COUNT, tooltip="How close price needs to get to the band to count as a touch. 0 = exact touch or breach. 0.1 = within 0.1% of band.")
+
+string G_DISPLAY = "═══ DISPLAY ═══"
+i_showTable   = input.bool(true, "Show Info Table", group=G_DISPLAY)
+i_tablePos    = input.string("Bottom Right", "Table Position", options=["Top Right", "Top Left", "Bottom Right", "Bottom Left"], group=G_DISPLAY)
+i_showMarkers = input.bool(true, "Show Touch Markers", group=G_DISPLAY)
+
+string G_FG = "═══ FEAR & GREED ═══"
+i_showFG      = input.bool(true, "Enable Fear & Greed", group=G_FG)
+i_showFGBg    = input.bool(true, "Show Channel Shading", group=G_FG)
+i_fgBgOpacity = input.int(80, "Shading Opacity", minval=70, maxval=95, group=G_FG, tooltip="Higher = more transparent. 88 is subtle, 75 is prominent.")
+i_fgRsiLen    = input.int(14, "RSI Length", minval=5, maxval=30, group=G_FG)
+i_fgAtrLen    = input.int(14, "ATR Length", minval=5, maxval=30, group=G_FG)
+i_fgAtrBase   = input.int(50, "ATR Baseline", minval=20, maxval=200, group=G_FG, tooltip="SMA period for ATR average. Longer = more stable baseline.")
+i_fgVolLen    = input.int(20, "Volume SMA Length", minval=5, maxval=100, group=G_FG)
+i_fgMaLen     = input.int(50, "Price MA Length", minval=10, maxval=200, group=G_FG, tooltip="SMA for price vs moving average component.")
+i_wRsi        = input.float(25, "Weight: RSI", minval=0, maxval=100, step=5, group=G_FG)
+i_wAtr        = input.float(20, "Weight: Volatility", minval=0, maxval=100, step=5, group=G_FG)
+i_wVol        = input.float(15, "Weight: Volume Pressure", minval=0, maxval=100, step=5, group=G_FG)
+i_wMa         = input.float(20, "Weight: Price vs MA", minval=0, maxval=100, step=5, group=G_FG)
+i_wDc         = input.float(20, "Weight: Channel Position", minval=0, maxval=100, step=5, group=G_FG)
+
+string G_FGLVL = "═══ F&G LEVELS & COLORS ═══"
+i_lvlXtrmFear = input.int(36, "Xtrm Fear Below", minval=10, maxval=50, group=G_FGLVL, tooltip="Score below this = Extreme Fear")
+i_lvlFear     = input.int(44, "Fear Below", minval=20, maxval=60, group=G_FGLVL, tooltip="Score below this (but above Xtrm Fear) = Fear")
+i_lvlGreed    = input.int(59, "Greed Above", minval=50, maxval=80, group=G_FGLVL, tooltip="Score at or above this = Greed")
+i_lvlXtrmGreed = input.int(67, "Xtrm Greed Above", minval=55, maxval=95, group=G_FGLVL, tooltip="Score at or above this = Extreme Greed")
+i_colXtrmFear = input.color(#FF0000, "Xtrm Fear Color", group=G_FGLVL)
+i_colFear     = input.color(#FF69B4, "Fear Color", group=G_FGLVL)
+i_colNeutral  = input.color(color.black, "Neutral Color", group=G_FGLVL)
+i_colGreed    = input.color(#16FF44, "Greed Color", group=G_FGLVL)
+i_colXtrmGreed = input.color(#18FCFE, "Xtrm Greed Color", group=G_FGLVL)
+i_showTransDots = input.bool(true, "Show Zone Transition Dots", group=G_FGLVL)
+i_smoothFG      = input.bool(true, "Smooth F&G Score", group=G_FGLVL, tooltip="EMA smoothing on F&G score reduces noise and false transition dots")
+i_smoothFGLen   = input.int(5, "├─ Smoothing Length", minval=2, maxval=20, group=G_FGLVL)
+
+string G_DIVERGENCE = "═══ ADX DIVERGENCE ═══"
+i_enableDivergence = input.bool(true, "Enable ADX Divergence", group=G_DIVERGENCE, tooltip="Detects when price makes new extremes but ADX fails to confirm — trend conviction is fading.")
+i_pivotLeft     = input.int(5, "Pivot Left Bars", minval=2, maxval=10, group=G_DIVERGENCE)
+i_pivotRight    = input.int(4, "Pivot Right Bars", minval=1, maxval=5, group=G_DIVERGENCE)
+i_maxPivotDist  = input.int(24, "Max Pivot Distance (bars)", minval=10, maxval=100, group=G_DIVERGENCE)
+i_showDivergence = input.bool(true, "Show Divergence Markers", group=G_DIVERGENCE)
+i_divAdxFilter  = input.bool(false, "Filter: Require ADX > 18", group=G_DIVERGENCE, tooltip="When enabled, divergences only trigger when ADX is above 18. Reduces noise but may miss exhaustion signals at trend death.")
+
+string G_EXTRAS = "═══ ENHANCEMENTS ═══"
+i_showVolSpike  = input.bool(true, "Show Volume Spike Markers", group=G_EXTRAS)
+i_volSpikeMult  = input.float(2.5, "Volume Spike Multiplier", minval=1.5, maxval=5.0, step=0.5, group=G_EXTRAS, tooltip="Volume above this multiple of SMA triggers a spike marker")
+i_showHTFBias   = input.bool(true, "Show HTF Bias", group=G_EXTRAS, tooltip="Pull higher timeframe net touch bias into table")
+i_htfTimeframe  = input.string("D", "HTF Timeframe", options=["60", "240", "D", "W"], group=G_EXTRAS, tooltip="Higher timeframe for bias comparison")
+i_showStreak    = input.bool(true, "Show Touch Streak", group=G_EXTRAS, tooltip="Count consecutive bars touching the same band")
+
+string G_FISHER = "═══ FISHER TRANSFORM ═══"
+i_showFisher  = input.bool(true, "Show Fisher Bar", group=G_FISHER)
+i_fisherLen   = input.int(10, "Fisher Length", minval=5, maxval=50, group=G_FISHER, tooltip="Lookback period for Fisher Transform calculation")
+i_fLvlExtOB   = input.float(2.0, "Extreme Overbought", minval=1.0, maxval=4.0, step=0.1, group=G_FISHER)
+i_fLvlOB      = input.float(1.0, "Overbought", minval=0.5, maxval=3.0, step=0.1, group=G_FISHER)
+i_fLvlOS      = input.float(-1.0, "Oversold", minval=-3.0, maxval=-0.5, step=0.1, group=G_FISHER)
+i_fLvlExtOS   = input.float(-2.0, "Extreme Oversold", minval=-4.0, maxval=-1.0, step=0.1, group=G_FISHER)
+i_fColExtOS   = input.color(#006400, "Extreme Oversold Color", group=G_FISHER)
+i_fColOS      = input.color(#32CD32, "Oversold Color", group=G_FISHER)
+i_fColNeutral = input.color(color.white, "Neutral Color", group=G_FISHER)
+i_fColOB      = input.color(#FF69B4, "Overbought Color", group=G_FISHER)
+i_fColExtOB   = input.color(#800000, "Extreme Overbought Color", group=G_FISHER)
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+// DONCHIAN CHANNEL
+// ─────────────────────────────────────────────────────────────────────────────
+
+float dcUpper = ta.highest(high, i_dcLength)[1]
+float dcLower = ta.lowest(low, i_dcLength)[1]
+float dcMid   = (dcUpper + dcLower) / 2
+
+p_dcUpper = plot(i_showBands ? dcUpper : na, "DC Upper", color.new(#FF6D00, 30), 1)
+p_dcLower = plot(i_showBands ? dcLower : na, "DC Lower", color.new(#2196F3, 30), 1)
+plot(i_showBands ? dcMid : na, "DC Mid", color.new(color.gray, 60), 1, plot.style_circles)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// DMI / ADX
+// ─────────────────────────────────────────────────────────────────────────────
+
+[diPlus, diMinus, adx] = ta.dmi(14, 14)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PIVOT-BASED ADX DIVERGENCE DETECTION
+// ─────────────────────────────────────────────────────────────────────────────
+// Bearish: price higher high + ADX lower high → uptrend fading
+// Bullish: price lower low + ADX lower low → downtrend exhausting
+
+float ph = ta.pivothigh(high, i_pivotLeft, i_pivotRight)
+float pl = ta.pivotlow(low, i_pivotLeft, i_pivotRight)
+
+var float prevPriceLow = na
+var float prevAdxLow = na
+var int prevLowBar = na
+var float currPriceLow = na
+var float currAdxLow = na
+var int currLowBar = na
+var float prevPriceHigh = na
+var float prevAdxHigh = na
+var int prevHighBar = na
+var float currPriceHigh = na
+var float currAdxHigh = na
+var int currHighBar = na
+
+float adxAtPivot = adx[i_pivotRight]
+
+if not na(pl)
+    prevPriceLow := currPriceLow
+    prevAdxLow := currAdxLow
+    prevLowBar := currLowBar
+    currPriceLow := pl
+    currAdxLow := adxAtPivot
+    currLowBar := bar_index - i_pivotRight
+
+if not na(ph)
+    prevPriceHigh := currPriceHigh
+    prevAdxHigh := currAdxHigh
+    prevHighBar := currHighBar
+    currPriceHigh := ph
+    currAdxHigh := adxAtPivot
+    currHighBar := bar_index - i_pivotRight
+
+bool adxPassFilter = not i_divAdxFilter or adxAtPivot > 18
+
+bool bullishDivergence = i_enableDivergence and adxPassFilter and not na(pl) and not na(prevPriceLow) and not na(prevAdxLow) and currPriceLow < prevPriceLow and currAdxLow < prevAdxLow and (bar_index - i_pivotRight - prevLowBar) <= i_maxPivotDist
+
+bool bearishDivergence = i_enableDivergence and adxPassFilter and not na(ph) and not na(prevPriceHigh) and not na(prevAdxHigh) and currPriceHigh > prevPriceHigh and currAdxHigh < prevAdxHigh and (bar_index - i_pivotRight - prevHighBar) <= i_maxPivotDist
+
+// Divergence markers
+plotshape(i_showDivergence and bullishDivergence, "Bullish Divergence", shape.labelup, location.belowbar, color.new(#00FF88, 0), textcolor=color.black, text="D", offset=-i_pivotRight, size=size.tiny)
+plotshape(i_showDivergence and bearishDivergence, "Bearish Divergence", shape.labeldown, location.abovebar, color.new(#FF4444, 0), textcolor=color.white, text="D", offset=-i_pivotRight, size=size.tiny)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// TOUCH DETECTION
+// ─────────────────────────────────────────────────────────────────────────────
+
+float marginUpper = dcUpper * (1 - i_touchMargin / 100)
+float marginLower = dcLower * (1 + i_touchMargin / 100)
+
+bool upperTouch = high >= marginUpper
+bool lowerTouch = low <= marginLower
+
+// Touch markers on chart
+plotshape(i_showMarkers and upperTouch and not lowerTouch, "Upper Touch", shape.triangledown, location.abovebar, color.new(#FF6D00, 20), size=size.tiny)
+plotshape(i_showMarkers and lowerTouch and not upperTouch, "Lower Touch", shape.triangleup, location.belowbar, color.new(#2196F3, 20), size=size.tiny)
+plotshape(i_showMarkers and upperTouch and lowerTouch, "Both Touch", shape.diamond, location.abovebar, color.new(color.yellow, 0), size=size.tiny)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// RSI (for table display)
+// ─────────────────────────────────────────────────────────────────────────────
+
+float rsi = ta.rsi(close, i_fgRsiLen)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// VOLUME SPIKE DETECTION
+// ─────────────────────────────────────────────────────────────────────────────
+
+float volSma = ta.sma(volume, 20)
+bool volSpike = volume > volSma * i_volSpikeMult
+plotchar(i_showVolSpike and volSpike and close >= open, "Vol Spike Up", "♦", location.abovebar, color.new(#00FF00, 30), size=size.tiny)
+plotchar(i_showVolSpike and volSpike and close < open, "Vol Spike Down", "♦", location.belowbar, color.new(#FF0000, 30), size=size.tiny)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// TOUCH STREAK COUNTER
+// ─────────────────────────────────────────────────────────────────────────────
+
+var int upperStreak = 0
+var int lowerStreak = 0
+upperStreak := upperTouch ? upperStreak + 1 : 0
+lowerStreak := lowerTouch ? lowerStreak + 1 : 0
+
+// ─────────────────────────────────────────────────────────────────────────────
+// HIGHER TIMEFRAME BIAS
+// ─────────────────────────────────────────────────────────────────────────────
+
+[htfUpper, htfLower, htfClose] = request.security(syminfo.tickerid, i_htfTimeframe, [ta.highest(high, i_dcLength)[1], ta.lowest(low, i_dcLength)[1], close[1]], lookahead=barmerge.lookahead_off, gaps=barmerge.gaps_off)
+float htfRange = htfUpper - htfLower
+float htfPos = htfRange > 0 ? (htfClose - htfLower) / htfRange * 100 : 50
+string htfBias = htfPos >= 65 ? "BULLISH" : htfPos <= 35 ? "BEARISH" : "NEUTRAL"
+color htfBiasBg = htfPos >= 65 ? color.new(color.green, 40) : htfPos <= 35 ? color.new(color.red, 40) : color.new(color.gray, 50)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ROLLING TOUCH COUNTS — Optimized with math.sum()
+// ─────────────────────────────────────────────────────────────────────────────
+
+float upper90  = math.sum(upperTouch ? 1 : 0, 90)
+float lower90  = math.sum(lowerTouch ? 1 : 0, 90)
+float net90    = upper90 - lower90
+
+float upper180 = math.sum(upperTouch ? 1 : 0, 180)
+float lower180 = math.sum(lowerTouch ? 1 : 0, 180)
+float net180   = upper180 - lower180
+
+float upper270 = math.sum(upperTouch ? 1 : 0, 270)
+float lower270 = math.sum(lowerTouch ? 1 : 0, 270)
+float net270   = upper270 - lower270
+
+// ─────────────────────────────────────────────────────────────────────────────
+// FISHER TRANSFORM
+// ─────────────────────────────────────────────────────────────────────────────
+
+float fHiHi = ta.highest(hl2, i_fisherLen)
+float fLoLo = ta.lowest(hl2, i_fisherLen)
+float fRange = fHiHi - fLoLo
+float fVal = fRange > 0 ? 2.0 * ((hl2 - fLoLo) / fRange - 0.5) : 0.0
+
+var float fSmooth = 0.0
+fSmooth := 0.33 * fVal + 0.67 * nz(fSmooth[1])
+
+float fClamped = math.max(-0.999, math.min(0.999, fSmooth))
+
+var float fisher = 0.0
+fisher := 0.5 * math.log((1 + fClamped) / (1 - fClamped)) + 0.5 * nz(fisher[1])
+
+color fisherColor = fisher <= i_fLvlExtOS ? i_fColExtOS : fisher <= i_fLvlOS ? i_fColOS : fisher >= i_fLvlExtOB ? i_fColExtOB : fisher >= i_fLvlOB ? i_fColOB : i_fColNeutral
+
+plotshape(i_showFisher, "Fisher Bar", shape.circle, location.bottom, fisherColor[1], size=size.tiny)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SYNTHETIC FEAR & GREED INDEX (0-100)
+// ─────────────────────────────────────────────────────────────────────────────
+// 5 components blended into a single score:
+//   1. RSI: low = fear, high = greed
+//   2. Volatility: high ATR vs avg = fear, low = complacency/greed
+//   3. Volume pressure: high vol + down = panic (fear), high vol + up = FOMO (greed)
+//   4. Price vs MA: deep below = fear, far above = greed
+//   5. Channel position: near lower band = fear, near upper = greed
+
+float fgScore = 50.0
+
+if i_showFG
+    // Component 1: RSI (0-100 maps directly, uses shared rsi series)
+    float rsiComponent = math.max(0, math.min(100, rsi))
+    
+    // Component 2: Volatility (inverted — high vol = fear = low score)
+    float fgAtr = ta.atr(i_fgAtrLen)
+    float fgAtrAvg = ta.sma(fgAtr, i_fgAtrBase)
+    float atrRatioFG = fgAtrAvg > 0 ? fgAtr / fgAtrAvg : 1.0
+    // ATR ratio 0.5 = very compressed (greed/complacency) → 100
+    // ATR ratio 1.0 = normal → 50
+    // ATR ratio 1.5+ = extreme vol (fear) → 0
+    float volComponent = math.max(0, math.min(100, 100 * (1.5 - atrRatioFG)))
+    
+    // Component 3: Volume pressure (directional)
+    float fgVolSma = ta.sma(volume, i_fgVolLen)
+    float relVol = fgVolSma > 0 ? volume / fgVolSma : 1.0
+    float priceChg = close - close[1]
+    // High vol + up = greed (high score), high vol + down = fear (low score)
+    // Low vol = neutral (50)
+    float volDir = relVol > 1.0 ? (priceChg >= 0 ? 50 + math.min(50, (relVol - 1.0) * 50) : 50 - math.min(50, (relVol - 1.0) * 50)) : 50.0
+    float volPressComponent = math.max(0, math.min(100, volDir))
+    
+    // Component 4: Price vs MA (0-100)
+    float fgMa = ta.sma(close, i_fgMaLen)
+    float maDevPct = fgMa > 0 ? (close - fgMa) / fgMa * 100 : 0
+    // -10% below MA = 0 (extreme fear), +10% above = 100 (extreme greed)
+    float maComponent = math.max(0, math.min(100, 50 + maDevPct * 5))
+    
+    // Component 5: Channel position (already have dcUpper/dcLower)
+    float chanRange = dcUpper - dcLower
+    float chanPos = chanRange > 0 ? (close - dcLower) / chanRange * 100 : 50
+    float chanComponent = math.max(0, math.min(100, chanPos))
+    
+    // Weighted blend
+    float totalWeight = i_wRsi + i_wAtr + i_wVol + i_wMa + i_wDc
+    fgScore := totalWeight > 0 ? (rsiComponent * i_wRsi + volComponent * i_wAtr + volPressComponent * i_wVol + maComponent * i_wMa + chanComponent * i_wDc) / totalWeight : 50.0
+
+// Apply optional smoothing
+if i_smoothFG
+    fgScore := ta.ema(fgScore, i_smoothFGLen)
+
+// Fear & Greed labels
+string fgLabel = fgScore >= i_lvlXtrmGreed ? "XTRM GREED" : fgScore >= i_lvlGreed ? "GREED" : fgScore >= i_lvlFear ? "NEUTRAL" : fgScore >= i_lvlXtrmFear ? "FEAR" : "XTRM FEAR"
+
+color fgColor = fgScore >= i_lvlXtrmGreed ? color.new(i_colXtrmGreed, 40) : fgScore >= i_lvlGreed ? color.new(i_colGreed, 40) : fgScore >= i_lvlFear ? color.new(i_colNeutral, 40) : fgScore >= i_lvlXtrmFear ? color.new(i_colFear, 40) : color.new(i_colXtrmFear, 40)
+
+// Fill color for Donchian band shading (replaces background)
+color fgFill = not i_showFG or not i_showFGBg ? na : fgScore >= i_lvlXtrmGreed ? color.new(i_colXtrmGreed, i_fgBgOpacity) : fgScore >= i_lvlGreed ? color.new(i_colGreed, math.min(100, i_fgBgOpacity + 3)) : fgScore >= i_lvlFear ? na : fgScore >= i_lvlXtrmFear ? color.new(i_colFear, i_fgBgOpacity) : color.new(i_colXtrmFear, math.max(0, i_fgBgOpacity - 5))
+
+fill(p_dcUpper, p_dcLower, color=fgFill, title="Fear & Greed Channel Fill")
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ZONE TRANSITION DOTS — yellow dot when fear/greed exits to neutral
+// ─────────────────────────────────────────────────────────────────────────────
+
+bool wasInFear  = fgScore[1] < i_lvlFear
+bool wasInGreed = fgScore[1] >= i_lvlGreed
+bool nowNeutral = fgScore >= i_lvlFear and fgScore < i_lvlGreed
+
+bool fearToNeutral  = i_showFG and i_showTransDots and wasInFear and nowNeutral
+bool greedToNeutral = i_showFG and i_showTransDots and wasInGreed and nowNeutral
+
+plotshape(fearToNeutral, "Fear→Neutral", shape.circle, location.belowbar, color.new(color.yellow, 0), size=size.tiny)
+plotshape(greedToNeutral, "Greed→Neutral", shape.circle, location.abovebar, color.new(color.yellow, 0), size=size.tiny)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// MARKET REGIME CLASSIFICATION
+// ─────────────────────────────────────────────────────────────────────────────
+// Confluence of net180, F&G zone, Fisher, ADX → single regime label
+// ACCUMULATE: net bearish + fear + fisher oversold
+// DISTRIBUTE: net bullish + greed + fisher overbought
+// EXHAUSTION: ADX dead + fisher extreme
+// BREAKOUT ▲/▼: ADX strong + net confirming + fisher confirming
+// TRANSITION: mixed signals
+// RANGE: no directional conviction
+
+bool _isFearZone  = fgScore < i_lvlFear
+bool _isGreedZone = fgScore >= i_lvlGreed
+bool _fisherOS    = fisher <= i_fLvlOS
+bool _fisherOB    = fisher >= i_fLvlOB
+bool _netBearish  = net180 < -3
+bool _netBullish  = net180 > 3
+bool _adxLow      = adx < 18
+bool _adxStrong   = adx >= 25
+
+string regimeLabel = "RANGE"
+color regimeBg = color.new(color.gray, 50)
+
+if _adxLow and (fisher <= i_fLvlExtOS or fisher >= i_fLvlExtOB)
+    regimeLabel := "EXHAUSTION"
+    regimeBg := color.new(#FF6D00, 40)
+else if _netBearish and _isFearZone and _fisherOS
+    regimeLabel := "ACCUMULATE"
+    regimeBg := color.new(#006400, 40)
+else if _netBullish and _isGreedZone and _fisherOB
+    regimeLabel := "DISTRIBUTE"
+    regimeBg := color.new(#800000, 40)
+else if _adxStrong and _netBullish and fisher > 0
+    regimeLabel := "BREAKOUT ▲"
+    regimeBg := color.new(color.green, 40)
+else if _adxStrong and _netBearish and fisher < 0
+    regimeLabel := "BREAKOUT ▼"
+    regimeBg := color.new(color.red, 40)
+else if (_isFearZone and not _fisherOS) or (_isGreedZone and not _fisherOB) or (_netBearish and not _isFearZone) or (_netBullish and not _isGreedZone)
+    regimeLabel := "TRANSITION"
+    regimeBg := color.new(#FFD700, 40)
+else
+    regimeLabel := "RANGE"
+    regimeBg := color.new(color.gray, 50)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// INFO TABLE — 3 columns for 270 / 180 / 90 periods + Fear & Greed row
+// ─────────────────────────────────────────────────────────────────────────────
+
+var table tbl = table.new(i_tablePos == "Top Right" ? position.top_right : i_tablePos == "Top Left" ? position.top_left : i_tablePos == "Bottom Left" ? position.bottom_left : position.bottom_right, 4, 13, bgcolor=color.new(color.black, 20), border_width=1)
+
+if i_showTable and barstate.islast
+    color grayBg = color.new(color.gray, 60)
+    color tealBg = color.new(color.teal, 50)
+    
+    // Header row
+    table.cell(tbl, 0, 0, "RegFlow V2", bgcolor=tealBg, text_color=color.white, text_size=size.small)
+    table.cell(tbl, 1, 0, "270", bgcolor=tealBg, text_color=color.white, text_size=size.small)
+    table.cell(tbl, 2, 0, "180", bgcolor=tealBg, text_color=color.white, text_size=size.small)
+    table.cell(tbl, 3, 0, "90", bgcolor=tealBg, text_color=color.white, text_size=size.small)
+    
+    // Upper row
+    table.cell(tbl, 0, 1, "Upper", bgcolor=grayBg, text_color=color.white, text_size=size.small)
+    table.cell(tbl, 1, 1, str.tostring(upper270, "#"), bgcolor=upper270 >= 20 ? color.new(#FF6D00, 40) : grayBg, text_color=color.white, text_size=size.small)
+    table.cell(tbl, 2, 1, str.tostring(upper180, "#"), bgcolor=upper180 >= 15 ? color.new(#FF6D00, 40) : grayBg, text_color=color.white, text_size=size.small)
+    table.cell(tbl, 3, 1, str.tostring(upper90, "#"), bgcolor=upper90 >= 10 ? color.new(#FF6D00, 40) : grayBg, text_color=color.white, text_size=size.small)
+    
+    // Lower row
+    table.cell(tbl, 0, 2, "Lower", bgcolor=grayBg, text_color=color.white, text_size=size.small)
+    table.cell(tbl, 1, 2, str.tostring(lower270, "#"), bgcolor=lower270 >= 20 ? color.new(#2196F3, 40) : grayBg, text_color=color.white, text_size=size.small)
+    table.cell(tbl, 2, 2, str.tostring(lower180, "#"), bgcolor=lower180 >= 15 ? color.new(#2196F3, 40) : grayBg, text_color=color.white, text_size=size.small)
+    table.cell(tbl, 3, 2, str.tostring(lower90, "#"), bgcolor=lower90 >= 10 ? color.new(#2196F3, 40) : grayBg, text_color=color.white, text_size=size.small)
+    
+    // Net row
+    table.cell(tbl, 0, 3, "Net", bgcolor=grayBg, text_color=color.white, text_size=size.small)
+    color net90Bg = net90 > 3 ? color.new(color.green, 40) : net90 < -3 ? color.new(color.red, 40) : color.new(color.gray, 50)
+    color net180Bg = net180 > 3 ? color.new(color.green, 40) : net180 < -3 ? color.new(color.red, 40) : color.new(color.gray, 50)
+    color net270Bg = net270 > 3 ? color.new(color.green, 40) : net270 < -3 ? color.new(color.red, 40) : color.new(color.gray, 50)
+    string pre90 = net90 > 0 ? "+" : ""
+    string pre180 = net180 > 0 ? "+" : ""
+    string pre270 = net270 > 0 ? "+" : ""
+    table.cell(tbl, 1, 3, pre270 + str.tostring(net270, "#"), bgcolor=net270Bg, text_color=color.white, text_size=size.small)
+    table.cell(tbl, 2, 3, pre180 + str.tostring(net180, "#"), bgcolor=net180Bg, text_color=color.white, text_size=size.small)
+    table.cell(tbl, 3, 3, pre90 + str.tostring(net90, "#"), bgcolor=net90Bg, text_color=color.white, text_size=size.small)
+    
+    // Upper % row
+    table.cell(tbl, 0, 4, "Upper %", bgcolor=grayBg, text_color=color.white, text_size=size.small)
+    float ratio90 = (upper90 + lower90) > 0 ? upper90 * 100.0 / (upper90 + lower90) : 50.0
+    float ratio180 = (upper180 + lower180) > 0 ? upper180 * 100.0 / (upper180 + lower180) : 50.0
+    float ratio270 = (upper270 + lower270) > 0 ? upper270 * 100.0 / (upper270 + lower270) : 50.0
+    color r90Bg = ratio90 >= 65 ? color.new(color.green, 40) : ratio90 <= 35 ? color.new(color.red, 40) : color.new(color.gray, 50)
+    color r180Bg = ratio180 >= 65 ? color.new(color.green, 40) : ratio180 <= 35 ? color.new(color.red, 40) : color.new(color.gray, 50)
+    color r270Bg = ratio270 >= 65 ? color.new(color.green, 40) : ratio270 <= 35 ? color.new(color.red, 40) : color.new(color.gray, 50)
+    table.cell(tbl, 1, 4, str.tostring(ratio270, "#") + "%", bgcolor=r270Bg, text_color=color.white, text_size=size.small)
+    table.cell(tbl, 2, 4, str.tostring(ratio180, "#") + "%", bgcolor=r180Bg, text_color=color.white, text_size=size.small)
+    table.cell(tbl, 3, 4, str.tostring(ratio90, "#") + "%", bgcolor=r90Bg, text_color=color.white, text_size=size.small)
+    
+    // Bias row
+    table.cell(tbl, 0, 5, "Bias", bgcolor=grayBg, text_color=color.white, text_size=size.small)
+    string bias90 = net90 > 3 ? "BULLISH" : net90 < -3 ? "BEARISH" : "NEUTRAL"
+    string bias180 = net180 > 3 ? "BULLISH" : net180 < -3 ? "BEARISH" : "NEUTRAL"
+    string bias270 = net270 > 3 ? "BULLISH" : net270 < -3 ? "BEARISH" : "NEUTRAL"
+    color b90Bg = net90 > 3 ? color.new(color.green, 40) : net90 < -3 ? color.new(color.red, 40) : color.new(color.gray, 50)
+    color b180Bg = net180 > 3 ? color.new(color.green, 40) : net180 < -3 ? color.new(color.red, 40) : color.new(color.gray, 50)
+    color b270Bg = net270 > 3 ? color.new(color.green, 40) : net270 < -3 ? color.new(color.red, 40) : color.new(color.gray, 50)
+    table.cell(tbl, 1, 5, bias270, bgcolor=b270Bg, text_color=color.white, text_size=size.small)
+    table.cell(tbl, 2, 5, bias180, bgcolor=b180Bg, text_color=color.white, text_size=size.small)
+    table.cell(tbl, 3, 5, bias90, bgcolor=b90Bg, text_color=color.white, text_size=size.small)
+    
+    // ADX / DI row
+    color adxBg = adx >= 35 ? color.new(#800000, 40) : adx >= 25 ? color.new(#FF69B4, 40) : adx < 18 ? color.new(color.white, 0) : color.new(color.gray, 50)
+    color adxText = adx < 18 ? color.black : color.white
+    color diPlusBg = diPlus > diMinus ? color.new(color.green, 40) : color.new(color.gray, 60)
+    color diMinusBg = diMinus > diPlus ? color.new(color.red, 40) : color.new(color.gray, 60)
+    table.cell(tbl, 0, 6, "ADX", bgcolor=color.new(color.gray, 60), text_color=color.white, text_size=size.small)
+    table.cell(tbl, 1, 6, str.tostring(adx, "#.#"), bgcolor=adxBg, text_color=adxText, text_size=size.small)
+    table.cell(tbl, 2, 6, "+DI " + str.tostring(diPlus, "#.#"), bgcolor=diPlusBg, text_color=color.white, text_size=size.small)
+    table.cell(tbl, 3, 6, "-DI " + str.tostring(diMinus, "#.#"), bgcolor=diMinusBg, text_color=color.white, text_size=size.small)
+    
+    // RSI row
+    color rsiBg = rsi <= 30 ? color.new(#006400, 40) : rsi <= 40 ? color.new(#32CD32, 40) : rsi >= 70 ? color.new(#800000, 40) : rsi >= 60 ? color.new(#FF69B4, 40) : color.new(color.gray, 50)
+    color rsiText = (rsi <= 30 or rsi >= 70) ? color.white : rsi <= 40 or rsi >= 60 ? color.white : color.white
+    string rsiLabel = rsi <= 30 ? "OVERSOLD" : rsi <= 40 ? "WEAK" : rsi >= 70 ? "OVERBOUGHT" : rsi >= 60 ? "STRONG" : "NEUTRAL"
+    table.cell(tbl, 0, 7, "RSI", bgcolor=color.new(color.gray, 60), text_color=color.white, text_size=size.small)
+    table.cell(tbl, 1, 7, str.tostring(rsi, "#.#"), bgcolor=rsiBg, text_color=rsiText, text_size=size.small)
+    table.cell(tbl, 2, 7, rsiLabel, bgcolor=rsiBg, text_color=color.white, text_size=size.small)
+    // Streak
+    string streakText = upperStreak > 0 ? "▲" + str.tostring(upperStreak) : lowerStreak > 0 ? "▼" + str.tostring(lowerStreak) : "—"
+    color streakBg = upperStreak >= 3 ? color.new(#FF6D00, 40) : lowerStreak >= 3 ? color.new(#2196F3, 40) : color.new(color.gray, 50)
+    table.cell(tbl, 3, 7, i_showStreak ? streakText : "", bgcolor=streakBg, text_color=color.white, text_size=size.small)
+    
+    // HTF Bias row
+    if i_showHTFBias
+        string htfLabel = i_htfTimeframe == "60" ? "1H" : i_htfTimeframe == "240" ? "4H" : i_htfTimeframe == "D" ? "Daily" : "Weekly"
+        table.cell(tbl, 0, 8, "HTF", bgcolor=color.new(color.gray, 60), text_color=color.white, text_size=size.small)
+        table.cell(tbl, 1, 8, htfLabel, bgcolor=color.new(color.gray, 50), text_color=color.white, text_size=size.small)
+        table.cell(tbl, 2, 8, htfBias, bgcolor=htfBiasBg, text_color=color.white, text_size=size.small)
+        table.cell(tbl, 3, 8, str.tostring(htfPos, "#") + "%", bgcolor=htfBiasBg, text_color=color.white, text_size=size.small)
+    
+    // Volume spike info row
+    string volStatus = volSpike ? (close >= open ? "SPIKE ▲" : "SPIKE ▼") : "NORMAL"
+    color volBg = volSpike ? (close >= open ? color.new(color.green, 40) : color.new(color.red, 40)) : color.new(color.gray, 50)
+    float volRatio = volSma > 0 ? volume / volSma : 1.0
+    table.cell(tbl, 0, 9, "Vol", bgcolor=color.new(color.gray, 60), text_color=color.white, text_size=size.small)
+    table.cell(tbl, 1, 9, str.tostring(volRatio, "#.#") + "x", bgcolor=volBg, text_color=color.white, text_size=size.small)
+    table.cell(tbl, 2, 9, volStatus, bgcolor=volBg, text_color=color.white, text_size=size.small)
+    table.merge_cells(tbl, 2, 9, 3, 9)
+    
+    // Fisher row
+    if i_showFisher
+        string fisherLabel = fisher >= i_fLvlExtOB ? "XTRM OB" : fisher >= i_fLvlOB ? "OVERBOUGHT" : fisher <= i_fLvlExtOS ? "XTRM OS" : fisher <= i_fLvlOS ? "OVERSOLD" : "NEUTRAL"
+        table.cell(tbl, 0, 10, "Fisher", bgcolor=color.new(color.gray, 60), text_color=color.white, text_size=size.small)
+        table.cell(tbl, 1, 10, str.tostring(fisher, "#.##"), bgcolor=color.new(fisherColor, 40), text_color=color.white, text_size=size.small)
+        table.cell(tbl, 2, 10, fisherLabel, bgcolor=color.new(fisherColor, 40), text_color=color.white, text_size=size.small)
+        table.merge_cells(tbl, 2, 10, 3, 10)
+    
+    // Fear & Greed row (row 11)
+    if i_showFG
+        table.cell(tbl, 0, 11, "F&G", bgcolor=color.new(color.gray, 60), text_color=color.white, text_size=size.small)
+        table.cell(tbl, 1, 11, str.tostring(fgScore, "#") + " " + fgLabel, bgcolor=fgColor, text_color=color.white, text_size=size.small)
+        table.merge_cells(tbl, 1, 11, 3, 11)
+    
+    // Market Regime Label (row 12) — uses pre-computed regimeLabel/regimeBg
+    table.cell(tbl, 0, 12, "Regime", bgcolor=color.new(#9C27B0, 50), text_color=color.white, text_size=size.small)
+    table.cell(tbl, 1, 12, regimeLabel, bgcolor=regimeBg, text_color=color.white, text_size=size.small)
+    table.merge_cells(tbl, 1, 12, 3, 12)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ALERTS
+// ─────────────────────────────────────────────────────────────────────────────
+
+alertcondition(upperTouch, "Upper Band Touch", "RegimeFlow: {{ticker}} touched upper Donchian band")
+alertcondition(lowerTouch, "Lower Band Touch", "RegimeFlow: {{ticker}} touched lower Donchian band")
+alertcondition(net180 > 5, "Strong Bullish", "RegimeFlow: {{ticker}} net score above +5 (bullish)")
+alertcondition(net180 < -5, "Strong Bearish", "RegimeFlow: {{ticker}} net score below -5 (bearish)")
+alertcondition(bullishDivergence, "Bullish ADX Divergence", "RegimeFlow: Bullish ADX divergence on {{ticker}}")
+alertcondition(bearishDivergence, "Bearish ADX Divergence", "RegimeFlow: Bearish ADX divergence on {{ticker}}")
+alertcondition(volSpike, "Volume Spike", "RegimeFlow: {{ticker}} volume spike detected")
+alertcondition(upperStreak >= 5, "Upper Streak 5+", "RegimeFlow: {{ticker}} 5+ consecutive upper band touches")
+alertcondition(lowerStreak >= 5, "Lower Streak 5+", "RegimeFlow: {{ticker}} 5+ consecutive lower band touches")
+alertcondition(ta.crossunder(fisher, i_fLvlExtOS), "Fisher Extreme Oversold", "RegimeFlow: {{ticker}} Fisher crossed below extreme oversold")
+alertcondition(ta.crossover(fisher, i_fLvlExtOB), "Fisher Extreme Overbought", "RegimeFlow: {{ticker}} Fisher crossed above extreme overbought")
+alertcondition(fearToNeutral, "Fear→Neutral Transition", "RegimeFlow: {{ticker}} F&G exited fear zone to neutral")
+alertcondition(greedToNeutral, "Greed→Neutral Transition", "RegimeFlow: {{ticker}} F&G exited greed zone to neutral")
+alertcondition(regimeLabel != regimeLabel[1], "Regime Change", "RegimeFlow: {{ticker}} regime has changed")

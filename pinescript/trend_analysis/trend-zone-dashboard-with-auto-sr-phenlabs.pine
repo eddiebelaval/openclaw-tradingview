@@ -1,0 +1,437 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0)
+// https://creativecommons.org/licenses/by-nc-sa/4.0/
+//v2
+//@version=6
+indicator("Trend Zone Dashboard with Auto S/R [PhenLabs]", overlay = true, max_boxes_count = 500, max_labels_count = 500)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// USER INPUTS
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Auto Mode: intelligently adapts parameters to produce ~targetZones zones
+bool    autoMode            = input.bool(true, "Auto Mode (override manual settings)", group = "Auto Mode", tooltip = "When enabled, the script auto-tunes clustering tolerance to produce approximately the target number of zones.")
+int     targetZones         = input.int(5, "Target Number of Zones", minval = 2, maxval = 15, group = "Auto Mode")
+
+// Pivot detection
+int     lookbackInput       = input.int(200, "Lookback Period (bars)", minval = 20, maxval = 1000, group = "Pivot Detection")
+int     pivotStrength       = input.int(5, "Pivot Strength (left/right bars)", minval = 2, maxval = 20, group = "Pivot Detection")
+
+// Manual clustering settings (ignored in auto mode)
+string  clusterMethod       = input.string("ATR", "Clustering Method", options = ["ATR", "Percentage"], group = "Manual Clustering")
+float   atrMultiplier       = input.float(1.0, "ATR Multiplier", minval = 0.1, maxval = 5.0, step = 0.1, group = "Manual Clustering")
+float   pctThreshold        = input.float(0.5, "Percentage Threshold %", minval = 0.1, maxval = 5.0, step = 0.1, group = "Manual Clustering")
+int     atrLength           = input.int(14, "ATR Length", minval = 5, maxval = 50, group = "Manual Clustering")
+
+// Zone filtering
+int     minTouchesInput     = input.int(2, "Minimum Touches to Qualify", minval = 1, maxval = 20, group = "Zone Filtering")
+int     maxZones            = input.int(8, "Maximum Zones to Display", minval = 1, maxval = 20, group = "Zone Filtering")
+float   breakoutATRMult     = input.float(2.0, "Breakout Pruning (ATR mult)", minval = 0.5, maxval = 5.0, step = 0.1, tooltip = "Support is pruned if price closes BELOW it by this many ATRs. Resistance pruned if price closes ABOVE.", group = "Zone Filtering")
+
+// Dashboard settings
+string  dashPosition        = input.string("Top Right", "Dashboard Position", options = ["Top Left", "Top Right", "Bottom Left", "Bottom Right"], group = "Dashboard")
+bool    showDashboard       = input.bool(true, "Show Dashboard Table", group = "Dashboard")
+bool    showZoneBoxes       = input.bool(true, "Show Zone Boxes on Chart", group = "Dashboard")
+bool    showZoneLabels      = input.bool(true, "Show Zone Labels on Chart", group = "Dashboard")
+
+// Colors
+color   supportColorInput   = input.color(color.new(#089981, 0), "Support Zone Color", group = "Colors")
+color   resistanceColorInput= input.color(color.new(#F23645, 0), "Resistance Zone Color", group = "Colors")
+color   dashBgColor         = input.color(color.new(#1e222d, 0), "Dashboard Background", group = "Colors")
+color   dashTextColor       = input.color(color.new(color.white, 0), "Dashboard Text Color", group = "Colors")
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PRECOMPUTATION: Detect pivots incrementally, store in persistent arrays
+// ─────────────────────────────────────────────────────────────────────────────
+// We store every pivot detected throughout chart history. On the last bar,
+// we filter down to the lookback window, cluster, score, and render.
+
+float atrVal = ta.atr(atrLength)
+
+// Raw pivot storage — accumulated across all bars via `var`
+var array<float> rawPivotPrice = array.new<float>(0)
+var array<int>   rawPivotBar   = array.new<int>(0)
+var array<int>   rawPivotType  = array.new<int>(0)  // 1 = pivot high, -1 = pivot low
+
+float pivHigh = ta.pivothigh(high, pivotStrength, pivotStrength)
+float pivLow  = ta.pivotlow(low, pivotStrength, pivotStrength)
+
+// Pivots are confirmed pivotStrength bars ago
+if not na(pivHigh)
+    array.push(rawPivotPrice, pivHigh)
+    array.push(rawPivotBar, bar_index - pivotStrength)
+    array.push(rawPivotType, 1)
+
+if not na(pivLow)
+    array.push(rawPivotPrice, pivLow)
+    array.push(rawPivotBar, bar_index - pivotStrength)
+    array.push(rawPivotType, -1)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// LAST-BAR FULL COMPUTATION
+// ─────────────────────────────────────────────────────────────────────────────
+// Everything below runs ONLY on the last bar. This avoids performance issues
+// and ensures tables/boxes don't accumulate across bars.
+
+// Persistent drawing arrays for cleanup
+var array<box>   drawnBoxes  = array.new<box>(0)
+var array<label> drawnLabels = array.new<label>(0)
+var table        dashTable   = na
+
+if barstate.islast
+
+    // ── Clean up previous drawings ──────────────────────────────────────────
+    if array.size(drawnBoxes) > 0
+        for i = 0 to array.size(drawnBoxes) - 1
+            box.delete(array.get(drawnBoxes, i))
+    array.clear(drawnBoxes)
+
+    if array.size(drawnLabels) > 0
+        for i = 0 to array.size(drawnLabels) - 1
+            label.delete(array.get(drawnLabels, i))
+    array.clear(drawnLabels)
+
+    if not na(dashTable)
+        table.delete(dashTable)
+
+    // ── Step 1: Filter raw pivots to the lookback window ────────────────────
+    array<float> windowPrices = array.new<float>(0)
+    int cutoffBar = bar_index - lookbackInput
+
+    int rawSize = array.size(rawPivotPrice)
+    if rawSize > 0
+        for i = 0 to rawSize - 1
+            if array.get(rawPivotBar, i) >= cutoffBar
+                array.push(windowPrices, array.get(rawPivotPrice, i))
+
+    int pivotCount = array.size(windowPrices)
+
+    // ── Step 2: Determine clustering tolerance ──────────────────────────────
+    // In Auto Mode, we iteratively search for a tolerance that produces
+    // approximately targetZones clusters. We use binary search between
+    // a minimum tolerance (very tight = many zones) and maximum (very
+    // wide = one zone).
+
+    // Compute manual tolerance as a baseline
+    float manualTolerance = clusterMethod == "ATR" ? atrVal * atrMultiplier : close * pctThreshold / 100.0
+
+    // We'll define a clustering function inline via a loop.
+    // Given a tolerance, cluster the windowPrices and return how many zones result.
+    // Strategy: sort prices, then do a greedy merge — consecutive prices within
+    // tolerance of the running cluster midpoint get merged.
+
+    // First, sort the pivot prices (ascending) for greedy clustering
+    array<float> sortedPrices = array.copy(windowPrices)
+    array.sort(sortedPrices, order.ascending)
+
+    // Clustering function via iterative search for auto mode
+    float finalTolerance = manualTolerance
+    int   effectiveMinTouches = minTouchesInput
+
+    if autoMode and pivotCount >= 2
+        // Binary search for tolerance that yields ~targetZones clusters
+        float tolLow  = atrVal * 0.1              // very tight → many zones
+        float tolHigh = atrVal * 8.0               // very wide → few zones
+        float bestTol = (tolLow + tolHigh) / 2.0
+        int   bestCount = 0
+
+        // 15 iterations of bisection is more than enough to converge
+        for _iter = 0 to 14
+            float midTol = (tolLow + tolHigh) / 2.0
+            // Count clusters at this tolerance
+            int clusterCount = 1
+            float clusterMid = array.get(sortedPrices, 0)
+            int   clusterN   = 1
+            if pivotCount > 1
+                for j = 1 to pivotCount - 1
+                    float p = array.get(sortedPrices, j)
+                    if math.abs(p - clusterMid) <= midTol
+                        // Merge: update running midpoint
+                        clusterMid := (clusterMid * clusterN + p) / (clusterN + 1)
+                        clusterN   += 1
+                    else
+                        // New cluster
+                        clusterCount += 1
+                        clusterMid   := p
+                        clusterN     := 1
+
+            bestTol   := midTol
+            bestCount := clusterCount
+
+            if clusterCount > targetZones + 1
+                // Too many zones → widen tolerance
+                tolLow := midTol
+            else if clusterCount < targetZones - 1
+                // Too few zones → tighten tolerance
+                tolHigh := midTol
+            else
+                break  // close enough
+
+        finalTolerance := bestTol
+        // In auto mode, lower minTouches to 1 so zones don't get filtered out on
+        // shorter histories, then let the maxZones cap do the trimming
+        effectiveMinTouches := 1
+
+    // ── Step 3: Perform final clustering with chosen tolerance ──────────────
+    // Greedy merge on sorted prices. For each cluster, we track:
+    //   - sum of member prices (to compute midpoint)
+    //   - count of members
+    //   - min and max member price (to compute zone width)
+
+    array<float> cMid      = array.new<float>(0)   // cluster midpoints
+    array<float> cWidth    = array.new<float>(0)   // cluster half-widths
+    array<int>   cMembers  = array.new<int>(0)     // pivot count per cluster
+
+    if pivotCount > 0
+        float runSum  = array.get(sortedPrices, 0)
+        int   runN    = 1
+        float runMin  = array.get(sortedPrices, 0)
+        float runMax  = array.get(sortedPrices, 0)
+
+        if pivotCount > 1
+            for j = 1 to pivotCount - 1
+                float p = array.get(sortedPrices, j)
+                float currentMid = runSum / runN
+                if math.abs(p - currentMid) <= finalTolerance
+                    runSum += p
+                    runN   += 1
+                    runMin := math.min(runMin, p)
+                    runMax := math.max(runMax, p)
+                else
+                    // Finalize previous cluster
+                    float mid = runSum / runN
+                    float halfW = math.max((runMax - runMin) / 2.0, finalTolerance * 0.25)
+                    array.push(cMid, mid)
+                    array.push(cWidth, halfW)
+                    array.push(cMembers, runN)
+                    // Start new cluster
+                    runSum := p
+                    runN   := 1
+                    runMin := p
+                    runMax := p
+
+        // Finalize last cluster
+        float lastMid  = runSum / runN
+        float lastHalfW = math.max((runMax - runMin) / 2.0, finalTolerance * 0.25)
+        array.push(cMid, lastMid)
+        array.push(cWidth, lastHalfW)
+        array.push(cMembers, runN)
+
+    int numClusters = array.size(cMid)
+
+    // ── Step 4: Count touches and bounces for each zone ─────────────────────
+    // Scan the lookback window bar-by-bar. A "touch" is when the bar's range
+    // overlaps the zone. A "bounce" is a touch where the close moves away from
+    // the zone midpoint vs. the prior close (confirming rejection, not breakout).
+
+    array<int> cTouches  = array.new<int>(numClusters, 0)
+    array<int> cBounces  = array.new<int>(numClusters, 0)
+
+    // Determine safe scan depth: can't reference more bars than are available
+    int scanBars = math.min(lookbackInput, bar_index)
+
+    if numClusters > 0 and scanBars > 1
+        for i = 0 to numClusters - 1
+            float mid   = array.get(cMid, i)
+            float halfW = array.get(cWidth, i)
+            float upper = mid + halfW
+            float lower = mid - halfW
+
+            for j = 1 to scanBars - 1
+                float bHigh  = high[j]
+                float bLow   = low[j]
+                float bClose = close[j]
+                float pClose = close[j + 1]  // previous bar's close
+
+                bool touched = bLow <= upper and bHigh >= lower
+                if touched
+                    array.set(cTouches, i, array.get(cTouches, i) + 1)
+
+                    // Bounce: price reversed away from zone
+                    if not na(pClose)
+                        bool supBounce = mid <= bClose and bClose > pClose   // bounced up off support
+                        bool resBounce = mid >  bClose and bClose < pClose   // bounced down off resistance
+                        if supBounce or resBounce
+                            array.set(cBounces, i, array.get(cBounces, i) + 1)
+
+    // ── Step 5: Prune broken zones ──────────────────────────────────────────
+    // Support zones are invalid if price is now FAR BELOW them (broken support).
+    // Resistance zones are invalid if price is now FAR ABOVE them (broken resistance).
+    // This is directional: a support zone well below price is VALID (it's supporting).
+
+    float breakDist = atrVal * breakoutATRMult
+
+    if numClusters > 0
+        for i = numClusters - 1 to 0
+            float mid   = array.get(cMid, i)
+            float halfW = array.get(cWidth, i)
+            float upper = mid + halfW
+            float lower = mid - halfW
+
+            // Zone is below price → it's a support. Broken if price dropped far below it.
+            bool brokenSupport    = close < lower - breakDist
+            // Zone is above price → resistance. Broken if price surged far above it.
+            bool brokenResistance = close > upper + breakDist
+
+            if brokenSupport or brokenResistance
+                array.remove(cMid, i)
+                array.remove(cWidth, i)
+                array.remove(cMembers, i)
+                array.remove(cTouches, i)
+                array.remove(cBounces, i)
+
+    // ── Step 6: Filter by minTouches, sort by distance, cap at maxZones ─────
+
+    // Build display arrays sorted by distance from current price
+    array<float> dispMid      = array.new<float>(0)
+    array<float> dispWidth    = array.new<float>(0)
+    array<int>   dispTouches  = array.new<int>(0)
+    array<int>   dispBounces  = array.new<int>(0)
+    array<float> dispDist     = array.new<float>(0)
+    array<int>   dispMembers  = array.new<int>(0)
+
+    int afterPrune = array.size(cMid)
+    if afterPrune > 0
+        for i = 0 to afterPrune - 1
+            int tch = array.get(cTouches, i)
+            if tch >= effectiveMinTouches
+                float mid  = array.get(cMid, i)
+                float dist = math.abs(close - mid)
+
+                // Sorted insertion (ascending by distance)
+                int insertIdx = array.size(dispDist)
+                if insertIdx > 0
+                    for j = 0 to insertIdx - 1
+                        if dist < array.get(dispDist, j)
+                            insertIdx := j
+                            break
+
+                array.insert(dispMid, insertIdx, mid)
+                array.insert(dispWidth, insertIdx, array.get(cWidth, i))
+                array.insert(dispTouches, insertIdx, tch)
+                array.insert(dispBounces, insertIdx, array.get(cBounces, i))
+                array.insert(dispDist, insertIdx, dist)
+                array.insert(dispMembers, insertIdx, array.get(cMembers, i))
+
+    // Trim to maxZones (in auto mode, trim to targetZones)
+    int displayCap = autoMode ? math.min(targetZones, maxZones) : maxZones
+    while array.size(dispMid) > displayCap
+        array.pop(dispMid)
+        array.pop(dispWidth)
+        array.pop(dispTouches)
+        array.pop(dispBounces)
+        array.pop(dispDist)
+        array.pop(dispMembers)
+
+    int displayCount = array.size(dispMid)
+
+    // ── Step 7: Draw zone boxes on the chart ────────────────────────────────
+
+    if showZoneBoxes and displayCount > 0
+        for i = 0 to displayCount - 1
+            float mid      = array.get(dispMid, i)
+            float halfW    = array.get(dispWidth, i)
+            int   tch      = array.get(dispTouches, i)
+            int   members  = array.get(dispMembers, i)
+            bool  isSupport = mid <= close
+
+            // Strength-based transparency: more touches/members → more opaque
+            int strengthScore = tch + members
+            int transp = math.max(55, 92 - strengthScore * 3)
+
+            color zFill   = isSupport ? color.new(supportColorInput, transp) : color.new(resistanceColorInput, transp)
+            color zBorder = isSupport ? color.new(supportColorInput, transp - 20) : color.new(resistanceColorInput, transp - 20)
+
+            // Box extends from lookback start to 25 bars into the future
+            int leftEdge  = bar_index - lookbackInput
+            int rightEdge = bar_index + 25
+
+            box zBox = box.new(leftEdge, mid + halfW, rightEdge, mid - halfW, border_color = zBorder, border_width = 1, bgcolor = zFill, border_style = line.style_solid)
+            array.push(drawnBoxes, zBox)
+
+            // Zone label
+            if showZoneLabels
+                float bounceRate = tch > 0 ? array.get(dispBounces, i) / tch * 100.0 : 0.0
+                string typeStr = isSupport ? "S" : "R"
+                string lblText = typeStr + "  " + str.tostring(mid, format.mintick) + "  T:" + str.tostring(tch) + "  BR:" + str.tostring(bounceRate, "#.0") + "%"
+
+                color lblBg = isSupport ? color.new(supportColorInput, 15) : color.new(resistanceColorInput, 15)
+                label zLbl = label.new(rightEdge + 2, mid, lblText, style = label.style_label_left, color = lblBg, textcolor = color.white, size = size.small)
+                array.push(drawnLabels, zLbl)
+
+    // ── Step 8: Render the dashboard table ──────────────────────────────────
+
+    if showDashboard
+        string tblPos = switch dashPosition
+            "Top Left"     => position.top_left
+            "Top Right"    => position.top_right
+            "Bottom Left"  => position.bottom_left
+            "Bottom Right" => position.bottom_right
+            => position.top_right
+
+        int totalRows = displayCount + 2   // header + data + info row
+        dashTable := table.new(tblPos, 6, totalRows, bgcolor = dashBgColor, border_color = color.new(color.gray, 60), border_width = 1, frame_color = color.new(#2962ff, 40), frame_width = 2)
+
+        // ── Header row ──
+        color headerBg = color.new(#2962ff, 25)
+        table.cell(dashTable, 0, 0, "  Zone Level  ", text_color = color.white, bgcolor = headerBg, text_size = size.small, text_formatting = text.format_bold)
+        table.cell(dashTable, 1, 0, "  Type  ",       text_color = color.white, bgcolor = headerBg, text_size = size.small, text_formatting = text.format_bold)
+        table.cell(dashTable, 2, 0, "  Pivots  ",     text_color = color.white, bgcolor = headerBg, text_size = size.small, text_formatting = text.format_bold)
+        table.cell(dashTable, 3, 0, "  Strength  ",   text_color = color.white, bgcolor = headerBg, text_size = size.small, text_formatting = text.format_bold)
+        table.cell(dashTable, 4, 0, "  Distance  ",   text_color = color.white, bgcolor = headerBg, text_size = size.small, text_formatting = text.format_bold)
+        table.cell(dashTable, 5, 0, "  Bounce Rate  ", text_color = color.white, bgcolor = headerBg, text_size = size.small, text_formatting = text.format_bold)
+
+        if displayCount > 0
+            for i = 0 to displayCount - 1
+                float mid       = array.get(dispMid, i)
+                int   tch       = array.get(dispTouches, i)
+                int   bnc       = array.get(dispBounces, i)
+                int   members   = array.get(dispMembers, i)
+                float dist      = array.get(dispDist, i)
+                bool  isSupport = mid <= close
+                float pctDist   = close != 0 ? dist / close * 100.0 : 0.0
+                float hitRate   = tch > 0 ? bnc / tch * 100.0 : 0.0
+                int   row       = i + 1
+
+                // Column 0: Zone Level
+                color levelBg = isSupport ? color.new(supportColorInput, 78) : color.new(resistanceColorInput, 78)
+                table.cell(dashTable, 0, row, "  " + str.tostring(mid, format.mintick) + "  ", text_color = dashTextColor, bgcolor = levelBg, text_size = size.small)
+
+                // Column 1: Type
+                string typeStr   = isSupport ? " Support " : " Resistance "
+                color  typeColor = isSupport ? color.new(supportColorInput, 45) : color.new(resistanceColorInput, 45)
+                table.cell(dashTable, 1, row, typeStr, text_color = color.white, bgcolor = typeColor, text_size = size.small, text_formatting = text.format_bold)
+
+                // Column 2: Pivots in cluster
+                table.cell(dashTable, 2, row, "  " + str.tostring(members) + "  ", text_color = dashTextColor, bgcolor = dashBgColor, text_size = size.small)
+
+                // Column 3: Strength (touch count, color-coded)
+                color strengthClr = tch >= 8 ? color.new(#089981, 40) : tch >= 4 ? color.new(#FDD835, 50) : color.new(#FF6D00, 55)
+                string strengthStr = "  " + str.tostring(tch) + " touches  "
+                table.cell(dashTable, 3, row, strengthStr, text_color = color.white, bgcolor = strengthClr, text_size = size.small)
+
+                // Column 4: Distance from price
+                string distStr = "  " + str.tostring(dist, format.mintick) + " (" + str.tostring(pctDist, "#.##") + "%)  "
+                table.cell(dashTable, 4, row, distStr, text_color = dashTextColor, bgcolor = dashBgColor, text_size = size.small)
+
+                // Column 5: Bounce Rate (color-coded by quality)
+                color bounceClr = color.new(color.gray, 60)
+                if hitRate >= 55
+                    bounceClr := isSupport ? color.new(#089981, 35) : color.new(#F23645, 35)
+                else if hitRate >= 25
+                    bounceClr := isSupport ? color.new(#089981, 60) : color.new(#F23645, 60)
+                string bounceStr = "  " + str.tostring(hitRate, "#.0") + "%  "
+                table.cell(dashTable, 5, row, bounceStr, text_color = color.white, bgcolor = bounceClr, text_size = size.small)
+
+            // Info row at the bottom
+            string modeStr = autoMode ? "Auto | Tol: " + str.tostring(finalTolerance, format.mintick) : "Manual"
+            string infoStr = modeStr + " | Pivots: " + str.tostring(pivotCount) + " | Lookback: " + str.tostring(lookbackInput)
+            int infoRow = displayCount + 1
+            color infoBg = color.new(#363a45, 0)
+            table.cell(dashTable, 0, infoRow, infoStr, text_color = color.gray, bgcolor = infoBg, text_size = size.tiny)
+            table.merge_cells(dashTable, 0, infoRow, 5, infoRow)
+
+        else
+            // No zones found — display helpful message
+            string helpMsg = pivotCount < 3 ? "Too few pivots (" + str.tostring(pivotCount) + "). Try increasing lookback." : "No qualifying zones. Try lowering min touches."
+            table.cell(dashTable, 0, 1, helpMsg, text_color = color.orange, bgcolor = dashBgColor, text_size = size.small)
+            table.merge_cells(dashTable, 0, 1, 5, 1)

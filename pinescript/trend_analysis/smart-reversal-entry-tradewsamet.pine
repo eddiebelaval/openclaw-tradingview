@@ -1,0 +1,910 @@
+//@version=6
+// Smart Reversal Entry | tradewsamet
+// Reversal-entry indicator with shared backtest window.
+// Signals are confirmed on bar close.
+// SL has priority if TP and SL are touched on the same bar.
+// Optimizer is embedded and hidden from user settings.
+indicator("Smart Reversal Entry | tradewsamet", shorttitle="SRE | tradewsamet", overlay=true, max_labels_count=500, max_boxes_count=500, max_lines_count=500)
+
+//══════════════════════════════════════════════════════════════════════════════
+// VISIBLE INPUTS
+//══════════════════════════════════════════════════════════════════════════════
+groupSignal = "Signal Settings"
+emaLength       = input.int(100, "EMA Length", minval=1, group=groupSignal)
+minimumMovePips = input.int(400, "Minimum 3-Candle Move (Pips)", minval=1, group=groupSignal)
+
+groupPip = "Pip Settings"
+pipPreset = input.string(
+     "XAUUSD / Gold",
+     "Pip Preset",
+     options=["XAUUSD / Gold", "FX 5-Digit", "FX JPY", "Indices / CFD", "Auto Detect", "Manual"],
+     group=groupPip
+)
+manualPipSize = input.float(0.01, "Manual Pip Size", step=0.000001, group=groupPip, tooltip="Used only when Pip Preset = Manual.")
+
+groupRisk = "Risk Management"
+stopLossPips = input.int(500, "Stop Loss (Pips)", minval=1, group=groupRisk)
+rrMode       = input.string("1:1", "Take Profit RR", options=["1:1", "1:1.5", "1:2", "1:3"], group=groupRisk)
+
+groupVisual = "Visual Settings"
+showSignalLabels = input.bool(true, "Show Buy/Sell Labels", group=groupVisual)
+showSignalBg     = input.bool(false, "Highlight Signal Bars", group=groupVisual)
+showEntryLine    = input.bool(true, "Show Entry Line", group=groupVisual)
+showHitLabels    = input.bool(true, "Show TP/SL Hit Labels", group=groupVisual)
+showTpLabels     = input.bool(true, "Show TP Hit Labels", group=groupVisual)
+showSlLabels     = input.bool(true, "Show SL Hit Labels", group=groupVisual)
+
+groupSummary = "Summary Table"
+showSummaryTable = input.bool(true, "Show Summary Table", group=groupSummary)
+summaryPosition  = input.string("Top Right", "Table Position", options=["Top Right", "Top Left", "Bottom Right", "Bottom Left"], group=groupSummary)
+summaryTextSize  = input.string("Small", "Table Text Size", options=["Tiny", "Small", "Normal"], group=groupSummary)
+
+groupDaily = "Daily PnL Table"
+showDailyTable = input.bool(true, "Show Daily PnL Table", group=groupDaily)
+dailyPosition  = input.string("Top Left", "Daily Table Position", options=["Top Right", "Top Left", "Bottom Right", "Bottom Left"], group=groupDaily)
+dailyTextSize  = input.string("Small", "Daily Table Text Size", options=["Tiny", "Small", "Normal"], group=groupDaily)
+
+//══════════════════════════════════════════════════════════════════════════════
+// HIDDEN ENGINE SETTINGS
+//══════════════════════════════════════════════════════════════════════════════
+int   cooldownBars          = 10
+float dollarPerPip          = 1.0
+int   sharedBacktestBars    = 5000
+int   maxStoredClosedTrades = 40
+bool  enableOptimizer       = true
+
+//══════════════════════════════════════════════════════════════════════════════
+// EMBEDDED OPTIMIZER COMBINATIONS (NOT SHOWN IN SETTINGS)
+// 10 EMA values × 10 move values = 100 total combinations
+//══════════════════════════════════════════════════════════════════════════════
+getOptEmaValue(_idx) =>
+    int val =
+         _idx == 0 ? 25  :
+         _idx == 1 ? 50  :
+         _idx == 2 ? 75  :
+         _idx == 3 ? 100 :
+         _idx == 4 ? 125 :
+         _idx == 5 ? 150 :
+         _idx == 6 ? 175 :
+         _idx == 7 ? 200 :
+         _idx == 8 ? 225 : 250
+    val
+
+getOptMoveValue(_idx) =>
+    int val =
+         _idx == 0 ? 100  :
+         _idx == 1 ? 200  :
+         _idx == 2 ? 300  :
+         _idx == 3 ? 400  :
+         _idx == 4 ? 500  :
+         _idx == 5 ? 600  :
+         _idx == 6 ? 700  :
+         _idx == 7 ? 800  :
+         _idx == 8 ? 900  : 1000
+    val
+
+//══════════════════════════════════════════════════════════════════════════════
+// STYLE HELPERS
+//══════════════════════════════════════════════════════════════════════════════
+clrPanel      = color.rgb(13, 17, 23)
+clrCardA      = color.rgb(22, 27, 34)
+clrCardB      = color.rgb(18, 22, 28)
+clrBestA      = color.rgb(28, 24, 40)
+clrBestB      = color.rgb(23, 20, 34)
+clrHeader     = color.rgb(31, 41, 55)
+clrBorder     = color.rgb(48, 54, 61)
+clrText       = color.rgb(230, 237, 243)
+clrMuted      = color.rgb(139, 148, 158)
+clrBlue       = color.rgb(88, 166, 255)
+clrGreenSoft  = color.rgb(34, 197, 94)
+clrRedSoft    = color.rgb(239, 68, 68)
+clrOrange     = color.rgb(210, 153, 34)
+clrPurple     = color.rgb(168, 85, 247)
+
+getTablePosition(_pos) =>
+    switch _pos
+        "Top Left"     => position.top_left
+        "Bottom Right" => position.bottom_right
+        "Bottom Left"  => position.bottom_left
+        => position.top_right
+
+getTableTextSize(_size) =>
+    switch _size
+        "Tiny"   => size.tiny
+        "Normal" => size.normal
+        => size.small
+
+formatDate(_y, _m, _d) =>
+    str.tostring(_y) + "-" + (_m < 10 ? "0" : "") + str.tostring(_m) + "-" + (_d < 10 ? "0" : "") + str.tostring(_d)
+
+formatRR(_rr) =>
+    "1:" + str.tostring(_rr, "#.##")
+
+formatPipsAndUsd(_pips, _usd) =>
+    str.tostring(_pips, "#.##") + " pips | $" + str.tostring(_usd, "#.##")
+
+//══════════════════════════════════════════════════════════════════════════════
+// PIP SIZE HELPERS
+//══════════════════════════════════════════════════════════════════════════════
+getAutoPipSize() =>
+    float mt = syminfo.mintick
+    string tickerUp   = str.upper(syminfo.ticker)
+    string tickerIdUp = str.upper(syminfo.tickerid)
+
+    bool isGold =
+         str.contains(tickerUp, "XAU") or
+         str.contains(tickerIdUp, "XAU") or
+         str.contains(tickerUp, "GOLD") or
+         str.contains(tickerIdUp, "GOLD")
+
+    float result = mt
+
+    if syminfo.type == "forex"
+        result := (mt == 0.00001 or mt == 0.001) ? mt * 10.0 : mt
+    else if isGold
+        result := 0.01
+    else
+        result := mt
+
+    result
+
+getPresetPipSize(_preset, _manual) =>
+    float detected = getAutoPipSize()
+    float result =
+         _preset == "XAUUSD / Gold" ? 0.01 :
+         _preset == "FX 5-Digit"    ? 0.000001 :
+         _preset == "FX JPY"        ? 0.01 :
+         _preset == "Indices / CFD" ? syminfo.mintick :
+         _preset == "Manual"        ? _manual :
+         detected
+    result
+
+//══════════════════════════════════════════════════════════════════════════════
+// PIP SIZE + RR
+//══════════════════════════════════════════════════════════════════════════════
+pipSize = getPresetPipSize(pipPreset, manualPipSize)
+
+rrMultiplier =
+     rrMode == "1:1"   ? 1.0 :
+     rrMode == "1:1.5" ? 1.5 :
+     rrMode == "1:2"   ? 2.0 : 3.0
+
+//══════════════════════════════════════════════════════════════════════════════
+// SHARED ANALYSIS WINDOW
+//══════════════════════════════════════════════════════════════════════════════
+analysisStartBar = math.max(0, last_bar_index - sharedBacktestBars + 1)
+inAnalysisWindow = bar_index >= analysisStartBar
+
+//══════════════════════════════════════════════════════════════════════════════
+// EMA SERIES
+//══════════════════════════════════════════════════════════════════════════════
+emaMain = ta.ema(close, emaLength)
+plot(emaMain, "EMA Filter", color=color.new(clrOrange, 0), linewidth=2)
+
+optEmaSeries1  = ta.ema(close, 25)
+optEmaSeries2  = ta.ema(close, 50)
+optEmaSeries3  = ta.ema(close, 75)
+optEmaSeries4  = ta.ema(close, 100)
+optEmaSeries5  = ta.ema(close, 125)
+optEmaSeries6  = ta.ema(close, 150)
+optEmaSeries7  = ta.ema(close, 175)
+optEmaSeries8  = ta.ema(close, 200)
+optEmaSeries9  = ta.ema(close, 225)
+optEmaSeries10 = ta.ema(close, 250)
+
+//══════════════════════════════════════════════════════════════════════════════
+// SIGNAL LOGIC
+//══════════════════════════════════════════════════════════════════════════════
+red1 = close[3] < open[3]
+red2 = close[2] < open[2]
+red3 = close[1] < open[1]
+
+green1 = close[3] > open[3]
+green2 = close[2] > open[2]
+green3 = close[1] > open[1]
+
+currentGreen = close > open
+currentRed   = close < open
+
+threeRedSequence   = red1 and red2 and red3
+threeGreenSequence = green1 and green2 and green3
+
+downMovePips = (open[3] - close[1]) / pipSize
+upMovePips   = (close[1] - open[3]) / pipSize
+
+enoughDownMove = downMovePips >= minimumMovePips
+enoughUpMove   = upMovePips >= minimumMovePips
+
+rawLongSignal  = close > emaMain and threeRedSequence and enoughDownMove and currentGreen
+rawShortSignal = close < emaMain and threeGreenSequence and enoughUpMove and currentRed
+
+//══════════════════════════════════════════════════════════════════════════════
+// COOLDOWN FILTER
+//══════════════════════════════════════════════════════════════════════════════
+var int lastSignalBar = na
+cooldownPassed = na(lastSignalBar) or (bar_index - lastSignalBar > cooldownBars)
+
+longSignal  = rawLongSignal and cooldownPassed and inAnalysisWindow
+shortSignal = rawShortSignal and cooldownPassed and inAnalysisWindow
+
+if longSignal or shortSignal
+    lastSignalBar := bar_index
+
+//══════════════════════════════════════════════════════════════════════════════
+// MODERN SIGNAL VISUALS
+//══════════════════════════════════════════════════════════════════════════════
+if showSignalLabels and longSignal
+    label.new(
+         x=bar_index,
+         y=low,
+         text="🟢 BUY",
+         xloc=xloc.bar_index,
+         style=label.style_label_up,
+         color=color.new(clrGreenSoft, 0),
+         textcolor=color.black,
+         size=size.small
+     )
+
+if showSignalLabels and shortSignal
+    label.new(
+         x=bar_index,
+         y=high,
+         text="🔴 SELL",
+         xloc=xloc.bar_index,
+         style=label.style_label_down,
+         color=color.new(clrRedSoft, 0),
+         textcolor=color.white,
+         size=size.small
+     )
+
+bgcolor(showSignalBg and longSignal ? color.new(clrGreenSoft, 88) : na)
+bgcolor(showSignalBg and shortSignal ? color.new(clrRedSoft, 88) : na)
+
+//══════════════════════════════════════════════════════════════════════════════
+// MAIN TRADE STORAGE
+//══════════════════════════════════════════════════════════════════════════════
+var directionArray = array.new_int()
+var entryArray     = array.new_float()
+var tpArray        = array.new_float()
+var slArray        = array.new_float()
+var activeArray    = array.new_bool()
+var signalBarArray = array.new_int()
+
+var tpBoxArray     = array.new_box()
+var slBoxArray     = array.new_box()
+var entryLineArray = array.new_line()
+
+//══════════════════════════════════════════════════════════════════════════════
+// MAIN STATISTICS STORAGE
+//══════════════════════════════════════════════════════════════════════════════
+var int totalEntries      = 0
+var int winningTrades     = 0
+var int losingTrades      = 0
+var float grossProfitR    = 0.0
+var float grossLossR      = 0.0
+var float grossProfitPips = 0.0
+var float grossLossPips   = 0.0
+var float equityR         = 0.0
+var float peakEquityR     = 0.0
+var float maxDrawdownR    = 0.0
+var int currentWinStreak  = 0
+var int currentLossStreak = 0
+var int bestWinStreak     = 0
+var int bestLossStreak    = 0
+
+var dailyDateArray   = array.new_string()
+var dailyPnlArray    = array.new_float()
+var dailyWinsArray   = array.new_int()
+var dailyLossesArray = array.new_int()
+var dailyClosedArray = array.new_int()
+
+//══════════════════════════════════════════════════════════════════════════════
+// OPTIMIZER STORAGE
+//══════════════════════════════════════════════════════════════════════════════
+var optEmaIdxArray        = array.new_int()
+var optMoveValueArray     = array.new_int()
+var optActiveArray        = array.new_bool()
+var optDirectionArray     = array.new_int()
+var optTpArray            = array.new_float()
+var optSlArray            = array.new_float()
+var optSignalBarArray     = array.new_int()
+var optLastSignalBarArray = array.new_int()
+
+var optWinsArray          = array.new_int()
+var optLossesArray        = array.new_int()
+var optNetRArray          = array.new_float()
+var optGrossProfitRArray  = array.new_float()
+var optGrossLossRArray    = array.new_float()
+
+if barstate.isfirst and enableOptimizer
+    for e = 0 to 9
+        for m = 0 to 9
+            array.push(optEmaIdxArray, e)
+            array.push(optMoveValueArray, getOptMoveValue(m))
+            array.push(optActiveArray, false)
+            array.push(optDirectionArray, 0)
+            array.push(optTpArray, float(na))
+            array.push(optSlArray, float(na))
+            array.push(optSignalBarArray, int(na))
+            array.push(optLastSignalBarArray, int(na))
+
+            array.push(optWinsArray, 0)
+            array.push(optLossesArray, 0)
+            array.push(optNetRArray, 0.0)
+            array.push(optGrossProfitRArray, 0.0)
+            array.push(optGrossLossRArray, 0.0)
+
+//══════════════════════════════════════════════════════════════════════════════
+// CREATE NEW MAIN TRADE
+//══════════════════════════════════════════════════════════════════════════════
+if longSignal
+    float longEntry = close
+    float longSl    = longEntry - stopLossPips * pipSize
+    float longTp    = longEntry + stopLossPips * rrMultiplier * pipSize
+
+    box tpBox = box.new(
+         left=bar_index,
+         top=math.max(longEntry, longTp),
+         right=bar_index,
+         bottom=math.min(longEntry, longTp),
+         xloc=xloc.bar_index,
+         border_color=color.new(clrGreenSoft, 0),
+         border_width=2,
+         bgcolor=color.new(clrGreenSoft, 60)
+     )
+
+    box slBox = box.new(
+         left=bar_index,
+         top=math.max(longEntry, longSl),
+         right=bar_index,
+         bottom=math.min(longEntry, longSl),
+         xloc=xloc.bar_index,
+         border_color=color.new(clrRedSoft, 0),
+         border_width=2,
+         bgcolor=color.new(clrRedSoft, 60)
+     )
+
+    line entryLine = na
+    if showEntryLine
+        entryLine := line.new(
+             x1=bar_index,
+             y1=longEntry,
+             x2=bar_index,
+             y2=longEntry,
+             xloc=xloc.bar_index,
+             extend=extend.none,
+             color=color.new(clrBlue, 0),
+             width=2,
+             style=line.style_dashed
+         )
+
+    array.push(directionArray, 1)
+    array.push(entryArray, longEntry)
+    array.push(tpArray, longTp)
+    array.push(slArray, longSl)
+    array.push(activeArray, true)
+    array.push(signalBarArray, bar_index)
+    array.push(tpBoxArray, tpBox)
+    array.push(slBoxArray, slBox)
+    array.push(entryLineArray, entryLine)
+
+    totalEntries += 1
+
+if shortSignal
+    float shortEntry = close
+    float shortSl    = shortEntry + stopLossPips * pipSize
+    float shortTp    = shortEntry - stopLossPips * rrMultiplier * pipSize
+
+    box tpBox = box.new(
+         left=bar_index,
+         top=math.max(shortEntry, shortTp),
+         right=bar_index,
+         bottom=math.min(shortEntry, shortTp),
+         xloc=xloc.bar_index,
+         border_color=color.new(clrGreenSoft, 0),
+         border_width=2,
+         bgcolor=color.new(clrGreenSoft, 60)
+     )
+
+    box slBox = box.new(
+         left=bar_index,
+         top=math.max(shortEntry, shortSl),
+         right=bar_index,
+         bottom=math.min(shortEntry, shortSl),
+         xloc=xloc.bar_index,
+         border_color=color.new(clrRedSoft, 0),
+         border_width=2,
+         bgcolor=color.new(clrRedSoft, 60)
+     )
+
+    line entryLine = na
+    if showEntryLine
+        entryLine := line.new(
+             x1=bar_index,
+             y1=shortEntry,
+             x2=bar_index,
+             y2=shortEntry,
+             xloc=xloc.bar_index,
+             extend=extend.none,
+             color=color.new(clrBlue, 0),
+             width=2,
+             style=line.style_dashed
+         )
+
+    array.push(directionArray, -1)
+    array.push(entryArray, shortEntry)
+    array.push(tpArray, shortTp)
+    array.push(slArray, shortSl)
+    array.push(activeArray, true)
+    array.push(signalBarArray, bar_index)
+    array.push(tpBoxArray, tpBox)
+    array.push(slBoxArray, slBox)
+    array.push(entryLineArray, entryLine)
+
+    totalEntries += 1
+
+//══════════════════════════════════════════════════════════════════════════════
+// MAIN TP / SL HIT TRACKING
+//══════════════════════════════════════════════════════════════════════════════
+tradeCount = array.size(directionArray)
+
+bool longTpAlertBar  = false
+bool longSlAlertBar  = false
+bool shortTpAlertBar = false
+bool shortSlAlertBar = false
+
+if tradeCount > 0
+    for i = 0 to tradeCount - 1
+        bool isActiveTrade = array.get(activeArray, i)
+
+        if isActiveTrade
+            int direction    = array.get(directionArray, i)
+            float tpPrice    = array.get(tpArray, i)
+            float slPrice    = array.get(slArray, i)
+            int sigBar       = array.get(signalBarArray, i)
+            box tpBoxId      = array.get(tpBoxArray, i)
+            box slBoxId      = array.get(slBoxArray, i)
+            line entryLineId = array.get(entryLineArray, i)
+
+            box.set_right(tpBoxId, bar_index)
+            box.set_right(slBoxId, bar_index)
+            if not na(entryLineId)
+                line.set_x2(entryLineId, bar_index)
+
+            bool canCheckHit = bar_index > sigBar
+
+            if canCheckHit
+                bool tpHit = false
+                bool slHit = false
+
+                if direction == 1
+                    tpHit := high >= tpPrice
+                    slHit := low <= slPrice
+                else
+                    tpHit := low <= tpPrice
+                    slHit := high >= slPrice
+
+                if slHit
+                    array.set(activeArray, i, false)
+                    losingTrades += 1
+                    grossLossR += 1.0
+                    grossLossPips += stopLossPips
+
+                    if direction == 1
+                        longSlAlertBar := true
+                    else
+                        shortSlAlertBar := true
+
+                    equityR -= 1.0
+                    currentLossStreak += 1
+                    currentWinStreak := 0
+                    bestLossStreak := math.max(bestLossStreak, currentLossStreak)
+
+                    peakEquityR := math.max(peakEquityR, equityR)
+                    float currentDrawdownR = peakEquityR - equityR
+                    maxDrawdownR := math.max(maxDrawdownR, currentDrawdownR)
+
+                    string todayLabel = formatDate(year(time), month(time), dayofmonth(time))
+                    int dailyCount = array.size(dailyDateArray)
+
+                    if dailyCount > 0 and array.get(dailyDateArray, dailyCount - 1) == todayLabel
+                        array.set(dailyPnlArray, dailyCount - 1, array.get(dailyPnlArray, dailyCount - 1) - 1.0)
+                        array.set(dailyLossesArray, dailyCount - 1, array.get(dailyLossesArray, dailyCount - 1) + 1)
+                        array.set(dailyClosedArray, dailyCount - 1, array.get(dailyClosedArray, dailyCount - 1) + 1)
+                    else
+                        array.push(dailyDateArray, todayLabel)
+                        array.push(dailyPnlArray, -1.0)
+                        array.push(dailyWinsArray, 0)
+                        array.push(dailyLossesArray, 1)
+                        array.push(dailyClosedArray, 1)
+
+                    if showHitLabels and showSlLabels
+                        label.new(
+                             x=bar_index,
+                             y=slPrice,
+                             text="🛑 SL HIT",
+                             xloc=xloc.bar_index,
+                             style=direction == 1 ? label.style_label_down : label.style_label_up,
+                             color=color.new(clrRedSoft, 0),
+                             textcolor=color.white,
+                             size=size.small
+                         )
+
+                else if tpHit
+                    array.set(activeArray, i, false)
+                    winningTrades += 1
+                    grossProfitR += rrMultiplier
+                    grossProfitPips += stopLossPips * rrMultiplier
+
+                    if direction == 1
+                        longTpAlertBar := true
+                    else
+                        shortTpAlertBar := true
+
+                    equityR += rrMultiplier
+                    currentWinStreak += 1
+                    currentLossStreak := 0
+                    bestWinStreak := math.max(bestWinStreak, currentWinStreak)
+
+                    peakEquityR := math.max(peakEquityR, equityR)
+                    float currentDrawdownR = peakEquityR - equityR
+                    maxDrawdownR := math.max(maxDrawdownR, currentDrawdownR)
+
+                    string todayLabel = formatDate(year(time), month(time), dayofmonth(time))
+                    int dailyCount = array.size(dailyDateArray)
+
+                    if dailyCount > 0 and array.get(dailyDateArray, dailyCount - 1) == todayLabel
+                        array.set(dailyPnlArray, dailyCount - 1, array.get(dailyPnlArray, dailyCount - 1) + rrMultiplier)
+                        array.set(dailyWinsArray, dailyCount - 1, array.get(dailyWinsArray, dailyCount - 1) + 1)
+                        array.set(dailyClosedArray, dailyCount - 1, array.get(dailyClosedArray, dailyCount - 1) + 1)
+                    else
+                        array.push(dailyDateArray, todayLabel)
+                        array.push(dailyPnlArray, rrMultiplier)
+                        array.push(dailyWinsArray, 1)
+                        array.push(dailyLossesArray, 0)
+                        array.push(dailyClosedArray, 1)
+
+                    if showHitLabels and showTpLabels
+                        label.new(
+                             x=bar_index,
+                             y=tpPrice,
+                             text="✅ TP HIT",
+                             xloc=xloc.bar_index,
+                             style=direction == 1 ? label.style_label_up : label.style_label_down,
+                             color=color.new(clrGreenSoft, 0),
+                             textcolor=color.black,
+                             size=size.small
+                         )
+
+//══════════════════════════════════════════════════════════════════════════════
+// SHADOW OPTIMIZER
+//══════════════════════════════════════════════════════════════════════════════
+if enableOptimizer
+    int optCount = array.size(optEmaIdxArray)
+
+    if optCount > 0
+        for i = 0 to optCount - 1
+            bool optActive = array.get(optActiveArray, i)
+
+            if optActive
+                int optDir    = array.get(optDirectionArray, i)
+                float optTp   = array.get(optTpArray, i)
+                float optSl   = array.get(optSlArray, i)
+                int optSigBar = array.get(optSignalBarArray, i)
+
+                bool optCanCheck = bar_index > optSigBar
+
+                if optCanCheck
+                    bool optTpHit = false
+                    bool optSlHit = false
+
+                    if optDir == 1
+                        optTpHit := high >= optTp
+                        optSlHit := low <= optSl
+                    else
+                        optTpHit := low <= optTp
+                        optSlHit := high >= optSl
+
+                    if optSlHit
+                        array.set(optActiveArray, i, false)
+                        array.set(optLossesArray, i, array.get(optLossesArray, i) + 1)
+                        array.set(optGrossLossRArray, i, array.get(optGrossLossRArray, i) + 1.0)
+                        array.set(optNetRArray, i, array.get(optNetRArray, i) - 1.0)
+
+                    else if optTpHit
+                        array.set(optActiveArray, i, false)
+                        array.set(optWinsArray, i, array.get(optWinsArray, i) + 1)
+                        array.set(optGrossProfitRArray, i, array.get(optGrossProfitRArray, i) + rrMultiplier)
+                        array.set(optNetRArray, i, array.get(optNetRArray, i) + rrMultiplier)
+
+            else
+                int optEmaIdx    = array.get(optEmaIdxArray, i)
+                int optMoveValue = array.get(optMoveValueArray, i)
+                int optLastSig   = array.get(optLastSignalBarArray, i)
+
+                float optEmaSeries =
+                     optEmaIdx == 0 ? optEmaSeries1  :
+                     optEmaIdx == 1 ? optEmaSeries2  :
+                     optEmaIdx == 2 ? optEmaSeries3  :
+                     optEmaIdx == 3 ? optEmaSeries4  :
+                     optEmaIdx == 4 ? optEmaSeries5  :
+                     optEmaIdx == 5 ? optEmaSeries6  :
+                     optEmaIdx == 6 ? optEmaSeries7  :
+                     optEmaIdx == 7 ? optEmaSeries8  :
+                     optEmaIdx == 8 ? optEmaSeries9  : optEmaSeries10
+
+                bool optEnoughDown     = downMovePips >= optMoveValue
+                bool optEnoughUp       = upMovePips >= optMoveValue
+                bool optCooldownPassed = na(optLastSig) or (bar_index - optLastSig > cooldownBars)
+
+                bool optRawLong  = close > optEmaSeries and threeRedSequence and optEnoughDown and currentGreen
+                bool optRawShort = close < optEmaSeries and threeGreenSequence and optEnoughUp and currentRed
+
+                if optCooldownPassed and inAnalysisWindow
+                    if optRawLong
+                        float optEntry = close
+                        float optSl = optEntry - stopLossPips * pipSize
+                        float optTp = optEntry + stopLossPips * rrMultiplier * pipSize
+
+                        array.set(optActiveArray, i, true)
+                        array.set(optDirectionArray, i, 1)
+                        array.set(optTpArray, i, optTp)
+                        array.set(optSlArray, i, optSl)
+                        array.set(optSignalBarArray, i, bar_index)
+                        array.set(optLastSignalBarArray, i, bar_index)
+
+                    else if optRawShort
+                        float optEntry = close
+                        float optSl = optEntry + stopLossPips * pipSize
+                        float optTp = optEntry - stopLossPips * rrMultiplier * pipSize
+
+                        array.set(optActiveArray, i, true)
+                        array.set(optDirectionArray, i, -1)
+                        array.set(optTpArray, i, optTp)
+                        array.set(optSlArray, i, optSl)
+                        array.set(optSignalBarArray, i, bar_index)
+                        array.set(optLastSignalBarArray, i, bar_index)
+
+//══════════════════════════════════════════════════════════════════════════════
+// CLEAN UP OLD CLOSED MAIN VISUALS
+//══════════════════════════════════════════════════════════════════════════════
+closedStoredCount = 0
+storedCount = array.size(activeArray)
+
+if storedCount > 0
+    for i = 0 to storedCount - 1
+        if not array.get(activeArray, i)
+            closedStoredCount += 1
+
+while closedStoredCount > maxStoredClosedTrades
+    bool removedOne = false
+    int loopSize = array.size(activeArray)
+
+    if loopSize > 0
+        for i = 0 to loopSize - 1
+            if not array.get(activeArray, i)
+                box tpBoxId = array.get(tpBoxArray, i)
+                box slBoxId = array.get(slBoxArray, i)
+                line entryLn = array.get(entryLineArray, i)
+
+                if not na(tpBoxId)
+                    box.delete(tpBoxId)
+                if not na(slBoxId)
+                    box.delete(slBoxId)
+                if not na(entryLn)
+                    line.delete(entryLn)
+
+                array.remove(directionArray, i)
+                array.remove(entryArray, i)
+                array.remove(tpArray, i)
+                array.remove(slArray, i)
+                array.remove(activeArray, i)
+                array.remove(signalBarArray, i)
+                array.remove(tpBoxArray, i)
+                array.remove(slBoxArray, i)
+                array.remove(entryLineArray, i)
+
+                closedStoredCount -= 1
+                removedOne := true
+                break
+
+    if not removedOne
+        break
+
+//══════════════════════════════════════════════════════════════════════════════
+// MAIN STATISTICS
+//══════════════════════════════════════════════════════════════════════════════
+closedTrades = winningTrades + losingTrades
+
+activeTrades = 0
+activeCountSize = array.size(activeArray)
+if activeCountSize > 0
+    for i = 0 to activeCountSize - 1
+        if array.get(activeArray, i)
+            activeTrades += 1
+
+winRate      = closedTrades > 0 ? (winningTrades * 100.0) / closedTrades : 0.0
+netR         = equityR
+netPips      = grossProfitPips - grossLossPips
+netUsd       = netPips * dollarPerPip
+profitFactor = grossLossR > 0 ? grossProfitR / grossLossR : na
+
+//══════════════════════════════════════════════════════════════════════════════
+// OPTIMIZER BEST COMBO SELECTION
+//══════════════════════════════════════════════════════════════════════════════
+bool  bestOptFound          = false
+int   bestOptIndex          = na
+float bestOptWinRate        = na
+float bestOptNetR           = na
+int   bestOptClosed         = na
+float bestOptPf             = na
+
+if enableOptimizer
+    int optCount = array.size(optEmaIdxArray)
+
+    if optCount > 0
+        for i = 0 to optCount - 1
+            int ow    = array.get(optWinsArray, i)
+            int ol    = array.get(optLossesArray, i)
+            int oc    = ow + ol
+            float onr = array.get(optNetRArray, i)
+            float ogp = array.get(optGrossProfitRArray, i)
+            float ogl = array.get(optGrossLossRArray, i)
+            float owr = oc > 0 ? (ow * 100.0) / oc : na
+            float opf = ogl > 0 ? ogp / ogl : na
+
+            if oc > 0
+                if not bestOptFound
+                    bestOptFound   := true
+                    bestOptIndex   := i
+                    bestOptWinRate := owr
+                    bestOptNetR    := onr
+                    bestOptClosed  := oc
+                    bestOptPf      := opf
+                else
+                    bool better =
+                         owr > bestOptWinRate or
+                         (owr == bestOptWinRate and onr > bestOptNetR) or
+                         (owr == bestOptWinRate and onr == bestOptNetR and oc > bestOptClosed)
+
+                    if better
+                        bestOptIndex   := i
+                        bestOptWinRate := owr
+                        bestOptNetR    := onr
+                        bestOptClosed  := oc
+                        bestOptPf      := opf
+
+int   bestOptEma            = na
+int   bestOptMove           = na
+float bestOptDisplayWinRate = na
+float bestOptDisplayNetR    = na
+float bestOptDisplayPf      = na
+float bestOptDisplayNetPips = na
+float bestOptDisplayNetUsd  = na
+
+if not na(bestOptIndex)
+    int bestOptEmaIdx = array.get(optEmaIdxArray, bestOptIndex)
+
+    bestOptMove            := array.get(optMoveValueArray, bestOptIndex)
+    bestOptEma             := getOptEmaValue(bestOptEmaIdx)
+    bestOptDisplayWinRate  := bestOptWinRate
+    bestOptDisplayNetR     := array.get(optNetRArray, bestOptIndex)
+
+    float optGp = array.get(optGrossProfitRArray, bestOptIndex)
+    float optGl = array.get(optGrossLossRArray, bestOptIndex)
+
+    bestOptDisplayPf       := optGl > 0 ? optGp / optGl : na
+    bestOptDisplayNetPips  := bestOptDisplayNetR * stopLossPips
+    bestOptDisplayNetUsd   := bestOptDisplayNetPips * dollarPerPip
+
+//══════════════════════════════════════════════════════════════════════════════
+// TABLES
+//══════════════════════════════════════════════════════════════════════════════
+summaryTablePosition = getTablePosition(summaryPosition)
+summaryTableTextSize = getTableTextSize(summaryTextSize)
+
+dailyTablePosition = getTablePosition(dailyPosition)
+dailyTableTextSize = getTableTextSize(dailyTextSize)
+
+var table summaryTable = table.new(summaryTablePosition, 2, 16, border_width=1, frame_color=clrBorder, border_color=clrBorder)
+var table dailyTable   = table.new(dailyTablePosition, 5, 8, border_width=1, frame_color=clrBorder, border_color=clrBorder)
+
+if barstate.islast
+    if showSummaryTable
+        table.cell(summaryTable, 0, 0, "SUMMARY", text_color=clrText, text_size=summaryTableTextSize, bgcolor=clrHeader)
+        table.cell(summaryTable, 1, 0, "VALUE",   text_color=clrText, text_size=summaryTableTextSize, bgcolor=clrHeader)
+
+        table.cell(summaryTable, 0, 1, "Total Entries", text_color=clrMuted, text_size=summaryTableTextSize, bgcolor=clrCardA)
+        table.cell(summaryTable, 1, 1, str.tostring(totalEntries), text_color=clrText, text_size=summaryTableTextSize, bgcolor=clrCardA)
+
+        table.cell(summaryTable, 0, 2, "Win", text_color=clrMuted, text_size=summaryTableTextSize, bgcolor=clrCardB)
+        table.cell(summaryTable, 1, 2, str.tostring(winningTrades), text_color=clrGreenSoft, text_size=summaryTableTextSize, bgcolor=clrCardB)
+
+        table.cell(summaryTable, 0, 3, "Loss", text_color=clrMuted, text_size=summaryTableTextSize, bgcolor=clrCardA)
+        table.cell(summaryTable, 1, 3, str.tostring(losingTrades), text_color=clrRedSoft, text_size=summaryTableTextSize, bgcolor=clrCardA)
+
+        table.cell(summaryTable, 0, 4, "Win Rate", text_color=clrMuted, text_size=summaryTableTextSize, bgcolor=clrCardB)
+        table.cell(summaryTable, 1, 4, str.tostring(winRate, "#.##") + "%", text_color=clrText, text_size=summaryTableTextSize, bgcolor=clrCardB)
+
+        table.cell(summaryTable, 0, 5, "Net R", text_color=clrMuted, text_size=summaryTableTextSize, bgcolor=clrCardA)
+        table.cell(summaryTable, 1, 5, str.tostring(netR, "#.##"), text_color=netR >= 0 ? clrGreenSoft : clrRedSoft, text_size=summaryTableTextSize, bgcolor=clrCardA)
+
+        table.cell(summaryTable, 0, 6, "Net Pips / Est. $", text_color=clrMuted, text_size=summaryTableTextSize, bgcolor=clrCardB)
+        table.cell(summaryTable, 1, 6, formatPipsAndUsd(netPips, netUsd), text_color=netPips >= 0 ? clrGreenSoft : clrRedSoft, text_size=summaryTableTextSize, bgcolor=clrCardB)
+
+        table.cell(summaryTable, 0, 7, "Max Drawdown (R)", text_color=clrMuted, text_size=summaryTableTextSize, bgcolor=clrCardA)
+        table.cell(summaryTable, 1, 7, str.tostring(maxDrawdownR, "#.##"), text_color=clrRedSoft, text_size=summaryTableTextSize, bgcolor=clrCardA)
+
+        table.cell(summaryTable, 0, 8, "Risk/Reward", text_color=clrMuted, text_size=summaryTableTextSize, bgcolor=clrCardB)
+        table.cell(summaryTable, 1, 8, formatRR(rrMultiplier), text_color=clrOrange, text_size=summaryTableTextSize, bgcolor=clrCardB)
+
+        table.cell(summaryTable, 0, 9, "Profit Factor", text_color=clrMuted, text_size=summaryTableTextSize, bgcolor=clrCardA)
+        table.cell(summaryTable, 1, 9, na(profitFactor) ? "-" : str.tostring(profitFactor, "#.##"), text_color=clrText, text_size=summaryTableTextSize, bgcolor=clrCardA)
+
+        table.cell(summaryTable, 0, 10, "Best EMA Length", text_color=clrMuted, text_size=summaryTableTextSize, bgcolor=clrBestA)
+        table.cell(summaryTable, 1, 10, na(bestOptEma) ? "-" : str.tostring(bestOptEma), text_color=clrPurple, text_size=summaryTableTextSize, bgcolor=clrBestA)
+
+        table.cell(summaryTable, 0, 11, "Best Min Move (Pips)", text_color=clrMuted, text_size=summaryTableTextSize, bgcolor=clrBestB)
+        table.cell(summaryTable, 1, 11, na(bestOptMove) ? "-" : str.tostring(bestOptMove), text_color=clrPurple, text_size=summaryTableTextSize, bgcolor=clrBestB)
+
+        table.cell(summaryTable, 0, 12, "Best Win Rate", text_color=clrMuted, text_size=summaryTableTextSize, bgcolor=clrBestA)
+        table.cell(summaryTable, 1, 12, na(bestOptDisplayWinRate) ? "-" : str.tostring(bestOptDisplayWinRate, "#.##") + "%", text_color=clrPurple, text_size=summaryTableTextSize, bgcolor=clrBestA)
+
+        table.cell(summaryTable, 0, 13, "Best Profit Factor", text_color=clrMuted, text_size=summaryTableTextSize, bgcolor=clrBestB)
+        table.cell(summaryTable, 1, 13, na(bestOptDisplayPf) ? "-" : str.tostring(bestOptDisplayPf, "#.##"), text_color=clrPurple, text_size=summaryTableTextSize, bgcolor=clrBestB)
+
+        table.cell(summaryTable, 0, 14, "Best Net R", text_color=clrMuted, text_size=summaryTableTextSize, bgcolor=clrBestA)
+        table.cell(summaryTable, 1, 14, na(bestOptDisplayNetR) ? "-" : str.tostring(bestOptDisplayNetR, "#.##"), text_color=na(bestOptDisplayNetR) ? clrText : (bestOptDisplayNetR >= 0 ? clrGreenSoft : clrRedSoft), text_size=summaryTableTextSize, bgcolor=clrBestA)
+
+        table.cell(summaryTable, 0, 15, "Best Net Pips / Est. $", text_color=clrMuted, text_size=summaryTableTextSize, bgcolor=clrBestB)
+        table.cell(summaryTable, 1, 15, na(bestOptDisplayNetPips) ? "-" : formatPipsAndUsd(bestOptDisplayNetPips, bestOptDisplayNetUsd), text_color=na(bestOptDisplayNetPips) ? clrText : (bestOptDisplayNetPips >= 0 ? clrGreenSoft : clrRedSoft), text_size=summaryTableTextSize, bgcolor=clrBestB)
+    else
+        for row = 0 to 15
+            table.cell(summaryTable, 0, row, "", bgcolor=color.new(clrPanel, 100))
+            table.cell(summaryTable, 1, row, "", bgcolor=color.new(clrPanel, 100))
+
+    if showDailyTable
+        table.cell(dailyTable, 0, 0, "Date",    text_color=clrText, text_size=dailyTableTextSize, bgcolor=clrHeader)
+        table.cell(dailyTable, 1, 0, "PnL (R)", text_color=clrText, text_size=dailyTableTextSize, bgcolor=clrHeader)
+        table.cell(dailyTable, 2, 0, "Wins",    text_color=clrText, text_size=dailyTableTextSize, bgcolor=clrHeader)
+        table.cell(dailyTable, 3, 0, "Losses",  text_color=clrText, text_size=dailyTableTextSize, bgcolor=clrHeader)
+        table.cell(dailyTable, 4, 0, "Closed",  text_color=clrText, text_size=dailyTableTextSize, bgcolor=clrHeader)
+
+        int dailyRows  = 7
+        int dailyCount = array.size(dailyDateArray)
+
+        for row = 1 to dailyRows
+            int idx = dailyCount - row
+            if idx >= 0
+                string dayLabel = array.get(dailyDateArray, idx)
+                float dayPnl    = array.get(dailyPnlArray, idx)
+                int dayWins     = array.get(dailyWinsArray, idx)
+                int dayLoss     = array.get(dailyLossesArray, idx)
+                int dayClose    = array.get(dailyClosedArray, idx)
+
+                color pnlBg   = dayPnl >= 0 ? color.new(clrGreenSoft, 78) : color.new(clrRedSoft, 78)
+                color pnlText = dayPnl >= 0 ? clrGreenSoft : clrRedSoft
+                color rowBg   = row % 2 == 0 ? clrCardA : clrCardB
+
+                table.cell(dailyTable, 0, row, dayLabel, text_color=clrText, text_size=dailyTableTextSize, bgcolor=rowBg)
+                table.cell(dailyTable, 1, row, str.tostring(dayPnl, "#.##"), text_color=pnlText, text_size=dailyTableTextSize, bgcolor=pnlBg)
+                table.cell(dailyTable, 2, row, str.tostring(dayWins), text_color=clrGreenSoft, text_size=dailyTableTextSize, bgcolor=rowBg)
+                table.cell(dailyTable, 3, row, str.tostring(dayLoss), text_color=clrRedSoft, text_size=dailyTableTextSize, bgcolor=rowBg)
+                table.cell(dailyTable, 4, row, str.tostring(dayClose), text_color=clrText, text_size=dailyTableTextSize, bgcolor=rowBg)
+            else
+                for col = 0 to 4
+                    table.cell(dailyTable, col, row, "", text_color=clrText, text_size=dailyTableTextSize, bgcolor=clrCardA)
+    else
+        for row = 0 to 7
+            for col = 0 to 4
+                table.cell(dailyTable, col, row, "", bgcolor=color.new(clrPanel, 100))
+
+//══════════════════════════════════════════════════════════════════════════════
+// ALERTS
+//══════════════════════════════════════════════════════════════════════════════
+alertcondition(longSignal,      title="SRE Long Signal",   message="Smart Reversal Entry | tradewsamet: BUY")
+alertcondition(shortSignal,     title="SRE Short Signal",  message="Smart Reversal Entry | tradewsamet: SELL")
+alertcondition(longTpAlertBar,  title="SRE Long TP Hit",   message="Smart Reversal Entry | tradewsamet: LONG TP HIT")
+alertcondition(longSlAlertBar,  title="SRE Long SL Hit",   message="Smart Reversal Entry | tradewsamet: LONG SL HIT")
+alertcondition(shortTpAlertBar, title="SRE Short TP Hit",  message="Smart Reversal Entry | tradewsamet: SHORT TP HIT")
+alertcondition(shortSlAlertBar, title="SRE Short SL Hit",  message="Smart Reversal Entry | tradewsamet: SHORT SL HIT")

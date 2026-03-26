@@ -1,0 +1,511 @@
+// This source code is subject to the terms of the Mozilla Public License 2.0
+// © Finntech1
+
+//@version=6
+indicator("Kernel Regime Cloud Pro", shorttitle = "KRC Pro", overlay = true)
+
+//------------------------------------------------------------------------------
+// Inputs
+//------------------------------------------------------------------------------
+groupBaseline = "1. Baseline Engine"
+src           = input.source(hlc3, "Source", group = groupBaseline)
+kernelLen     = input.int(55, "Kernel Lookback", minval = 8, maxval = 300, group = groupBaseline)
+bandwidth     = input.float(12.0, "Gaussian Bandwidth", minval = 1.0, maxval = 100.0, step = 0.5, group = groupBaseline)
+
+groupVol      = "2. Adaptive Volatility Cloud"
+atrLen        = input.int(14, "ATR Length", minval = 2, maxval = 100, group = groupVol)
+momMode       = input.string("ER", "Momentum Scaler", options = ["ER", "ADX"], group = groupVol, tooltip = "ER = Efficiency Ratio. ADX = classic directional momentum.")
+momLen        = input.int(20, "Momentum Length", minval = 2, maxval = 100, group = groupVol)
+baseMult      = input.float(1.60, "Base ATR Multiplier", minval = 0.1, maxval = 10.0, step = 0.05, group = groupVol)
+expandMult    = input.float(1.20, "Adaptive Expansion", minval = 0.0, maxval = 5.0, step = 0.05, group = groupVol)
+
+groupRegime   = "3. Market Regime Filter"
+chopLen       = input.int(21, "CHOP Length", minval = 5, maxval = 100, group = groupRegime)
+chopThresh    = input.float(61.8, "Ranging Threshold", minval = 30.0, maxval = 80.0, step = 0.1, group = groupRegime)
+slopeGate     = input.bool(true, "Require Baseline Slope Alignment", group = groupRegime, tooltip = "Long flips require rising baseline. Short flips require falling baseline.")
+
+groupFlow     = "4. Institutional Volume & Spread Gating"
+volLen        = input.int(20, "Volume / Spread Lookback", minval = 5, maxval = 100, group = groupFlow)
+strongRvol    = input.float(1.20, "Strong RVOL Threshold", minval = 0.5, maxval = 5.0, step = 0.05, group = groupFlow)
+spreadFactor  = input.float(1.10, "Wide Spread Factor", minval = 0.5, maxval = 3.0, step = 0.05, group = groupFlow)
+closePosGate  = input.float(0.70, "Close Position Threshold", minval = 0.50, maxval = 0.95, step = 0.01, group = groupFlow)
+
+groupEx       = "5. Reversal / Exhaustion"
+zLen              = input.int(50, "Z-Score Length", minval = 10, maxval = 300, group = groupEx)
+zWarn             = input.float(2.50, "Exhaustion Threshold", minval = 1.0, maxval = 5.0, step = 0.1, group = groupEx)
+minExhaustGap     = input.int(20, "Minimum Bars Between Exhaustion Marks", minval = 1, maxval = 200, group = groupEx)
+exhaustReset      = input.float(1.25, "Exhaustion Reset Z", minval = 0.1, maxval = 4.0, step = 0.05, group = groupEx)
+exhaustCloseMax   = input.float(0.55, "Weak Close Threshold", minval = 0.05, maxval = 0.95, step = 0.01, group = groupEx, tooltip = "Bull exhaustion requires a weak close in the lower portion of the bar. Bear exhaustion requires a weak close in the upper portion of the bar.")
+
+groupVis      = "6. Visual Engine"
+showCloud     = input.bool(true, "Show Active Cloud", group = groupVis)
+showBands     = input.bool(false, "Show Outer Bands", group = groupVis)
+showNormal    = input.bool(true, "Show Normal Flip Marks", group = groupVis)
+showStrong    = input.bool(true, "Show Strong Flip Marks", group = groupVis)
+showExhaust   = input.bool(true, "Show Exhaustion Marks", group = groupVis)
+colorBars     = input.bool(false, "Subtle Bar Coloring", group = groupVis)
+showHud       = input.bool(true, "Show Dashboard", group = groupVis)
+showTag       = input.bool(false, "Show Last-Bar Briefing Tag", group = groupVis)
+showStrip     = input.bool(false, "Show Bottom Summary Strip", group = groupVis)
+panelPos      = input.string("Bottom Right", "Dashboard Position", options = ["Top Right", "Middle Right", "Bottom Right"], group = groupVis)
+
+//------------------------------------------------------------------------------
+// Helpers
+//------------------------------------------------------------------------------
+safeDiv(float num, float den) =>
+    na(num) or na(den) or den == 0.0 ? 0.0 : num / den
+
+clamp01(float x) =>
+    math.max(0.0, math.min(1.0, x))
+
+clampRange(float x, float lo, float hi) =>
+    math.max(lo, math.min(hi, x))
+
+tfLabel() =>
+    switch timeframe.period
+        "1"   => "1M"
+        "3"   => "3M"
+        "5"   => "5M"
+        "15"  => "15M"
+        "30"  => "30M"
+        "45"  => "45M"
+        "60"  => "1H"
+        "120" => "2H"
+        "180" => "3H"
+        "240" => "4H"
+        "1D"  => "1D"
+        "1W"  => "1W"
+        "1M"  => "1MO"
+        => timeframe.period
+
+meter(float value) =>
+    int filled = int(math.round(clampRange(value, 0.0, 100.0) / 12.5))
+    string out = ""
+    for i = 0 to 7
+        out += i < filled ? "█" : "░"
+    out
+
+gaussianKernel(float source, int length, float bw) =>
+    float num = 0.0
+    float den = 0.0
+    for i = 0 to length - 1
+        float w = math.exp(-(i * i) / (2.0 * bw * bw))
+        num += source[i] * w
+        den += w
+    den != 0.0 ? num / den : na
+
+//------------------------------------------------------------------------------
+// Base calculations
+//------------------------------------------------------------------------------
+float prevClose = nz(close[1], close)
+float tr = math.max(high - low, math.max(math.abs(high - prevClose), math.abs(low - prevClose)))
+float atr = ta.rma(tr, atrLen)
+
+bool enoughKernel = bar_index >= kernelLen - 1
+bool enoughMom    = bar_index >= momLen
+bool enoughChop   = bar_index >= chopLen
+bool enoughZ      = bar_index >= zLen
+bool enoughVol    = bar_index >= volLen
+
+float baseline = enoughKernel ? gaussianKernel(src, kernelLen, bandwidth) : na
+float baselineSlope = baseline - baseline[1]
+
+//------------------------------------------------------------------------------
+// Momentum scaler for adaptive cloud
+//------------------------------------------------------------------------------
+float erDen = math.sum(math.abs(ta.change(src)), momLen)
+float erNum = enoughMom ? math.abs(src - src[momLen]) : 0.0
+float er    = enoughMom ? clamp01(safeDiv(erNum, erDen)) : 0.0
+
+float upMove    = high - high[1]
+float downMove  = low[1] - low
+float plusDM    = (upMove > downMove and upMove > 0.0) ? upMove : 0.0
+float minusDM   = (downMove > upMove and downMove > 0.0) ? downMove : 0.0
+
+float smTr      = ta.rma(tr, momLen)
+float smPlusDM  = ta.rma(plusDM, momLen)
+float smMinusDM = ta.rma(minusDM, momLen)
+
+float plusDI    = 100.0 * safeDiv(smPlusDM, smTr)
+float minusDI   = 100.0 * safeDiv(smMinusDM, smTr)
+float dx        = 100.0 * safeDiv(math.abs(plusDI - minusDI), math.max(plusDI + minusDI, 1e-10))
+float adx       = ta.rma(dx, momLen)
+
+float momentumMetric = momMode == "ADX" ? clamp01(adx / 100.0) : er
+float dynMult        = baseMult + momentumMetric * expandMult
+float cloudWidth     = atr * dynMult
+
+float upperBand = baseline + cloudWidth
+float lowerBand = baseline - cloudWidth
+
+//------------------------------------------------------------------------------
+// CHOP regime filter
+//------------------------------------------------------------------------------
+float hh      = ta.highest(high, chopLen)
+float ll      = ta.lowest(low, chopLen)
+float span    = math.max(hh - ll, syminfo.mintick)
+float sumTR   = math.sum(tr, chopLen)
+float chop    = enoughChop ? 100.0 * safeDiv(math.log(sumTR / span), math.log(chopLen)) : na
+bool ranging  = enoughChop and chop > chopThresh
+
+//------------------------------------------------------------------------------
+// Trend state machine
+//------------------------------------------------------------------------------
+bool ready = enoughKernel and enoughMom and enoughChop and enoughVol and enoughZ and not na(baseline)
+
+bool bullCandidate = ready and not ranging and ta.crossover(close, upperBand) and (not slopeGate or baselineSlope > 0)
+bool bearCandidate = ready and not ranging and ta.crossunder(close, lowerBand) and (not slopeGate or baselineSlope < 0)
+
+var int trend = 0
+
+if barstate.isconfirmed
+    if bullCandidate
+        trend := 1
+    else if bearCandidate
+        trend := -1
+
+bool bullFlip = barstate.isconfirmed and trend == 1 and nz(trend[1], 0) != 1
+bool bearFlip = barstate.isconfirmed and trend == -1 and nz(trend[1], 0) != -1
+
+//------------------------------------------------------------------------------
+// Institutional volume & spread grading
+//------------------------------------------------------------------------------
+float barRange     = math.max(high - low, syminfo.mintick)
+float avgSpread    = ta.sma(barRange, volLen)
+float avgVolume    = ta.sma(volume, volLen)
+float rvol         = safeDiv(volume, avgVolume)
+float bullClosePos = safeDiv(close - low, barRange)
+float bearClosePos = safeDiv(high - close, barRange)
+
+bool strongBull = bullFlip and rvol > strongRvol and barRange > avgSpread * spreadFactor and bullClosePos > closePosGate
+bool strongBear = bearFlip and rvol > strongRvol and barRange > avgSpread * spreadFactor and bearClosePos > closePosGate
+
+bool normalBull = bullFlip and not strongBull
+bool normalBear = bearFlip and not strongBear
+
+//------------------------------------------------------------------------------
+// Exhaustion / reversal warnings
+//------------------------------------------------------------------------------
+float dist     = close - baseline
+float distMean = ta.sma(dist, zLen)
+float distStd  = ta.stdev(dist, zLen)
+float distZ    = safeDiv(dist - distMean, distStd)
+
+var bool bullExhaustArmed = true
+var bool bearExhaustArmed = true
+var int  lastBullExBar    = na
+var int  lastBearExBar    = na
+
+bool bullGapOk = na(lastBullExBar) or (bar_index - lastBullExBar > minExhaustGap)
+bool bearGapOk = na(lastBearExBar) or (bar_index - lastBearExBar > minExhaustGap)
+
+bool bullExhaust = false
+bool bearExhaust = false
+
+if barstate.isconfirmed
+    if trend != 1 or distZ < exhaustReset
+        bullExhaustArmed := true
+    if trend != -1 or distZ > -exhaustReset
+        bearExhaustArmed := true
+
+    bool bullExhaustSetup = trend == 1 and distZ > zWarn and close < open and bullClosePos < exhaustCloseMax
+    bool bearExhaustSetup = trend == -1 and distZ < -zWarn and close > open and bearClosePos < exhaustCloseMax
+
+    bullExhaust := showExhaust and bullExhaustArmed and bullGapOk and bullExhaustSetup
+    bearExhaust := showExhaust and bearExhaustArmed and bearGapOk and bearExhaustSetup
+
+    if bullExhaust
+        bullExhaustArmed := false
+        lastBullExBar := bar_index
+
+    if bearExhaust
+        bearExhaustArmed := false
+        lastBearExBar := bar_index
+
+//------------------------------------------------------------------------------
+// Score engine + state language
+//------------------------------------------------------------------------------
+float closeQuality = trend == 1 ? bullClosePos : trend == -1 ? bearClosePos : 0.5
+float compressionScore = clampRange((chop - chopThresh) * 2.0 + (1.0 - momentumMetric) * 35.0 + (1.5 - math.min(rvol, 1.5)) * 12.0, 0.0, 100.0)
+float trendScore       = clampRange(45.0 + momentumMetric * 25.0 + math.min(rvol, 2.0) * 12.0 + closeQuality * 15.0 + (1.0 - clamp01(chop / 100.0)) * 10.0, 0.0, 100.0)
+float bullFlipScore    = clampRange(55.0 + momentumMetric * 20.0 + math.min(rvol, 2.0) * 15.0 + bullClosePos * 10.0 + (barRange > avgSpread * spreadFactor ? 8.0 : 0.0), 0.0, 100.0)
+float bearFlipScore    = clampRange(55.0 + momentumMetric * 20.0 + math.min(rvol, 2.0) * 15.0 + bearClosePos * 10.0 + (barRange > avgSpread * spreadFactor ? 8.0 : 0.0), 0.0, 100.0)
+float exhaustScore     = clampRange(50.0 + math.min(math.abs(distZ), 4.0) * 12.0, 0.0, 100.0)
+
+string regimeName = "Neutral"
+string signalName = "Inactive"
+string actionText = "Wait"
+string noteText   = "The model is waiting for enough structure to classify trend."
+color  uiColor    = color.silver
+int    stateId    = 0
+int    dirBias    = 0
+int    stateScore = 50
+
+if ranging
+    regimeName := "Compression"
+    signalName := "Range State"
+    actionText := "Wait for confirmed breakout"
+    noteText   := "CHOP is elevated and trend transitions are suppressed."
+    uiColor    := color.gray
+    stateId    := 1
+    dirBias    := 0
+    stateScore := int(compressionScore)
+else if bullExhaust
+    regimeName := "Bull Trend"
+    signalName := "Bullish Exhaustion"
+    actionText := "Trail stops / reduce risk"
+    noteText   := "Trend remains up, but z-score stretch is extreme."
+    uiColor    := color.fuchsia
+    stateId    := 6
+    dirBias    := 1
+    stateScore := int(exhaustScore)
+else if bearExhaust
+    regimeName := "Bear Trend"
+    signalName := "Bearish Exhaustion"
+    actionText := "Trail stops / reduce risk"
+    noteText   := "Trend remains down, but z-score stretch is extreme."
+    uiColor    := color.fuchsia
+    stateId    := -6
+    dirBias    := -1
+    stateScore := int(exhaustScore)
+else if strongBull
+    regimeName := "Bull Trend"
+    signalName := "Strong Bullish Flip"
+    actionText := "Breakout continuation only"
+    noteText   := "Bullish transition confirmed by RVOL, wide spread, and strong close position."
+    uiColor    := color.teal
+    stateId    := 3
+    dirBias    := 1
+    stateScore := int(bullFlipScore)
+else if strongBear
+    regimeName := "Bear Trend"
+    signalName := "Strong Bearish Flip"
+    actionText := "Breakdown continuation only"
+    noteText   := "Bearish transition confirmed by RVOL, wide spread, and strong close position."
+    uiColor    := color.orange
+    stateId    := -3
+    dirBias    := -1
+    stateScore := int(bearFlipScore)
+else if normalBull
+    regimeName := "Bull Trend"
+    signalName := "Bullish Flip"
+    actionText := "Monitor follow-through"
+    noteText   := "Bullish transition confirmed on bar close."
+    uiColor    := color.teal
+    stateId    := 2
+    dirBias    := 1
+    stateScore := int(bullFlipScore)
+else if normalBear
+    regimeName := "Bear Trend"
+    signalName := "Bearish Flip"
+    actionText := "Monitor follow-through"
+    noteText   := "Bearish transition confirmed on bar close."
+    uiColor    := color.orange
+    stateId    := -2
+    dirBias    := -1
+    stateScore := int(bearFlipScore)
+else if trend == 1
+    regimeName := "Bull Trend"
+    signalName := "Trend Intact"
+    actionText := "Hold / trail"
+    noteText   := "Price remains above the adaptive cloud boundary and the regime is bullish."
+    uiColor    := color.teal
+    stateId    := 4
+    dirBias    := 1
+    stateScore := int(trendScore)
+else if trend == -1
+    regimeName := "Bear Trend"
+    signalName := "Trend Intact"
+    actionText := "Hold / trail"
+    noteText   := "Price remains below the adaptive cloud boundary and the regime is bearish."
+    uiColor    := color.orange
+    stateId    := -4
+    dirBias    := -1
+    stateScore := int(trendScore)
+else
+    regimeName := "Neutral"
+    signalName := "Inactive"
+    actionText := "Wait"
+    noteText   := "The model has not confirmed a directional regime yet."
+    uiColor    := color.silver
+    stateId    := 0
+    dirBias    := 0
+    stateScore := 50
+
+var int stateAge = 0
+stateAge := stateId == nz(stateId[1], stateId) ? nz(stateAge[1]) + 1 : 1
+
+string summaryLine = "Regime: " + regimeName + " | Signal: " + signalName + " | Score: " + str.tostring(stateScore) + " | CHOP: " + str.tostring(chop, "#.0") + " | RVOL: " + str.tostring(rvol, "#.00")
+
+//------------------------------------------------------------------------------
+// Visual engine
+//------------------------------------------------------------------------------
+color bullColor  = color.new(color.teal, 0)
+color bearColor  = color.new(color.orange, 0)
+color neutralCol = color.new(color.silver, 10)
+color rangeCol   = color.new(color.gray, 20)
+
+color baseColor =
+     ranging ? rangeCol :
+     trend == 1 ? bullColor :
+     trend == -1 ? bearColor :
+     neutralCol
+
+float activeBullBorder = showCloud and not ranging and trend == 1 ? lowerBand : na
+float activeBearBorder = showCloud and not ranging and trend == -1 ? upperBand : na
+
+plotBase = plot(baseline, "Kernel Baseline", color = baseColor, linewidth = 2)
+plotBull = plot(activeBullBorder, "Bull Cloud Border", color = color.new(bullColor, 40), linewidth = 1)
+plotBear = plot(activeBearBorder, "Bear Cloud Border", color = color.new(bearColor, 40), linewidth = 1)
+
+plot(showBands ? upperBand : na, "Upper Band", color = color.new(color.silver, 80), linewidth = 1)
+plot(showBands ? lowerBand : na, "Lower Band", color = color.new(color.silver, 80), linewidth = 1)
+
+fill(plotBase, plotBull, color = color.new(bullColor, 88), title = "Bull Cloud")
+fill(plotBase, plotBear, color = color.new(bearColor, 88), title = "Bear Cloud")
+
+plotshape(showNormal and normalBull, title = "Normal Buy", style = shape.circle, location = location.belowbar, color = bullColor, size = size.tiny)
+plotshape(showNormal and normalBear, title = "Normal Sell", style = shape.circle, location = location.abovebar, color = bearColor, size = size.tiny)
+
+plotshape(showStrong and strongBull, title = "Strong Buy", style = shape.diamond, location = location.belowbar, color = bullColor, size = size.small)
+plotshape(showStrong and strongBear, title = "Strong Sell", style = shape.diamond, location = location.abovebar, color = bearColor, size = size.small)
+
+plotshape(
+     showExhaust and bullExhaust,
+     title = "Bull Exhaustion",
+     style = shape.labeldown,
+     location = location.abovebar,
+     color = color.new(color.red, 70),
+     textcolor = color.new(color.white, 20),
+     size = size.tiny,
+     text = "A")
+
+plotshape(
+     showExhaust and bearExhaust,
+     title = "Bear Exhaustion",
+     style = shape.labelup,
+     location = location.belowbar,
+     color = color.new(color.aqua, 70),
+     textcolor = color.new(color.black, 20),
+     size = size.tiny,
+     text = "A")
+
+color barCol =
+     ranging ? color.new(color.gray, 80) :
+     trend == 1 ? color.new(bullColor, 75) :
+     trend == -1 ? color.new(bearColor, 75) : na
+
+barcolor(colorBars ? barCol : na)
+
+//------------------------------------------------------------------------------
+// Data Window outputs
+//------------------------------------------------------------------------------
+plot(stateScore, "KRC Score", display = display.data_window)
+plot(dirBias, "KRC Direction", display = display.data_window)
+plot(chop, "KRC CHOP", display = display.data_window)
+plot(rvol, "KRC RVOL", display = display.data_window)
+plot(momentumMetric * 100.0, "KRC Momentum Metric", display = display.data_window)
+plot(distZ, "KRC Distance Z", display = display.data_window)
+plot(cloudWidth, "KRC Cloud Width", display = display.data_window)
+plot(stateAge, "KRC State Age", display = display.data_window)
+
+//------------------------------------------------------------------------------
+// HUD
+//------------------------------------------------------------------------------
+var table hud = table.new(
+    position.bottom_right, 2, 8,
+    bgcolor = color.new(color.black, 82),
+    frame_color = color.new(color.white, 50),
+    frame_width = 1,
+    border_color = color.new(color.white, 30),
+    border_width = 1)
+
+var table strip = table.new(
+    position.bottom_center, 1, 1,
+    bgcolor = color.new(color.black, 18),
+    frame_color = color.new(color.white, 35),
+    frame_width = 1,
+    border_color = color.new(color.white, 25),
+    border_width = 1)
+
+if barstate.islast
+    if panelPos == "Top Right"
+        table.set_position(hud, position.top_right)
+    else if panelPos == "Middle Right"
+        table.set_position(hud, position.middle_right)
+    else
+        table.set_position(hud, position.bottom_right)
+
+    if panelPos == "Bottom Right"
+        table.set_position(strip, position.bottom_center)
+    else
+        table.set_position(strip, position.bottom_right)
+
+    if showHud
+        table.cell(hud, 0, 0, "KERNEL REGIME CLOUD", text_color = color.white, bgcolor = color.new(color.black, 35), text_size = size.small)
+        table.cell(hud, 1, 0, tfLabel(), text_color = color.white, bgcolor = color.new(color.black, 35), text_size = size.small)
+
+        table.cell(hud, 0, 1, "Regime", text_color = color.white, text_size = size.small)
+        table.cell(hud, 1, 1, regimeName, text_color = uiColor, text_size = size.small)
+
+        table.cell(hud, 0, 2, "Signal", text_color = color.white, text_size = size.small)
+        table.cell(hud, 1, 2, signalName, text_color = uiColor, text_size = size.small)
+
+        table.cell(hud, 0, 3, "Action", text_color = color.white, text_size = size.small)
+        table.cell(hud, 1, 3, actionText, text_color = color.white, text_size = size.small)
+
+        table.cell(hud, 0, 4, "Score", text_color = color.white, text_size = size.small)
+        table.cell(hud, 1, 4, meter(stateScore) + " " + str.tostring(stateScore), text_color = uiColor, text_size = size.small)
+
+        table.cell(hud, 0, 5, "CHOP / RVOL", text_color = color.white, text_size = size.small)
+        table.cell(hud, 1, 5, str.tostring(chop, "#.0") + " / " + str.tostring(rvol, "#.00"), text_color = color.white, text_size = size.small)
+
+        table.cell(hud, 0, 6, "Cloud / Z", text_color = color.white, text_size = size.small)
+        table.cell(hud, 1, 6, str.tostring(cloudWidth, "#.00") + " / " + str.tostring(distZ, "#.00"), text_color = color.white, text_size = size.small)
+
+        table.cell(hud, 0, 7, "State Age", text_color = color.white, text_size = size.small)
+        table.cell(hud, 1, 7, str.tostring(stateAge) + " bars", text_color = color.white, text_size = size.small)
+    else
+        for r = 0 to 7
+            table.cell(hud, 0, r, "", text_color = color.new(color.white, 100), bgcolor = color.new(color.black, 100), text_size = size.small)
+            table.cell(hud, 1, r, "", text_color = color.new(color.white, 100), bgcolor = color.new(color.black, 100), text_size = size.small)
+
+    if showStrip
+        table.cell(strip, 0, 0, summaryLine, text_color = uiColor, text_size = size.small, bgcolor = color.new(color.black, 18))
+    else
+        table.cell(strip, 0, 0, "", text_color = color.new(color.white, 100), bgcolor = color.new(color.black, 100), text_size = size.small)
+
+//------------------------------------------------------------------------------
+// Last-bar briefing tag
+//------------------------------------------------------------------------------
+var label briefTag = na
+
+if barstate.islast
+    if showTag
+        if na(briefTag)
+            briefTag := label.new(bar_index, high, "", xloc = xloc.bar_index, yloc = yloc.price, style = label.style_label_left, color = color.new(color.black, 12), textcolor = color.white, size = size.small)
+        label.set_xy(briefTag, bar_index, high + atr * 1.15)
+        label.set_style(briefTag, label.style_label_left)
+        label.set_color(briefTag, color.new(color.black, 12))
+        label.set_textcolor(briefTag, color.white)
+        label.set_text(
+             briefTag,
+             "KRC BRIEF\n" +
+             "Regime: " + regimeName + "\n" +
+             "Signal: " + signalName + "\n" +
+             "Action: " + actionText + "\n" +
+             "Note: " + noteText)
+    else
+        if not na(briefTag)
+            label.delete(briefTag)
+            briefTag := na
+
+//------------------------------------------------------------------------------
+// Alerts
+//------------------------------------------------------------------------------
+alertcondition(bullFlip, "Trend Flip Bullish", "Kernel Regime Cloud Pro bullish flip on {{ticker}} on {{interval}}")
+alertcondition(bearFlip, "Trend Flip Bearish", "Kernel Regime Cloud Pro bearish flip on {{ticker}} on {{interval}}")
+alertcondition(strongBull, "Strong Buy", "Kernel Regime Cloud Pro STRONG BUY on {{ticker}} on {{interval}}")
+alertcondition(strongBear, "Strong Sell", "Kernel Regime Cloud Pro STRONG SELL on {{ticker}} on {{interval}}")
+alertcondition(bullExhaust, "Bull Exhaustion", "Kernel Regime Cloud Pro bullish exhaustion on {{ticker}} on {{interval}}")
+alertcondition(bearExhaust, "Bear Exhaustion", "Kernel Regime Cloud Pro bearish exhaustion on {{ticker}} on {{interval}}")

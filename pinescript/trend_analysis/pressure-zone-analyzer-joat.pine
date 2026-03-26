@@ -1,0 +1,416 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © officialjackofalltrades
+//@version=6
+indicator("Pressure Zone Analyzer [JOAT]", "PZA [JOAT]", overlay=true, max_lines_count=500, max_labels_count=100)
+
+// ─────────────────────────────────────────────────────────────────────────
+// INPUTS
+// ─────────────────────────────────────────────────────────────────────────
+
+// Pressure Zone Settings
+int zoneLength = input.int(50, "Zone Detection Length", minval=20, maxval=200, group="Pressure Zones")
+int pivotLength = input.int(10, "Pivot Length", minval=5, maxval=50, group="Pressure Zones")
+int maxZones = input.int(8, "Max Zones", minval=4, maxval=20, group="Pressure Zones")
+float zoneThickness = input.float(0.5, "Zone Thickness Percent", minval=0.1, maxval=2.0, step=0.1, group="Pressure Zones")
+
+// Fibonacci Settings
+bool showFibLevels = input.bool(true, "Show Fibonacci Levels", group="Fibonacci")
+bool showGoldenZone = input.bool(true, "Show Golden Zone", group="Fibonacci")
+
+// Institutional Levels
+bool showLastWeek = input.bool(true, "Show Last Week High/Low", group="Institutional")
+bool showYesterday = input.bool(true, "Show Yesterday High/Low", group="Institutional")
+
+// Strength Scoring
+bool showStrength = input.bool(true, "Show Zone Strength", group="Scoring")
+float volumeWeight = input.float(0.4, "Volume Weight", minval=0.0, maxval=1.0, step=0.1, group="Scoring")
+float touchWeight = input.float(0.3, "Touch Weight", minval=0.0, maxval=1.0, step=0.1, group="Scoring")
+float ageWeight = input.float(0.3, "Age Weight", minval=0.0, maxval=1.0, step=0.1, group="Scoring")
+
+// Multi-Timeframe
+string htfTimeframe = input.timeframe("D", "HTF Timeframe", group="Multi-Timeframe")
+bool showHTFLevels = input.bool(true, "Show HTF Levels", group="Multi-Timeframe")
+
+// Visual Settings - ENHANCED SHOCKING COLORS
+color resistanceColor = input.color(color.new(#FF1744, 70), "Resistance", group="Colors", inline="c1")
+color supportColor = input.color(color.new(#00E676, 70), "Support", group="Colors", inline="c1")
+color fibColor = input.color(color.new(#FFD700, 0), "Fibonacci", group="Colors", inline="c2")
+color goldenZoneColor = input.color(color.new(#FFA500, 85), "Golden Zone", group="Colors", inline="c2")
+color htfColor = input.color(color.new(#00E5FF, 0), "HTF Levels", group="Colors", inline="c3")
+color instColor = input.color(color.new(#E040FB, 0), "Institutional", group="Colors", inline="c3")
+
+// ─────────────────────────────────────────────────────────────────────────
+// TYPE DEFINITIONS
+// ─────────────────────────────────────────────────────────────────────────
+
+type PressureZone
+    line zoneLine
+    float price
+    int startBar
+    string zoneType
+    int touches = 0
+    float volumeAtZone = 0.0
+    float strength = 0.0
+
+// ─────────────────────────────────────────────────────────────────────────
+// ARRAYS
+// ─────────────────────────────────────────────────────────────────────────
+
+var array<PressureZone> resistanceZones = array.new<PressureZone>()
+var array<PressureZone> supportZones = array.new<PressureZone>()
+
+// ─────────────────────────────────────────────────────────────────────────
+// FUNCTIONS
+// ─────────────────────────────────────────────────────────────────────────
+
+// Calculate zone thickness in price
+calcZoneThickness(float price, float thicknessPercent) =>
+    float thickness = price * (thicknessPercent / 100)
+    thickness
+
+// Detect if price is in zone
+inZone(float price, float zonePrice, float thickness) =>
+    bool inZone = math.abs(price - zonePrice) <= thickness
+    inZone
+
+// Calculate zone strength score
+calcZoneStrength(int touches, float volAtZone, int age, float volWeight, float touchWeight, float ageWeight) =>
+    float avgVolume = ta.sma(volume, 50)
+    float volScore = avgVolume > 0 ? math.min(volAtZone / avgVolume, 3.0) / 3.0 : 0.5
+    float touchScore = math.min(touches / 5.0, 1.0)
+    float ageScore = math.max(1.0 - (age / 500.0), 0.0)
+    
+    float strength = (volScore * volWeight) + (touchScore * touchWeight) + (ageScore * ageWeight)
+    strength
+
+// Clean up old zones
+cleanupZones(array<PressureZone> zones, int maxZones) =>
+    while array.size(zones) > maxZones
+        PressureZone oldZone = array.shift(zones)
+        line.delete(oldZone.zoneLine)
+
+// Calculate Fibonacci levels
+calcFibLevels(float high, float low) =>
+    float priceRange = high - low
+    float fib236 = low + (priceRange * 0.236)
+    float fib382 = low + (priceRange * 0.382)
+    float fib500 = low + (priceRange * 0.500)
+    float fib618 = low + (priceRange * 0.618)
+    float fib786 = low + (priceRange * 0.786)
+    [fib236, fib382, fib500, fib618, fib786]
+
+// Calculate golden zone
+calcGoldenZone(float high, float low) =>
+    float priceRange = high - low
+    float goldenTop = low + (priceRange * 0.618)
+    float goldenBottom = low + (priceRange * 0.5)
+    [goldenTop, goldenBottom]
+
+// ─────────────────────────────────────────────────────────────────────────
+// CALCULATIONS
+// ─────────────────────────────────────────────────────────────────────────
+
+// Detect pivot highs and lows
+float pivotHigh = ta.pivothigh(high, pivotLength, pivotLength)
+float pivotLow = ta.pivotlow(low, pivotLength, pivotLength)
+
+// Zone thickness
+float thickness = calcZoneThickness(close, zoneThickness)
+
+// Create new resistance zone
+if not na(pivotHigh) and barstate.isconfirmed
+    PressureZone newZone = PressureZone.new()
+    newZone.zoneLine := line.new(bar_index - pivotLength, pivotHigh, bar_index + 50, pivotHigh, 
+         color=resistanceColor, width=2, extend=extend.right)
+    newZone.price := pivotHigh
+    newZone.startBar := bar_index - pivotLength
+    newZone.zoneType := "resistance"
+    newZone.volumeAtZone := volume[pivotLength]
+    
+    array.push(resistanceZones, newZone)
+    cleanupZones(resistanceZones, maxZones)
+
+// Create new support zone
+if not na(pivotLow) and barstate.isconfirmed
+    PressureZone newZone = PressureZone.new()
+    newZone.zoneLine := line.new(bar_index - pivotLength, pivotLow, bar_index + 50, pivotLow, 
+         color=supportColor, width=2, extend=extend.right)
+    newZone.price := pivotLow
+    newZone.startBar := bar_index - pivotLength
+    newZone.zoneType := "support"
+    newZone.volumeAtZone := volume[pivotLength]
+    
+    array.push(supportZones, newZone)
+    cleanupZones(supportZones, maxZones)
+
+// Update zone touches and strength
+for zone in resistanceZones
+    if inZone(high, zone.price, thickness)
+        zone.touches += 1
+        zone.volumeAtZone := math.max(zone.volumeAtZone, volume)
+
+// Calculate strength outside the loop for consistency
+for zone in resistanceZones
+    int age = bar_index - zone.startBar
+    float strength = calcZoneStrength(zone.touches, zone.volumeAtZone, age, 
+         volumeWeight, touchWeight, ageWeight)
+    zone.strength := strength
+
+for zone in supportZones
+    if inZone(low, zone.price, thickness)
+        zone.touches += 1
+        zone.volumeAtZone := math.max(zone.volumeAtZone, volume)
+
+// Calculate strength outside the loop for consistency
+for zone in supportZones
+    int age = bar_index - zone.startBar
+    float strength = calcZoneStrength(zone.touches, zone.volumeAtZone, age, 
+         volumeWeight, touchWeight, ageWeight)
+    zone.strength := strength
+
+// Fibonacci Levels
+float swingHigh = ta.highest(high, zoneLength)
+float swingLow = ta.lowest(low, zoneLength)
+[fib236, fib382, fib500, fib618, fib786] = calcFibLevels(swingHigh, swingLow)
+
+// Golden Zone
+[goldenTop, goldenBottom] = calcGoldenZone(swingHigh, swingLow)
+
+// Institutional Levels - Last Week
+float lastWeekHigh = request.security(syminfo.tickerid, "W", high[1], 
+     barmerge.gaps_off, barmerge.lookahead_off)
+float lastWeekLow = request.security(syminfo.tickerid, "W", low[1], 
+     barmerge.gaps_off, barmerge.lookahead_off)
+
+// Institutional Levels - Yesterday
+float yesterdayHigh = request.security(syminfo.tickerid, "D", high[1], 
+     barmerge.gaps_off, barmerge.lookahead_off)
+float yesterdayLow = request.security(syminfo.tickerid, "D", low[1], 
+     barmerge.gaps_off, barmerge.lookahead_off)
+
+// HTF Levels
+float htfHigh = request.security(syminfo.tickerid, htfTimeframe, high[1], 
+     barmerge.gaps_off, barmerge.lookahead_off)
+float htfLow = request.security(syminfo.tickerid, htfTimeframe, low[1], 
+     barmerge.gaps_off, barmerge.lookahead_off)
+
+// ─────────────────────────────────────────────────────────────────────────
+// VISUALIZATION - CLEANED UP & ENHANCED
+// ─────────────────────────────────────────────────────────────────────────
+
+// Fibonacci Levels - ONLY KEY LEVELS, NO DOTS
+plot(showFibLevels ? fib500 : na, "Fib 50.0%", color.new(#FFD700, 0), 2, plot.style_line)  // Keep middle golden line
+plot(showFibLevels ? fib618 : na, "Fib 61.8%", color.new(#FFA500, 30), 1, plot.style_line)  // Golden ratio
+
+// Golden Zone - FILLED AREA WITH GRADIENT
+goldenTopPlot = plot(showGoldenZone ? goldenTop : na, "Golden Top", color.new(goldenZoneColor, 100), display=display.none)
+goldenBottomPlot = plot(showGoldenZone ? goldenBottom : na, "Golden Bottom", color.new(goldenZoneColor, 100), display=display.none)
+fill(goldenTopPlot, goldenBottomPlot, color.new(#FFA500, 90), title="Golden Zone")
+
+// Institutional Levels - CLEAN LINES, NO OVERLAP
+plot(showLastWeek ? lastWeekHigh : na, "Last Week High", color.new(#E040FB, 0), 3, plot.style_line)
+plot(showLastWeek ? lastWeekLow : na, "Last Week Low", color.new(#E040FB, 0), 3, plot.style_line)
+
+// HTF Levels - DISTINCT COLOR
+plot(showHTFLevels ? htfHigh : na, "HTF High", color.new(#00E5FF, 0), 2, plot.style_line)
+plot(showHTFLevels ? htfLow : na, "HTF Low", color.new(#00E5FF, 0), 2, plot.style_line)
+
+// NEW: Zone strength visualization - ONLY STRONGEST ZONES
+if showStrength and barstate.islast
+    // Show only top 2 strongest resistance zones
+    if array.size(resistanceZones) > 0
+        for i = 0 to math.min(array.size(resistanceZones) - 1, 1)
+            PressureZone zone = array.get(resistanceZones, array.size(resistanceZones) - 1 - i)
+            if zone.strength > 0.6
+                // Create filled box for strong zones
+                box.new(bar_index - 50, zone.price + thickness, bar_index + 10, zone.price - thickness,
+                    border_color=color.new(resistanceColor, 50),
+                    bgcolor=color.new(resistanceColor, 85),
+                    extend=extend.right,
+                    text="R" + str.tostring(i+1) + " | " + str.tostring(zone.strength, "#.##"),
+                    text_color=color.new(#FF1744, 0),
+                    text_size=size.small)
+    
+    // Show only top 2 strongest support zones
+    if array.size(supportZones) > 0
+        for i = 0 to math.min(array.size(supportZones) - 1, 1)
+            PressureZone zone = array.get(supportZones, array.size(supportZones) - 1 - i)
+            if zone.strength > 0.6
+                // Create filled box for strong zones
+                box.new(bar_index - 50, zone.price + thickness, bar_index + 10, zone.price - thickness,
+                    border_color=color.new(supportColor, 50),
+                    bgcolor=color.new(supportColor, 85),
+                    extend=extend.right,
+                    text="S" + str.tostring(i+1) + " | " + str.tostring(zone.strength, "#.##"),
+                    text_color=color.new(#00E676, 0),
+                    text_size=size.small)
+
+// NEW: Price position indicator
+bool inGoldenZone = close >= goldenBottom and close <= goldenTop
+bool nearResistance = false
+bool nearSupport = false
+
+for zone in resistanceZones
+    if inZone(close, zone.price, thickness * 2)
+        nearResistance := true
+
+for zone in supportZones
+    if inZone(close, zone.price, thickness * 2)
+        nearSupport := true
+
+// Visual alerts on chart
+plotshape(inGoldenZone and not inGoldenZone[1], "Enter Golden", shape.diamond, 
+    location.abovebar, color.new(#FFA500, 0), size=size.small, text="GOLDEN")
+plotshape(nearResistance and not nearResistance[1], "Near Resistance", shape.triangledown, 
+    location.abovebar, color.new(#FF1744, 0), size=size.tiny)
+plotshape(nearSupport and not nearSupport[1], "Near Support", shape.triangleup, 
+    location.belowbar, color.new(#00E676, 0), size=size.tiny)
+
+// ─────────────────────────────────────────────────────────────────────────
+// TABLE DISPLAY - ENHANCED & BIGGER
+// ─────────────────────────────────────────────────────────────────────────
+
+var table zoneTable = table.new(position.bottom_right, 3, 13, 
+     bgcolor=color.new(#000000, 5), frame_color=color.new(#FFFFFF, 50), 
+     frame_width=2, border_width=1, border_color=color.new(#FFFFFF, 70))
+
+if barstate.islast
+    int rowIdx = 0
+    
+    // Header - BIGGER
+    table.cell(zoneTable, 0, rowIdx, "PRESSURE ZONES", bgcolor=color.new(#1E1E1E, 0), 
+         text_color=color.new(#00E5FF, 0), text_size=size.normal)
+    table.cell(zoneTable, 1, rowIdx, "Price", bgcolor=color.new(#1E1E1E, 0), 
+         text_color=color.new(#00E5FF, 0), text_size=size.normal)
+    table.cell(zoneTable, 2, rowIdx, "Strength", bgcolor=color.new(#1E1E1E, 0), 
+         text_color=color.new(#00E5FF, 0), text_size=size.normal)
+    rowIdx += 1
+    
+    // Top 2 resistance zones - ENHANCED COLORS
+    int resCount = math.min(array.size(resistanceZones), 2)
+    for i = 0 to resCount - 1
+        PressureZone zone = array.get(resistanceZones, array.size(resistanceZones) - 1 - i)
+        color strengthColor = zone.strength > 0.7 ? color.new(#FF1744, 20) : zone.strength > 0.5 ? color.new(#FF5252, 40) : color.new(#FF8A80, 60)
+        
+        table.cell(zoneTable, 0, rowIdx, "RESISTANCE " + str.tostring(i + 1), 
+             bgcolor=color.new(#000000, 15), text_color=color.new(#FF1744, 0), text_size=size.small)
+        table.cell(zoneTable, 1, rowIdx, str.tostring(zone.price, format.mintick), 
+             bgcolor=color.new(#000000, 15), text_color=color.white, text_size=size.small)
+        table.cell(zoneTable, 2, rowIdx, str.tostring(zone.strength * 100, "#") + "%", 
+             bgcolor=strengthColor, text_color=color.new(#000000, 0), text_size=size.small)
+        rowIdx += 1
+    
+    // Top 2 support zones - ENHANCED COLORS
+    int supCount = math.min(array.size(supportZones), 2)
+    for i = 0 to supCount - 1
+        PressureZone zone = array.get(supportZones, array.size(supportZones) - 1 - i)
+        color strengthColor = zone.strength > 0.7 ? color.new(#00E676, 20) : zone.strength > 0.5 ? color.new(#4CAF50, 40) : color.new(#81C784, 60)
+        
+        table.cell(zoneTable, 0, rowIdx, "SUPPORT " + str.tostring(i + 1), 
+             bgcolor=color.new(#000000, 15), text_color=color.new(#00E676, 0), text_size=size.small)
+        table.cell(zoneTable, 1, rowIdx, str.tostring(zone.price, format.mintick), 
+             bgcolor=color.new(#000000, 15), text_color=color.white, text_size=size.small)
+        table.cell(zoneTable, 2, rowIdx, str.tostring(zone.strength * 100, "#") + "%", 
+             bgcolor=strengthColor, text_color=color.new(#000000, 0), text_size=size.small)
+        rowIdx += 1
+    
+    // Separator
+    table.cell(zoneTable, 0, rowIdx, "INSTITUTIONAL", bgcolor=color.new(#1E1E1E, 0), 
+         text_color=color.new(#E040FB, 0), text_size=size.normal)
+    table.cell(zoneTable, 1, rowIdx, "", bgcolor=color.new(#1E1E1E, 0), text_size=size.small)
+    table.cell(zoneTable, 2, rowIdx, "", bgcolor=color.new(#1E1E1E, 0), text_size=size.small)
+    rowIdx += 1
+    
+    // Last Week High
+    table.cell(zoneTable, 0, rowIdx, "Last Week High", bgcolor=color.new(#000000, 15), 
+         text_color=color.new(#E040FB, 0), text_size=size.small)
+    table.cell(zoneTable, 1, rowIdx, str.tostring(lastWeekHigh, format.mintick), 
+         bgcolor=color.new(#000000, 15), text_color=color.white, text_size=size.small)
+    float distToWeekHigh = ((lastWeekHigh - close) / close) * 100
+    table.cell(zoneTable, 2, rowIdx, str.tostring(distToWeekHigh, "#.#") + "%", 
+         bgcolor=color.new(#E040FB, 70), text_color=color.white, text_size=size.small)
+    rowIdx += 1
+    
+    // Last Week Low
+    table.cell(zoneTable, 0, rowIdx, "Last Week Low", bgcolor=color.new(#000000, 15), 
+         text_color=color.new(#E040FB, 0), text_size=size.small)
+    table.cell(zoneTable, 1, rowIdx, str.tostring(lastWeekLow, format.mintick), 
+         bgcolor=color.new(#000000, 15), text_color=color.white, text_size=size.small)
+    float distToWeekLow = ((close - lastWeekLow) / close) * 100
+    table.cell(zoneTable, 2, rowIdx, str.tostring(distToWeekLow, "#.#") + "%", 
+         bgcolor=color.new(#E040FB, 70), text_color=color.white, text_size=size.small)
+    rowIdx += 1
+    
+    // Separator
+    table.cell(zoneTable, 0, rowIdx, "FIBONACCI", bgcolor=color.new(#1E1E1E, 0), 
+         text_color=color.new(#FFD700, 0), text_size=size.normal)
+    table.cell(zoneTable, 1, rowIdx, "", bgcolor=color.new(#1E1E1E, 0), text_size=size.small)
+    table.cell(zoneTable, 2, rowIdx, "", bgcolor=color.new(#1E1E1E, 0), text_size=size.small)
+    rowIdx += 1
+    
+    // Golden Zone Status
+    string goldenStatus = inGoldenZone ? "IN ZONE" : close > goldenTop ? "ABOVE" : "BELOW"
+    color goldenStatusColor = inGoldenZone ? color.new(#00E676, 20) : close > goldenTop ? color.new(#FF1744, 40) : color.new(#00E5FF, 40)
+    table.cell(zoneTable, 0, rowIdx, "Golden Zone", bgcolor=color.new(#000000, 15), 
+         text_color=color.new(#FFA500, 0), text_size=size.small)
+    table.cell(zoneTable, 1, rowIdx, str.tostring(goldenTop, format.mintick) + "-" + str.tostring(goldenBottom, format.mintick), 
+         bgcolor=color.new(#000000, 15), text_color=color.white, text_size=size.tiny)
+    table.cell(zoneTable, 2, rowIdx, goldenStatus, 
+         bgcolor=goldenStatusColor, text_color=color.new(#000000, 0), text_size=size.small)
+    rowIdx += 1
+    
+    // 50% Fib
+    table.cell(zoneTable, 0, rowIdx, "Fib 50%", bgcolor=color.new(#000000, 15), 
+         text_color=color.new(#FFD700, 0), text_size=size.small)
+    table.cell(zoneTable, 1, rowIdx, str.tostring(fib500, format.mintick), 
+         bgcolor=color.new(#000000, 15), text_color=color.white, text_size=size.small)
+    float distToFib50 = ((fib500 - close) / close) * 100
+    table.cell(zoneTable, 2, rowIdx, str.tostring(distToFib50, "#.#") + "%", 
+         bgcolor=color.new(#FFD700, 70), text_color=color.new(#000000, 0), text_size=size.small)
+    rowIdx += 1
+    
+    // 61.8% Fib
+    table.cell(zoneTable, 0, rowIdx, "Fib 61.8%", bgcolor=color.new(#000000, 15), 
+         text_color=color.new(#FFA500, 0), text_size=size.small)
+    table.cell(zoneTable, 1, rowIdx, str.tostring(fib618, format.mintick), 
+         bgcolor=color.new(#000000, 15), text_color=color.white, text_size=size.small)
+    float distToFib618 = ((fib618 - close) / close) * 100
+    table.cell(zoneTable, 2, rowIdx, str.tostring(distToFib618, "#.#") + "%", 
+         bgcolor=color.new(#FFA500, 70), text_color=color.new(#000000, 0), text_size=size.small)
+    rowIdx += 1
+    
+    // Price Position Summary
+    table.cell(zoneTable, 0, rowIdx, "POSITION", bgcolor=color.new(#1E1E1E, 0), 
+         text_color=color.new(#00E5FF, 0), text_size=size.normal)
+    string positionText = nearResistance ? "AT RESISTANCE" : nearSupport ? "AT SUPPORT" : inGoldenZone ? "GOLDEN ZONE" : "NEUTRAL"
+    color positionColor = nearResistance ? color.new(#FF1744, 20) : nearSupport ? color.new(#00E676, 20) : inGoldenZone ? color.new(#FFA500, 20) : color.new(#808080, 50)
+    table.cell(zoneTable, 1, rowIdx, positionText, bgcolor=positionColor, 
+         text_color=color.new(#000000, 0), text_size=size.normal)
+    table.cell(zoneTable, 2, rowIdx, "", bgcolor=color.new(#1E1E1E, 0), text_size=size.small)
+
+// ─────────────────────────────────────────────────────────────────────────
+// ALERTS
+// ─────────────────────────────────────────────────────────────────────────
+
+// Check for zone touches
+bool resistanceTouch = false
+bool supportTouch = false
+
+for zone in resistanceZones
+    if inZone(high, zone.price, thickness) and zone.strength > 0.6
+        resistanceTouch := true
+
+for zone in supportZones
+    if inZone(low, zone.price, thickness) and zone.strength > 0.6
+        supportTouch := true
+
+alertcondition(resistanceTouch, "Strong Resistance Touch", 
+     "Price touched strong resistance: {{ticker}}")
+alertcondition(supportTouch, "Strong Support Touch", 
+     "Price touched strong support: {{ticker}}")
+alertcondition(close >= goldenBottom and close <= goldenTop, "Golden Zone", 
+     "Price in golden zone: {{ticker}}")
+alertcondition(nearResistance and not nearResistance[1], "Approaching Resistance", 
+     "Price approaching resistance zone: {{ticker}}")
+alertcondition(nearSupport and not nearSupport[1], "Approaching Support", 
+     "Price approaching support zone: {{ticker}}")

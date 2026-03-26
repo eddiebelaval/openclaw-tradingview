@@ -1,0 +1,309 @@
+// (c) EXCAVO
+// This work is licensed under Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0)
+//
+// Adaptive SuperTrend [EXCAVO]
+// -----------------------------------------------------------------------------
+// Original indicator by EXCAVO. Written entirely from scratch.
+// Volatility-adaptive trend band with guard mode and momentum filter.
+//
+//@version=6
+indicator("Adaptive SuperTrend [EXCAVO]", "EXCAVO AST",
+     overlay          = true,
+     max_boxes_count  = 500,
+     max_lines_count  = 500,
+     max_labels_count = 500)
+
+//-----------------------------------------------------------------------------}
+// Inputs
+//-----------------------------------------------------------------------------{
+string GRP_ST     = "SuperTrend"
+string GRP_ADAPT  = "Volatility Scaling"
+string GRP_GUARD  = "Guard Mode"
+string GRP_MOM    = "Momentum Gate"
+string GRP_VIZ    = "Visualization"
+string GRP_DASH   = "Dashboard"
+string GRP_ALERTS = "Alert Settings"
+
+int    atr_len    = input.int  (10,   "ATR Length",      minval = 1, maxval = 200, group = GRP_ST,
+     tooltip = "Number of bars used to calculate ATR (volatility). Shorter = more responsive, longer = smoother.")
+float  base_mult  = input.float(2.5,  "Base Multiplier", minval = 0.5, maxval = 10.0, step = 0.1, group = GRP_ST,
+     tooltip = "Distance from price to band, measured in ATR units. Higher = fewer signals and more distance from price.")
+
+bool   use_adapt  = input.bool (true, "Enable Adaptive Multiplier", group = GRP_ADAPT,
+     tooltip = "Automatically adjusts band distance based on current volatility. Recommended: on.")
+int    adapt_len  = input.int  (50,   "Volatility Lookback", minval = 10, maxval = 200, group = GRP_ADAPT,
+     tooltip = "How many bars back to measure volatility history.")
+float  adapt_str  = input.float(0.4,  "Adaptation Strength", minval = 0.0, maxval = 1.0, step = 0.05, group = GRP_ADAPT,
+     tooltip = "How strongly the multiplier responds to volatility changes. 0 = no adaptation, 1 = maximum.")
+
+float  alpha_raw  = input.float(8.0,  "Recovery Alpha (%)",        minval = 1.0, maxval = 50.0, step = 1.0, group = GRP_GUARD,
+     tooltip = "How fast the band tracks price when guard activates. Higher = more reactive.")
+float  rec_thres  = input.float(1.0,  "Recovery Threshold (xATR)", minval = 0.1, maxval = 5.0, step = 0.1, group = GRP_GUARD,
+     tooltip = "How far price must move against the trend before guard activates, in ATR units.")
+bool   use_accel  = input.bool (true, "Accelerated Recovery", group = GRP_GUARD,
+     tooltip = "Makes guard mode react faster the deeper the pullback goes. Recommended: on.")
+
+bool   use_mom    = input.bool (false, "Enable Momentum Filter", group = GRP_MOM,
+     tooltip = "Requires RSI confirmation before registering a trend flip. Reduces false signals in ranging markets.")
+int    mom_len    = input.int  (14,    "RSI Length", minval = 2, maxval = 50, group = GRP_MOM,
+     tooltip = "Period for the RSI momentum filter. Only active when Enable Momentum Filter is on.")
+
+color  C_BULL     = input.color(color.rgb(0, 60, 180),  "Bullish Color", group = GRP_VIZ,
+     tooltip = "Band and fill color during an uptrend.")
+color  C_BEAR     = input.color(color.rgb(200, 40, 40), "Bearish Color", group = GRP_VIZ,
+     tooltip = "Band and fill color during a downtrend.")
+color  C_SIGNAL   = input.color(color.rgb(255, 140, 0), "Signal Color",  group = GRP_VIZ,
+     tooltip = "Band color when guard mode is active -- trend under pressure but not reversed.")
+bool   show_fill  = input.bool (true,  "Show Gradient Fill", group = GRP_VIZ,
+     tooltip = "Toggle the shaded fill between price and the band.")
+bool   show_lbl   = input.bool (true,  "Show Signal Labels", group = GRP_VIZ,
+     tooltip = "Toggle BULL / BEAR text labels at the center of each trend zone.")
+int    smooth_len = input.int  (3,     "Band Smoothness", minval = 1, maxval = 20, group = GRP_VIZ,
+     tooltip = "EMA smoothing applied to the visual band only. Does not affect signals or alerts.")
+bool   clr_bars   = input.bool (false, "Color Candles", group = GRP_VIZ,
+     tooltip = "Color candle bodies with the current trend color.")
+
+bool   show_dash  = input.bool (true,  "Show Dashboard", group = GRP_DASH,
+     tooltip = "Toggle the real-time dashboard panel.")
+bool   show_lgnd  = input.bool (true,  "Show Legend",    group = GRP_DASH,
+     tooltip = "Toggle the abbreviation legend.")
+
+bool   i_repaint  = input.bool (false, "Allow Repainting", group = GRP_ALERTS,
+     tooltip = "OFF = signals on bar close only (recommended). ON = real-time signals that may repaint.")
+bool   i_json     = input.bool (false, "JSON Alerts (for bots)", group = GRP_ALERTS,
+     tooltip = "Enable JSON-formatted alerts for bot integration (3Commas, Alertatron). Fires only on confirmed bars.")
+
+//-----------------------------------------------------------------------------}
+// Constants
+//-----------------------------------------------------------------------------{
+color C_NEUTRAL     = color.rgb(80, 80, 100)
+color C_DASH_BG     = color.rgb(50, 53, 60)
+color C_DASH_BORDER = color.rgb(80, 85, 95)
+color C_DASH_BULL   = color.rgb(80, 140, 255)
+color C_DASH_BEAR   = color.rgb(240, 70, 70)
+color C_DASH_SIGNAL = color.rgb(255, 170, 50)
+
+//-----------------------------------------------------------------------------}
+// Core
+//-----------------------------------------------------------------------------{
+float alpha = alpha_raw / 100.0
+float atr   = ta.atr(atr_len)
+float rank  = nz(ta.percentrank(atr, adapt_len) / 100.0, 0.5)
+float mult  = use_adapt ? math.max(0.5, base_mult - adapt_str * (rank - 0.5) * 2.0) : base_mult
+
+float src   = hl2
+float upper = src + mult * atr
+float lower = src - mult * atr
+float rsi   = ta.rsi(close, mom_len)
+
+var float band         = na
+var float switch_price = na
+var int   trend        = 1
+
+float deviation = rec_thres * atr
+float prev_b    = nz(band[1], lower)
+
+float bull_loss    = nz(switch_price, close) - close
+float bear_loss    = close - nz(switch_price, close)
+bool  bull_at_loss = trend ==  1 and bull_loss > deviation
+bool  bear_at_loss = trend == -1 and bear_loss > deviation
+bool  is_at_loss   = bull_at_loss or bear_at_loss
+
+float active_loss = bull_at_loss ? bull_loss : bear_loss
+float excess      = math.max(0.0, active_loss - deviation)
+float accel       = use_accel ? excess / atr : 0.0
+float eff_alpha   = math.min(alpha * (1.0 + accel), 1.0)
+
+float rec_band  = eff_alpha * close + (1.0 - eff_alpha) * prev_b
+float bull_band = bull_at_loss ? math.max(rec_band, prev_b) : math.max(lower, prev_b)
+float bear_band = bear_at_loss ? math.min(rec_band, prev_b) : math.min(upper, prev_b)
+
+if trend == 1
+    band := bull_band
+    bool mom_ok = use_mom ? rsi < 50.0 : true
+    if close < band and mom_ok
+        trend        := -1
+        band         := upper
+        switch_price := close
+else
+    band := bear_band
+    bool mom_ok = use_mom ? rsi > 50.0 : true
+    if close > band and mom_ok
+        trend        := 1
+        band         := lower
+        switch_price := close
+
+if barstate.isfirst
+    switch_price := close
+    band         := lower
+
+bool  trend_changed = trend != trend[1]
+bool  confirmed     = i_repaint or barstate.isconfirmed
+bool  sig_bull      = trend_changed and trend ==  1 and confirmed
+bool  sig_bear      = trend_changed and trend == -1 and confirmed
+color trend_color   = trend == 1 ? C_BULL : C_BEAR
+
+//-----------------------------------------------------------------------------}
+// Visuals
+//-----------------------------------------------------------------------------{
+float smooth_band  = ta.ema(band, smooth_len)
+color smooth_color = is_at_loss ? C_SIGNAL : trend_color
+
+barcolor(clr_bars ? trend_color : na)
+
+// NOTE: plot() used here because fill() gradient requires plot references.
+// Band values are price-derived (hl2 +/- ATR*mult) -- no separate scale created.
+p_band = plot(trend_changed ? na : smooth_band, "Band",
+     color     = color.new(smooth_color, 0),
+     linewidth = 2,
+     style     = plot.style_linebr)
+p_src  = plot(src, "Source", color = na)
+
+float top_val = math.max(src, smooth_band)
+float bot_val = math.min(src, smooth_band)
+color top_clr = trend == 1 ? color.new(C_BULL, 80) : color.new(C_BEAR, 35)
+color bot_clr = trend == 1 ? color.new(C_BULL, 35) : color.new(C_BEAR, 80)
+
+fill(p_band, p_src, top_val, bot_val, top_clr, bot_clr,
+     title   = "Trend Fill",
+     display = show_fill ? display.all : display.none)
+
+var int     trend_start_bar = 0
+var label   zone_lbl        = na
+var label[] lbl_pool        = array.new<label>()
+
+if barstate.isfirst or trend_changed
+    trend_start_bar := bar_index
+
+if show_lbl
+    int   zone_len   = bar_index - trend_start_bar
+    int   mid_offset = int(zone_len / 2)
+    int   mid_bar    = bar_index - mid_offset
+    float mid_smooth = smooth_band[mid_offset]
+    float lbl_y      = trend == 1
+         ? mid_smooth - atr * 0.9
+         : mid_smooth + atr * 0.9
+
+    if trend_changed
+        zone_lbl := label.new(mid_bar, lbl_y,
+             text      = trend == 1 ? "BULL" : "BEAR",
+             color     = color.new(color.white, 100),
+             textcolor = color.new(trend_color, 0),
+             style     = label.style_none,
+             size      = size.normal)
+        lbl_pool.push(zone_lbl)
+        if lbl_pool.size() > 450
+            label.delete(lbl_pool.shift())
+    else if not na(zone_lbl)
+        label.set_x(zone_lbl, mid_bar)
+        label.set_y(zone_lbl, lbl_y)
+
+//-----------------------------------------------------------------------------}
+// Dashboard
+//-----------------------------------------------------------------------------{
+if barstate.islast and show_dash
+    var table dash = table.new(position.top_right, 2, 5,
+         bgcolor      = C_DASH_BG,
+         border_color = C_DASH_BORDER,
+         border_width = 2,
+         frame_color  = C_DASH_BORDER,
+         frame_width  = 2)
+
+    // Header
+    table.cell(dash, 0, 0, "EXCAVO",
+         text_color = C_DASH_BULL, text_size = size.normal, text_halign = text.align_left)
+    table.cell(dash, 1, 0, "Adaptive ST v1.0",
+         text_color = color.white, text_size = size.normal, text_halign = text.align_right)
+
+    // Trend
+    string trend_txt = trend == 1 ? "▲  BULL" : "▼  BEAR"
+    color  trend_clr = trend == 1 ? C_DASH_BULL : C_DASH_BEAR
+    table.cell(dash, 0, 1, "Trend",
+         text_color = color.white, text_size = size.small, text_halign = text.align_left)
+    table.cell(dash, 1, 1, trend_txt,
+         text_color = trend_clr, text_size = size.small, text_halign = text.align_right)
+
+    // Band
+    table.cell(dash, 0, 2, "Band",
+         text_color = color.white, text_size = size.small, text_halign = text.align_left)
+    table.cell(dash, 1, 2, str.tostring(smooth_band, format.mintick),
+         text_color = color.white, text_size = size.small, text_halign = text.align_right)
+
+    // Guard
+    string guard_txt = is_at_loss ? "Active" : "Off"
+    color  guard_clr = is_at_loss ? C_DASH_SIGNAL : C_NEUTRAL
+    table.cell(dash, 0, 3, "Guard",
+         text_color = color.white, text_size = size.small, text_halign = text.align_left)
+    table.cell(dash, 1, 3, guard_txt,
+         text_color = guard_clr, text_size = size.small, text_halign = text.align_right)
+
+    // Multiplier
+    table.cell(dash, 0, 4, "Multiplier",
+         text_color = color.white, text_size = size.small, text_halign = text.align_left)
+    table.cell(dash, 1, 4, str.tostring(mult, "#.##") + "x",
+         text_color = color.white, text_size = size.small, text_halign = text.align_right)
+
+//-----------------------------------------------------------------------------}
+// Legend
+//-----------------------------------------------------------------------------{
+if barstate.islast and show_lgnd
+    var table leg = table.new(position.bottom_left, 2, 7,
+         bgcolor      = C_DASH_BG,
+         border_color = C_DASH_BORDER,
+         border_width = 1,
+         frame_color  = C_DASH_BORDER,
+         frame_width  = 1)
+
+    table.cell(leg, 0, 0, "LEGEND",
+         text_color = C_DASH_BULL, text_size = size.normal, text_halign = text.align_left)
+    table.cell(leg, 1, 0, "",
+         text_color = color.white, text_size = size.normal)
+
+    table.cell(leg, 0, 1, "AST",
+         text_color = color.white, text_size = size.small, text_halign = text.align_left)
+    table.cell(leg, 1, 1, "Adaptive SuperTrend",
+         text_color = color.white, text_size = size.small, text_halign = text.align_left)
+
+    table.cell(leg, 0, 2, "ATR",
+         text_color = color.white, text_size = size.small, text_halign = text.align_left)
+    table.cell(leg, 1, 2, "Average True Range",
+         text_color = color.white, text_size = size.small, text_halign = text.align_left)
+
+    table.cell(leg, 0, 3, "BULL",
+         text_color = color.white, text_size = size.small, text_halign = text.align_left)
+    table.cell(leg, 1, 3, "Uptrend State",
+         text_color = color.white, text_size = size.small, text_halign = text.align_left)
+
+    table.cell(leg, 0, 4, "BEAR",
+         text_color = color.white, text_size = size.small, text_halign = text.align_left)
+    table.cell(leg, 1, 4, "Downtrend State",
+         text_color = color.white, text_size = size.small, text_halign = text.align_left)
+
+    table.cell(leg, 0, 5, "GUARD",
+         text_color = color.white, text_size = size.small, text_halign = text.align_left)
+    table.cell(leg, 1, 5, "Recovery Mode Active",
+         text_color = color.white, text_size = size.small, text_halign = text.align_left)
+
+    // Empty row for TradingView logo
+    table.cell(leg, 0, 6, "", text_size = size.small)
+    table.cell(leg, 1, 6, "", text_size = size.small)
+
+//-----------------------------------------------------------------------------}
+// Alerts
+//-----------------------------------------------------------------------------{
+alertcondition(sig_bull, title = "Bullish Trend",
+     message = "EXCAVO AST: Bullish trend on {{ticker}} ({{interval}})")
+alertcondition(sig_bear, title = "Bearish Trend",
+     message = "EXCAVO AST: Bearish trend on {{ticker}} ({{interval}})")
+alertcondition(sig_bull or sig_bear, title = "Any Trend Change",
+     message = "EXCAVO AST: Trend change on {{ticker}} ({{interval}})")
+alertcondition(is_at_loss and not is_at_loss[1] and confirmed, title = "Guard Activated",
+     message = "EXCAVO AST: Guard mode activated on {{ticker}} ({{interval}})")
+
+if i_json and barstate.isconfirmed
+    if trend_changed and trend == 1
+        alert('{"action":"trend_change","direction":"bullish","ticker":"' + syminfo.ticker + '","price":' + str.tostring(close) + ',"timeframe":"' + timeframe.period + '","indicator":"EXCAVO_AST"}', alert.freq_once_per_bar)
+    if trend_changed and trend == -1
+        alert('{"action":"trend_change","direction":"bearish","ticker":"' + syminfo.ticker + '","price":' + str.tostring(close) + ',"timeframe":"' + timeframe.period + '","indicator":"EXCAVO_AST"}', alert.freq_once_per_bar)
+    if is_at_loss and not is_at_loss[1]
+        alert('{"action":"guard_activated","direction":"neutral","ticker":"' + syminfo.ticker + '","price":' + str.tostring(close) + ',"timeframe":"' + timeframe.period + '","indicator":"EXCAVO_AST"}', alert.freq_once_per_bar)

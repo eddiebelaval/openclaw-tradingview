@@ -1,0 +1,1137 @@
+// This Pine Script™ code is subject to the terms of the Mozilla Public License 2.0
+// https://mozilla.org/MPL/2.0/
+// © BullByte
+
+//@version=6
+indicator("Price Memory Heatmap [BullByte]", overlay = true,
+     max_boxes_count = 500, max_lines_count = 500, max_labels_count = 500,
+     max_bars_back = 500)
+
+// =====================================================================
+//
+//   PRICE MEMORY HEATMAP [PMH]
+//
+//   A unified analytical engine that identifies price levels where
+//   repeated reactions have occurred historically. Each level
+//   accumulates "heat" from touches and decays over time when
+//   untouched, creating a dynamic memory of market structure.
+//
+//   CORE CONCEPT:
+//   Markets tend to react at prices where prior significant activity
+//   occurred. This indicator tracks those reactions, measures their
+//   intensity, and visualizes them as heat-mapped zones that evolve
+//   with every new bar.
+//
+//   HOW IT WORKS:
+//   1. Pivot swings (confirmed highs and lows) seed memory levels.
+//   2. Wick rejections at existing levels add heat.
+//   3. Volume weighting amplifies levels with above-average activity.
+//   4. Exponential decay cools untouched levels each bar.
+//   5. Levels falling below the death threshold are removed.
+//   6. Behavior detection classifies how price interacts with levels.
+//   7. Level age tracks maturity (Fresh / Seasoned / Veteran).
+//
+//   IMPORTANT DISCLOSURES:
+//
+//   1. RETROACTIVE ANCHORING: Pivot-based reactions are confirmed
+//      after the Pivot Sensitivity number of bars have passed. The
+//      level is anchored at the true swing bar but only becomes
+//      known after confirmation. This is standard pivot behavior
+//      and does not use future data.
+//
+//   2. VOLUME METHODOLOGY: Volume is displayed as a relative
+//      multiplier (e.g., 2.3x) representing how much volume each
+//      reaction attracted compared to the average bar. This
+//      normalizes readings across all asset classes and currencies.
+//      1.0x = average volume, >2.0x = above-average interest.
+//      Assets without volume data will show a dash instead.
+//
+//   3. BEHAVIOR DETECTION: Pattern classification (Rejection,
+//      Absorption, Sweep, Retest, Break) only activates when price
+//      is within proximity of a qualified level. Behaviors display
+//      in real-time as part of the zone label.
+//
+//   4. ANALYTICAL ONLY: This indicator visualizes historical price
+//      reaction zones. It does not predict future price movement,
+//      generate buy/sell signals, or constitute financial advice.
+//      Always use proper risk management and independent analysis.
+//
+// =====================================================================
+
+
+// =====================================================================
+// SETTINGS: CORE
+// =====================================================================
+
+g_core = "CORE"
+
+i_pivLen = input.int(5, "Pivot Sensitivity",
+     minval = 2, maxval = 50, group = g_core,
+     tooltip = "Number of bars required on each side to confirm a pivot swing.\n\nLower values detect more reactions (noisier).\nHigher values detect fewer reactions (smoother).\n\nRecommended:\n  2-4   Scalping (1m to 15m)\n  5-10  Day Trading (15m to 1H)\n  10-20 Swing Trading (4H to 1D)\n  20+   Position Trading (1W+)\n\nNote: Pivots are confirmed retroactively after this many bars have passed.")
+
+i_mergeDist = input.float(1.0, "Merge Distance (x ATR)",
+     minval = 0.2, maxval = 3.0, step = 0.1, group = g_core,
+     tooltip = "Maximum distance (as a multiple of ATR) between two reactions for them to merge into a single memory level.\n\nSmaller values create more distinct levels.\nLarger values consolidate nearby reactions.")
+
+i_atrLen = input.int(14, "ATR Period",
+     minval = 5, maxval = 50, group = g_core,
+     tooltip = "Period for Average True Range calculation.\n\nATR is used internally for merge distance, zone thickness, and proximity calculations.")
+
+
+// =====================================================================
+// SETTINGS: MEMORY
+// =====================================================================
+
+g_mem = "MEMORY"
+
+i_decay = input.float(0.992, "Decay Rate",
+     minval = 0.95, maxval = 0.999, step = 0.001, group = g_mem,
+     tooltip = "Multiplier applied to each level's heat every bar.\n\nControls how quickly untouched levels fade:\n  0.999 = Very slow decay\n  0.992 = Default (balanced)\n  0.980 = Fast decay")
+
+i_heatBoost = input.float(1.0, "Heat Per Reaction",
+     minval = 0.5, maxval = 5.0, step = 0.5, group = g_mem,
+     tooltip = "Base amount of heat added when a reaction occurs at a level.\n\nModified by relative volume when Volume-Weighted Heat is enabled.")
+
+i_deathThresh = input.float(0.08, "Death Threshold",
+     minval = 0.01, maxval = 0.3, step = 0.01, group = g_mem,
+     tooltip = "Heat level below which a memory level is permanently removed.")
+
+i_maxLevels = input.int(20, "Max Memory Slots",
+     minval = 5, maxval = 40, group = g_mem,
+     tooltip = "Maximum number of memory levels tracked simultaneously.")
+
+i_minHits = input.int(2, "Min Hits to Display",
+     minval = 1, maxval = 5, group = g_mem,
+     tooltip = "Minimum number of confirmed reactions required before a level becomes visible.")
+
+i_topN = input.int(8, "Show Top N Levels",
+     minval = 3, maxval = 15, group = g_mem,
+     tooltip = "Maximum number of levels displayed on the chart at once.")
+
+
+// =====================================================================
+// SETTINGS: DETECTION
+// =====================================================================
+
+g_det = "DETECTION"
+
+i_wickReact = input.bool(true, "Wick Rejections", group = g_det,
+     tooltip = "When enabled, detects candles that wick into a memory level and reject.")
+
+i_wickMinPct = input.float(55.0, "  Min Wick Ratio (%)",
+     minval = 20.0, maxval = 80.0, step = 5.0, group = g_det,
+     tooltip = "Minimum percentage of the candle's range that must be wick for a wick rejection to count.")
+
+i_useVol = input.bool(true, "Volume-Weighted Heat", group = g_det,
+     tooltip = "When enabled, reactions with above-average volume add proportionally more heat.")
+
+i_behEnabled = input.bool(true, "Behavior Detection", group = g_det,
+     tooltip = "When enabled, classifies how price interacts with memory levels.\n\nDetected behaviors:\n  Break      = Decisive close through zone\n  Sweep      = Price pierces beyond then reverses\n  Rejection  = Wick into zone, close away\n  Retest     = Return to broken level\n  Absorption = Consolidation inside zone")
+
+i_behLookback = input.int(3, "  Behavior Lookback",
+     minval = 2, maxval = 8, group = g_det,
+     tooltip = "Number of recent bars analyzed to determine behavior pattern.")
+
+
+// =====================================================================
+// SETTINGS: APPEARANCE
+// =====================================================================
+
+g_look = "APPEARANCE"
+
+i_theme = input.string("Classic S/R", "Color Theme",
+     options = ["Dark", "Light", "Classic S/R"], group = g_look,
+     tooltip = "Visual theme for zone coloring.")
+
+i_zoneHeight = input.float(0.12, "Zone Thickness (x ATR)",
+     minval = 0.02, maxval = 0.5, step = 0.02, group = g_look,
+     tooltip = "Visual height of each zone as a fraction of ATR.")
+
+i_showGlow = input.bool(true, "Glow Effect", group = g_look,
+     tooltip = "Adds a soft outer glow around each zone.")
+
+i_glowMult = input.float(1.8, "  Glow Size",
+     minval = 1.2, maxval = 4.0, step = 0.2, group = g_look,
+     tooltip = "Multiplier for glow radius relative to zone thickness.")
+
+i_zoneExtend = input.int(15, "Right Extension (bars)",
+     minval = 5, maxval = 50, group = g_look,
+     tooltip = "How many bars into the future each zone extends.")
+
+i_proxRadius = input.float(2.5, "Proximity Radius (x ATR)",
+     minval = 0.5, maxval = 5.0, step = 0.5, group = g_look,
+     tooltip = "Distance at which proximity effects and behavior detection activate.")
+
+i_proxBoost = input.float(0.25, "  Proximity Glow Boost",
+     minval = 0.0, maxval = 0.5, step = 0.05, group = g_look,
+     tooltip = "Additional visual intensity when price approaches a level.")
+
+
+// =====================================================================
+// SETTINGS: LABELS
+// =====================================================================
+
+g_lbl = "LABELS"
+
+i_showLabel = input.bool(true, "Show Zone Labels", group = g_lbl,
+     tooltip = "Display information labels next to each visible memory zone.")
+
+i_labelMode = input.string("Standard", "  Label Mode",
+     options = ["Minimal", "Standard", "Detailed", "Large"], group = g_lbl,
+     tooltip = "Controls how much information is shown on each label.")
+
+i_showHits = input.bool(true, "  Show Hit Count", group = g_lbl,
+     tooltip = "Include the number of confirmed reactions in the label.")
+
+i_showVol = input.bool(true, "  Show Relative Volume", group = g_lbl,
+     tooltip = "Include the relative volume multiplier in the label.")
+
+i_showDots = input.bool(false, "Reaction Dots", group = g_lbl,
+     tooltip = "Show small dots at the exact price where each reaction occurred.")
+
+i_dotSize = input.string("Tiny", "  Dot Size",
+     options = ["Auto", "Tiny", "Small"], group = g_lbl,
+     tooltip = "Size of reaction dots.")
+
+
+// =====================================================================
+// SETTINGS: DASHBOARD
+// =====================================================================
+
+g_dash = "DASHBOARD"
+
+i_showDash = input.bool(true, "Show Dashboard", group = g_dash,
+     tooltip = "Display a summary table showing the top memory levels ranked by heat.")
+
+i_dashPos = input.string("Top Right", "  Position",
+     options = ["Top Right", "Top Left", "Top Center",
+                "Middle Right", "Middle Left",
+                "Bottom Right", "Bottom Left", "Bottom Center"], group = g_dash,
+     tooltip = "Screen position for the dashboard table.")
+
+i_dashSize = input.string("Small", "  Text Size",
+     options = ["Tiny", "Small", "Normal"], group = g_dash,
+     tooltip = "Font size for dashboard text.")
+
+i_dashTopN = input.int(5, "  Rows",
+     minval = 3, maxval = 10, group = g_dash,
+     tooltip = "Number of top levels displayed in the dashboard.")
+
+
+// =====================================================================
+// DATA STRUCTURES
+// =====================================================================
+
+type MemoryLevel
+    float   price
+    float   heat
+    int     hits
+    int     birthBar
+    int     lastHitBar
+    float   totalVol
+    bool    visible
+    string  behavior
+    string  lastBehavior
+    bool    wasBroken
+    box     bxGlow
+    box     bxCore
+    label   lbInfo
+
+
+// =====================================================================
+// STATE VARIABLES
+// =====================================================================
+
+var array<MemoryLevel> MEM = array.new<MemoryLevel>()
+var int lastDashRows = -1
+
+// Managed pool for reaction dot labels to prevent exceeding
+// TradingView's 500 label limit. Oldest dots are removed first
+// when the pool reaches capacity.
+var array<label> DOT_POOL = array.new<label>()
+var int MAX_DOTS = 0
+
+atr       = ta.atr(i_atrLen)
+safeATR   = nz(atr, ta.sma(ta.tr, i_atrLen))
+tolerance = safeATR * i_mergeDist
+zoneHalf  = safeATR * i_zoneHeight * 0.5
+glowHalf  = zoneHalf * i_glowMult
+
+pivHi     = ta.pivothigh(high, i_pivLen, i_pivLen)
+pivLo     = ta.pivotlow(low, i_pivLen, i_pivLen)
+
+CLEAR     = color.new(color.black, 100)
+int visibleLeft = bar_index - 500
+
+// Calculate safe dot budget: total labels minus reserved for zones
+// Reserve: max memory slots (zone labels) + 30 safety margin
+if MAX_DOTS == 0
+    MAX_DOTS := math.max(50, 500 - i_maxLevels - 30)
+
+
+// =====================================================================
+// VOLUME ENGINE
+// =====================================================================
+
+var bool _hasVol = false
+var bool _volChecked = false
+
+if not _volChecked and bar_index >= 50
+    float _cumV = 0.0
+    for k = 0 to 49
+        _cumV += nz(volume[k], 0.0)
+    _hasVol := _cumV > 0
+    _volChecked := true
+
+volEma = ta.ema(nz(volume, 0.0), 20)
+
+var float _cumNotional = 0.0
+var int   _cumNotBars  = 0
+
+if _hasVol and not na(volume) and volume > 0 and not na(close)
+    float barRange = high - low
+    float zoneW    = safeATR * i_zoneHeight
+    float frac     = barRange > 0 and zoneW > 0 ? math.min(1.0, zoneW / barRange) : 1.0
+    _cumNotional  += volume * frac * close
+    _cumNotBars   += 1
+
+f_avgNotional() =>
+    _cumNotBars > 0 ? _cumNotional / _cumNotBars : 1.0
+
+f_volFraction(int offset) =>
+    float barRange = high[offset] - low[offset]
+    float zoneWidth = safeATR * i_zoneHeight
+    float frac = 1.0
+    if barRange > 0 and zoneWidth > 0
+        frac := math.min(1.0, zoneWidth / barRange)
+    frac
+
+f_levelVol(int offset, float levelPrice) =>
+    float raw = _hasVol ? nz(volume[offset], 0.0) : 0.0
+    float frac = f_volFraction(offset)
+    float attributed = raw * frac * nz(close[offset], 0.0)
+    attributed
+
+f_volWeight(int offset) =>
+    float w = 1.0
+    if i_useVol and _hasVol
+        float v = nz(volume[offset], 0.0)
+        float e = nz(volEma[offset], 0.0)
+        if e > 0 and v > 0
+            w := math.max(0.4, math.min(2.5, v / e))
+    w
+
+f_vol(float totalV, int hits) =>
+    string s = "—"
+    if not na(totalV) and totalV > 0.0 and hits > 0
+        float avgN = f_avgNotional()
+        if avgN > 0
+            float perHit = totalV / math.max(hits, 1)
+            float relVol = perHit / avgN
+            if relVol >= 10.0
+                s := str.tostring(relVol, "#.#") + "x"
+            else
+                s := str.tostring(relVol, "#.##") + "x"
+    s
+
+
+// =====================================================================
+// COLOR ENGINE
+// =====================================================================
+
+f_lerp(color c1, color c2, float t) =>
+    _t = math.max(0.0, math.min(1.0, t))
+    color.rgb(
+         color.r(c1) + (color.r(c2) - color.r(c1)) * _t,
+         color.g(c1) + (color.g(c2) - color.g(c1)) * _t,
+         color.b(c1) + (color.b(c2) - color.b(c1)) * _t)
+
+f_themeColor(float norm) =>
+    n = math.max(0.0, math.min(1.0, norm))
+    color result = color.gray
+    if i_theme == "Dark"
+        result := n < 0.25 ? f_lerp(#2d1b4e, #8b2fc9, n / 0.25) :
+             n < 0.50 ? f_lerp(#8b2fc9, #e74c3c, (n - 0.25) / 0.25) :
+             n < 0.75 ? f_lerp(#e74c3c, #f39c12, (n - 0.50) / 0.25) :
+             f_lerp(#f39c12, #f5f5a0, (n - 0.75) / 0.25)
+    else if i_theme == "Light"
+        result := n < 0.25 ? f_lerp(#a8b5c4, #7b8fa8, n / 0.25) :
+             n < 0.50 ? f_lerp(#7b8fa8, #c0392b, (n - 0.25) / 0.25) :
+             n < 0.75 ? f_lerp(#c0392b, #d4541e, (n - 0.50) / 0.25) :
+             f_lerp(#d4541e, #8b0000, (n - 0.75) / 0.25)
+    else
+        result := color.gray
+    result
+
+f_srColor(float norm, float lvlPrice) =>
+    bool isSupport = close > lvlPrice
+    color baseGreen = f_lerp(#1b5e3a, #27ae60, norm)
+    color baseRed = f_lerp(#5e1b2a, #e74c3c, norm)
+    isSupport ? baseGreen : baseRed
+
+f_zoneColor(float norm, float lvlPrice) =>
+    i_theme == "Classic S/R" ? f_srColor(norm, lvlPrice) : f_themeColor(norm)
+
+f_glowCol(float n, float lvlPrice) =>
+    int tr = i_theme == "Dark" ? math.round(80 - n * 35) :
+         i_theme == "Light" ? math.round(85 - n * 30) :
+         math.round(80 - n * 35)
+    color.new(f_zoneColor(n, lvlPrice), tr)
+
+f_coreCol(float n, float lvlPrice) =>
+    int tr = i_theme == "Dark" ? math.round(45 - n * 40) :
+         i_theme == "Light" ? math.round(60 - n * 40) :
+         math.round(50 - n * 40)
+    color.new(f_zoneColor(n, lvlPrice), tr)
+
+f_lblCol(float n, float lvlPrice) =>
+    color baseCol = f_zoneColor(n, lvlPrice)
+    color finalCol = baseCol
+    if i_theme == "Dark"
+        finalCol := f_lerp(baseCol, #ffffff, 0.4 + n * 0.3)
+    color.new(finalCol, 0)
+
+
+// =====================================================================
+// CLASSIFICATION ENGINE
+// =====================================================================
+
+f_classify(float norm, int hits) =>
+    norm > 0.80 and hits >= 5 ? "Dominant" :
+     norm > 0.60 and hits >= 4 ? "Strong" :
+     norm > 0.40 and hits >= 3 ? "Active" : "Developing"
+
+f_classifyShort(float norm, int hits) =>
+    norm > 0.80 and hits >= 5 ? "DOM" :
+     norm > 0.60 and hits >= 4 ? "STR" :
+     norm > 0.40 and hits >= 3 ? "ACT" : "DEV"
+
+
+// =====================================================================
+// LEVEL AGE ENGINE
+// =====================================================================
+
+f_age(int birthBar) =>
+    int age = bar_index - birthBar
+    age > 200 ? "Veteran" : age > 50 ? "Seasoned" : "Fresh"
+
+f_ageShort(int birthBar) =>
+    int age = bar_index - birthBar
+    age > 200 ? "VET" : age > 50 ? "SEA" : "NEW"
+
+
+// =====================================================================
+// BEHAVIOR ENGINE (AUDITED & CORRECTED)
+// =====================================================================
+
+f_detectBehavior(float zonePrice, float zHalf, bool wasBroken) =>
+    string result = ""
+    if not i_behEnabled
+        result
+    else
+        float zoneTop = zonePrice + zHalf
+        float zoneBot = zonePrice - zHalf
+        float sweepTop = zoneTop + zHalf * 1.5
+        float sweepBot = zoneBot - zHalf * 1.5
+        int lb = i_behLookback
+
+        float currHigh = high
+        float currLow = low
+        float currClose = close
+        float currOpen = open
+        float currRange = currHigh - currLow
+        float currBody = math.abs(currClose - currOpen)
+        float currBodyTop = math.max(currClose, currOpen)
+        float currBodyBot = math.min(currClose, currOpen)
+        float currUpperWick = currHigh - currBodyTop
+        float currLowerWick = currBodyBot - currLow
+        bool currBullish = currClose > currOpen
+        bool currBearish = currClose < currOpen
+
+        int closeAbove = 0
+        int closeBelow = 0
+        int closeInside = 0
+        int bodyTouchZone = 0
+        float totalRange = 0.0
+        float totalBody = 0.0
+
+        for k = 1 to lb
+            float h = high[k]
+            float l = low[k]
+            float c = close[k]
+            float o = open[k]
+            float bTop = math.max(o, c)
+            float bBot = math.min(o, c)
+
+            totalRange += h - l
+            totalBody += math.abs(c - o)
+
+            if c > zoneTop
+                closeAbove += 1
+            else if c < zoneBot
+                closeBelow += 1
+            else
+                closeInside += 1
+                
+            if bBot <= zoneTop and bTop >= zoneBot
+                bodyTouchZone += 1
+
+        float avgRange = lb > 0 ? totalRange / lb : currRange
+        float avgBody = lb > 0 ? totalBody / lb : currBody
+        float minRange = safeATR * 0.1
+        bool validRange = currRange > minRange
+
+        // BREAK
+        if validRange and currBody > currRange * 0.50
+            bool bullBreak = currClose > zoneTop and 
+                             (currOpen <= zoneTop or currLow <= zoneTop) and
+                             currBullish
+            bool bearBreak = currClose < zoneBot and 
+                             (currOpen >= zoneBot or currHigh >= zoneBot) and
+                             currBearish
+            if bullBreak
+                result := "Break ^"
+            else if bearBreak
+                result := "Break v"
+
+        // SWEEP
+        if result == "" and validRange
+            bool bearSweep = currHigh > sweepTop and 
+                             currClose <= zoneTop and
+                             currUpperWick > currBody * 0.8 and
+                             currUpperWick > currRange * 0.35
+            bool bullSweep = currLow < sweepBot and 
+                             currClose >= zoneBot and
+                             currLowerWick > currBody * 0.8 and
+                             currLowerWick > currRange * 0.35
+            if bearSweep
+                result := "Sweep v"
+            else if bullSweep
+                result := "Sweep ^"
+
+        // REJECTION
+        if result == "" and validRange
+            bool wickTouchedFromBelow = currLow <= zoneTop and currLow >= zoneBot - zHalf
+            bool wickTouchedFromAbove = currHigh >= zoneBot and currHigh <= zoneTop + zHalf
+            
+            bool bullRej = wickTouchedFromBelow and 
+                           currClose > zoneTop and
+                           currLowerWick > currRange * 0.45 and
+                           currBody > currRange * 0.25
+            bool bearRej = wickTouchedFromAbove and 
+                           currClose < zoneBot and
+                           currUpperWick > currRange * 0.45 and
+                           currBody > currRange * 0.25
+            if bullRej
+                result := "Rejection ^"
+            else if bearRej
+                result := "Rejection v"
+
+        // RETEST
+        if result == "" and wasBroken
+            bool wasAboveZone = closeAbove == lb
+            bool wasBelowZone = closeBelow == lb
+            bool touchingNow = currLow <= zoneTop and currHigh >= zoneBot
+            
+            if touchingNow
+                if wasAboveZone
+                    result := "Retest v"
+                else if wasBelowZone
+                    result := "Retest ^"
+
+        // ABSORPTION
+        if result == "" and bodyTouchZone >= lb - 1
+            bool currBodyInZone = currBodyBot <= zoneTop and currBodyTop >= zoneBot
+            bool smallBodies = avgBody < avgRange * 0.45
+            bool manyInside = closeInside >= math.floor(lb * 0.6)
+            
+            if currBodyInZone and smallBodies and manyInside
+                result := "Absorption"
+
+        result
+
+
+// =====================================================================
+// BEHAVIOR FORMATTERS
+// =====================================================================
+
+f_behaviorShort(string beh) =>
+    string result = ""
+    if str.contains(beh, "Rejection")
+        result := str.contains(beh, "^") ? "REJ↑" : "REJ↓"
+    else if str.contains(beh, "Sweep")
+        result := str.contains(beh, "^") ? "SWP↑" : "SWP↓"
+    else if str.contains(beh, "Break")
+        result := str.contains(beh, "^") ? "BRK↑" : "BRK↓"
+    else if str.contains(beh, "Retest")
+        result := str.contains(beh, "^") ? "RET↑" : "RET↓"
+    else if str.contains(beh, "Absorption")
+        result := "ABS"
+    result
+
+f_behaviorFull(string beh) =>
+    string result = ""
+    if str.contains(beh, "Rejection")
+        result := str.contains(beh, "^") ? "Rejection ↑" : "Rejection ↓"
+    else if str.contains(beh, "Sweep")
+        result := str.contains(beh, "^") ? "Sweep ↑" : "Sweep ↓"
+    else if str.contains(beh, "Break")
+        result := str.contains(beh, "^") ? "Break ↑" : "Break ↓"
+    else if str.contains(beh, "Retest")
+        result := str.contains(beh, "^") ? "Retest ↑" : "Retest ↓"
+    else if str.contains(beh, "Absorption")
+        result := "Absorption"
+    result
+
+
+// =====================================================================
+// MEMORY ENGINE
+// =====================================================================
+
+f_findNearest(float price) =>
+    int bestIdx = -1
+    float bestDist = tolerance
+    if MEM.size() > 0
+        for i = 0 to MEM.size() - 1
+            d = math.abs(MEM.get(i).price - price)
+            if d < bestDist
+                bestDist := d
+                bestIdx := i
+    bestIdx
+
+f_destroy(MemoryLevel lvl) =>
+    box.delete(lvl.bxGlow)
+    box.delete(lvl.bxCore)
+    label.delete(lvl.lbInfo)
+    true
+
+f_removeColdest() =>
+    if MEM.size() > 1
+        int coldIdx = 0
+        float coldH = MEM.get(0).heat
+        for i = 1 to MEM.size() - 1
+            if MEM.get(i).heat < coldH
+                coldH := MEM.get(i).heat
+                coldIdx := i
+        f_destroy(MEM.get(coldIdx))
+        MEM.remove(coldIdx)
+    else if MEM.size() == 1
+        f_destroy(MEM.get(0))
+        MEM.remove(0)
+    true
+
+// =====================================================================
+// DOT MANAGEMENT
+// Creates a reaction dot label and manages the pool to prevent
+// exceeding TradingView's 500 total label limit.
+// Oldest dots are removed when pool capacity is reached.
+// =====================================================================
+
+f_addDot(int xBar, float yPrice, color dotCol, string dotSz) =>
+    // Remove oldest dot if pool is full
+    if DOT_POOL.size() >= MAX_DOTS
+        label oldDot = DOT_POOL.shift()
+        label.delete(oldDot)
+    // Create new dot and add to pool
+    label newDot = label.new(xBar, yPrice, "●",
+         style = label.style_label_center, color = CLEAR,
+         textcolor = dotCol, size = dotSz)
+    DOT_POOL.push(newDot)
+    true
+
+// =====================================================================
+// REACTION DETECTION
+// =====================================================================
+
+if not na(pivHi)
+    int off = i_pivLen
+    int srcBar = bar_index - off
+    int nearIdx = f_findNearest(pivHi)
+    float attrVol = f_levelVol(off, pivHi)
+    float vWeight = f_volWeight(off)
+
+    if i_showDots and srcBar >= visibleLeft
+        float norm = 0.5
+        if nearIdx >= 0 and MEM.size() > 0
+            norm := math.min(MEM.get(nearIdx).heat / math.max(i_heatBoost * 3, 0.01), 1.0)
+        color dotCol = color.new(f_zoneColor(norm, pivHi), 20)
+        string dotSz = i_dotSize == "Small" ? size.small : size.tiny
+        if i_dotSize == "Auto"
+            dotSz := norm > 0.7 ? size.small : size.tiny
+        f_addDot(srcBar, pivHi, dotCol, dotSz)
+
+    if nearIdx >= 0
+        lvl = MEM.get(nearIdx)
+        float w = lvl.heat
+        float boost = i_heatBoost * vWeight
+        lvl.price := (lvl.price * w + pivHi * boost) / (w + boost)
+        lvl.heat += boost
+        lvl.hits += 1
+        lvl.lastHitBar := srcBar
+        lvl.totalVol += attrVol
+    else
+        if MEM.size() >= i_maxLevels
+            f_removeColdest()
+        MEM.push(MemoryLevel.new(
+             price = pivHi, heat = i_heatBoost * vWeight,
+             hits = 1, birthBar = srcBar, lastHitBar = srcBar,
+             totalVol = attrVol, visible = false,
+             behavior = "", lastBehavior = "", wasBroken = false,
+             bxGlow = box.new(bar_index, pivHi, bar_index, pivHi,
+                 bgcolor = CLEAR, border_color = CLEAR, border_width = 0),
+             bxCore = box.new(bar_index, pivHi, bar_index, pivHi,
+                 bgcolor = CLEAR, border_color = CLEAR, border_width = 0),
+             lbInfo = label.new(bar_index, pivHi, "",
+                 style = label.style_label_left, color = CLEAR,
+                 textcolor = color.white, size = size.tiny)))
+
+if not na(pivLo)
+    int off = i_pivLen
+    int srcBar = bar_index - off
+    int nearIdx = f_findNearest(pivLo)
+    float attrVol = f_levelVol(off, pivLo)
+    float vWeight = f_volWeight(off)
+
+    if i_showDots and srcBar >= visibleLeft
+        float norm = 0.5
+        if nearIdx >= 0 and MEM.size() > 0
+            norm := math.min(MEM.get(nearIdx).heat / math.max(i_heatBoost * 3, 0.01), 1.0)
+        color dotCol = color.new(f_zoneColor(norm, pivLo), 20)
+        string dotSz = i_dotSize == "Small" ? size.small : size.tiny
+        if i_dotSize == "Auto"
+            dotSz := norm > 0.7 ? size.small : size.tiny
+        f_addDot(srcBar, pivLo, dotCol, dotSz)
+
+    if nearIdx >= 0
+        lvl = MEM.get(nearIdx)
+        float w = lvl.heat
+        float boost = i_heatBoost * vWeight
+        lvl.price := (lvl.price * w + pivLo * boost) / (w + boost)
+        lvl.heat += boost
+        lvl.hits += 1
+        lvl.lastHitBar := srcBar
+        lvl.totalVol += attrVol
+    else
+        if MEM.size() >= i_maxLevels
+            f_removeColdest()
+        MEM.push(MemoryLevel.new(
+             price = pivLo, heat = i_heatBoost * vWeight,
+             hits = 1, birthBar = srcBar, lastHitBar = srcBar,
+             totalVol = attrVol, visible = false,
+             behavior = "", lastBehavior = "", wasBroken = false,
+             bxGlow = box.new(bar_index, pivLo, bar_index, pivLo,
+                 bgcolor = CLEAR, border_color = CLEAR, border_width = 0),
+             bxCore = box.new(bar_index, pivLo, bar_index, pivLo,
+                 bgcolor = CLEAR, border_color = CLEAR, border_width = 0),
+             lbInfo = label.new(bar_index, pivLo, "",
+                 style = label.style_label_left, color = CLEAR,
+                 textcolor = color.white, size = size.tiny)))
+
+if i_wickReact and MEM.size() > 0
+    float bRange = high[1] - low[1]
+    float upWick = high[1] - math.max(open[1], close[1])
+    float dnWick = math.min(open[1], close[1]) - low[1]
+    if bRange > 0
+        float wickThresh = i_wickMinPct / 100.0
+        float vw = f_volWeight(1) * 0.5
+        float wickVol = f_levelVol(1, close[1])
+        int srcBar = bar_index - 1
+        for i = 0 to MEM.size() - 1
+            lvl = MEM.get(i)
+            float prc = lvl.price
+            float tol = tolerance
+            if high[1] >= prc - tol and high[1] <= prc + tol
+                if upWick / bRange >= wickThresh and close[1] < prc
+                    lvl.heat += i_heatBoost * vw
+                    lvl.hits += 1
+                    lvl.lastHitBar := srcBar
+                    lvl.totalVol += wickVol
+                    if i_showDots and srcBar >= visibleLeft
+                        f_addDot(srcBar, high[1], color.new(f_zoneColor(0.5, prc), 30), size.tiny)
+            if low[1] >= prc - tol and low[1] <= prc + tol
+                if dnWick / bRange >= wickThresh and close[1] > prc
+                    lvl.heat += i_heatBoost * vw
+                    lvl.hits += 1
+                    lvl.lastHitBar := srcBar
+                    lvl.totalVol += wickVol
+                    if i_showDots and srcBar >= visibleLeft
+                        f_addDot(srcBar, low[1], color.new(f_zoneColor(0.5, prc), 30), size.tiny)
+
+
+// =====================================================================
+// DECAY AND CLEANUP
+// =====================================================================
+
+if MEM.size() > 0
+    for i = MEM.size() - 1 to 0
+        lvl = MEM.get(i)
+        lvl.heat := lvl.heat * i_decay
+        if lvl.heat < i_deathThresh
+            f_destroy(lvl)
+            MEM.remove(i)
+
+
+// =====================================================================
+// MAX HEAT CALCULATION
+// =====================================================================
+
+float maxH = 0.001
+if MEM.size() > 0
+    for i = 0 to MEM.size() - 1
+        if MEM.get(i).heat > maxH
+            maxH := MEM.get(i).heat
+
+
+// =====================================================================
+// RENDERING ENGINE
+// =====================================================================
+
+int rEdge = bar_index + i_zoneExtend
+int lBack = math.max(bar_index - 500, 0)
+float proxRad = safeATR * i_proxRadius
+
+var bool newBehaviorThisBar = false
+newBehaviorThisBar := false
+
+if MEM.size() > 0
+    for i = 0 to MEM.size() - 1
+        lvl = MEM.get(i)
+        float p = lvl.price
+
+        bool qualified = lvl.hits >= i_minHits
+        bool inTopN = false
+        if qualified
+            int higher = 0
+            for j = 0 to MEM.size() - 1
+                if j != i
+                    other = MEM.get(j)
+                    if other.hits >= i_minHits and other.heat > lvl.heat
+                        higher += 1
+            inTopN := higher < i_topN
+
+        lvl.visible := qualified and inTopN
+
+        lvl.lbInfo.set_xy(rEdge + 2, p)
+        lvl.lbInfo.set_style(label.style_label_left)
+        lvl.lbInfo.set_color(CLEAR)
+
+        if lvl.visible
+            float norm = math.min(lvl.heat / maxH, 1.0)
+            int lEdge = math.max(lvl.birthBar, lBack)
+
+            float dist = 0.0
+            if p > high
+                dist := p - high
+            else if p < low
+                dist := low - p
+            float proxNorm = proxRad > 0 ? math.max(0.0, 1.0 - dist / proxRad) : 0.0
+            float vNorm = math.min(norm + proxNorm * i_proxBoost, 1.0)
+            float proxScale = 1.0 + proxNorm * 0.15
+
+            lvl.lastBehavior := lvl.behavior
+            if i_behEnabled and proxNorm > 0.4
+                string newBeh = f_detectBehavior(p, zoneHalf, lvl.wasBroken)
+                if newBeh != ""
+                    if newBeh != lvl.behavior
+                        newBehaviorThisBar := true
+                    lvl.behavior := newBeh
+                    if str.contains(newBeh, "Break")
+                        lvl.wasBroken := true
+
+            if i_showGlow
+                float gH = glowHalf * (0.5 + vNorm * 0.5) * proxScale
+                lvl.bxGlow.set_lefttop(lEdge, p + gH)
+                lvl.bxGlow.set_rightbottom(rEdge, p - gH)
+                lvl.bxGlow.set_bgcolor(f_glowCol(vNorm, p))
+                lvl.bxGlow.set_border_color(CLEAR)
+            else
+                lvl.bxGlow.set_bgcolor(CLEAR)
+                lvl.bxGlow.set_border_color(CLEAR)
+
+            float cH = zoneHalf * (0.7 + vNorm * 0.3) * proxScale
+            lvl.bxCore.set_lefttop(lEdge, p + cH)
+            lvl.bxCore.set_rightbottom(rEdge, p - cH)
+            lvl.bxCore.set_bgcolor(f_coreCol(vNorm, p))
+            lvl.bxCore.set_border_color(CLEAR)
+
+            if i_showLabel
+                string vStr = ""
+                if i_showVol and _hasVol and lvl.totalVol > 0
+                    vStr := f_vol(lvl.totalVol, lvl.hits)
+
+                string statusStr = close > p ? "Support" : "Resistance"
+                
+                string behStr = ""
+                if lvl.behavior != ""
+                    behStr := i_labelMode == "Minimal" ? f_behaviorShort(lvl.behavior) : f_behaviorFull(lvl.behavior)
+
+                string txt = ""
+                
+                if i_labelMode == "Minimal"
+                    txt := f_classifyShort(norm, lvl.hits)
+                    if i_showHits
+                        txt += " " + str.tostring(lvl.hits)
+                    if vStr != ""
+                        txt += " " + vStr
+                    txt += " " + f_ageShort(lvl.birthBar)
+                    if behStr != ""
+                        txt += " " + behStr
+                    lvl.lbInfo.set_size(size.tiny)
+
+                else if i_labelMode == "Detailed"
+                    txt := f_classify(norm, lvl.hits)
+                    txt += " | " + statusStr
+                    if i_showHits
+                        txt += " | " + str.tostring(lvl.hits)
+                    if vStr != ""
+                        txt += " | " + vStr
+                    txt += " | " + str.tostring(p, format.mintick)
+                    txt += " | " + f_age(lvl.birthBar)
+                    if behStr != ""
+                        txt += " | " + behStr
+                    lvl.lbInfo.set_size(size.small)
+
+                else if i_labelMode == "Large"
+                    txt := f_classify(norm, lvl.hits)
+                    if i_showHits
+                        txt += " | " + str.tostring(lvl.hits) + " hits"
+                    if vStr != ""
+                        txt += " | " + vStr
+                    txt += " | " + f_age(lvl.birthBar)
+                    txt += " | " + statusStr
+                    if behStr != ""
+                        txt += " | " + behStr
+                    lvl.lbInfo.set_size(size.normal)
+
+                else
+                    txt := f_classify(norm, lvl.hits)
+                    if i_showHits
+                        txt += " | " + str.tostring(lvl.hits) + " hits"
+                    if vStr != ""
+                        txt += " | " + vStr
+                    txt += " | " + f_ageShort(lvl.birthBar)
+                    if behStr != ""
+                        txt += " | " + behStr
+                    lvl.lbInfo.set_size(size.small)
+
+                lvl.lbInfo.set_text(txt)
+                lvl.lbInfo.set_textcolor(f_lblCol(vNorm, p))
+
+            else
+                lvl.lbInfo.set_text("")
+                lvl.lbInfo.set_textcolor(CLEAR)
+
+        else
+            lvl.bxGlow.set_bgcolor(CLEAR)
+            lvl.bxGlow.set_border_color(CLEAR)
+            lvl.bxCore.set_bgcolor(CLEAR)
+            lvl.bxCore.set_border_color(CLEAR)
+            lvl.lbInfo.set_text("")
+            lvl.lbInfo.set_textcolor(CLEAR)
+            lvl.behavior := ""
+
+
+// =====================================================================
+// DASHBOARD
+// =====================================================================
+
+var table dash = na
+
+if i_showDash
+    if barstate.isfirst
+        string tPos = i_dashPos == "Top Left" ? position.top_left :
+             i_dashPos == "Top Center" ? position.top_center :
+             i_dashPos == "Middle Right" ? position.middle_right :
+             i_dashPos == "Middle Left" ? position.middle_left :
+             i_dashPos == "Bottom Right" ? position.bottom_right :
+             i_dashPos == "Bottom Left" ? position.bottom_left :
+             i_dashPos == "Bottom Center" ? position.bottom_center :
+             position.top_right
+
+        color tblBg = i_theme == "Light" ? color.new(#f5f5fa, 5) :
+             color.new(#0a0a1a, 5)
+        color tblBrd = i_theme == "Light" ? color.new(#bbbbcc, 50) :
+             color.new(#333355, 50)
+        color tblFrame = i_theme == "Light" ? color.new(#9999bb, 30) :
+             color.new(#444477, 30)
+
+        dash := table.new(tPos, 8, i_dashTopN + 2,
+             bgcolor = tblBg, border_color = tblBrd, border_width = 1,
+             frame_color = tblFrame, frame_width = 2)
+
+    if barstate.islast and not na(dash)
+        string actualTSize = i_dashSize == "Tiny" ? size.tiny :
+             i_dashSize == "Normal" ? size.normal : size.small
+
+        color hdrBg = i_theme == "Light" ? color.new(#e8e8f0, 10) :
+             color.new(#1a1a3a, 10)
+        color hdrTxt = i_theme == "Light" ? color.new(#333355, 0) :
+             color.new(#ccccee, 0)
+
+        table.cell(dash, 0, 0, " # ",      bgcolor = hdrBg, text_color = hdrTxt, text_size = actualTSize)
+        table.cell(dash, 1, 0, " PRICE ",   bgcolor = hdrBg, text_color = hdrTxt, text_size = actualTSize)
+        table.cell(dash, 2, 0, " CLASS ",   bgcolor = hdrBg, text_color = hdrTxt, text_size = actualTSize)
+        table.cell(dash, 3, 0, " HEAT ",    bgcolor = hdrBg, text_color = hdrTxt, text_size = actualTSize)
+        table.cell(dash, 4, 0, " HITS ",    bgcolor = hdrBg, text_color = hdrTxt, text_size = actualTSize)
+        table.cell(dash, 5, 0, " RVOL ",    bgcolor = hdrBg, text_color = hdrTxt, text_size = actualTSize)
+        table.cell(dash, 6, 0, " STATUS ",  bgcolor = hdrBg, text_color = hdrTxt, text_size = actualTSize)
+        table.cell(dash, 7, 0, " AGE ",     bgcolor = hdrBg, text_color = hdrTxt, text_size = actualTSize)
+
+        array<int> sIdx = array.new<int>()
+        array<float> sHeat = array.new<float>()
+
+        if MEM.size() > 0
+            for i = 0 to MEM.size() - 1
+                if MEM.get(i).hits >= i_minHits
+                    sIdx.push(i)
+                    sHeat.push(MEM.get(i).heat)
+
+        if sIdx.size() > 1
+            for i = 0 to sIdx.size() - 2
+                for j = 0 to sIdx.size() - i - 2
+                    if sHeat.get(j) < sHeat.get(j + 1)
+                        float tmpH = sHeat.get(j)
+                        int tmpI = sIdx.get(j)
+                        sHeat.set(j, sHeat.get(j + 1))
+                        sIdx.set(j, sIdx.get(j + 1))
+                        sHeat.set(j + 1, tmpH)
+                        sIdx.set(j + 1, tmpI)
+
+        int rows = math.min(i_dashTopN, sIdx.size())
+        float topHeat = rows > 0 ? sHeat.get(0) : 1.0
+
+        if rows != lastDashRows
+            table.merge_cells(dash, 0, rows + 1, 7, rows + 1)
+            lastDashRows := rows
+
+        if rows > 0
+            for r = 0 to rows - 1
+                lvl = MEM.get(sIdx.get(r))
+                float norm = math.min(lvl.heat / math.max(topHeat, 0.001), 1.0)
+                string cls = f_classify(norm, lvl.hits)
+                float dist2 = close != 0 ? (lvl.price - close) / close * 100.0 : 0.0
+
+                color rowBg = color.new(f_zoneColor(norm, lvl.price), 85)
+                color rowTxt = i_theme == "Light" ?
+                     color.new(f_zoneColor(norm, lvl.price), 0) :
+                     f_lblCol(norm, lvl.price)
+
+                int filled = math.round(norm * 8)
+                string hBar = ""
+                for b = 0 to 7
+                    hBar += b < filled ? "|" : "."
+
+                string rank = r == 0 ? "*" : str.tostring(r + 1)
+
+                string dirTxt = dist2 > 0 ? "above" : "below"
+                string statusTxt = ""
+                if lvl.behavior != ""
+                    statusTxt := f_behaviorShort(lvl.behavior)
+                else if math.abs(dist2) < 0.15
+                    statusTxt := "At level"
+                else
+                    statusTxt := str.tostring(math.abs(dist2), "#.##") + "% " + dirTxt
+
+                color statusCol = color.new(#888899, 0)
+                if lvl.behavior != ""
+                    statusCol := rowTxt
+                else if math.abs(dist2) < 0.15
+                    statusCol := color.new(#00ff88, 0)
+                else if math.abs(dist2) < 0.8
+                    statusCol := color.new(#ffaa00, 0)
+
+                string clsTxt = cls
+                if i_theme == "Classic S/R"
+                    clsTxt += close > lvl.price ? " S" : " R"
+
+                string volTxt = "—"
+                if _hasVol and lvl.totalVol > 0
+                    volTxt := f_vol(lvl.totalVol, lvl.hits)
+
+                table.cell(dash, 0, r + 1, " " + rank + " ",
+                     bgcolor = rowBg, text_color = rowTxt, text_size = actualTSize)
+                table.cell(dash, 1, r + 1, " " + str.tostring(lvl.price, format.mintick) + " ",
+                     bgcolor = rowBg, text_color = rowTxt, text_size = actualTSize)
+                table.cell(dash, 2, r + 1, " " + clsTxt + " ",
+                     bgcolor = rowBg, text_color = rowTxt, text_size = actualTSize)
+                table.cell(dash, 3, r + 1, " " + hBar + " ",
+                     bgcolor = rowBg, text_color = rowTxt, text_size = actualTSize)
+                table.cell(dash, 4, r + 1, " " + str.tostring(lvl.hits) + " ",
+                     bgcolor = rowBg, text_color = rowTxt, text_size = actualTSize)
+                table.cell(dash, 5, r + 1, " " + volTxt + " ",
+                     bgcolor = rowBg, text_color = rowTxt, text_size = actualTSize)
+                table.cell(dash, 6, r + 1, " " + statusTxt + " ",
+                     bgcolor = rowBg, text_color = statusCol, text_size = actualTSize)
+                table.cell(dash, 7, r + 1, " " + f_ageShort(lvl.birthBar) + " ",
+                     bgcolor = rowBg, text_color = rowTxt, text_size = actualTSize)
+
+        int visCount = 0
+        if MEM.size() > 0
+            for i = 0 to MEM.size() - 1
+                if MEM.get(i).visible
+                    visCount += 1
+
+        string footTxt = " Memory: " + str.tostring(MEM.size()) +
+             " | Showing: " + str.tostring(visCount) +
+             " | Decay: " + str.tostring(i_decay, "#.###") + " "
+
+        color footBg = i_theme == "Light" ? color.new(#f0f0f5, 10) :
+             color.new(#0a0a1a, 10)
+        color footTxtCol = i_theme == "Light" ? color.new(#666688, 0) :
+             color.new(#888899, 0)
+
+        table.cell(dash, 0, rows + 1, footTxt,
+             bgcolor = footBg, text_color = footTxtCol, text_size = size.tiny)
+
+
+// =====================================================================
+// ALERTS
+// =====================================================================
+
+var bool wasInHotZone = false
+bool isInHotZone = false
+
+if MEM.size() > 0
+    for i = 0 to MEM.size() - 1
+        lvl = MEM.get(i)
+        if lvl.visible
+            float norm = math.min(lvl.heat / maxH, 1.0)
+            if norm > 0.5 and lvl.hits >= 3
+                if close >= lvl.price - zoneHalf and close <= lvl.price + zoneHalf
+                    isInHotZone := true
+
+bool hotZoneEntry = isInHotZone and not wasInHotZone
+wasInHotZone := isInHotZone
+
+alertcondition(hotZoneEntry,
+     title = "PMH: Price entered hot zone",
+     message = "Price entered a high-heat memory zone")
+
+alertcondition(newBehaviorThisBar,
+     title = "PMH: New behavior detected",
+     message = "New behavior pattern detected at memory level")
+
+alertcondition(not na(pivHi) or not na(pivLo),
+     title = "PMH: New reaction",
+     message = "New pivot reaction confirmed")
+
+
+// =====================================================================
+// DATA WINDOW
+// =====================================================================
+
+plot(MEM.size(), "Memory Levels", display = display.data_window, color = CLEAR)
+plot(maxH, "Max Heat", display = display.data_window, color = CLEAR)
+
+
+// =====================================================================
+// END OF SCRIPT
+//
+// Disclaimer: This indicator is provided for educational and
+// analytical purposes only. It does not constitute financial advice,
+// investment recommendations, or trading signals. Past price
+// reactions at specific levels do not guarantee future behavior.
+// Always conduct your own analysis and use proper risk management.
+// The author assumes no liability for any trading decisions made
+// using this tool.
+// =====================================================================

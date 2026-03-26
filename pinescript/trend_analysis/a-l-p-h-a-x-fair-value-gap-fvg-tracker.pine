@@ -1,0 +1,400 @@
+//@version=6
+indicator("AlphaX Fair Value Gap (FVG) Tracker", overlay=true, max_boxes_count=500, max_lines_count=500, max_labels_count=500)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// INPUTS
+// ─────────────────────────────────────────────────────────────────────────────
+
+grp_general = "═══════ General Settings ═══════"
+maxFVGs        = input.int(8,    "Max FVGs to Display",              minval=5,  maxval=200, group=grp_general)
+showFilledFVGs = input.bool(true, "Show Filled FVGs (Dimmed)",                               group=grp_general)
+removeFilled   = input.bool(false,"Auto-Remove Fully Filled FVGs",                           group=grp_general)
+extendFVGs     = input.int(50,    "Extend FVG Boxes (bars)",          minval=5,  maxval=500, group=grp_general)
+showMidline    = input.bool(true, "Show CE Midline",                                         group=grp_general)
+showSignals    = input.bool(true, "Show Signals on New FVG",                                 group=grp_general)
+
+grp_bull = "═══════ Bullish FVG ═══════"
+showBullFVG     = input.bool(true,                                "Show Bullish FVGs",  group=grp_bull)
+bullColor       = input.color(color.new(color.rgb(178, 208, 72), 82), "Fill Color",     group=grp_bull)
+bullBorderColor = input.color(color.new(color.rgb(178, 208, 72), 30), "Border Color",   group=grp_bull)
+bullFilledColor = input.color(color.new(color.rgb(178, 208, 72), 93), "Filled (Dimmed)",group=grp_bull)
+bullCEColor     = input.color(color.new(color.rgb(178, 208, 72), 40), "CE Line Color",  group=grp_bull)
+
+grp_bear = "═══════ Bearish FVG ═══════"
+showBearFVG     = input.bool(true,                                "Show Bearish FVGs",  group=grp_bear)
+bearColor       = input.color(color.new(color.rgb(176, 58,  58), 82), "Fill Color",     group=grp_bear)
+bearBorderColor = input.color(color.new(color.rgb(176, 58,  58), 30), "Border Color",   group=grp_bear)
+bearFilledColor = input.color(color.new(color.rgb(176, 58,  58), 93), "Filled (Dimmed)",group=grp_bear)
+bearCEColor     = input.color(color.new(color.rgb(176, 58,  58), 40), "CE Line Color",  group=grp_bear)
+
+grp_mtf = "═══════ Multi-Timeframe ═══════"
+showMTF      = input.bool(false, "Enable HTF FVGs",                                          group=grp_mtf)
+htfInput     = input.timeframe("60", "Higher Timeframe",                                     group=grp_mtf, options=["5","15","30","60","120","240","D","W"])
+htfBullColor = input.color(color.new(color.rgb(178, 208, 72), 65), "HTF Bullish Color",      group=grp_mtf)
+htfBearColor = input.color(color.new(color.rgb(176, 58,  58), 65), "HTF Bearish Color",      group=grp_mtf)
+htfBorderW   = input.int(2, "HTF Border Width", minval=1, maxval=4,                          group=grp_mtf)
+
+grp_filter = "═══════ Filter Settings ═══════"
+minFVGSize    = input.float(0.0,  "Min FVG Size (points, 0=off)", minval=0.0,                group=grp_filter)
+useATRFilter  = input.bool(false, "Use ATR Filter",                                          group=grp_filter)
+atrMult       = input.float(0.1,  "ATR Multiplier", minval=0.01, maxval=2.0, step=0.01,     group=grp_filter)
+atrLen        = input.int(14,     "ATR Length", minval=1,                                    group=grp_filter)
+
+grp_entry = "═══════ Entry Signals (ICT/SMC) ═══════"
+showEntries    = input.bool(true,  "Show FVG Entry Signals",                                 group=grp_entry)
+entryMode      = input.string("CE Touch", "Entry Mode", options=["CE Touch","50% Retest","Full Fill Edge"], group=grp_entry)
+confirmCandle  = input.bool(true,  "Require Candle Close Confirmation",                      group=grp_entry)
+
+grp_alert = "═══════ Alerts ═══════"
+alertOnNewBull = input.bool(true, "Alert: New Bullish FVG",  group=grp_alert)
+alertOnNewBear = input.bool(true, "Alert: New Bearish FVG",  group=grp_alert)
+alertOnFill    = input.bool(true, "Alert: FVG Filled",       group=grp_alert)
+alertOnEntry   = input.bool(true, "Alert: Entry Signal",     group=grp_alert)
+
+grp_dash = "═══════ Dashboard ═══════"
+showDashboard = input.bool(true, "Show Dashboard",                                           group=grp_dash)
+dashPosition  = input.string("Top Right", "Position", options=["Top Right","Top Left","Bottom Right","Bottom Left"], group=grp_dash)
+dashSize      = input.string("Small", "Text Size", options=["Tiny","Small","Normal"],        group=grp_dash)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ARRAYS
+// ─────────────────────────────────────────────────────────────────────────────
+
+var box[]   fvgBoxes     = array.new<box>()
+var line[]  fvgLines     = array.new<line>()
+var float[] fvgTop       = array.new<float>()
+var float[] fvgBot       = array.new<float>()
+var int[]   fvgDir       = array.new<int>()
+var int[]   fvgStatus    = array.new<int>()
+var int[]   fvgBar       = array.new<int>()
+var bool[]  fvgIsHTF     = array.new<bool>()
+var bool[]  fvgTriggered = array.new<bool>()
+
+// ─────────────────────────────────────────────────────────────────────────────
+// COUNTERS
+// ─────────────────────────────────────────────────────────────────────────────
+
+var int totalBull  = 0
+var int totalBear  = 0
+var int activeBull = 0
+var int activeBear = 0
+var int filledBull = 0
+var int filledBear = 0
+
+// ─────────────────────────────────────────────────────────────────────────────
+// HELPERS
+// ─────────────────────────────────────────────────────────────────────────────
+
+atrValue = ta.atr(atrLen)
+
+f_minSize() =>
+    useATRFilter ? math.max(minFVGSize, atrValue * atrMult) : minFVGSize
+
+f_dashPos(string p) =>
+    switch p
+        "Top Left"     => position.top_left
+        "Bottom Right" => position.bottom_right
+        "Bottom Left"  => position.bottom_left
+        =>               position.top_right
+
+f_tSize(string s) =>
+    switch s
+        "Tiny"   => size.tiny
+        "Normal" => size.normal
+        =>          size.small
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ADD FVG
+// ─────────────────────────────────────────────────────────────────────────────
+
+f_addFVG(_top, _bot, _dir, _barIdx, _isHTF) =>
+    color bgCol   = _isHTF ? (_dir == 1 ? htfBullColor : htfBearColor)
+                           : (_dir == 1 ? bullColor     : bearColor)
+    color bordCol = _isHTF ? (_dir == 1 ? color.new(htfBullColor, 20) : color.new(htfBearColor, 20))
+                           : (_dir == 1 ? bullBorderColor              : bearBorderColor)
+    color ceCol   = _isHTF ? (_dir == 1 ? color.new(htfBullColor, 35) : color.new(htfBearColor, 35))
+                           : (_dir == 1 ? bullCEColor                  : bearCEColor)
+    int bw        = _isHTF ? htfBorderW : 1
+
+    bx = box.new(_barIdx, _top, _barIdx + extendFVGs, _bot,
+                 border_color=bordCol, bgcolor=bgCol, border_width=bw)
+    ln = line(na)
+    if showMidline
+        float mid = (_top + _bot) / 2.0
+        ln := line.new(_barIdx, mid, _barIdx + extendFVGs, mid,
+                       color=ceCol, style=line.style_dashed, width=1)
+
+    array.push(fvgBoxes,     bx)
+    array.push(fvgLines,     ln)
+    array.push(fvgTop,       _top)
+    array.push(fvgBot,       _bot)
+    array.push(fvgDir,       _dir)
+    array.push(fvgStatus,    0)
+    array.push(fvgBar,       _barIdx)
+    array.push(fvgIsHTF,     _isHTF)
+    array.push(fvgTriggered, false)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// DETECT CURRENT TF FVGs
+// ─────────────────────────────────────────────────────────────────────────────
+
+float fvgMin = f_minSize()
+
+bool bullCond = showBullFVG and (low > high[2]) and ((low - high[2]) >= fvgMin)
+bool bearCond = showBearFVG and (high < low[2]) and ((low[2] - high) >= fvgMin)
+
+if bullCond
+    f_addFVG(low, high[2], 1, bar_index - 1, false)
+    totalBull  += 1
+    activeBull += 1
+    if alertOnNewBull
+        alert("AlphaX FVG BULL " + syminfo.ticker + " | " + str.tostring(high[2], format.mintick) + "-" + str.tostring(low, format.mintick), alert.freq_once_per_bar_close)
+
+if bearCond
+    f_addFVG(low[2], high, -1, bar_index - 1, false)
+    totalBear  += 1
+    activeBear += 1
+    if alertOnNewBear
+        alert("AlphaX FVG BEAR " + syminfo.ticker + " | " + str.tostring(high, format.mintick) + "-" + str.tostring(low[2], format.mintick), alert.freq_once_per_bar_close)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// DETECT HIGHER TF FVGs
+// ─────────────────────────────────────────────────────────────────────────────
+
+[htfH0, htfL0, htfH2, htfL2, htfT] = request.security(syminfo.tickerid, htfInput,
+     [high, low, high[2], low[2], time], lookahead=barmerge.lookahead_off)
+
+var float ph0 = na
+var float pl0 = na
+var float ph2 = na
+var float pl2 = na
+var int   pt  = na
+
+if showMTF
+    bool htfNew = not na(htfT) and htfT != pt
+    if htfNew and not na(ph0)
+        if showBullFVG and (pl0 > ph2) and ((pl0 - ph2) >= fvgMin)
+            f_addFVG(pl0, ph2, 1, bar_index - 1, true)
+            totalBull  += 1
+            activeBull += 1
+            if alertOnNewBull
+                alert("AlphaX FVG HTF BULL on " + htfInput + " | " + syminfo.ticker, alert.freq_once_per_bar_close)
+        if showBearFVG and (ph0 < pl2) and ((pl2 - ph0) >= fvgMin)
+            f_addFVG(pl2, ph0, -1, bar_index - 1, true)
+            totalBear  += 1
+            activeBear += 1
+            if alertOnNewBear
+                alert("AlphaX FVG HTF BEAR on " + htfInput + " | " + syminfo.ticker, alert.freq_once_per_bar_close)
+    if htfNew
+        ph0 := htfH0
+        pl0 := htfL0
+        ph2 := htfH2
+        pl2 := htfL2
+        pt  := int(htfT)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// TRIM TO maxFVGs
+// ─────────────────────────────────────────────────────────────────────────────
+
+while array.size(fvgBoxes) > maxFVGs
+    box.delete(array.shift(fvgBoxes))
+    ln0 = array.shift(fvgLines)
+    if not na(ln0)
+        line.delete(ln0)
+    array.shift(fvgTop)
+    array.shift(fvgBot)
+    int trimDir    = array.shift(fvgDir)
+    int trimStatus = array.shift(fvgStatus)
+    array.shift(fvgBar)
+    array.shift(fvgIsHTF)
+    array.shift(fvgTriggered)
+    if trimStatus == 0
+        if trimDir == 1
+            activeBull := math.max(activeBull - 1, 0)
+        else
+            activeBear := math.max(activeBear - 1, 0)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// UPDATE FVGs — fill detection, box extension, entry signals
+// ─────────────────────────────────────────────────────────────────────────────
+
+var label[] entryLabels = array.new<label>()
+
+// clean old entry labels
+if array.size(entryLabels) > 20
+    label.delete(array.shift(entryLabels))
+
+int n = array.size(fvgBoxes)
+if n > 0
+    for i = 0 to n - 1
+        box   bx     = array.get(fvgBoxes, i)
+        line  ln     = array.get(fvgLines, i)
+        float top    = array.get(fvgTop, i)
+        float bot    = array.get(fvgBot, i)
+        int   dir    = array.get(fvgDir, i)
+        int   status = array.get(fvgStatus, i)
+        int   bIdx   = array.get(fvgBar, i)
+        bool  isHTF  = array.get(fvgIsHTF, i)
+        bool  trig   = array.get(fvgTriggered, i)
+        float mid    = (top + bot) / 2.0
+
+        // ── extend box and CE line to current bar ──
+        int newRight = bar_index + extendFVGs
+        box.set_right(bx, newRight)
+        if not na(ln)
+            line.set_x2(ln, newRight)
+
+        // ── fill detection ──
+        bool fullFill = dir == 1 ? close < bot : close > top
+        bool partFill = dir == 1 ? (low < top and low > bot) : (high > bot and high < top)
+
+        if status == 0
+            if fullFill
+                array.set(fvgStatus, i, 2)
+                if dir == 1
+                    activeBull := math.max(activeBull - 1, 0)
+                    filledBull += 1
+                else
+                    activeBear := math.max(activeBear - 1, 0)
+                    filledBear += 1
+                if alertOnFill
+                    alert("AlphaX FVG FILLED " + syminfo.ticker + " @ " + str.tostring(close, format.mintick), alert.freq_once_per_bar_close)
+                if removeFilled
+                    box.delete(bx)
+                    if not na(ln)
+                        line.delete(ln)
+                else if showFilledFVGs
+                    color fc = isHTF ? (dir == 1 ? color.new(htfBullColor, 90) : color.new(htfBearColor, 90))
+                                     : (dir == 1 ? bullFilledColor : bearFilledColor)
+                    box.set_bgcolor(bx, fc)
+                    box.set_border_color(bx, color.new(fc, 70))
+                    if not na(ln)
+                        line.set_color(ln, color.new(fc, 80))
+            else if partFill
+                array.set(fvgStatus, i, 1)
+
+        // ── entry signal logic ──
+        if showEntries and status == 0 and not trig
+            bool entryHit = false
+            if entryMode == "CE Touch"
+                entryHit := dir == 1 ? (low <= mid and close > mid) : (high >= mid and close < mid)
+            else if entryMode == "50% Retest"
+                entryHit := dir == 1 ? (low <= mid) : (high >= mid)
+            else
+                entryHit := dir == 1 ? (low <= bot) : (high >= top)
+
+            if confirmCandle
+                entryHit := entryHit and (dir == 1 ? close > open : close < open)
+
+            if entryHit
+                array.set(fvgTriggered, i, true)
+                color  ec    = dir == 1 ? color.rgb(178, 208, 72) : color.rgb(176, 58, 58)
+                string etxt  = dir == 1 ? " ▲ BULL FVG ENTRY " : " ▼ BEAR FVG ENTRY "
+                float offset = ta.atr(14) * 0.8
+                label el = label.new(bar_index, dir == 1 ? low - offset : high + offset,
+                                     text      = etxt,
+                                     style     = dir == 1 ? label.style_label_up : label.style_label_down,
+                                     color     = color.new(ec, 75),
+                                     textcolor = ec,
+                                     size      = size.small)
+                array.push(entryLabels, el)
+                if alertOnEntry
+                    alert("AlphaX FVG ENTRY " + (dir == 1 ? "BULL" : "BEAR") + " | " + syminfo.ticker + " @ " + str.tostring(close, format.mintick), alert.freq_once_per_bar_close)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// NEW FVG SIGNAL MARKERS
+// ─────────────────────────────────────────────────────────────────────────────
+
+if showSignals
+    if bullCond
+        label.new(bar_index - 1, low[1],
+                  text      = " FVG ",
+                  style     = label.style_label_up,
+                  color     = color.new(color.rgb(10, 13, 20), 5),
+                  textcolor = color.rgb(178, 208, 72),
+                  size      = size.tiny)
+    if bearCond
+        label.new(bar_index - 1, high[1],
+                  text      = " FVG ",
+                  style     = label.style_label_down,
+                  color     = color.new(color.rgb(10, 13, 20), 5),
+                  textcolor = color.rgb(176, 58, 58),
+                  size      = size.tiny)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// DASHBOARD
+// ─────────────────────────────────────────────────────────────────────────────
+
+var table dash = na
+
+if showDashboard
+    if na(dash)
+        dash := table.new(f_dashPos(dashPosition), 3, 7,
+                          frame_color  = color.new(color.rgb(178, 208, 72), 60),
+                          frame_width  = 1,
+                          border_color = color.new(color.rgb(40, 46, 56), 20),
+                          border_width = 1)
+
+    // ── color tokens ──────────────────────────────────────────────────────────
+    color c_hdr    = color.new(color.rgb(12, 15, 22),  5)
+    color c_row    = color.new(color.rgb(10, 13, 20),  8)
+    color c_accent = color.rgb(178, 208, 72)
+    color c_dim    = color.new(color.rgb(140, 150, 165), 0)
+    color c_white  = color.rgb(220, 225, 232)
+    color c_bull   = color.rgb(178, 208, 72)
+    color c_bear   = color.rgb(176, 58,  58)
+    color c_gold   = color.rgb(255, 200, 40)
+
+    sz = f_tSize(dashSize)
+
+    // ── Row 0: header ─────────────────────────────────────────────────────────
+    table.cell(dash, 0, 0, "ALPHAX FVG TRACKER",
+               text_color=c_accent, text_size=sz, bgcolor=c_hdr,
+               text_halign=text.align_left)
+    table.cell(dash, 1, 0, "",      text_size=sz, bgcolor=c_hdr)
+    table.cell(dash, 2, 0, timeframe.period,
+               text_color=c_dim, text_size=sz, bgcolor=c_hdr,
+               text_halign=text.align_right)
+
+    // ── Row 1: column headers ─────────────────────────────────────────────────
+    table.cell(dash, 0, 1, "METRIC",      text_color=c_dim,   text_size=size.tiny, bgcolor=c_hdr, text_halign=text.align_left)
+    table.cell(dash, 1, 1, "BULL",        text_color=c_bull,  text_size=size.tiny, bgcolor=c_hdr, text_halign=text.align_center)
+    table.cell(dash, 2, 1, "BEAR",        text_color=c_bear,  text_size=size.tiny, bgcolor=c_hdr, text_halign=text.align_center)
+
+    // ── Row 2: total detected ─────────────────────────────────────────────────
+    table.cell(dash, 0, 2, "TOTAL DETECTED", text_color=c_dim,   text_size=size.tiny, bgcolor=c_row, text_halign=text.align_left)
+    table.cell(dash, 1, 2, str.tostring(totalBull),  text_color=c_white, text_size=size.tiny, bgcolor=c_row, text_halign=text.align_center)
+    table.cell(dash, 2, 2, str.tostring(totalBear),  text_color=c_white, text_size=size.tiny, bgcolor=c_row, text_halign=text.align_center)
+
+    // ── Row 3: active ─────────────────────────────────────────────────────────
+    table.cell(dash, 0, 3, "ACTIVE",      text_color=c_dim,   text_size=size.tiny, bgcolor=c_row, text_halign=text.align_left)
+    table.cell(dash, 1, 3, str.tostring(activeBull), text_color=c_bull,  text_size=size.tiny, bgcolor=c_row, text_halign=text.align_center)
+    table.cell(dash, 2, 3, str.tostring(activeBear), text_color=c_bear,  text_size=size.tiny, bgcolor=c_row, text_halign=text.align_center)
+
+    // ── Row 4: filled ─────────────────────────────────────────────────────────
+    table.cell(dash, 0, 4, "FILLED",      text_color=c_dim,   text_size=size.tiny, bgcolor=c_row, text_halign=text.align_left)
+    table.cell(dash, 1, 4, str.tostring(filledBull), text_color=c_dim,   text_size=size.tiny, bgcolor=c_row, text_halign=text.align_center)
+    table.cell(dash, 2, 4, str.tostring(filledBear), text_color=c_dim,   text_size=size.tiny, bgcolor=c_row, text_halign=text.align_center)
+
+    // ── Row 5: fill rate ─────────────────────────────────────────────────────
+    float bullRate = totalBull > 0 ? math.round((filledBull / totalBull) * 1000) / 10 : 0.0
+    float bearRate = totalBear > 0 ? math.round((filledBear / totalBear) * 1000) / 10 : 0.0
+    table.cell(dash, 0, 5, "FILL RATE",   text_color=c_dim,   text_size=size.tiny, bgcolor=c_row, text_halign=text.align_left)
+    table.cell(dash, 1, 5, str.tostring(bullRate) + "%", text_color=c_gold, text_size=size.tiny, bgcolor=c_row, text_halign=text.align_center)
+    table.cell(dash, 2, 5, str.tostring(bearRate) + "%", text_color=c_gold, text_size=size.tiny, bgcolor=c_row, text_halign=text.align_center)
+
+    // ── Row 6: HTF status ─────────────────────────────────────────────────────
+    table.cell(dash, 0, 6, "HTF MODE",    text_color=c_dim,   text_size=size.tiny, bgcolor=c_row, text_halign=text.align_left)
+    table.cell(dash, 1, 6, showMTF ? htfInput : "OFF",
+               text_color=showMTF ? c_accent : c_dim,
+               text_size=size.tiny, bgcolor=c_row, text_halign=text.align_center)
+    table.cell(dash, 2, 6, entryMode,
+               text_color=c_white, text_size=size.tiny, bgcolor=c_row, text_halign=text.align_right)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ALERT CONDITIONS
+// ─────────────────────────────────────────────────────────────────────────────
+
+alertcondition(bullCond, "AlphaX FVG: New Bullish FVG",  "New Bullish FVG detected on {{ticker}} @ {{close}}")
+alertcondition(bearCond, "AlphaX FVG: New Bearish FVG",  "New Bearish FVG detected on {{ticker}} @ {{close}}")
+alertcondition(bullCond or bearCond, "AlphaX FVG: New FVG (Any)", "New FVG detected on {{ticker}} @ {{close}}")

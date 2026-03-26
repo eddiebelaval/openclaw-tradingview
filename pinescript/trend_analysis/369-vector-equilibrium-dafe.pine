@@ -1,0 +1,802 @@
+//@version=6
+indicator("369 Vector Equilibrium [DAFE]", shorttitle="369-VE", overlay=true, max_bars_back=5000, max_lines_count=500, max_labels_count=500, max_boxes_count=500, precision=5)
+//==============================================================================
+// 🎛️ INPUTS
+//==============================================================================
+group_core = "⬡ Core Geometry"
+baseAngle  = input.int(0, "Base Angle (deg)", minval=-180, maxval=180, group=group_core, tooltip="Rotational offset applied to the computed vector angle. 0° = standard orientation.")
+gannDiv    = input.int(8, "Gann Divisions (per 360°)", minval=4, maxval=24, group=group_core, tooltip="Number of evenly-spaced Gann spokes around the full circle. 8 = 45° intervals (standard Gann).")
+vectorPer  = input.int(6, "Vector Period", minval=2, maxval=60, group=group_core, tooltip="EMA period for computing momentum vector.")
+eqPer      = input.int(21, "Equilibrium Period", minval=5, maxval=200, group=group_core, tooltip="EMA period defining the central equilibrium line.")
+angTol     = input.float(7.0, "Angle Tolerance (deg)", minval=1, maxval=30, step=0.5, group=group_core, tooltip="How close the vector angle must be to a Gann spoke to register as 'aligned'.")
+ringTol    = input.int(1, "369 Ring Tolerance (bins)", minval=0, maxval=5, group=group_core, tooltip="Bin proximity for 369 resonance detection.")
+touchATR   = input.float(0.35, "Pitch Touch Tolerance (ATRx)", minval=0.05, maxval=2.0, step=0.05, group=group_core, tooltip="How close price must be to a pitchfork line (in ATR multiples) to count as a 'touch'.")
+group_fib = "🔱 Harmonic Pitchforks"
+fibA      = input.int(15, "Fib Period A (Fast)", minval=5, maxval=144, group=group_fib)
+fibB      = input.int(34, "Fib Period B (Mid)", minval=5, maxval=233, group=group_fib)
+fibC      = input.int(61, "Fib Period C (Slow)", minval=5, maxval=377, group=group_fib)
+group_bayes = "⚖️ Bayesian Weights"
+w369      = input.float(0.35, "Weight: 369 Resonance", minval=0.05, maxval=0.70, step=0.01, group=group_bayes)
+wGann     = input.float(0.20, "Weight: Gann Angle", minval=0.05, maxval=0.50, step=0.01, group=group_bayes)
+wPitch    = input.float(0.25, "Weight: Pitchfork", minval=0.05, maxval=0.50, step=0.01, group=group_bayes)
+wPress    = input.float(0.20, "Weight: Bubble Pressure", minval=0.05, maxval=0.50, step=0.01, group=group_bayes)
+alpha_mem_base = input.float(0.45, "Blend: Memory vs Real-time (Base)", minval=0.0, maxval=1.0, step=0.05, group=group_bayes, tooltip="Base blend ratio. WPK regime modulation dynamically adjusts this: trending → lower (trust RT), mean-reverting → higher (trust memory).")
+group_wpk = "🔬 WPK Regime Engine"
+enableWPK   = input.bool(true, "Enable WPK Regime Modulation", group=group_wpk, tooltip="Dynamically adjusts alpha_mem based on Hurst exponent and DFA. Trending regimes lean real-time, mean-reverting regimes lean memory.")
+hurstLen    = input.int(100, "Hurst R/S Period", minval=34, maxval=300, group=group_wpk, tooltip="Lookback for Rescaled Range (R/S) Hurst estimate. 100 = balanced sensitivity.")
+hurstTrend  = input.float(0.60, "Hurst Trend Threshold", minval=0.52, maxval=0.75, step=0.01, group=group_wpk, tooltip="Hurst > this = trending regime → alpha shifts toward real-time.")
+hurstMR     = input.float(0.42, "Hurst Mean-Revert Threshold", minval=0.25, maxval=0.48, step=0.01, group=group_wpk, tooltip="Hurst < this = mean-reverting regime → alpha shifts toward memory bank.")
+regimeShift = input.float(0.15, "Regime Alpha Shift", minval=0.05, maxval=0.30, step=0.01, group=group_wpk, tooltip="How much alpha_mem shifts from base when a regime is detected. ±0.15 is moderate.")
+group_fp = "📊 Footprint Integration"
+enableFP   = input.bool(true, "Enable Footprint Delta (6th KNN Dim)", group=group_fp, tooltip="Feeds request.footprint() delta into the memory feature vector as a 6th dimension. Provides genuine order flow orthogonal to price-derived features. Gracefully degrades to WPK approximation when tick data unavailable. Requires Premium/Ultimate TradingView plan.")
+fpDeltaPer = input.int(8, "Delta Smoothing Period", minval=1, maxval=34, group=group_fp, tooltip="EMA smoothing applied to raw footprint delta before normalization. Lower = more reactive to individual prints.")
+fpTicksRow = input.int(100, "Footprint Ticks Per Row", minval=1, maxval=500, group=group_fp, tooltip="Tick resolution for footprint rows. 100 = standard. Lower = finer granularity but heavier computation.")
+fpVAPct    = input.int(70, "Footprint Value Area %", minval=1, maxval=100, group=group_fp, tooltip="Value Area percentage for the footprint request. 70% is standard institutional convention.")
+group_sig = "🎯 Signal Gating (Dynamic)"
+sigMinConf    = input.float(0.55, "Min Composite Confidence (Base)", minval=0.20, maxval=0.95, step=0.05, group=group_sig)
+sigMinProb    = input.float(0.55, "Min Final Probability (Base)", minval=0.30, maxval=0.90, step=0.05, group=group_sig)
+sigMinFactors = input.int(3, "Min Active Factors (of 4)", minval=2, maxval=4, group=group_sig)
+sigFactorThr  = input.float(0.40, "Individual Factor Threshold", minval=0.10, maxval=0.80, step=0.05, group=group_sig)
+sigCooldown   = input.int(3, "Signal Cooldown (bars)", minval=0, maxval=20, group=group_sig)
+sigTier2Conf  = input.float(0.70, "Tier 2 (Strong) Threshold", minval=0.50, maxval=0.95, step=0.05, group=group_sig)
+sigTier3Conf  = input.float(0.85, "Tier 3 (Elite) Threshold", minval=0.60, maxval=0.99, step=0.05, group=group_sig)
+group_mem = "🧠 Memory & KNN"
+enableMem  = input.bool(true, "Enable Memory Voting (KNN)", group=group_mem)
+memSizeCap = input.int(384, "Memory Size (capped)", minval=64, maxval=1024, group=group_mem)
+memFade    = input.float(0.995, "Age Fade Factor", minval=0.90, maxval=1.00, step=0.001, group=group_mem)
+kNeighbors = input.int(13, "K Neighbors", minval=3, maxval=31, group=group_mem)
+horizon    = input.int(13, "Outcome Horizon (bars)", minval=5, maxval=55, group=group_mem)
+group_heat = "🌡️ Heatmap Engine"
+heatAngleBins = input.int(24, "Angle Bins", minval=8, maxval=60, group=group_heat)
+heatPressBins = input.int(10, "Pressure Bins", minval=4, maxval=24, group=group_heat)
+heatFade      = input.float(0.98, "Heat Decay per Bar", minval=0.90, maxval=1.0, step=0.005, group=group_heat)
+group_viz = "🎨 Visual Design"
+showHUD       = input.bool(true, "Show Professional Dashboard", group=group_viz)
+showBubble    = input.bool(true, "Vector Equilibrium Bubble", group=group_viz)
+showRibbons   = input.bool(true, "Probability Ribbons", group=group_viz)
+showForks     = input.bool(true, "Fibonacci Pitchforks", group=group_viz)
+showDots      = input.bool(true, "Confluence Dots", group=group_viz)
+showParticles = input.bool(true, "Energy Flow Particles", group=group_viz)
+showGannRays  = input.bool(false, "Gann Angular Rays (Last Bar)", group=group_viz)
+showHeatGrid  = input.bool(false, "Heatmap Grid Overlay (Last Bar)", group=group_viz, tooltip="Renders the 2D angle×pressure heatmap as a compact colored grid below price. Shows probability surface visually. Uses box budget — keep disabled if box-heavy.")
+heatGridRows  = input.int(8, "Heatmap Grid Rows (angle bins shown)", minval=4, maxval=16, group=group_viz, tooltip="Number of angle bins to display in the grid. Lower = more compact.")
+heatGridCols  = input.int(6, "Heatmap Grid Cols (press bins shown)", minval=3, maxval=10, group=group_viz, tooltip="Number of pressure bins to display in the grid.")
+colorTheme    = input.string("Ocean", "Color Theme", options=["Neon", "Cyber", "Solar", "Ocean", "Aurora", "Plasma"], group=group_viz)
+hudPosition   = input.string("Top Right", "Dashboard Position", options=["Top Left", "Top Right", "Bottom Left", "Bottom Right"], group=group_viz)
+//==============================================================================
+// 🎨 COLOR THEME SYSTEM
+//==============================================================================
+f_getColors(theme) =>
+    if theme == "Cyber"
+        [color.rgb(0, 240, 255), color.rgb(255, 0, 247), color.rgb(123, 97, 255)]
+    else if theme == "Solar"
+        [color.rgb(255, 179, 0), color.rgb(255, 65, 97), color.rgb(255, 142, 0)]
+    else if theme == "Ocean"
+        [color.rgb(0, 245, 233), color.rgb(255, 123, 172), color.rgb(125, 249, 255)]
+    else if theme == "Aurora"
+        [color.rgb(0, 255, 127), color.rgb(147, 112, 219), color.rgb(32, 178, 170)]
+    else if theme == "Plasma"
+        [color.rgb(255, 0, 255), color.rgb(0, 191, 255), color.rgb(255, 20, 147)]
+    else
+        [color.rgb(57, 255, 20), color.rgb(255, 16, 240), color.rgb(0, 245, 255)]
+[bullColor, bearColor, quantumColor] = f_getColors(colorTheme)
+C_GOLD   = color.rgb(255, 215, 0)
+C_WHITE  = color.rgb(220, 220, 230)
+C_GRAY   = color.rgb(178, 181, 190)
+C_DARK   = color.rgb(30, 34, 45)
+C_GREEN  = color.rgb(38, 166, 154)
+C_RED    = color.rgb(239, 83, 80)
+C_ORANGE = color.rgb(255, 140, 0)
+C_PFA = color.rgb(227, 255, 77)
+C_PFB = color.rgb(255, 122, 230)
+C_PFC = color.rgb(77, 255, 251)
+//==============================================================================
+// ⚙️ UTILITY FUNCTIONS
+//==============================================================================
+clamp(float v, float lo, float hi) => math.max(lo, math.min(hi, v))
+nzv(float x, float d) => na(x) ? d : x
+safeDiv(float a, float b, float d) => b == 0 ? d : a / b
+toDeg(float x) => x * 180.0 / math.pi
+mod360(float x) =>
+    _v = x % 360.0
+    _v < 0 ? _v + 360.0 : _v
+sigmoid(float x) => 1.0 / (1.0 + math.exp(-x))
+idx2d(int r, int c, int ncols) => r * ncols + c
+var float step369 = 360.0 / 369.0
+//==============================================================================
+// 📐 CORE SERIES
+//==============================================================================
+h4 = (high + low + close + close) / 4.0
+atr14 = ta.atr(14)
+eqMid = ta.ema(h4, eqPer)
+entropyUpDown(int len) =>
+    up = h4 >= nz(h4[1]) ? 1.0 : 0.0
+    p = ta.sma(up, len)
+    pp = clamp(nzv(p, 0.5), 1e-6, 1.0 - 1e-6)
+    (-pp * math.log(pp) - (1.0 - pp) * math.log(1.0 - pp)) / math.log(2.0)
+entVal = entropyUpDown(eqPer)
+ord = 1.0 - clamp(entVal, 0.0, 1.0)
+bubble = atr14 * (0.6 + 1.4 * ord)
+emaFast = ta.ema(h4, math.max(3, vectorPer))
+emaPrev = nz(emaFast[1])
+mom = safeDiv(emaFast - emaPrev, atr14, 0.0)
+disp = safeDiv(h4 - eqMid, atr14, 0.0)
+angle = mod360(toDeg(math.atan(disp / nzv(mom, 1e-8))) + baseAngle)
+bin369 = math.round(angle / step369)
+rem3 = math.abs(bin369 % 3)
+ringRes = (bin369 % 3 == 0 or bin369 % 6 == 0 or bin369 % 9 == 0) ? 1.0 : 0.0
+ringHit = (rem3 == 0 or rem3 == ringTol or rem3 == (3 - ringTol) % 3) ? 1.0 : 0.0
+f369 = math.max(ringRes, ringHit)
+gannStep = 360.0 / gannDiv
+nearestGannDelta(float a, float step) =>
+    g = math.round(a / step) * step
+    d = math.abs(mod360(a - g))
+    d > 180 ? 360 - d : d
+dG = nearestGannDelta(angle, gannStep)
+fGann = math.max(0.0, 1.0 - dG / math.max(1.0, angTol * 2.0))
+//==============================================================================
+// 📊 FOOTPRINT DELTA ENGINE
+//==============================================================================
+wpk_buyWick  = high - math.max(open, close)
+wpk_sellWick = math.min(open, close) - low
+wpk_body     = close - open
+wpk_rawDelta = (wpk_sellWick - wpk_buyWick + wpk_body * 0.5)
+wpk_deltaEma = ta.ema(wpk_rawDelta, fpDeltaPer)
+wpk_deltaNorm = safeDiv(wpk_deltaEma, atr14, 0.0)
+footprint fp = enableFP ? request.footprint(fpTicksRow, fpVAPct) : na
+float fp_rawDelta = not na(fp) ? fp.delta() : na
+bool  fp_available = not na(fp_rawDelta)
+fp_deltaSmooth = ta.ema(nzv(fp_rawDelta, 0.0), fpDeltaPer)
+fp_absSmooth   = ta.ema(math.abs(nzv(fp_rawDelta, 0.0)), fpDeltaPer * 3)
+fp_deltaNorm   = fp_available ? safeDiv(fp_deltaSmooth, fp_absSmooth + 1e-8, 0.0) : na
+float fDelta = fp_available ? clamp(nzv(fp_deltaNorm, 0.0), -1.0, 1.0) : clamp(wpk_deltaNorm, -1.0, 1.0)
+string deltaSource = fp_available ? "FP" : "WPK"
+//==============================================================================
+// 🔬 WPK REGIME ENGINE — Hurst Exponent 
+//==============================================================================
+float _logRet = math.log(close / nz(close[1], close))
+float _meanRet = ta.sma(_logRet, hurstLen)
+float hurstVal = 0.50
+string regimeLabel = "NEUTRAL"
+float alpha_mem = alpha_mem_base
+if enableWPK and bar_index > hurstLen + 10
+    float maxDev = -1e18
+    float minDev = 1e18
+    float cumDev = 0.0
+    float sumSq  = 0.0
+    float mr = nzv(_meanRet, 0.0)
+    for i = 0 to hurstLen - 1
+        lr = nzv(_logRet[i], 0.0)
+        cumDev += (lr - mr)
+        maxDev := math.max(maxDev, cumDev)
+        minDev := math.min(minDev, cumDev)
+        sumSq  += (lr - mr) * (lr - mr)
+    R = maxDev - minDev
+    S = math.sqrt(sumSq / hurstLen)
+    RS = S > 1e-10 ? R / S : 0.0
+    hurstVal := RS > 0 ? clamp(math.log(RS) / math.log(hurstLen), 0.01, 0.99) : 0.50
+    if hurstVal > hurstTrend
+        regimeLabel := "TREND"
+        alpha_mem := clamp(alpha_mem_base - regimeShift, 0.0, 1.0)
+    else if hurstVal < hurstMR
+        regimeLabel := "MR"
+        alpha_mem := clamp(alpha_mem_base + regimeShift, 0.0, 1.0)
+    else
+        regimeLabel := "NEUTRAL"
+        alpha_mem := alpha_mem_base
+//==============================================================================
+// 🔱 SINE-WEIGHTED PITCHFORK ENGINE
+//==============================================================================
+buildSinWeights(int len) =>
+    arr = array.new_float(len, 0.0)
+    ww = 0.0
+    for i = 0 to len - 1
+        w = math.sin(math.pi * (i + 1) / (len + 1))
+        array.set(arr, i, w)
+        ww += w
+    [arr, ww]
+var array<float> arrWA = array.new_float(0)
+var float sumWA = 0.0
+var array<float> arrWB = array.new_float(0)
+var float sumWB = 0.0
+var array<float> arrWC = array.new_float(0)
+var float sumWC = 0.0
+if barstate.isfirst
+    [a1, s1] = buildSinWeights(fibA)
+    arrWA := a1, sumWA := s1
+    [b1, s2] = buildSinWeights(fibB)
+    arrWB := b1, sumWB := s2
+    [c1, s3] = buildSinWeights(fibC)
+    arrWC := c1, sumWC := s3
+sinWMA_src(float src, int len, array<float> warr, float wsum) =>
+    if bar_index < len or wsum == 0
+        na
+    else
+        acc = 0.0
+        for i = 0 to len - 1
+            acc += nzv(src[i], src) * array.get(warr, i)
+        acc / wsum
+pfMidA = sinWMA_src(h4, fibA, arrWA, sumWA)
+pfMidB = sinWMA_src(h4, fibB, arrWB, sumWB)
+pfMidC = sinWMA_src(h4, fibC, arrWC, sumWC)
+ampA = math.max(0.6, math.min(2.5, math.sqrt(fibA) / 6.0))
+ampB = math.max(0.6, math.min(2.5, math.sqrt(fibB) / 6.0))
+ampC = math.max(0.6, math.min(2.5, math.sqrt(fibC) / 6.0))
+pfUpA = na(pfMidA) ? na : pfMidA + atr14 * ampA
+pfDnA = na(pfMidA) ? na : pfMidA - atr14 * ampA
+pfUpB = na(pfMidB) ? na : pfMidB + atr14 * ampB
+pfDnB = na(pfMidB) ? na : pfMidB - atr14 * ampB
+pfUpC = na(pfMidC) ? na : pfMidC + atr14 * ampC
+pfDnC = na(pfMidC) ? na : pfMidC - atr14 * ampC
+pitchMinDist() =>
+    dA = na(pfMidA) ? 1e9 : math.min(math.abs(close - pfMidA), math.min(math.abs(close - pfUpA), math.abs(close - pfDnA)))
+    dB = na(pfMidB) ? 1e9 : math.min(math.abs(close - pfMidB), math.min(math.abs(close - pfUpB), math.abs(close - pfDnB)))
+    dC = na(pfMidC) ? 1e9 : math.min(math.abs(close - pfMidC), math.min(math.abs(close - pfUpC), math.abs(close - pfDnC)))
+    safeDiv(math.min(dA, math.min(dB, dC)), atr14, 1.0)
+dMinATR = pitchMinDist()
+fPitch = math.max(0.0, 1.0 - dMinATR / math.max(1e-6, touchATR * 2.0))
+bubbleATR = safeDiv(bubble, atr14, 1.0)
+press = math.abs(disp) / math.max(0.5, bubbleATR)
+fPress = clamp(sigmoid(press - 1.0), 0.0, 1.0)
+longLean  = (angle <= 90 or angle >= 330) ? 1.0 : (angle >= 150 and angle <= 210 ? 0.0 : 0.3)
+shortLean = (angle >= 180 and angle <= 270) ? 1.0 : (angle >= 30 and angle <= 150 ? 0.0 : 0.3)
+dirBias = mom >= 0 ? longLean : shortLean
+confRT = clamp(w369 * f369 + wGann * fGann + wPitch * fPitch + wPress * fPress, 0.0, 1.0)
+P_long_rt  = clamp(confRT * dirBias, 0.0, 1.0)
+P_short_rt = clamp(confRT * (1.0 - dirBias), 0.0, 1.0)
+//==============================================================================
+// 🧠 MEMORY BANK (KNN ENGINE)
+//==============================================================================
+featDim = 6 
+var int memSize = memSizeCap
+var array<float> memFeat = array.new_float(memSize * featDim, 0.0)
+var array<int> memBar = array.new_int(memSize, 0)
+var array<float> memOut = array.new_float(memSize, na)
+var array<bool> memValid = array.new_bool(memSize, false)
+var int memPtr = 0
+var int memCount = 0
+memSet(int slot, int col, float val) =>
+    k = idx2d(slot, col, featDim)
+    if k >= 0 and k < array.size(memFeat)
+        array.set(memFeat, k, val)
+memGet(int slot, int col) =>
+    k = idx2d(slot, col, featDim)
+    k >= 0 and k < array.size(memFeat) ? array.get(memFeat, k) : na
+memWrite6(int slot, int barI, float f1, float f2, float f3, float f4, float f5, float f6, float outv) =>
+    memSet(slot, 0, f1)
+    memSet(slot, 1, f2)
+    memSet(slot, 2, f3)
+    memSet(slot, 3, f4)
+    memSet(slot, 4, f5)
+    memSet(slot, 5, f6)
+    array.set(memBar, slot, barI)
+    array.set(memOut, slot, outv)
+    array.set(memValid, slot, true)
+if enableMem and bar_index > horizon + 5
+    s = horizon
+    f1_val = nzv(f369[s], 0.0)
+    f2_val = nzv(fGann[s], 0.0)
+    f3_val = nzv(fPitch[s], 0.0)
+    f4_val = nzv(fPress[s], 0.0)
+    f5_val = nzv(dirBias[s], 0.5)
+    f6_val = nzv(fDelta[s], 0.0)
+    ret = safeDiv(close - nz(close[s]), nz(close[s]), 0.0)
+    if not na(ret) and math.abs(ret) > 0.0001
+        memWrite6(memPtr, bar_index - s, f1_val, f2_val, f3_val, f4_val, f5_val, f6_val, ret)
+        memPtr   := (memPtr + 1) % memSize
+        memCount := math.min(memSize, memCount + 1)
+var array<float> knnTopScores = array.new_float(kNeighbors, 0.0)
+var array<int>   knnTopIdx    = array.new_int(kNeighbors, -1)
+var int          knnTopCount  = 0
+float P_long_mem = 0.0
+float P_short_mem = 0.0
+float memAssurance = 0.0
+int memUsed = 0
+if enableMem and memCount > 3
+    knnTopCount := 0
+    for j = 0 to kNeighbors - 1
+        array.set(knnTopScores, j, 0.0)
+        array.set(knnTopIdx, j, -1)
+    float minTopScore = 0.0
+    for i = 0 to memCount - 1
+        if not array.get(memValid, i)
+            continue
+        dx1 = f369    - nzv(memGet(i, 0), 0.0)
+        dx2 = fGann   - nzv(memGet(i, 1), 0.0)
+        dx3 = fPitch  - nzv(memGet(i, 2), 0.0)
+        dx4 = fPress  - nzv(memGet(i, 3), 0.0)
+        dx5 = dirBias - nzv(memGet(i, 4), 0.5)
+        dx6 = fDelta  - nzv(memGet(i, 5), 0.0)
+        sc = (1.0 / (1.0 + dx1 * dx1)) *
+             (1.0 / (1.0 + dx2 * dx2)) *
+             (1.0 / (1.0 + dx3 * dx3)) *
+             (1.0 / (1.0 + dx4 * dx4)) *
+             (1.0 / (1.0 + dx5 * dx5)) *
+             (1.0 / (1.0 + dx6 * dx6))
+        ageB = bar_index - array.get(memBar, i)
+        sc := sc * math.pow(memFade, math.max(0, ageB))
+        if knnTopCount >= kNeighbors and sc <= minTopScore
+            continue
+        if knnTopCount < kNeighbors
+            int ins = knnTopCount
+            for p = 0 to knnTopCount - 1
+                if sc >= array.get(knnTopScores, p)
+                    ins := p
+                    break
+            if ins < knnTopCount
+                for sh = knnTopCount - 1 to ins
+                    if sh + 1 < kNeighbors
+                        array.set(knnTopScores, sh + 1, array.get(knnTopScores, sh))
+                        array.set(knnTopIdx, sh + 1, array.get(knnTopIdx, sh))
+            array.set(knnTopScores, ins, sc)
+            array.set(knnTopIdx, ins, i)
+            knnTopCount += 1
+            if knnTopCount >= kNeighbors
+                minTopScore := array.get(knnTopScores, kNeighbors - 1)
+        else
+            int ins = kNeighbors - 1
+            for p = 0 to kNeighbors - 2
+                if sc >= array.get(knnTopScores, p)
+                    ins := p
+                    break
+            for sh = kNeighbors - 2 to ins
+                if sh + 1 < kNeighbors
+                    array.set(knnTopScores, sh + 1, array.get(knnTopScores, sh))
+                    array.set(knnTopIdx, sh + 1, array.get(knnTopIdx, sh))
+            array.set(knnTopScores, ins, sc)
+            array.set(knnTopIdx, ins, i)
+            minTopScore := array.get(knnTopScores, kNeighbors - 1)
+    if knnTopCount > 0
+        sw = 0.0, sL = 0.0, sS = 0.0
+        for j = 0 to knnTopCount - 1
+            idx = array.get(knnTopIdx, j)
+            w   = array.get(knnTopScores, j)
+            ret = nzv(array.get(memOut, idx), 0.0)
+            if ret >= 0
+                sL += w
+            else
+                sS += w
+            sw += w
+        memAssurance := sw
+        memUsed := knnTopCount
+        if sw > 0
+            P_long_mem  := clamp(sL / sw, 0.0, 1.0)
+            P_short_mem := clamp(sS / sw, 0.0, 1.0)
+P_long  = clamp((1.0 - alpha_mem) * P_long_rt  + alpha_mem * P_long_mem,  0.0, 1.0)
+P_short = clamp((1.0 - alpha_mem) * P_short_rt + alpha_mem * P_short_mem, 0.0, 1.0)
+//==============================================================================
+// 🌡️ HEATMAP ENGINE — SPARSE DECAY
+//==============================================================================
+var array<float> heatW = array.new_float(heatAngleBins * heatPressBins, 0.0)
+var array<float> heatV = array.new_float(heatAngleBins * heatPressBins, 0.0)
+var array<int> heatActive = array.new_int(0)
+int heatTotalCells = heatAngleBins * heatPressBins
+int activeCount = array.size(heatActive)
+if activeCount > 0
+    for ii = activeCount - 1 to 0
+        cellIdx = array.get(heatActive, ii)
+        wVal = array.get(heatW, cellIdx) * heatFade
+        vVal = array.get(heatV, cellIdx) * heatFade
+        if math.abs(wVal) < 0.001 and math.abs(vVal) < 0.001
+            array.set(heatW, cellIdx, 0.0)
+            array.set(heatV, cellIdx, 0.0)
+            array.remove(heatActive, ii)
+        else
+            array.set(heatW, cellIdx, wVal)
+            array.set(heatV, cellIdx, vVal)
+angBin = int(math.floor(angle / (360.0 / heatAngleBins)))
+pressClamped = clamp(press, 0.0, 3.0)
+prsBin = int(math.floor(pressClamped / 3.0 * heatPressBins))
+r_hm = int(clamp(angBin, 0, heatAngleBins - 1))
+c_hm = int(clamp(prsBin, 0, heatPressBins - 1))
+kCell = idx2d(r_hm, c_hm, heatPressBins)
+if kCell >= 0 and kCell < heatTotalCells
+    prevW = array.get(heatW, kCell)
+    array.set(heatW, kCell, prevW + confRT)
+    array.set(heatV, kCell, array.get(heatV, kCell) + confRT * (P_long - P_short))
+    if prevW < 0.001
+        array.push(heatActive, kCell)
+heatBias = kCell >= 0 and kCell < heatTotalCells and array.get(heatW, kCell) > 0.01 ? safeDiv(array.get(heatV, kCell), array.get(heatW, kCell), 0.0) : 0.0
+heatStrength = kCell >= 0 and kCell < heatTotalCells ? array.get(heatW, kCell) : 0.0
+//==============================================================================
+// 🎯 SIGNAL GATING ENGINE
+//==============================================================================
+int activeFCount = 0
+if f369   >= sigFactorThr
+    activeFCount += 1
+if fGann  >= sigFactorThr
+    activeFCount += 1
+if fPitch >= sigFactorThr
+    activeFCount += 1
+if fPress >= sigFactorThr
+    activeFCount += 1
+float angleInstability = clamp(ta.stdev(angle, 5) / 45.0, 0.0, 1.0)
+float hurstPenalty = hurstVal < 0.50 ? (0.50 - hurstVal) * 0.40 : 0.0 // Add penalty in MR regime
+float angPenalty   = angleInstability * 0.12                          // Add penalty when vectors thrash
+float chopPenalty  = clamp(hurstPenalty + angPenalty, 0.0, 0.20)      // Max penalty is strict +20%
+dynamicMinConf = sigMinConf + chopPenalty
+dynamicMinProb = sigMinProb + (chopPenalty * 0.7)
+float P_dominant = math.max(P_long, P_short)
+bool isLongDir   = P_long >= P_short
+bool isShortDir  = P_short > P_long
+bool passConf    = confRT >= dynamicMinConf
+bool passProb    = P_dominant >= dynamicMinProb
+bool passFactors = activeFCount >= sigMinFactors
+var int lastLongBar  = -9999
+var int lastShortBar = -9999
+bool passCooldownL = (bar_index - lastLongBar)  >= sigCooldown
+bool passCooldownS = (bar_index - lastShortBar) >= sigCooldown
+bool signalLong  = passConf and passProb and passFactors and isLongDir  and passCooldownL and barstate.isconfirmed
+bool signalShort = passConf and passProb and passFactors and isShortDir and passCooldownS and barstate.isconfirmed
+if signalLong
+    lastLongBar := bar_index
+if signalShort
+    lastShortBar := bar_index
+int signalTier = confRT >= sigTier3Conf ? 3 : confRT >= sigTier2Conf ? 2 : 1
+//==============================================================================
+// 🎨 VISUAL ENGINE
+//==============================================================================
+bRing1_up = showBubble ? eqMid + bubble * 0.25 : na
+bRing1_dn = showBubble ? eqMid - bubble * 0.25 : na
+bRing2_up = showBubble ? eqMid + bubble * 0.65 : na
+bRing2_dn = showBubble ? eqMid - bubble * 0.65 : na
+bRing3_up = showBubble ? eqMid + bubble * 1.10 : na
+bRing3_dn = showBubble ? eqMid - bubble * 1.10 : na
+p_r1u = plot(bRing1_up, color=na, display=display.none, editable=false)
+p_r1d = plot(bRing1_dn, color=na, display=display.none, editable=false)
+p_r2u = plot(bRing2_up, color=na, display=display.none, editable=false)
+p_r2d = plot(bRing2_dn, color=na, display=display.none, editable=false)
+p_r3u = plot(bRing3_up, color=na, display=display.none, editable=false)
+p_r3d = plot(bRing3_dn, color=na, display=display.none, editable=false)
+fill(p_r1u, p_r1d, color=showBubble ? color.new(quantumColor, 82) : na, title="Core Field")
+fill(p_r2u, p_r1u, color=showBubble ? color.new(quantumColor, 90) : na, title="Mid Field Upper")
+fill(p_r1d, p_r2d, color=showBubble ? color.new(quantumColor, 90) : na, title="Mid Field Lower")
+fill(p_r3u, p_r2u, color=showBubble ? color.new(quantumColor, 95) : na, title="Outer Field Upper")
+fill(p_r2d, p_r3d, color=showBubble ? color.new(quantumColor, 95) : na, title="Outer Field Lower")
+plot(showBubble ? bRing3_up : na, color=color.new(quantumColor, 60), linewidth=1, style=plot.style_circles, title="Outer Ring Up")
+plot(showBubble ? bRing3_dn : na, color=color.new(quantumColor, 60), linewidth=1, style=plot.style_circles, title="Outer Ring Dn")
+eqColor = P_long > P_short ? color.new(bullColor, 30) : color.new(bearColor, 30)
+plot(eqMid, color=eqColor, linewidth=2, title="Equilibrium Midline")
+offR = atr14 * 0.08
+r_long_base  = showRibbons ? high + offR : na
+r_long_top   = showRibbons ? high + offR + offR * 4.0 * P_long : na
+r_short_base = showRibbons ? high + offR * 5.5 : na
+r_short_top  = showRibbons ? high + offR * 5.5 + offR * 4.0 * P_short : na
+pr_lb = plot(r_long_base, color=na, display=display.none, editable=false)
+pr_lt = plot(r_long_top, color=na, display=display.none, editable=false)
+pr_sb = plot(r_short_base, color=na, display=display.none, editable=false)
+pr_st = plot(r_short_top, color=na, display=display.none, editable=false)
+longRibbonAlpha = math.round(90 - P_long * 60)
+shortRibbonAlpha = math.round(90 - P_short * 60)
+fill(pr_lt, pr_lb, color=showRibbons ? color.new(bullColor, longRibbonAlpha) : na, title="P(Long) Ribbon")
+fill(pr_st, pr_sb, color=showRibbons ? color.new(bearColor, shortRibbonAlpha) : na, title="P(Short) Ribbon")
+pfAlphaA = math.round(30 + (1 - fPitch) * 50)
+pfAlphaB = math.round(40 + (1 - fPitch) * 40)
+pfAlphaC = math.round(50 + (1 - fPitch) * 30)
+p_pf_ma = plot(showForks ? pfMidA : na, color=color.new(C_PFA, pfAlphaA), linewidth=2, title="PF-A Mid")
+p_pf_ua = plot(showForks ? pfUpA : na, color=color.new(C_PFA, pfAlphaA + 20), linewidth=1, title="PF-A Up")
+p_pf_da = plot(showForks ? pfDnA : na, color=color.new(C_PFA, pfAlphaA + 20), linewidth=1, title="PF-A Dn")
+fill(p_pf_ua, p_pf_da, color=showForks ? color.new(C_PFA, 88) : na, title="PF-A Cloud")
+p_pf_mb = plot(showForks ? pfMidB : na, color=color.new(C_PFB, pfAlphaB), linewidth=2, title="PF-B Mid")
+p_pf_ub = plot(showForks ? pfUpB : na, color=color.new(C_PFB, pfAlphaB + 20), linewidth=1, title="PF-B Up")
+p_pf_db = plot(showForks ? pfDnB : na, color=color.new(C_PFB, pfAlphaB + 20), linewidth=1, title="PF-B Dn")
+fill(p_pf_ub, p_pf_db, color=showForks ? color.new(C_PFB, 88) : na, title="PF-B Cloud")
+p_pf_mc = plot(showForks ? pfMidC : na, color=color.new(C_PFC, pfAlphaC), linewidth=2, title="PF-C Mid")
+p_pf_uc = plot(showForks ? pfUpC : na, color=color.new(C_PFC, pfAlphaC + 20), linewidth=1, title="PF-C Up")
+p_pf_dc = plot(showForks ? pfDnC : na, color=color.new(C_PFC, pfAlphaC + 20), linewidth=1, title="PF-C Dn")
+fill(p_pf_uc, p_pf_dc, color=showForks ? color.new(C_PFC, 88) : na, title="PF-C Cloud")
+var int PARTICLE_CAP = 300
+var int SIGNAL_CAP   = 150
+var array<label> particleLabels = array.new_label(0)
+var array<label> signalLabels   = array.new_label(0)
+managedPush(array<label> buf, label lbl, int cap) =>
+    array.push(buf, lbl)
+    if array.size(buf) > cap
+        old = array.shift(buf)
+        label.delete(old)
+if showParticles
+    flow_strength = ord
+    if flow_strength > 0.2
+        pColor = mom > 0 ? bullColor : bearColor
+        yP = mom > 0 ? low - atr14 * 0.15 : high + atr14 * 0.15
+        pSize = flow_strength > 0.7 ? size.small : size.tiny
+        lbl = label.new(bar_index, yP, '•', color=color.new(color.black, 100), textcolor=color.new(pColor, 40), style=label.style_none, size=pSize)
+        managedPush(particleLabels, lbl, PARTICLE_CAP)
+if showDots
+    if signalLong
+        prob = math.round(P_long * 100)
+        dotAlpha = signalTier == 3 ? 0 : signalTier == 2 ? 15 : 35
+        dotSize  = signalTier == 3 ? size.normal : signalTier == 2 ? size.small : size.small
+        dotIcon  = signalTier == 3 ? "◆" : signalTier == 2 ? "▲" : "△"
+        tierTag  = signalTier == 3 ? " ★" : signalTier == 2 ? " ◈" : ""
+        dotCol   = color.new(bullColor, dotAlpha)
+        lbl1 = label.new(bar_index, low - atr14 * 0.5, text=dotIcon, color=color.new(color.black, 100), textcolor=dotCol, style=label.style_none, size=dotSize)
+        lbl2 = label.new(bar_index, low - atr14 * 0.9, text=str.tostring(prob) + "%" + tierTag, color=color.new(color.black, 100), textcolor=dotCol, style=label.style_none, size=size.tiny)
+        managedPush(signalLabels, lbl1, SIGNAL_CAP)
+        managedPush(signalLabels, lbl2, SIGNAL_CAP)
+    if signalShort
+        prob = math.round(P_short * 100)
+        dotAlpha = signalTier == 3 ? 0 : signalTier == 2 ? 15 : 35
+        dotSize  = signalTier == 3 ? size.normal : signalTier == 2 ? size.small : size.small
+        dotIcon  = signalTier == 3 ? "◆" : signalTier == 2 ? "▼" : "▽"
+        tierTag  = signalTier == 3 ? " ★" : signalTier == 2 ? " ◈" : ""
+        dotCol   = color.new(bearColor, dotAlpha)
+        lbl1 = label.new(bar_index, high + atr14 * 0.5, text=dotIcon, color=color.new(color.black, 100), textcolor=dotCol, style=label.style_none, size=dotSize)
+        lbl2 = label.new(bar_index, high + atr14 * 0.9, text=str.tostring(prob) + "%" + tierTag, color=color.new(color.black, 100), textcolor=dotCol, style=label.style_none, size=size.tiny)
+        managedPush(signalLabels, lbl1, SIGNAL_CAP)
+        managedPush(signalLabels, lbl2, SIGNAL_CAP)
+var array<line> gannLines = array.new_line(0)
+var array<bool> gannIsActive = array.new_bool(0)
+var array<int>  gannSetSizes = array.new_int(0)
+var int GANN_KEEP_SETS = 3
+if showGannRays and barstate.isconfirmed
+    int newSetCount = 0
+    float rayReach = atr14 * 8.0
+    int   barReach = 25
+    for k = 0 to gannDiv - 1
+        gAngle = k * gannStep
+        radians = gAngle * math.pi / 180.0
+        float angDist = math.abs(mod360(angle - gAngle))
+        angDist := angDist > 180 ? 360 - angDist : angDist
+        bool isActive = angDist < angTol
+        float proximity = math.max(0.0, 1.0 - angDist / (angTol * 3.0))
+        float dy = math.sin(radians) * rayReach
+        int   dx = math.round(math.cos(radians) * barReach)
+        int   x2 = bar_index + math.max(1, dx)
+        float y2 = close + dy
+        if isActive
+            ln1 = line.new(bar_index, close, x2, y2, color=color.new(C_GOLD, 65), width=4, style=line.style_solid)
+            ln2 = line.new(bar_index, close, x2, y2, color=color.new(C_GOLD, 25), width=2, style=line.style_solid)
+            ln3 = line.new(bar_index, close, x2, y2, color=color.new(C_GOLD, 5), width=1, style=line.style_solid)
+            array.push(gannLines, ln1),     array.push(gannIsActive, true)
+            array.push(gannLines, ln2),     array.push(gannIsActive, true)
+            array.push(gannLines, ln3),     array.push(gannIsActive, true)
+            newSetCount += 3
+        else
+            inactiveAlpha = math.round(80 - proximity * 20)
+            inactiveStyle = proximity > 0.5 ? line.style_dashed : line.style_dotted
+            ln = line.new(bar_index, close, x2, y2, color=color.new(C_GRAY, inactiveAlpha), width=1, style=inactiveStyle)
+            array.push(gannLines, ln),      array.push(gannIsActive, false)
+            newSetCount += 1
+    array.push(gannSetSizes, newSetCount)
+    while array.size(gannSetSizes) > GANN_KEEP_SETS
+        int removeCount = array.shift(gannSetSizes)
+        for rm = 0 to removeCount - 1
+            if array.size(gannLines) > 0
+                line.delete(array.shift(gannLines))
+                array.shift(gannIsActive)
+    if array.size(gannSetSizes) > 1
+        int lineOffset = 0
+        for setIdx = 0 to array.size(gannSetSizes) - 2
+            int age = array.size(gannSetSizes) - 1 - setIdx
+            int setSize = array.get(gannSetSizes, setIdx)
+            color fadeGold = age >= 2 ? color.new(C_GOLD, 88) : color.new(C_GOLD, 70)
+            color fadeGray = age >= 2 ? color.new(C_GRAY, 93) : color.new(C_GRAY, 88)
+            for li = 0 to setSize - 1
+                int arrIdx = lineOffset + li
+                if arrIdx < array.size(gannLines) and arrIdx < array.size(gannIsActive)
+                    existingLine = array.get(gannLines, arrIdx)
+                    wasActive = array.get(gannIsActive, arrIdx)
+                    line.set_color(existingLine, wasActive ? fadeGold : fadeGray)
+                    line.set_width(existingLine, 1)
+            lineOffset += setSize
+var array<box> heatBoxes = array.new_box(0)
+if showHeatGrid and barstate.islast
+    if array.size(heatBoxes) > 0
+        for i = array.size(heatBoxes) - 1 to 0
+            box.delete(array.get(heatBoxes, i))
+        array.clear(heatBoxes)
+    float gridBottom = low - atr14 * 3.5
+    float cellH = atr14 * 0.25
+    int gridStartBar = bar_index - heatGridCols - 2
+    float maxW = 0.01
+    int rowStep = math.max(1, int(math.floor(heatAngleBins / heatGridRows)))
+    int colStep = math.max(1, int(math.floor(heatPressBins / heatGridCols)))
+    for gr = 0 to heatGridRows - 1
+        for gc = 0 to heatGridCols - 1
+            aBin = int(clamp(gr * rowStep, 0, heatAngleBins - 1))
+            pBin = int(clamp(gc * colStep, 0, heatPressBins - 1))
+            cellK = idx2d(aBin, pBin, heatPressBins)
+            if cellK >= 0 and cellK < heatTotalCells
+                maxW := math.max(maxW, array.get(heatW, cellK))
+    for gr = 0 to heatGridRows - 1
+        for gc = 0 to heatGridCols - 1
+            aBin = int(clamp(gr * rowStep, 0, heatAngleBins - 1))
+            pBin = int(clamp(gc * colStep, 0, heatPressBins - 1))
+            cellK = idx2d(aBin, pBin, heatPressBins)
+            if cellK >= 0 and cellK < heatTotalCells
+                wt = array.get(heatW, cellK)
+                bias = wt > 0.01 ? safeDiv(array.get(heatV, cellK), wt, 0.0) : 0.0
+                intensity = clamp(wt / maxW, 0.0, 1.0)
+                alpha = math.round(95 - intensity * 70)
+                cellColor = bias > 0.05 ? color.new(bullColor, alpha) : bias < -0.05 ? color.new(bearColor, alpha) : color.new(C_GRAY, alpha)
+                if aBin == r_hm and pBin == c_hm
+                    cellColor := color.new(C_GOLD, math.max(10, alpha - 30))
+                x1 = gridStartBar + gc
+                x2 = gridStartBar + gc + 1
+                y1 = gridBottom + gr * cellH
+                y2 = gridBottom + (gr + 1) * cellH
+                b = box.new(x1, y2, x2, y1, border_color=color.new(C_GRAY, 85), bgcolor=cellColor, border_width=0)
+                array.push(heatBoxes, b)
+//==============================================================================
+// 🖥️ PROFESSIONAL DASHBOARD
+//==============================================================================
+var table hud = na
+if showHUD and barstate.islast
+    hudPos = hudPosition == "Top Left" ? position.top_left : hudPosition == "Top Right" ? position.top_right : hudPosition == "Bottom Left" ? position.bottom_left : position.bottom_right
+    if not na(hud)
+        table.delete(hud)
+    hud := table.new(hudPos, 4, 32, border_width=1, border_color=color.new(color.gray, 50), bgcolor=color.new(C_DARK, 15))
+    bg_header = color.new(color.black, 30)
+    bg_section = color.new(color.gray, 85)
+    row = 0
+    table.merge_cells(hud, 0, row, 3, row)
+    table.cell(hud, 0, row, "⬡ 369 Vector Equilibrium [DAFE]", text_halign=text.align_center, text_color=C_WHITE, bgcolor=bg_header, text_size=size.small)
+    row += 1
+    table.merge_cells(hud, 0, row, 3, row)
+    table.cell(hud, 0, row, "══ ⬡ GEOMETRY & RESONANCE ══", text_halign=text.align_center, text_color=C_GOLD, bgcolor=bg_section, text_size=size.tiny)
+    row += 1
+    table.cell(hud, 0, row, "Vector Angle", text_color=C_GRAY, text_size=size.tiny)
+    table.cell(hud, 1, row, str.tostring(angle, "#.1") + "°", text_color=quantumColor, text_size=size.tiny)
+    table.cell(hud, 2, row, "Gann Δ", text_color=C_GRAY, text_size=size.tiny)
+    gannColor = dG <= angTol ? C_GREEN : dG <= angTol * 2 ? C_ORANGE : C_RED
+    table.cell(hud, 3, row, str.tostring(dG, "#.1") + "°", text_color=gannColor, text_size=size.tiny)
+    row += 1
+    table.cell(hud, 0, row, "369 Ring", text_color=C_GRAY, text_size=size.tiny)
+    ringEmoji = f369 > 0.5 ? "🔮 IN" : "○ OUT"
+    table.cell(hud, 1, row, ringEmoji, text_color=f369 > 0.5 ? C_GOLD : C_GRAY, text_size=size.tiny)
+    table.cell(hud, 2, row, "Bin #", text_color=C_GRAY, text_size=size.tiny)
+    table.cell(hud, 3, row, str.tostring(bin369), text_color=C_WHITE, text_size=size.tiny)
+    row += 1
+    table.cell(hud, 0, row, "Entropy", text_color=C_GRAY, text_size=size.tiny)
+    entEmoji = entVal < 0.4 ? "🔥" : entVal < 0.7 ? "📊" : "😴"
+    entColor = entVal < 0.4 ? C_GREEN : entVal < 0.7 ? C_GOLD : C_RED
+    table.cell(hud, 1, row, entEmoji + " " + str.tostring(entVal, "#.##"), text_color=entColor, text_size=size.tiny)
+    table.cell(hud, 2, row, "Order", text_color=C_GRAY, text_size=size.tiny)
+    table.cell(hud, 3, row, str.tostring(ord * 100, "#.0") + "%", text_color=entColor, text_size=size.tiny)
+    row += 1
+    table.merge_cells(hud, 0, row, 3, row)
+    table.cell(hud, 0, row, "══ 🔬 WPK REGIME ENGINE ══", text_halign=text.align_center, text_color=C_GOLD, bgcolor=bg_section, text_size=size.tiny)
+    row += 1
+    table.cell(hud, 0, row, "Hurst", text_color=C_GRAY, text_size=size.tiny)
+    hurstColor = hurstVal > hurstTrend ? C_GREEN : hurstVal < hurstMR ? color.rgb(180, 120, 255) : C_GRAY
+    table.cell(hud, 1, row, str.tostring(hurstVal, "#.###"), text_color=hurstColor, text_size=size.tiny)
+    table.cell(hud, 2, row, "Regime", text_color=C_GRAY, text_size=size.tiny)
+    regimeColor = regimeLabel == "TREND" ? C_GREEN : regimeLabel == "MR" ? color.rgb(180, 120, 255) : C_GRAY
+    table.cell(hud, 3, row, regimeLabel, text_color=regimeColor, text_size=size.tiny)
+    row += 1
+    table.cell(hud, 0, row, "α(mem)", text_color=C_GRAY, text_size=size.tiny)
+    alphaShift = alpha_mem - alpha_mem_base
+    alphaTag = alphaShift > 0.01 ? " ↑MEM" : alphaShift < -0.01 ? " ↓RT" : " =BASE"
+    table.cell(hud, 1, row, str.tostring(alpha_mem, "#.##") + alphaTag, text_color=regimeColor, text_size=size.tiny)
+    table.cell(hud, 2, row, "Delta", text_color=C_GRAY, text_size=size.tiny)
+    deltaColor = fDelta > 0.1 ? C_GREEN : fDelta < -0.1 ? C_RED : C_GRAY
+    table.cell(hud, 3, row, deltaSource + " " + str.tostring(fDelta, "#.##"), text_color=deltaColor, text_size=size.tiny)
+    row += 1
+    table.merge_cells(hud, 0, row, 3, row)
+    table.cell(hud, 0, row, "══ 🔱 PITCHFORK PROXIMITY ══", text_halign=text.align_center, text_color=C_GOLD, bgcolor=bg_section, text_size=size.tiny)
+    row += 1
+    table.cell(hud, 0, row, "Nearest Line", text_color=C_GRAY, text_size=size.tiny)
+    touchColor = dMinATR <= touchATR ? C_GREEN : dMinATR <= touchATR * 2 ? C_ORANGE : C_RED
+    touchEmoji = dMinATR <= touchATR ? "✦ TOUCH" : dMinATR <= touchATR * 2 ? "◇ NEAR" : "○ FAR"
+    table.merge_cells(hud, 1, row, 3, row)
+    table.cell(hud, 1, row, touchEmoji + "  " + str.tostring(dMinATR, "#.##") + " ATR", text_halign=text.align_right, text_color=touchColor, text_size=size.tiny)
+    row += 1
+    table.cell(hud, 0, row, "Bubble (ATR)", text_color=C_GRAY, text_size=size.tiny)
+    table.cell(hud, 1, row, str.tostring(bubbleATR, "#.##"), text_color=C_WHITE, text_size=size.tiny)
+    table.cell(hud, 2, row, "Pressure", text_color=C_GRAY, text_size=size.tiny)
+    pressColor = press > 1.5 ? C_RED : press > 0.8 ? C_ORANGE : C_GREEN
+    table.cell(hud, 3, row, str.tostring(press, "#.##"), text_color=pressColor, text_size=size.tiny)
+    row += 1
+    table.merge_cells(hud, 0, row, 3, row)
+    table.cell(hud, 0, row, "══ 📊 CONFLUENCE FACTORS ══", text_halign=text.align_center, text_color=C_GOLD, bgcolor=bg_section, text_size=size.tiny)
+    row += 1
+    table.cell(hud, 0, row, "f(369)", text_color=C_GRAY, text_size=size.tiny)
+    bar369 = f369 > 0.5 ? "██████" : "░░░░░░"
+    table.cell(hud, 1, row, bar369 + " " + str.tostring(f369 * 100, "#") + "%", text_color=f369 > 0.5 ? C_GOLD : C_GRAY, text_size=size.tiny)
+    table.cell(hud, 2, row, "f(Gann)", text_color=C_GRAY, text_size=size.tiny)
+    barGann = fGann > 0.7 ? "██████" : fGann > 0.3 ? "███░░░" : "░░░░░░"
+    table.cell(hud, 3, row, barGann + " " + str.tostring(fGann * 100, "#") + "%", text_color=fGann > 0.5 ? C_GREEN : C_GRAY, text_size=size.tiny)
+    row += 1
+    table.cell(hud, 0, row, "f(Pitch)", text_color=C_GRAY, text_size=size.tiny)
+    barPitch = fPitch > 0.7 ? "██████" : fPitch > 0.3 ? "███░░░" : "░░░░░░"
+    table.cell(hud, 1, row, barPitch + " " + str.tostring(fPitch * 100, "#") + "%", text_color=fPitch > 0.5 ? C_GREEN : C_GRAY, text_size=size.tiny)
+    table.cell(hud, 2, row, "f(Press)", text_color=C_GRAY, text_size=size.tiny)
+    barPress = fPress > 0.7 ? "██████" : fPress > 0.3 ? "███░░░" : "░░░░░░"
+    table.cell(hud, 3, row, barPress + " " + str.tostring(fPress * 100, "#") + "%", text_color=fPress > 0.5 ? C_ORANGE : C_GRAY, text_size=size.tiny)
+    row += 1
+    table.cell(hud, 0, row, "Composite", text_color=C_GRAY, text_size=size.tiny)
+    table.merge_cells(hud, 1, row, 3, row)
+    confColor = confRT > 0.7 ? C_GOLD : confRT > 0.4 ? C_GREEN : C_GRAY
+    confEmoji = confRT > 0.7 ? "🌟" : confRT > 0.4 ? "💫" : "○"
+    table.cell(hud, 1, row, confEmoji + " " + str.tostring(confRT * 100, "#.0") + "%", text_halign=text.align_right, text_color=confColor, text_size=size.small)
+    row += 1
+    table.cell(hud, 0, row, "Gate Penalty", text_color=C_GRAY, text_size=size.tiny)
+    table.merge_cells(hud, 1, row, 3, row)
+    table.cell(hud, 1, row, "+" + str.tostring(chopPenalty * 100, "#.1") + "%", text_halign=text.align_right, text_color=chopPenalty > 0.1 ? C_RED : C_ORANGE, text_size=size.tiny)
+    row += 1
+    table.merge_cells(hud, 0, row, 3, row)
+    table.cell(hud, 0, row, "══ 🚦 SIGNAL GATE ══", text_halign=text.align_center, text_color=C_GOLD, bgcolor=bg_section, text_size=size.tiny)
+    row += 1
+    table.cell(hud, 0, row, "Conf Gate", text_color=C_GRAY, text_size=size.tiny)
+    table.cell(hud, 1, row, (passConf ? "✓ " : "✗ ") + str.tostring(dynamicMinConf*100, "#.0")+"%", text_color=passConf ? C_GREEN : C_RED, text_size=size.tiny)
+    table.cell(hud, 2, row, "Prob Gate", text_color=C_GRAY, text_size=size.tiny)
+    table.cell(hud, 3, row, (passProb ? "✓ " : "✗ ") + str.tostring(dynamicMinProb*100, "#.0")+"%", text_color=passProb ? C_GREEN : C_RED, text_size=size.tiny)
+    row += 1
+    table.cell(hud, 0, row, "Factors", text_color=C_GRAY, text_size=size.tiny)
+    table.cell(hud, 1, row, str.tostring(activeFCount) + "/" + str.tostring(sigMinFactors), text_color=passFactors ? C_GREEN : C_RED, text_size=size.tiny)
+    table.cell(hud, 2, row, "Tier", text_color=C_GRAY, text_size=size.tiny)
+    tierColor = signalTier == 3 ? C_GOLD : signalTier == 2 ? C_GREEN : C_GRAY
+    tierText  = signalTier == 3 ? "★ ELITE" : signalTier == 2 ? "◈ STRONG" : "○ BASE"
+    table.cell(hud, 3, row, tierText, text_color=tierColor, text_size=size.tiny)
+    row += 1
+    int pUsed = array.size(particleLabels)
+    int sUsed = array.size(signalLabels)
+    int totalLabels = pUsed + sUsed
+    table.cell(hud, 0, row, "Labels", text_color=C_GRAY, text_size=size.tiny)
+    table.cell(hud, 1, row, str.tostring(totalLabels) + "/500", text_color=totalLabels > 400 ? C_RED : totalLabels > 300 ? C_ORANGE : C_GREEN, text_size=size.tiny)
+    table.cell(hud, 2, row, "P|S", text_color=C_GRAY, text_size=size.tiny)
+    table.cell(hud, 3, row, str.tostring(pUsed) + "|" + str.tostring(sUsed), text_color=C_WHITE, text_size=size.tiny)
+    row += 1
+    table.merge_cells(hud, 0, row, 3, row)
+    table.cell(hud, 0, row, "══ 🌡️ HEATMAP CELL ══", text_halign=text.align_center, text_color=C_GOLD, bgcolor=bg_section, text_size=size.tiny)
+    row += 1
+    table.cell(hud, 0, row, "Cell Bias", text_color=C_GRAY, text_size=size.tiny)
+    table.cell(hud, 1, row, str.tostring(heatBias, "#.##"), text_color=heatBias > 0.1 ? C_GREEN : heatBias < -0.1 ? C_RED : C_GRAY, text_size=size.tiny)
+    table.cell(hud, 2, row, "Cell Weight", text_color=C_GRAY, text_size=size.tiny)
+    table.cell(hud, 3, row, str.tostring(heatStrength, "#.##"), text_color=C_WHITE, text_size=size.tiny)
+    row += 1
+    table.cell(hud, 0, row, "Active Cells", text_color=C_GRAY, text_size=size.tiny)
+    table.cell(hud, 1, row, str.tostring(array.size(heatActive)) + "/" + str.tostring(heatTotalCells), text_color=C_WHITE, text_size=size.tiny)
+    table.cell(hud, 2, row, "Grid", text_color=C_GRAY, text_size=size.tiny)
+    table.cell(hud, 3, row, showHeatGrid ? "ON" : "OFF", text_color=showHeatGrid ? C_GREEN : C_GRAY, text_size=size.tiny)
+    row += 1
+    table.merge_cells(hud, 0, row, 3, row)
+    table.cell(hud, 0, row, "══ 🧠 MEMORY KNN ENGINE ══", text_halign=text.align_center, text_color=C_GOLD, bgcolor=bg_section, text_size=size.tiny)
+    row += 1
+    memStatusColor = enableMem and memCount > 10 ? C_GREEN : enableMem ? C_ORANGE : C_RED
+    memStatusText = enableMem ? (memCount > 10 ? "ACTIVE" : "LEARNING") : "DISABLED"
+    table.cell(hud, 0, row, "Status", text_color=C_GRAY, text_size=size.tiny)
+    table.cell(hud, 1, row, memStatusText, text_color=memStatusColor, text_size=size.tiny)
+    table.cell(hud, 2, row, "Stored", text_color=C_GRAY, text_size=size.tiny)
+    table.cell(hud, 3, row, str.tostring(memCount) + "/" + str.tostring(memSize), text_color=C_WHITE, text_size=size.tiny)
+    row += 1
+    table.cell(hud, 0, row, "K Used", text_color=C_GRAY, text_size=size.tiny)
+    table.cell(hud, 1, row, str.tostring(memUsed) + "/" + str.tostring(kNeighbors), text_color=C_WHITE, text_size=size.tiny)
+    table.cell(hud, 2, row, "Assurance", text_color=C_GRAY, text_size=size.tiny)
+    table.cell(hud, 3, row, str.tostring(memAssurance, "#.##"), text_color=memAssurance > 3.0 ? C_GREEN : memAssurance > 1.0 ? C_ORANGE : C_GRAY, text_size=size.tiny)
+    row += 1
+    table.cell(hud, 0, row, "Feat Dims", text_color=C_GRAY, text_size=size.tiny)
+    table.cell(hud, 1, row, str.tostring(featDim) + "D", text_color=quantumColor, text_size=size.tiny)
+    table.cell(hud, 2, row, "Δ Source", text_color=C_GRAY, text_size=size.tiny)
+    table.cell(hud, 3, row, deltaSource, text_color=fp_available ? C_GREEN : C_ORANGE, text_size=size.tiny)
+    row += 1
+    table.merge_cells(hud, 0, row, 3, row)
+    table.cell(hud, 0, row, "══ 🎯 FINAL PROBABILITIES ══", text_halign=text.align_center, text_color=C_GOLD, bgcolor=bg_section, text_size=size.tiny)
+    row += 1
+    table.cell(hud, 0, row, "P(Long) RT", text_color=C_GRAY, text_size=size.tiny)
+    table.cell(hud, 1, row, str.tostring(P_long_rt * 100, "#.1") + "%", text_color=bullColor, text_size=size.tiny)
+    table.cell(hud, 2, row, "P(Short) RT", text_color=C_GRAY, text_size=size.tiny)
+    table.cell(hud, 3, row, str.tostring(P_short_rt * 100, "#.1") + "%", text_color=bearColor, text_size=size.tiny)
+    row += 1
+    table.cell(hud, 0, row, "P(Long) Mem", text_color=C_GRAY, text_size=size.tiny)
+    table.cell(hud, 1, row, str.tostring(P_long_mem * 100, "#.1") + "%", text_color=bullColor, text_size=size.tiny)
+    table.cell(hud, 2, row, "P(Short) Mem", text_color=C_GRAY, text_size=size.tiny)
+    table.cell(hud, 3, row, str.tostring(P_short_mem * 100, "#.1") + "%", text_color=bearColor, text_size=size.tiny)
+    row += 1
+    finalDir = P_long > P_short ? "LONG" : "SHORT"
+    finalProb = math.max(P_long, P_short)
+    finalColor = P_long > P_short ? bullColor : bearColor
+    finalQuality = finalProb > 0.7 ? "🌟 HIGH CONF" : finalProb > 0.4 ? "💫 MODERATE" : "⚠️ LOW"
+    table.cell(hud, 0, row, "FINAL", text_color=C_WHITE, text_size=size.small, bgcolor=color.new(finalColor, 70))
+    table.cell(hud, 1, row, finalDir, text_color=finalColor, text_size=size.small, bgcolor=color.new(finalColor, 85))
+    table.cell(hud, 2, row, str.tostring(finalProb * 100, "#.1") + "%", text_color=finalColor, text_size=size.small, bgcolor=color.new(finalColor, 85))
+    table.cell(hud, 3, row, finalQuality, text_color=finalColor, text_size=size.tiny, bgcolor=color.new(finalColor, 85))
+//==============================================================================
+// 🏷️ WATERMARK
+//==============================================================================
+var table watermark = na
+if na(watermark)
+    watermark := table.new(position.bottom_center, 1, 1, bgcolor=color.new(color.black, 90), border_color=color.new(quantumColor, 80), border_width=1)
+table.clear(watermark, 0, 0)
+table.cell(watermark, 0, 0, "⬡ 369 Vector Equilibrium [DAFE]", text_color=color.new(quantumColor, 30), text_size=size.normal)

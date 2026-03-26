@@ -1,0 +1,280 @@
+//@version=6
+indicator(title="Wyckoff Range (Accumulation Phase A) AA", overlay=true, max_labels_count=500, max_boxes_count=200)
+
+//─────────────────────────────────────────────────────────────
+// Inputs
+//─────────────────────────────────────────────────────────────
+lookback   = input.int(50, "Lowest-low lookback (bars)", minval=2)
+volMult    = input.float(1.5, "Volume climax × avg_vol", step=0.1)
+retracePct = input.float(50.0, "Freeze on retrace % of SC→AR swing", minval=10, maxval=90, step=5)
+
+// Phase A size filters
+groupSize          = "Phase A Size Filters"
+minHeightATR       = input.float(5.0, "Minimum Height (ATR)", step=0.1, minval=0.0, group=groupSize)
+maxHeightATR       = input.float(10.0, "Maximum Height (ATR)", step=0.1, minval=0.0, group=groupSize)
+minWidthBarsPhaseA = input.int(10, "Minimum Width (bars)", minval=1, group=groupSize)
+maxWidthBarsPhaseA = input.int(100, "Maximum Width (bars)", minval=1, group=groupSize)
+
+// OPTIONAL Wyckoff Effort/Result filter
+grpER       = "Wyckoff Filter (optional)"
+useERFilter = input.bool(true, "Enable Effort/Result Filter (AR efficient, ST inefficient)", group=grpER)
+
+// Phase A box
+groupBox      = "Phase A Box"
+showPhaseABox = input.bool(true, "Show Phase A Confirmation Box", group=groupBox)
+keepBoxes     = input.int(20, "Keep Last N Boxes", minval=0, maxval=200, group=groupBox)
+
+// yellow confirmation area
+confirmFill   = color.new(color.yellow, 82)
+confirmBorder = color.new(color.yellow, 35)
+
+//─────────────────────────────────────────────────────────────
+// Helpers
+//─────────────────────────────────────────────────────────────
+atrRange(_multi) =>
+    nz(ta.atr(200) * _multi, ta.cum(high - low) / (bar_index + 1))
+
+//─────────────────────────────────────────────────────────────
+// Original volume code (made safe)
+//─────────────────────────────────────────────────────────────
+V   = volume
+eps = syminfo.mintick > 0 ? syminfo.mintick : 1e-10
+rng = math.max(high - low, eps)
+
+volume_bought = V * ((close - low) / rng)
+volume_sold   = V * ((high - close) / rng)
+
+cumulative_vol = ta.cum(V)
+avg_vol        = cumulative_vol / (bar_index > 0 ? bar_index : 1)
+
+// Cum sums for leg effort
+cumB = ta.cum(volume_bought)
+cumS = ta.cum(volume_sold)
+
+//─────────────────────────────────────────────────────────────
+// SC candidate: lowest low in X + vol climax
+//─────────────────────────────────────────────────────────────
+isLowest    = low <= ta.lowest(low, lookback)
+isVolClimax = volume_sold >= (volMult * avg_vol) or volume_bought >= (volMult * avg_vol)
+scCandidate = isLowest and isVolClimax
+
+//─────────────────────────────────────────────────────────────
+// State
+//─────────────────────────────────────────────────────────────
+var bool  pending   = false
+var int   pBar      = na
+var float pHigh     = na
+var float pLow      = na
+
+var float pBaseCumB = na
+
+var bool  trackingAR = false
+var int   scBar      = na
+var float scLow      = na
+var float scHigh     = na
+var float arHigh     = na
+var int   arBar      = na
+
+var bool  retraceHit    = false
+var int   retraceHitBar = na
+var float retraceLow    = na
+
+// Lock AR at first retrace hit (core rule)
+var bool  arLocked   = false
+var float arHighLock = na
+var int   arBarLock  = na
+
+// Wyckoff E/R state (computed at retraceHit)
+var float arCumB_atTop  = na
+var float arBaseCumS    = na
+var bool  erOK          = false
+
+var bool frozen = false
+
+// yellow confirmation boxes only
+var box   confirmBox   = na
+var box[] confirmBoxes = array.new_box()
+
+// confirmed pattern labels
+var label[] scLabels = array.new_label()
+var label[] arLabels = array.new_label()
+var label[] stLabels = array.new_label()
+
+// keep labels under TV cap
+labelsKeep = math.min(keepBoxes, 166)
+
+// alert pulse
+bool newPhaseABoxPlotted = false
+
+//─────────────────────────────────────────────────────────────
+// Start pending SC
+//─────────────────────────────────────────────────────────────
+if scCandidate
+    pending := true
+    pBar    := bar_index
+    pHigh   := high
+    pLow    := low
+    pBaseCumB := nz(cumB[1], 0.0)
+
+    // reset active detection only
+    trackingAR    := false
+    frozen        := false
+    retraceHit    := false
+    retraceHitBar := na
+    retraceLow    := na
+
+    arLocked      := false
+    arHighLock    := na
+    arBarLock     := na
+
+    arHigh        := na
+    arBar         := na
+    confirmBox    := na
+
+    arCumB_atTop := na
+    arBaseCumS   := na
+    erOK         := false
+
+//─────────────────────────────────────────────────────────────
+// Confirm/Invalidate SC
+//─────────────────────────────────────────────────────────────
+if pending and bar_index > pBar
+    if low < pLow
+        pending := false
+    else if close > pHigh
+        trackingAR := true
+        frozen     := false
+
+        scBar  := pBar
+        scLow  := pLow
+        scHigh := pHigh
+
+        arHigh := high
+        arBar  := bar_index
+
+        retraceHit    := false
+        retraceHitBar := na
+        retraceLow    := na
+
+        arLocked      := false
+        arHighLock    := na
+        arBarLock     := na
+
+        arCumB_atTop := cumB
+        arBaseCumS   := nz(cumS[1], 0.0)
+        erOK         := false
+
+        pending := false
+
+//─────────────────────────────────────────────────────────────
+// Track AR + detect retrace-hit (core)
+// Once retraceHit happens, AR is LOCKED and cannot grow.
+//─────────────────────────────────────────────────────────────
+if trackingAR and not frozen
+    if not arLocked and high > nz(arHigh, high)
+        arHigh := high
+        arBar  := bar_index
+
+        // update ER anchors for new top
+        arCumB_atTop := cumB
+        arBaseCumS   := nz(cumS[1], 0.0)
+        erOK         := false
+
+    arTopNow = arLocked ? arHighLock : arHigh
+    swing    = arTopNow - scLow
+    thr      = arTopNow - swing * (retracePct * 0.01)
+
+    if not retraceHit and swing > eps and close <= thr
+        retraceHit    := true
+        retraceHitBar := bar_index
+        retraceLow    := low
+
+        // LOCK AR at first retrace hit (core rule)
+        arLocked   := true
+        arHighLock := arHigh
+        arBarLock  := arBar
+
+        if useERFilter
+            effortAR = nz(arCumB_atTop, 0.0) - nz(pBaseCumB, 0.0)
+            effortST = cumS - nz(arBaseCumS, 0.0)
+
+            resultAR = arHighLock - scLow
+            resultST = arHighLock - close
+
+            erOK := (resultAR > eps and resultST > eps) ? ((effortST / resultST) >= (effortAR / resultAR)) : false
+
+            // If E/R fails, discard immediately
+            if not erOK
+                trackingAR := false
+                retraceHit := false
+                arLocked   := false
+
+//─────────────────────────────────────────────────────────────
+// Freeze logic:
+//   CORE: retraceHit (and AR is locked)
+//   ER: if enabled, require erOK
+//   SIZE: Phase A height must fit ATR band, width must fit bar band
+//─────────────────────────────────────────────────────────────
+canFreezeBasic = trackingAR and not frozen and retraceHit and arLocked
+canFreezeER    = (not useERFilter) ? true : erOK
+
+phaseAHeight = arHighLock - scLow
+phaseAWidth  = not na(scBar) and not na(retraceHitBar) ? (retraceHitBar - scBar + 1) : na
+
+canFreezeHeightATR = not na(phaseAHeight) and phaseAHeight >= atrRange(minHeightATR) and phaseAHeight <= atrRange(maxHeightATR)
+canFreezeWidthBars = not na(phaseAWidth)  and phaseAWidth  >= minWidthBarsPhaseA and phaseAWidth <= maxWidthBarsPhaseA
+
+// discard pattern if basic + ER passed, but size gate fails
+if canFreezeBasic and canFreezeER and not (canFreezeHeightATR and canFreezeWidthBars)
+    trackingAR := false
+    retraceHit := false
+    arLocked   := false
+
+if canFreezeBasic and canFreezeER and canFreezeHeightATR and canFreezeWidthBars
+    frozen     := true
+    trackingAR := false
+
+    if showPhaseABox and keepBoxes > 0
+        confirmBox := box.new(left=scBar, right=retraceHitBar, top=arHighLock, bottom=scLow,
+             xloc=xloc.bar_index, bgcolor=confirmFill, border_color=confirmBorder)
+        array.push(confirmBoxes, confirmBox)
+        newPhaseABoxPlotted := true
+
+        if array.size(confirmBoxes) > keepBoxes
+            oldConfirm = array.shift(confirmBoxes)
+            box.delete(oldConfirm)
+
+    // Create SC / AR / ST labels ONLY after full pattern confirmation
+    if labelsKeep > 0
+        scLbl = label.new(scBar, scLow, "SC",
+             xloc=xloc.bar_index, yloc=yloc.price,
+             style=label.style_label_up, size=size.tiny,
+             color=color.new(color.lime, 0), textcolor=color.white)
+
+        arLbl = label.new(arBarLock, arHighLock, "AR",
+             xloc=xloc.bar_index, yloc=yloc.price,
+             style=label.style_label_down, size=size.tiny,
+             color=color.new(color.aqua, 0), textcolor=color.black)
+
+        stLbl = label.new(retraceHitBar, retraceLow, "ST",
+             xloc=xloc.bar_index, yloc=yloc.price,
+             style=label.style_label_up, size=size.tiny,
+             color=color.new(color.orange, 0), textcolor=color.black)
+
+        array.push(scLabels, scLbl)
+        array.push(arLabels, arLbl)
+        array.push(stLabels, stLbl)
+
+        if array.size(scLabels) > labelsKeep
+            oldSc = array.shift(scLabels)
+            label.delete(oldSc)
+
+        if array.size(arLabels) > labelsKeep
+            oldAr = array.shift(arLabels)
+            label.delete(oldAr)
+
+        if array.size(stLabels) > labelsKeep
+            oldSt = array.shift(stLabels)
+            label.delete(oldSt)
+
+alertcondition(newPhaseABoxPlotted, title="Wyckoff Phase A Box Plotted", message="New Wyckoff SC→AR→ST Phase A box plotted")

@@ -1,0 +1,256 @@
+// This Pine Script™ code is subject to the terms of the Mozilla Public License 2.0
+// Mark Novak
+// MetalMind: Kernel Flow v3.1 [Institutional Edition]
+
+//@version=6
+indicator("MetalMind: Kernel Flow v3", "MM:KF v3", overlay=true, max_lines_count=500, max_labels_count=500, max_bars_back=500)
+
+// ─────────────────────────────────────────────
+// ███  INPUTS
+// ─────────────────────────────────────────────
+
+grpKernel = "AI Kernel Engine"
+kernelLen    = input.int(50, "Kernel Lookback", minval=10, maxval=200, group=grpKernel)
+bandwidth    = input.float(8.0, "Bandwidth (h)", minval=0.5, step=0.5, group=grpKernel)
+alpha        = input.float(1.0, "Alpha (α)", minval=0.1, step=0.1, group=grpKernel)
+fastMult     = input.float(0.35, "Fast Kernel Multiplier", minval=0.1, maxval=0.8, step=0.05, group=grpKernel)
+kernelSrc    = input.source(close, "Source", group=grpKernel)
+
+grpRibbon = "Kernel Ribbon"
+useRibbon    = input.bool(true, "Enable Ribbon Confirmation", group=grpRibbon)
+ribbonSpread = input.float(1.8, "Ribbon BW Spread", minval=1.1, maxval=3.0, step=0.1, group=grpRibbon)
+
+grpFilters = "Entry Filters"
+useADX       = input.bool(true, "ADX Trend Filter", group=grpFilters)
+adxLen       = input.int(14, "ADX Length", minval=7, maxval=50, group=grpFilters)
+adxThresh    = input.float(20.0, "ADX Min Threshold", minval=10.0, maxval=50.0, step=1.0, group=grpFilters)
+useRSI       = input.bool(true, "RSI Overbought/Oversold Filter", group=grpFilters)
+rsiLen       = input.int(14, "RSI Length", minval=5, maxval=50, group=grpFilters)
+rsiOB        = input.float(70.0, "RSI Overbought", minval=60.0, maxval=90.0, step=5.0, group=grpFilters)
+rsiOS        = input.float(30.0, "RSI Oversold", minval=10.0, maxval=40.0, step=5.0, group=grpFilters)
+useConfBar   = input.bool(true, "Wait Confirmation Bar", group=grpFilters)
+
+grpMetal = "Metal Intelligence"
+useGSR       = input.bool(true, "Gold/Silver Ratio Filter", group=grpMetal)
+// FIX: Добавили выбор тикеров для гибкости
+symGold      = input.symbol("OANDA:XAUUSD", "Gold Ticker", group=grpMetal)
+symSilver    = input.symbol("OANDA:XAGUSD", "Silver Ticker", group=grpMetal)
+gsrLen       = input.int(50, "GSR Lookback", minval=10, maxval=200, group=grpMetal)
+gsrSens      = input.float(1.5, "GSR Sensitivity", minval=0.5, maxval=5.0, step=0.1, group=grpMetal)
+useVolNorm   = input.bool(true, "Volatility Spike Protection", group=grpMetal)
+spikeMulti   = input.float(3.0, "Spike Threshold (σ)", minval=1.5, maxval=6.0, step=0.5, group=grpMetal)
+
+grpSignal = "Signal"
+sigCooldown   = input.int(3, "Signal Cooldown (bars)", minval=1, maxval=20, group=grpSignal)
+
+grpVis = "Visual"
+showRibbon   = input.bool(true, "Show Ribbon", group=grpVis)
+showBubbles  = input.bool(true, "Show Bubbles", group=grpVis)
+showFiltered = input.bool(true, "Show Filtered (Grey) Signals", group=grpVis, tooltip="Shows where AI prevented a bad trade")
+heatOpacity  = input.int(85, "Bubble Opacity", minval=50, maxval=97, group=grpVis)
+bullColor    = input.color(#00E676, "Bull", group=grpVis)
+bearColor    = input.color(#FF1744, "Bear", group=grpVis)
+neutColor    = input.color(#FFD600, "Neutral", group=grpVis)
+
+// ─────────────────────────────────────────────
+// ███  KERNEL REGRESSION
+// ─────────────────────────────────────────────
+
+rqKernel(int _idx, float _h, float _alpha) =>
+    math.pow(1.0 + math.pow(_idx, 2) / (2.0 * _alpha * math.pow(_h, 2)), -_alpha)
+
+calcKR(float src, int len, float h, float a) =>
+    float sW = 0.0, float sS = 0.0
+    for i = 0 to len - 1
+        float w = rqKernel(i, h, a)
+        sW += w * nz(src[i])
+        sS += w
+    sS != 0 ? sW / sS : src
+
+// ─────────────────────────────────────────────
+// ███  SPIKE PROTECTION
+// ─────────────────────────────────────────────
+
+barBody     = math.abs(close - open)
+avgBody     = ta.sma(barBody, 20)
+stdBody     = ta.stdev(barBody, 20)
+isSpike     = useVolNorm and (barBody > avgBody + spikeMulti * stdBody)
+filteredSrc = isSpike ? (high + low) / 2.0 : kernelSrc
+spikeConf   = isSpike[1] and math.abs(close - close[1]) > barBody[1] * 0.5
+finalSrc    = spikeConf[1] ? kernelSrc : filteredSrc
+
+// ─────────────────────────────────────────────
+// ███  GSR FILTER
+// ─────────────────────────────────────────────
+
+// FIX: Используем inputs вместо хардкода
+float goldP   = request.security(symGold, timeframe.period, close, ignore_invalid_symbol=true)
+float silverP = request.security(symSilver, timeframe.period, close, ignore_invalid_symbol=true)
+float gsR     = (not na(goldP) and not na(silverP) and silverP > 0) ? goldP / silverP : na
+float gsrMean = ta.sma(gsR, gsrLen)
+float gsrStd  = ta.stdev(gsR, gsrLen)
+float gsrZ    = (not na(gsR) and not na(gsrMean) and gsrStd > 0) ? (gsR - gsrMean) / gsrStd : 0.0
+// FIX: Ограничиваем влияние GSR только на лонги (High GSR = Bad for Longs, OK for Shorts)
+float gsrW    = useGSR ? math.max(0.0, math.min(1.0, gsrZ * gsrSens * 0.3)) : 0.0
+
+// ─────────────────────────────────────────────
+// ███  COMPUTE KERNELS
+// ─────────────────────────────────────────────
+
+int fastLen = math.max(5, math.round(kernelLen * fastMult))
+float fastBW = bandwidth * 0.5
+
+float kSlow  = calcKR(finalSrc, kernelLen, bandwidth, alpha)
+float kSlow1 = calcKR(finalSrc[1], kernelLen, bandwidth, alpha)
+
+float kFast  = calcKR(finalSrc, fastLen, fastBW, alpha)
+float kFast1 = calcKR(finalSrc[1], fastLen, fastBW, alpha)
+
+float bw2 = bandwidth * ribbonSpread
+float bw3 = bandwidth * math.pow(ribbonSpread, 2)
+float kR2  = calcKR(finalSrc, kernelLen, bw2, alpha)
+float kR3  = calcKR(finalSrc, kernelLen, bw3, alpha)
+float kR2p = calcKR(finalSrc[1], kernelLen, bw2, alpha)
+float kR3p = calcKR(finalSrc[1], kernelLen, bw3, alpha)
+
+float atrNorm  = ta.atr(14)
+float rawSlope = kSlow - kSlow1
+float normSlope = atrNorm > 0 ? rawSlope / atrNorm : 0.0
+
+// FIX LOGIC: Мы только "наказываем" лонги при высоком GSR. Шорты не трогаем.
+float adjSlope  = normSlope > 0 ? normSlope - (gsrW * math.abs(normSlope)) : normSlope
+
+bool slowBull = adjSlope > 0
+bool slowBear = adjSlope < 0
+
+// ─────────────────────────────────────────────
+// ███  CROSSOVER SIGNALS
+// ─────────────────────────────────────────────
+
+bool fastCrossUp   = kFast > kSlow and kFast1 <= kSlow1
+bool fastCrossDown = kFast < kSlow and kFast1 >= kSlow1
+
+// ─────────────────────────────────────────────
+// ███  FILTERS
+// ─────────────────────────────────────────────
+
+bool ribBull = not useRibbon or (kSlow > kR2 and kR2 > kR3 and kSlow > kSlow1)
+bool ribBear = not useRibbon or (kSlow < kR2 and kR2 < kR3 and kSlow < kSlow1)
+
+adxCalc(dilen, adxlen) =>
+    up   = ta.change(high)
+    down = -ta.change(low)
+    pDM  = na(up) ? na : (up > down and up > 0 ? up : 0)
+    mDM  = na(down) ? na : (down > up and down > 0 ? down : 0)
+    tr   = ta.rma(ta.tr, dilen)
+    pDI  = fixnan(100 * ta.rma(pDM, dilen) / tr)
+    mDI  = fixnan(100 * ta.rma(mDM, dilen) / tr)
+    sum  = pDI + mDI
+    100 * ta.rma(math.abs(pDI - mDI) / (sum == 0 ? 1 : sum), adxlen)
+
+float adxVal = adxCalc(adxLen, adxLen)
+bool adxOK = not useADX or adxVal >= adxThresh
+
+float rsiVal = ta.rsi(close, rsiLen)
+bool rsiLongOK  = not useRSI or rsiVal < rsiOB
+bool rsiShortOK = not useRSI or rsiVal > rsiOS
+
+// Confirmation: cross happened 1 bar ago, still holding this bar
+bool confLong  = not useConfBar or (fastCrossUp[1]  and kFast > kSlow)
+bool confShort = not useConfBar or (fastCrossDown[1] and kFast < kSlow)
+
+bool rawLong  = useConfBar ? confLong  : fastCrossUp
+bool rawShort = useConfBar ? confShort : fastCrossDown
+
+// Cooldown
+var int barsSince = 100
+barsSince := barsSince + 1
+
+// ★ COMBINED SIGNAL
+bool filtersLong  = ribBull and adxOK and rsiLongOK
+bool filtersShort = ribBear and adxOK and rsiShortOK
+
+bool longSig  = rawLong  and filtersLong  and barsSince >= sigCooldown
+bool shortSig = rawShort and filtersShort and barsSince >= sigCooldown
+
+if longSig or shortSig
+    barsSince := 0
+
+// ─────────────────────────────────────────────
+// ███  RENDERING
+// ─────────────────────────────────────────────
+
+color trendClr = slowBull ? bullColor : slowBear ? bearColor : neutColor
+
+plot(kSlow, "Slow Kernel", color=trendClr, linewidth=3)
+plot(kFast, "Fast Kernel", color=color.new(trendClr, 40), linewidth=1)
+
+p_slow = plot(showRibbon ? kSlow : na, "Rib Slow", color=na, display=display.none)
+p_r2   = plot(showRibbon ? kR2 : na, "Rib Mid", color=color.new(trendClr, 80), linewidth=1)
+p_r3   = plot(showRibbon ? kR3 : na, "Rib Outer", color=color.new(trendClr, 90), linewidth=1)
+fill(p_slow, p_r2, color.new(trendClr, 88), title="Ribbon Inner")
+fill(p_r2, p_r3, color.new(trendClr, 93), title="Ribbon Outer")
+
+float sAbs  = math.abs(adjSlope)
+float sMax  = ta.highest(math.abs(adjSlope), 100)
+float sInt  = sMax > 0 ? math.min(sAbs / sMax, 1.0) : 0.0
+int dynOp   = math.round(heatOpacity - sInt * (heatOpacity - 50))
+float bRad  = atrNorm * (0.5 + sInt * 1.5)
+
+bool showBub = showBubbles and (slowBull or slowBear)
+float bTop = showBub ? kSlow + bRad : na
+float bBot = showBub ? kSlow - bRad : na
+p_bt = plot(bTop, "BubT", color=na, display=display.none)
+p_bb = plot(bBot, "BubB", color=na, display=display.none)
+fill(p_bt, p_bb, slowBull ? color.new(bullColor, dynOp) : color.new(bearColor, dynOp), title="Bubble")
+
+// Main Signals
+if longSig
+    label.new(bar_index, low - atrNorm * 0.5, "BUY", style=label.style_label_up, color=bullColor, textcolor=color.white, size=size.small,
+         tooltip="ADX:" + str.tostring(adxVal, "#.#") + "\nRSI:" + str.tostring(rsiVal, "#.#") + "\nGSR Z:" + str.tostring(gsrZ, "#.##"))
+if shortSig
+    label.new(bar_index, high + atrNorm * 0.5, "SELL", style=label.style_label_down, color=bearColor, textcolor=color.white, size=size.small,
+         tooltip="ADX:" + str.tostring(adxVal, "#.#") + "\nRSI:" + str.tostring(rsiVal, "#.#") + "\nGSR Z:" + str.tostring(gsrZ, "#.##"))
+
+bool showFBuy = showFiltered and rawLong and not filtersLong
+bool showFSell = showFiltered and rawShort and not filtersShort
+
+plotshape(showFBuy, "Filtered Buy", shape.xcross, location.belowbar, color.new(color.gray, 50), size=size.tiny, text="F", textcolor=color.gray)
+plotshape(showFSell, "Filtered Sell", shape.xcross, location.abovebar, color.new(color.gray, 50), size=size.tiny, text="F", textcolor=color.gray)
+
+// ─────────────────────────────────────────────
+// ███  INFO TABLE
+// ─────────────────────────────────────────────
+
+var table info = table.new(position.top_right, 2, 7, bgcolor=color.new(#2d2d4e, 30), border_width=1, border_color=color.new(#333355, 30), frame_width=2, frame_color=color.new(#4a4a8a, 40))
+
+if barstate.islast
+    table.cell(info, 0, 0, "MetalMind v3", text_color=color.white, text_size=size.small, text_halign=text.align_left)
+    table.cell(info, 1, 0, "Kernel Flow", text_color=#00BFFF, text_size=size.small, text_halign=text.align_right)
+
+    table.cell(info, 0, 1, "Trend", text_color=color.white, text_size=size.small, text_halign=text.align_left)
+    table.cell(info, 1, 1, slowBull ? "▲ BULL" : slowBear ? "▼ BEAR" : "◆ FLAT", text_color=trendClr, text_size=size.small, text_halign=text.align_right)
+
+    table.cell(info, 0, 2, "AI Confidence", text_color=color.white, text_size=size.small, text_halign=text.align_left)
+    float conf = sInt * 100
+    table.cell(info, 1, 2, str.tostring(conf, "#") + "%", text_color=color.new(trendClr, 0), text_size=size.small, text_halign=text.align_right)
+
+    table.cell(info, 0, 3, "Ribbon", text_color=color.white, text_size=size.small, text_halign=text.align_left)
+    table.cell(info, 1, 3, ribBull ? "Aligned" : ribBear ? "Aligned" : "Choppy", text_color=ribBull ? bullColor : ribBear ? bearColor : neutColor, text_size=size.small, text_halign=text.align_right)
+
+    table.cell(info, 0, 4, "ADX Filter", text_color=color.white, text_size=size.small, text_halign=text.align_left)
+    table.cell(info, 1, 4, str.tostring(adxVal, "#.#") + (adxOK ? " ✅" : " ❌"), text_color=adxOK ? bullColor : bearColor, text_size=size.small, text_halign=text.align_right)
+
+    table.cell(info, 0, 5, "RSI Filter", text_color=color.white, text_size=size.small, text_halign=text.align_left)
+    table.cell(info, 1, 5, str.tostring(rsiVal, "#.#"), text_color=rsiVal > rsiOB ? bearColor : rsiVal < rsiOS ? bullColor : color.white, text_size=size.small, text_halign=text.align_right)
+
+    string gsrTxt = not na(gsR) ? str.tostring(gsR, "#.##") + " Z:" + str.tostring(gsrZ, "#.1") : "N/A"
+    table.cell(info, 0, 6, "GSR Risk", text_color=color.white, text_size=size.small, text_halign=text.align_left)
+    table.cell(info, 1, 6, gsrTxt, text_color=gsrZ > 0.5 ? bearColor : gsrZ < -0.5 ? bullColor : neutColor, text_size=size.small, text_halign=text.align_right)
+
+// ─────────────────────────────────────────────
+// ███  ALERTS
+// ─────────────────────────────────────────────
+
+alertcondition(longSig, "MetalMind BUY", "MetalMind: BUY signal on {{ticker}} at {{close}}")
+alertcondition(shortSig, "MetalMind SELL", "MetalMind: SELL signal on {{ticker}} at {{close}}")

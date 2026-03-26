@@ -1,0 +1,352 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © Accuracy_Strategy
+
+//@version=6
+import TradingView/Request/2 as req
+indicator("Aggregate S/R Liquidations", overlay=true, max_boxes_count=500, max_bars_back=1000)
+
+//==============================================================================
+// DYNAMIC TICKER SETUP
+//==============================================================================
+// Grabs the base currency of the current chart (e.g., "BTC", "ETH")
+// and appends "USDT.P" to format standard perpetual contract tickers.
+targetTicker = syminfo.basecurrency + "USDT.P"
+targetPriceRef = "BINANCE:" + syminfo.basecurrency + "USDT"
+
+//==============================================================================
+// INPUTS - EXCHANGES
+//==============================================================================
+g_exchanges = 'Exchanges'
+showBinance = input.bool(true, "Binance", group=g_exchanges)
+showBybit = input.bool(true, "Bybit", group=g_exchanges)
+showOKX = input.bool(true, "OKX", group=g_exchanges)
+
+// Conversion Adjustments
+g_adjust = 'Conversion Adjustments'
+customPriceRef = input.string("", "Custom Price Symbol (Optional)", group=g_adjust, tooltip="Leave empty to auto-detect. Only fill this if auto-detect fails for a specific altcoin.")
+okxNotional = input.float(100, "OKX - Notional Value per Contract (USD)", group=g_adjust, tooltip="Default: 100 USD. Adjust based on the specific asset.")
+
+// Define final price reference symbol
+symbolPriceRef = customPriceRef == "" ? targetPriceRef : customPriceRef
+
+//==============================================================================
+// INPUTS - S/R SETTINGS
+//==============================================================================
+// Heatmap Thresholds
+g_hmz = 'Threshold Multipliers'
+thresholdPlusPlus = input.float(4, title='++ Multiplier', tooltip='4 = 4x Standard Deviation above mean', group=g_hmz)
+thresholdPlus = input.float(2.5, title='+ Multiplier', group=g_hmz)
+
+// Visual Settings
+g_visual = "Visual Settings"
+box_width = input.float(2.5, title='Box Width', group=g_visual, minval=1, maxval=10, step=0.5)
+history_to_keep = input.int(20, title='History to Keep', group=g_visual, minval=5, maxval=50)
+showDebugInfo = input.bool(false, "Show Debug Info in Zones", group=g_visual)
+
+// Support Colors (Green)
+g_support = "Support Colors"
+support_plus_color = input.color(color.new(#00FF00, 70), title='+ (Lighter)', group=g_support, inline='s1')
+support_plus_outline = input.color(color.new(#00FF00, 50), title='Outline', group=g_support, inline='s1')
+support_plusplus_color = input.color(color.new(#00AA00, 60), title='++ (Darker)', group=g_support, inline='s2')
+support_plusplus_outline = input.color(color.new(#00AA00, 40), title='Outline', group=g_support, inline='s2')
+
+// Resistance Colors (Red)
+g_resistance = "Resistance Colors"
+resistance_plus_color = input.color(color.new(#FF0000, 70), title='+ (Lighter)', group=g_resistance, inline='r1')
+resistance_plus_outline = input.color(color.new(#FF0000, 50), title='Outline', group=g_resistance, inline='r1')
+resistance_plusplus_color = input.color(color.new(#AA0000, 60), title='++ (Darker)', group=g_resistance, inline='r2')
+resistance_plusplus_outline = input.color(color.new(#AA0000, 40), title='Outline', group=g_resistance, inline='r2')
+
+poi_label_color = input.color(color.white, title='POI Label Color', group=g_visual)
+
+//==============================================================================
+// CUSTOM TYPES
+//==============================================================================
+type LiqZone
+    box zone_box
+    box poi_label
+    float price
+    bool is_plusplus
+    string original_type  // "long" or "short"
+    bool is_support       // current state
+    float liq_usd         // aggregate USD value
+    float liq_binance     // exchange breakdown
+    float liq_bybit
+    float liq_okx
+
+//==============================================================================
+// AGGREGATE LIQUIDATION FUNCTIONS
+//==============================================================================
+// Function to fetch liquidations per exchange
+getLiquidations(exchange, ticker, contractType, contractNotional, liquidationType, invertMetric = false) =>
+    sym = exchange + ":" + ticker
+    
+    // Bybit has an inverted metric
+    metric = invertMetric ? 
+             (liquidationType == "Long" ? "Liquidations Buy" : "Liquidations Sell") :
+             (liquidationType == "Long" ? "Liquidations Sell" : "Liquidations Buy")
+    
+    // Convert timeframe to minutes
+    tf_mins = timeframe.in_seconds() / 60
+    
+    // Fetch exchange liquidations
+    liq_raw = req.cryptoDerivativeMetric(sym, metric, str.tostring(tf_mins))
+    
+    // Get reference price
+    price = request.security(symbolPriceRef, timeframe.period, close, lookahead=barmerge.lookahead_off)
+    price := na(price) ? request.security("BINANCE:BTCUSDT", timeframe.period, close, lookahead=barmerge.lookahead_off) : price
+
+    float liqUSD = na
+
+    // Convert based on contract type
+    if contractType == "crypto"
+        liqUSD := liq_raw * price
+    else if contractType == "usd"
+        liqUSD := liq_raw
+    else if contractType == "contracts"
+        liqUSD := liq_raw * contractNotional
+
+    liqUSD
+
+//==============================================================================
+// HELPER FUNCTIONS
+//==============================================================================
+// Format values into K/M/B
+f_format_value(val) =>
+    abs_val = math.abs(val)
+    if abs_val >= 1e9
+        str.tostring(math.round(val / 1e9, 2)) + "B"
+    else if abs_val >= 1e6
+        str.tostring(math.round(val / 1e6, 2)) + "M"
+    else if abs_val >= 1e3
+        str.tostring(math.round(val / 1e3, 2)) + "K"
+    else
+        str.tostring(math.round(val, 2))
+
+// Add to array and pop oldest
+f_array_add_pop(arr, new_value) =>
+    array.unshift(arr, new_value)
+    array.pop(arr)
+
+// Check for zone overlap
+f_check_overlapping(new_poi, zone_array, atr) =>
+    atr_threshold = atr * 2
+    okay_to_draw = true
+    
+    for i = 0 to array.size(zone_array) - 1
+        zone = array.get(zone_array, i)
+        if not na(zone)
+            poi = zone.price
+            upper_boundary = poi + atr_threshold
+            lower_boundary = poi - atr_threshold
+            
+            if new_poi >= lower_boundary and new_poi <= upper_boundary
+                okay_to_draw := false
+                break
+    okay_to_draw
+
+// Update zone colors based on Support/Resistance state
+f_update_zone_colors(zone, is_support) =>
+    var color box_color = na
+    var color outline_color = na
+    var string zone_text = ""
+    
+    if is_support
+        if zone.is_plusplus
+            box_color := support_plusplus_color
+            outline_color := support_plusplus_outline
+            zone_text := "SUPPORT ++ $" + f_format_value(zone.liq_usd)
+        else
+            box_color := support_plus_color
+            outline_color := support_plus_outline
+            zone_text := "SUPPORT + $" + f_format_value(zone.liq_usd)
+    else
+        if zone.is_plusplus
+            box_color := resistance_plusplus_color
+            outline_color := resistance_plusplus_outline
+            zone_text := "RESISTANCE ++ $" + f_format_value(zone.liq_usd)
+        else
+            box_color := resistance_plus_color
+            outline_color := resistance_plus_outline
+            zone_text := "RESISTANCE + $" + f_format_value(zone.liq_usd)
+    
+    // Add breakdown if debug is enabled
+    if showDebugInfo
+        zone_text := zone_text + "\n"
+        if showBinance and zone.liq_binance > 0
+            zone_text := zone_text + "\nBIN: $" + f_format_value(zone.liq_binance)
+        if showBybit and zone.liq_bybit > 0
+            zone_text := zone_text + "\nBYB: $" + f_format_value(zone.liq_bybit)
+        if showOKX and zone.liq_okx > 0
+            zone_text := zone_text + "\nOKX: $" + f_format_value(zone.liq_okx)
+    
+    box.set_bgcolor(zone.zone_box, box_color)
+    box.set_border_color(zone.zone_box, outline_color)
+    box.set_text(zone.zone_box, zone_text)
+    zone.is_support := is_support
+
+// Create new liquidation zone
+f_create_liquidation_zone(price, zone_array, original_type, is_plusplus, atr, liq_total, liq_bin, liq_byb, liq_okx) =>
+    atr_buffer = atr * (box_width / 10)
+    box_left = bar_index
+    box_right = bar_index + 100
+    
+    box_top = price + atr_buffer
+    box_bottom = price - atr_buffer
+    poi = price
+    
+    okay_to_draw = f_check_overlapping(poi, zone_array, atr)
+    
+    if okay_to_draw
+        // Determine S/R based on CURRENT PRICE POSITION
+        is_support = close > poi
+        
+        // Select colors
+        var color box_color = na
+        var color outline_color = na
+        var string zone_text = ""
+        var string contract_type = original_type == "long" ? "LONG" : "SHORT"
+        
+        if is_support
+            if is_plusplus
+                box_color := support_plusplus_color
+                outline_color := support_plusplus_outline
+                zone_text := "SUPPORT ++"
+            else
+                box_color := support_plus_color
+                outline_color := support_plus_outline
+                zone_text := "SUPPORT +"
+        else
+            if is_plusplus
+                box_color := resistance_plusplus_color
+                outline_color := resistance_plusplus_outline
+                zone_text := "RESISTANCE ++"
+            else
+                box_color := resistance_plus_color
+                outline_color := resistance_plus_outline
+                zone_text := "RESISTANCE +"
+        
+        // Add liquidation info
+        zone_text := zone_text + "\nLiq. " + contract_type + ": $" + f_format_value(liq_total)
+        
+        // Add breakdown if debug is enabled
+        if showDebugInfo
+            zone_text := zone_text + "\n"
+            if showBinance and liq_bin > 0
+                zone_text := zone_text + "\nBIN: $" + f_format_value(liq_bin)
+            if showBybit and liq_byb > 0
+                zone_text := zone_text + "\nBYB: $" + f_format_value(liq_byb)
+            if showOKX and liq_okx > 0
+                zone_text := zone_text + "\nOKX: $" + f_format_value(liq_okx)
+        
+        // Create box
+        new_box = box.new(left=box_left, top=box_top, right=box_right, bottom=box_bottom, 
+             border_color=outline_color, bgcolor=box_color, extend=extend.right,
+             text=zone_text, text_halign=text.align_center, text_valign=text.align_center, 
+             text_color=poi_label_color, text_size=size.small)
+        
+        // Create POI label
+        new_label = box.new(left=box_left, top=poi, right=box_right, bottom=poi,
+             border_color=color.new(poi_label_color, 90), bgcolor=color.new(poi_label_color, 90),
+             extend=extend.right, text="", text_halign=text.align_left, 
+             text_valign=text.align_center, text_color=poi_label_color, text_size=size.small)
+        
+        // Create zone object
+        new_zone = LiqZone.new(new_box, new_label, price, is_plusplus, original_type, is_support, 
+                               liq_total, liq_bin, liq_byb, liq_okx)
+        
+        // Delete oldest zone and add new one
+        old_zone = array.get(zone_array, array.size(zone_array) - 1)
+        if not na(old_zone)
+            box.delete(old_zone.zone_box)
+            box.delete(old_zone.poi_label)
+        
+        f_array_add_pop(zone_array, new_zone)
+
+// Convert zones based on price position
+f_convert_zones_by_price(zone_array) =>
+    for i = 0 to array.size(zone_array) - 1
+        zone = array.get(zone_array, i)
+        if not na(zone)
+            poi = zone.price
+            
+            // If price is ABOVE zone = SUPPORT (green)
+            if close > poi and not zone.is_support
+                f_update_zone_colors(zone, true)
+            
+            // If price is BELOW zone = RESISTANCE (red)
+            else if close < poi and zone.is_support
+                f_update_zone_colors(zone, false)
+
+//==============================================================================
+// AGGREGATE LIQUIDATION DATA - LONG
+//==============================================================================
+// LONG liquidations (Sell) per exchange
+liqLongBinance = showBinance ? nz(getLiquidations("BINANCE", targetTicker, "crypto", 1, "Long", false)) : 0
+liqLongBybit = showBybit ? nz(getLiquidations("BYBIT", targetTicker, "crypto", 1, "Long", true)) : 0  // Inverted logic
+liqLongOKX = showOKX ? nz(getLiquidations("OKX", targetTicker, "contracts", okxNotional, "Long", false)) : 0
+
+// Total LONG liquidations
+liq_long_usd = liqLongBinance + liqLongBybit + liqLongOKX
+
+//==============================================================================
+// AGGREGATE LIQUIDATION DATA - SHORT
+//==============================================================================
+// SHORT liquidations (Buy) per exchange
+liqShortBinance = showBinance ? nz(getLiquidations("BINANCE", targetTicker, "crypto", 1, "Short", false)) : 0
+liqShortBybit = showBybit ? nz(getLiquidations("BYBIT", targetTicker, "crypto", 1, "Short", true)) : 0  // Inverted logic
+liqShortOKX = showOKX ? nz(getLiquidations("OKX", targetTicker, "contracts", okxNotional, "Short", false)) : 0
+
+// Total SHORT liquidations
+liq_short_usd = liqShortBinance + liqShortBybit + liqShortOKX
+
+//==============================================================================
+// STATISTICAL CALCULATIONS
+//==============================================================================
+// ATR for box sizing
+atr = ta.atr(50)
+
+// Single array for all zones
+var all_zones = array.new<LiqZone>(history_to_keep)
+
+// Calculate mean and standard deviation for liquidations
+length = 610
+slength = 610
+
+mean_long = ta.sma(liq_long_usd, length)
+std_long = ta.stdev(liq_long_usd, slength)
+stdbar_long = std_long > 0 ? (liq_long_usd - mean_long) / std_long : 0
+
+mean_short = ta.sma(liq_short_usd, length)
+std_short = ta.stdev(liq_short_usd, slength)
+stdbar_short = std_short > 0 ? (liq_short_usd - mean_short) / std_short : 0
+
+//==============================================================================
+// S/R ZONE CREATION
+//==============================================================================
+// Detect significant liquidations and create zones
+// LONG Liquidations (Sell) → Create SUPPORT at LOW (green zone at bottom)
+if stdbar_long > thresholdPlusPlus
+    f_create_liquidation_zone(low, all_zones, "long", true, atr, liq_long_usd, 
+                             liqLongBinance, liqLongBybit, liqLongOKX)
+else if stdbar_long > thresholdPlus
+    f_create_liquidation_zone(low, all_zones, "long", false, atr, liq_long_usd,
+                             liqLongBinance, liqLongBybit, liqLongOKX)
+
+// SHORT Liquidations (Buy) → Create RESISTANCE at HIGH (red zone at top)
+if stdbar_short > thresholdPlusPlus
+    f_create_liquidation_zone(high, all_zones, "short", true, atr, liq_short_usd,
+                              liqShortBinance, liqShortBybit, liqShortOKX)
+else if stdbar_short > thresholdPlus
+    f_create_liquidation_zone(high, all_zones, "short", false, atr, liq_short_usd,
+                              liqShortBinance, liqShortBybit, liqShortOKX)
+
+// Convert zones based on price position
+f_convert_zones_by_price(all_zones)
+
+// Extend existing boxes
+for i = 0 to array.size(all_zones) - 1
+    zone = array.get(all_zones, i)
+    if not na(zone)
+        box.set_right(zone.zone_box, bar_index + 100)
+        box.set_right(zone.poi_label, bar_index + 100)

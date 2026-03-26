@@ -1,0 +1,246 @@
+//@version=6
+indicator("Adaptive MAD Supertrend", overlay=true)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ADAPTIVE MAD SUPERTREND
+// ─────────────────────────────────────────────────────────────────────────────
+// Two enhancements over standard Supertrend:
+//
+//  VOLATILITY — Mean Absolute Deviation replaces ATR
+//    MAD = mean(|close − mean(close, n)|, n)
+//    Deviations are averaged linearly, not squared, so a single spike candle
+//    cannot disproportionately widen the bands the way ATR/StdDev allows.
+//
+//  REGIME — Kaufman Efficiency Ratio scales the multiplier
+//    ER = |net price change over n bars| / sum(|bar-to-bar changes|, n)
+//    ER → 1: clean directional trend  → multiplier tightens → stop trails close
+//    ER → 0: choppy, directionless    → multiplier widens  → stop absorbs noise
+//    adaptive_mult = mult_max − ER × (mult_max − mult_min)
+//
+//  BASIS — full MA menu for band centre
+//    Any MA type can serve as the band centre. Default: T3 (smooth, low lag).
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// ───────────────────────────────────────────────────────────────────────────────
+// DISPLAY
+// ───────────────────────────────────────────────────────────────────────────────
+show_signals = input.bool(true, "Show Signal Markers", group="📊 Display")
+show_fill    = input.bool(true, "Show Trend Fill",     group="📊 Display")
+
+theme = input.string("Matrix Green", "Visual Theme",
+     options=["Cyberpunk Red","Plasma Fire","Royal Purple","Matrix Green","Arctic Ice",
+              "Neon Dreams","Coral Reef","Volcanic Ash","Aurora Borealis","Desert Storm",
+              "Retro Wave","Pearl White","Pure Grayscale"],
+     group="🎨 Theme")
+
+[primary_up, primary_dn, accent] = switch theme
+    "Cyberpunk Red"    => [#00E5FF, #FF1744, #6a6a68]
+    "Plasma Fire"      => [#FFEB3B, #E91E63, color.rgb(255,115,0)]
+    "Royal Purple"     => [#9C27B0, #FFC107, #E040FB]
+    "Matrix Green"     => [#00FF00, #FF0000, #76FF03]
+    "Arctic Ice"       => [#E0F7FA, #5b6267, #00E5FF]
+    "Neon Dreams"      => [#00FFFF, #FF00FF, #514f4f]
+    "Coral Reef"       => [#FF7F50, #4682B4, #FFD700]
+    "Volcanic Ash"     => [#FF4500, #708090, #FFA500]
+    "Aurora Borealis"  => [#00FF7F, #BA55D3, #00FFFF]
+    "Desert Storm"     => [#F4A460, #8B4513, #FFD700]
+    "Retro Wave"       => [#FF6EC7, #00E5FF, #FFF700]
+    "Pearl White"      => [#23e3cd, #D32F2F, color.rgb(8,203,190)]
+    "Pure Grayscale"   => [#E0E0E0, #616161, #9E9E9E]
+
+// ───────────────────────────────────────────────────────────────────────────────
+// SUPERTREND PARAMETERS
+// ───────────────────────────────────────────────────────────────────────────────
+src      = input(hl2, "Source", group="📈 Supertrend")
+mad_len  = input.int(26,   "MAD Length",        minval=3, maxval=200, group="📈 Supertrend",
+     tooltip="Lookback for Mean Absolute Deviation. Controls how far back the volatility estimate looks.")
+mad_smooth = input.int(3,  "MAD Smoothing",      minval=1, maxval=50,  group="📈 Supertrend",
+     tooltip="EMA applied to raw MAD before band calculation. Prevents single spike bars from temporarily blowing out band width. 1 = off.")
+er_len   = input.int(10,   "ER Length",          minval=3, maxval=200, group="📈 Supertrend",
+     tooltip="Kaufman Efficiency Ratio lookback. Shorter = faster regime detection. Longer = smoother, slower to recognise transitions.")
+mult_min = input.float(2.5, "Multiplier — Trend", minval=0.1, maxval=5.0,  step=0.1, group="📈 Supertrend",
+     tooltip="Band multiplier when ER=1 (clean trend). Tight bands trail close to price.")
+mult_max = input.float(3.0, "Multiplier — Chop",  minval=0.5, maxval=10.0, step=0.1, group="📈 Supertrend",
+     tooltip="Band multiplier when ER=0 (pure chop). Wide bands filter whipsaw flips.")
+
+// ───────────────────────────────────────────────────────────────────────────────
+// BASIS MA
+// ───────────────────────────────────────────────────────────────────────────────
+basis_type = input.string("T3", "Basis MA Type",
+     options=["None (raw src)","SMA","EMA","WMA","HMA","DEMA","TEMA","VWMA","RMA","ALMA","T3","JMA"],
+     group="🔧 Basis MA",
+     tooltip="MA applied to the source before band calculation. Serves as the band centre line.\nT3 (default) — very smooth, minimal lag overshoot, ideal centre line.\nDEMA/TEMA — faster with slightly more centre-line noise.\nRMA — very smooth, suits higher timeframes.\nVWMA — volume-weighted, anchors to liquid price levels.")
+basis_len   = input.int(8,   "Basis MA Length",  minval=2, maxval=200,  group="🔧 Basis MA")
+alma_offset = input.float(0.85,"ALMA Offset",     minval=0.0, maxval=1.0, step=0.05, group="🔧 Basis MA",
+     tooltip="Only used when Basis MA Type = ALMA.")
+alma_sigma  = input.float(6.0, "ALMA Sigma",      minval=1.0, maxval=20.0, step=0.5, group="🔧 Basis MA",
+     tooltip="Only used when Basis MA Type = ALMA.")
+t3_vf       = input.float(0.85, "T3 Volume Factor",minval=0.0, maxval=1.0, step=0.05, group="🔧 Basis MA",
+     tooltip="Only used when Basis MA Type = T3. 0 = triple EMA, 1 = maximum smoothing.")
+jma_phase   = input.float(0.0, "JMA Phase",       minval=-100, maxval=100, step=10,  group="🔧 Basis MA",
+     tooltip="Only used when Basis MA Type = JMA. -100 = max lag, 0 = balanced, +100 = max lead.")
+jma_power   = input.float(2.0, "JMA Power",       minval=0.5,  maxval=5.0, step=0.1, group="🔧 Basis MA",
+     tooltip="Only used when Basis MA Type = JMA. Higher = smoother.")
+
+// ───────────────────────────────────────────────────────────────────────────────
+// STRATEGY SETTINGS
+// ───────────────────────────────────────────────────────────────────────────────
+trade_mode = input.string("Long/Cash", "Trading Mode",
+     options=["Long/Short","Long/Cash"],
+     tooltip="Long/Short: flips between long and short on every signal.\nLong/Cash: exits to flat on bearish flips — no short exposure.",
+     group="⚙️ Strategy")
+
+// ───────────────────────────────────────────────────────────────────────────────
+// JMA  (Jurik-style adaptive filter)
+// Stage 1: power-curved adaptive EMA — smooths the source.
+// Stage 2: phase-corrected error term — compensates for Stage 1 lag.
+// ───────────────────────────────────────────────────────────────────────────────
+type JmaState
+    float e0
+    float e1
+    float val
+
+jma_calc(float _src, int _len, float _phase, float _power, JmaState _s) =>
+    float pr    = _phase < -100 ? 0.5 : _phase > 100 ? 2.5 : _phase / 100.0 + 1.5
+    float beta  = 0.45 * (_len - 1) / (0.45 * (_len - 1) + 2.0)
+    float alpha = math.pow(beta, _power)
+    if na(_s.e0)
+        _s.e0  := _src
+        _s.e1  := 0.0
+        _s.val := _src
+    else
+        _s.e0  := (1.0 - alpha) * _src + alpha * _s.e0
+        _s.e1  := (_src - _s.e0) * (1.0 - beta) + beta * _s.e1
+        _s.val := _s.e0 + pr * _s.e1
+    _s.val
+
+var JmaState jma_s = JmaState.new(na, na, na)
+
+// ───────────────────────────────────────────────────────────────────────────────
+// T3  (Tillson — 6-stage cascaded EMA with polynomial coefficients)
+// ───────────────────────────────────────────────────────────────────────────────
+t3_calc(float _src, int _len, float _vf) =>
+    float e1 = ta.ema(_src, _len)
+    float e2 = ta.ema(e1,   _len)
+    float e3 = ta.ema(e2,   _len)
+    float e4 = ta.ema(e3,   _len)
+    float e5 = ta.ema(e4,   _len)
+    float e6 = ta.ema(e5,   _len)
+    float c1 = -_vf * _vf * _vf
+    float c2 =  3.0 * _vf * _vf + 3.0 * _vf * _vf * _vf
+    float c3 = -6.0 * _vf * _vf - 3.0 * _vf - 3.0 * _vf * _vf * _vf
+    float c4 =  1.0 + 3.0 * _vf + _vf * _vf * _vf + 3.0 * _vf * _vf
+    c1 * e6 + c2 * e5 + c3 * e4 + c4 * e3
+
+// ───────────────────────────────────────────────────────────────────────────────
+// BASIS MA
+// All variants computed every bar — Pine requires continuous history for ta.*
+// functions regardless of which branch is active.
+// ───────────────────────────────────────────────────────────────────────────────
+float _e1   = ta.ema(src, basis_len)
+float _e2   = ta.ema(_e1, basis_len)
+float _e3   = ta.ema(_e2, basis_len)
+int   _half = math.max(1, math.round(basis_len / 2))
+int   _sqr  = math.max(1, math.round(math.sqrt(basis_len)))
+
+float basis = switch basis_type
+    "None (raw src)" => src
+    "SMA"  => ta.sma (src, basis_len)
+    "EMA"  => _e1
+    "WMA"  => ta.wma (src, basis_len)
+    "HMA"  => ta.wma(2.0 * ta.wma(src, _half) - ta.wma(src, basis_len), _sqr)
+    "DEMA" => 2.0 * _e1 - _e2
+    "TEMA" => 3.0 * _e1 - 3.0 * _e2 + _e3
+    "VWMA" => ta.vwma(src, basis_len)
+    "RMA"  => ta.rma (src, basis_len)
+    "ALMA" => ta.alma(src, basis_len, alma_offset, alma_sigma)
+    "T3"   => t3_calc(src, basis_len, t3_vf)
+    "JMA"  => jma_calc(src, basis_len, jma_phase, jma_power, jma_s)
+
+// ───────────────────────────────────────────────────────────────────────────────
+// CORE: ADAPTIVE MAD SUPERTREND
+// ───────────────────────────────────────────────────────────────────────────────
+
+// MAD — spike-robust volatility
+float rolling_mean = ta.sma(close, mad_len)
+float raw_mad      = ta.sma(math.abs(close - rolling_mean), mad_len)
+float smooth_mad   = mad_smooth > 1 ? ta.ema(raw_mad, mad_smooth) : raw_mad
+
+// ER — directional efficiency, range [0, 1]
+float net_move   = math.abs(src - src[er_len])
+float total_path = math.sum(math.abs(src - src[1]), er_len)
+float er         = total_path > 0.0 ? math.min(1.0, net_move / total_path) : 0.0
+
+// Adaptive multiplier: ER=1 → mult_min (tight), ER=0 → mult_max (wide)
+float adapt_mult = mult_max - er * (mult_max - mult_min)
+float band_dist  = adapt_mult * smooth_mad
+
+// Band construction
+float up_raw = basis + band_dist
+float dn_raw = basis - band_dist
+
+// Ratchet — lower band only moves up, upper band only moves down
+var float up = na
+var float dn = na
+up := close[1] < nz(up[1], up_raw) ? math.min(up_raw, nz(up[1], up_raw)) : up_raw
+dn := close[1] > nz(dn[1], dn_raw) ? math.max(dn_raw, nz(dn[1], dn_raw)) : dn_raw
+
+// Trend direction
+var int trend = 1
+trend := trend == -1 and close > nz(up[1], up) ?  1 :
+         trend ==  1 and close < nz(dn[1], dn) ? -1 : trend
+
+float st_line = trend == 1 ? dn : up
+
+// ───────────────────────────────────────────────────────────────────────────────
+// SIGNALS
+// ───────────────────────────────────────────────────────────────────────────────
+bool is_bull    = trend == 1
+bool long_flip  = trend ==  1 and trend[1] == -1
+bool short_flip = trend == -1 and trend[1] ==  1
+
+var string signal_state = "flat"
+if long_flip
+    signal_state := "long"
+else if short_flip
+    signal_state := trade_mode == "Long/Short" ? "short" : "flat"
+
+bool long_signal  = long_flip  and signal_state[1] != "long"
+bool short_signal = short_flip and signal_state[1] != "short" and trade_mode == "Long/Short"
+bool cash_signal  = short_flip and signal_state[1] != "flat"  and trade_mode == "Long/Cash"
+
+// ───────────────────────────────────────────────────────────────────────────────
+// VISUALS  (matching original SD Supertrend style)
+// ───────────────────────────────────────────────────────────────────────────────
+color trend_color = is_bull ? primary_up : primary_dn
+
+// Supertrend line with glow
+plot(st_line, "Glow 3",          color=color.new(trend_color, 85), linewidth=10)
+plot(st_line, "Glow 2",          color=color.new(trend_color, 70), linewidth=6)
+plot(st_line, "Glow 1",          color=color.new(trend_color, 50), linewidth=3)
+plot(st_line, "Adaptive MAD ST", color=trend_color,                linewidth=2)
+
+// Trend fill
+p_close = plot(show_fill ? close   : na, display=display.none)
+p_st    = plot(show_fill ? st_line : na, display=display.none)
+fill(p_close, p_st, color=show_fill ? color.new(trend_color, 85) : na, title="Trend Fill")
+
+// Inactive band — shows where the next flip would trigger
+plot(is_bull     ? up : na, "Inactive Upper", color=color.new(primary_dn, 80), linewidth=1, style=plot.style_cross)
+plot(not is_bull ? dn : na, "Inactive Lower", color=color.new(primary_up, 80), linewidth=1, style=plot.style_cross)
+
+// Bar coloring
+plotcandle(open, high, low, close, title="Bars",
+     color=trend_color, bordercolor=trend_color, wickcolor=trend_color)
+
+// Signal diamonds
+plotshape(show_signals ? long_signal                   : false,
+     title="Long",       style=shape.diamond, location=location.belowbar, color=primary_up, size=size.tiny)
+plotshape(show_signals ? (short_signal or cash_signal) : false,
+     title="Short/Cash", style=shape.diamond, location=location.abovebar, color=primary_dn, size=size.tiny)
+
+// ───────────────────────────────────────────────────────────────────────────────
+// ALERTS
+// ───────────────────────────────────────────────────────────────────────────────
+alertcondition(long_signal,                  "Long Signal",  "Adaptive MAD ST: Bullish flip")
+alertcondition(short_signal or cash_signal,  "Short Signal", "Adaptive MAD ST: Bearish flip")

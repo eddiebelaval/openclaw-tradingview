@@ -1,0 +1,459 @@
+// This Pine Script™ code is subject to the terms of the Mozilla Public License 2.0
+//@version=6
+// ═══════════════════════════════════════════════════════════════════════════════
+//  Volume Profile Projection Box [Confirmed]
+
+//
+//  LIVE volume profile box — builds bar by bar in real time
+//  VAH = top of 68% value area
+//  VAL = bottom of 68% value area
+//  POC = highest volume price level
+//
+//  BUY  — confirmation closes ABOVE VAL (price broke up through floor)
+//  SELL — confirmation closes BELOW VAH (price broke down through ceiling)
+//
+//  Box resets: new session OR after trade completes
+// ═══════════════════════════════════════════════════════════════════════════════
+indicator("Volume Profile Projection Box [Confirmed]",
+     overlay          = true,
+     max_boxes_count  = 200,
+     max_lines_count  = 100,
+     max_labels_count = 200)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// INPUTS
+// ─────────────────────────────────────────────────────────────────────────────
+grp1 = "Session"
+sessionStart = input.int(19, "Session Start Hour (EST)", group=grp1, minval=0, maxval=23,
+               tooltip="Hour in New York time when the first box starts building.\nFutures overnight: 19\nEquity day: 9")
+resetOnTrade = input.bool(true, "Reset Box After Trade Closes", group=grp1,
+               tooltip="Start a fresh profile box once a trade is flat")
+
+grp2 = "Volume Profile"
+numRows   = input.int(34, "Profile Rows", group=grp2, minval=8, maxval=100,
+            tooltip="Number of price levels — more rows = finer detail")
+vaPercent = input.float(61.0, "Value Area %", group=grp2, minval=50, maxval=95, step=1,
+            tooltip="68% = 1 standard deviation (institutional standard)")
+profWidth = input.float(20.0, "Tower Width %", group=grp2, minval=5, maxval=80, step=5,
+            tooltip="Width of volume towers relative to box bar count") / 100
+
+grp3 = "Trade Management"
+confirmB = input.int(4,    "Confirmation Bars",   group=grp3, minval=1, maxval=5,
+           tooltip="Consecutive closes beyond VAH/VAL required to confirm signal")
+tpPct    = input.float(0.25,  "TP %",              group=grp3, minval=0.05, maxval=20.0, step=0.05,
+           tooltip="Take profit %\nMNQ futures: 0.3–0.8%\nCrypto: 1–3%")
+slPct    = input.float(0.6, "SL %",              group=grp3, minval=0.05, maxval=20.0, step=0.05,
+           tooltip="Stop loss %\nMNQ futures: 0.2–0.5%\nCrypto: 0.5–2%")
+maxBars  = input.int(37,   "Max Bars in Trade",   group=grp3, minval=5,  maxval=500)
+cooldown = input.int(9,    "Cooldown Bars",       group=grp3, minval=1,  maxval=50)
+rsiLen   = input.int(50,   "RSI Length",          group=grp3, minval=2,  maxval=50)
+rsiOB    = input.int(80,   "RSI OB (block BUY)",  group=grp3, minval=50, maxval=100,
+           tooltip="Don't buy when RSI above this — set 100 to disable")
+rsiOS    = input.int(20,   "RSI OS (block SELL)", group=grp3, minval=0,  maxval=50,
+           tooltip="Don't sell when RSI below this — set 0 to disable")
+showSig  = input.bool(true, "Show Entry Labels",  group=grp3)
+showTPSL = input.bool(true, "Show TP/SL Lines",   group=grp3)
+
+grp4 = "Colors"
+colVAH   = input.color(color.new(#00FF88,  0), "VAH Line",  group=grp4)
+colVAL   = input.color(color.new(#00FF88,  0), "VAL Line",  group=grp4)
+colPOC   = input.color(color.new(#FF4466,  0), "POC Line",  group=grp4)
+colVAFill= input.color(color.new(#00FF88, 88), "VA Fill",   group=grp4)
+colBox   = input.color(color.new(#2962FF, 93), "Box BG",    group=grp4)
+colTower = input.color(color.new(#00F5D4, 40), "Tower",     group=grp4)
+colVATow = input.color(color.new(#00F5D4, 65), "VA Tower",  group=grp4)
+showDash = input.bool(true, "Show Dashboard",    group=grp4)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// COLORS — CodaPro Standard
+// ─────────────────────────────────────────────────────────────────────────────
+color C_TEAL   = color.new(#00F5D4,  0)
+color C_BULL   = color.new(#00FF88,  0)
+color C_BEAR   = color.new(#FF4466,  0)
+color C_GOLD   = color.new(#FFD700,  0)
+color C_MUTED  = color.new(#AAAAAA, 40)
+color C_HDR_BG = color.new(#0d1f1e,  0)
+color C_COL_BG = color.new(#0a0a14, 10)
+color C_COL_ALT= color.new(#0d1117, 30)
+color C_STRIPE = color.new(#00F5D4, 20)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// TRADE STATE — CodaPro standard, global scope
+// ─────────────────────────────────────────────────────────────────────────────
+var bool  g_inTrade  = false
+var bool  g_isLong   = false
+var int   entryBar   = 0
+var float entryPrice = na
+var float g_tp       = na
+var float g_sl       = na
+var line  g_tpLine   = na
+var line  g_slLine   = na
+var int   lastSigBar = 0
+
+float rsi14 = ta.rsi(close, rsiLen)
+max_bars_back(high,   1000)
+max_bars_back(low,    1000)
+max_bars_back(close,  1000)
+max_bars_back(volume, 1000)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SESSION / BOX STATE
+// ─────────────────────────────────────────────────────────────────────────────
+var int   boxStartBar = -1
+var bool  boxActive   = false
+var float g_vah       = na
+var float g_val       = na
+var float g_poc       = na
+var bool  prevInTrade = false
+
+int  nyHour         = hour(time, "America/New_York")
+int  nyMin          = minute(time, "America/New_York")
+bool isSessionStart = nyHour == sessionStart and nyMin == 0
+
+// ─────────────────────────────────────────────────────────────────────────────
+// BOX RESET TRIGGERS
+// ─────────────────────────────────────────────────────────────────────────────
+bool tradeJustClosed = prevInTrade and not g_inTrade and resetOnTrade
+prevInTrade := g_inTrade
+
+bool startNewBox = (isSessionStart or tradeJustClosed) and barstate.isconfirmed
+
+if startNewBox
+    boxStartBar := bar_index
+    boxActive   := true
+    g_vah       := na
+    g_val       := na
+    g_poc       := na
+
+if boxStartBar == -1 and isSessionStart
+    boxStartBar := bar_index
+    boxActive   := true
+
+// ─────────────────────────────────────────────────────────────────────────────
+// VALUE AREA FUNCTION
+// ─────────────────────────────────────────────────────────────────────────────
+f_valueArea(array<float> vol, int pocIdx, int rows, float pct) =>
+    target = array.sum(vol) * pct / 100.0
+    accum  = array.get(vol, pocIdx)
+    hi     = pocIdx
+    lo     = pocIdx
+    while accum < target
+        if lo == 0 and hi == rows - 1
+            break
+        vUp = hi < rows - 1 ? array.get(vol, hi + 1) : 0.0
+        vDn = lo > 0        ? array.get(vol, lo - 1) : 0.0
+        if vUp == 0.0 and vDn == 0.0
+            break
+        if vUp >= vDn
+            hi    := hi + 1
+            accum := accum + vUp
+        else
+            lo    := lo - 1
+            accum := accum + vDn
+    [hi, lo]
+
+// ─────────────────────────────────────────────────────────────────────────────
+// BUILD LIVE PROFILE — every confirmed bar + last bar
+// ─────────────────────────────────────────────────────────────────────────────
+var float _vah    = na
+var float _val    = na
+var float _poc    = na
+var float _hi     = na
+var float _lo     = na
+var int   _pocIdx = 0
+
+if boxActive and boxStartBar >= 0 and (barstate.islast or barstate.isconfirmed)
+    int barsInBox = math.min(bar_index - boxStartBar, 999)
+
+    if barsInBox >= 1
+        float rHi = high[0]
+        float rLo = low[0]
+        for b = 0 to barsInBox
+            rHi := math.max(rHi, high[b])
+            rLo := math.min(rLo, low[b])
+
+        float priceStep = (rHi - rLo) / numRows
+        if priceStep > 0
+            volArr = array.new<float>(numRows, 0.0)
+            for b = 0 to barsInBox
+                bH   = high[b]
+                bL   = low[b]
+                bV   = nz(volume[b])
+                bRng = bH - bL
+                for lvl = 0 to numRows - 1
+                    lvlLo = rLo + lvl * priceStep
+                    lvlHi = lvlLo + priceStep
+                    if bH >= lvlLo and bL < lvlHi
+                        alloc = bRng > 0 ? bV * priceStep / bRng : bV
+                        array.set(volArr, lvl, array.get(volArr, lvl) + alloc)
+
+            pocI     = array.indexof(volArr, array.max(volArr))
+            _pocIdx := pocI
+            _poc    := rLo + (pocI + 0.5) * priceStep
+            _hi     := rHi
+            _lo     := rLo
+
+            [vaHi, vaLo] = f_valueArea(volArr, pocI, numRows, vaPercent)
+            _vah := rLo + (vaHi + 1.0) * priceStep
+            _val := rLo + vaLo * priceStep
+            g_vah := _vah
+            g_val := _val
+            g_poc := _poc
+
+// ─────────────────────────────────────────────────────────────────────────────
+// DRAW BOX + TOWERS + LINES (last bar only — full redraw)
+// ─────────────────────────────────────────────────────────────────────────────
+var box      g_box     = na
+var line     g_vahLine = na
+var line     g_valLine = na
+var line     g_pocLine = na
+var linefill g_vaFill  = na
+var box[]    g_towers  = array.new<box>()
+
+if boxActive and boxStartBar >= 0 and barstate.islast and not na(_vah)
+    int barsInBox = math.min(bar_index - boxStartBar, 999)
+    int x1        = bar_index - barsInBox
+    int x2        = bar_index + 5
+
+    if not na(g_box)
+        box.delete(g_box)
+    if not na(g_vahLine)
+        line.delete(g_vahLine)
+    if not na(g_valLine)
+        line.delete(g_valLine)
+    if not na(g_pocLine)
+        line.delete(g_pocLine)
+    if not na(g_vaFill)
+        linefill.delete(g_vaFill)
+    if array.size(g_towers) > 0
+        for i = 0 to array.size(g_towers) - 1
+            box.delete(array.get(g_towers, i))
+    array.clear(g_towers)
+
+    g_box     := box.new(x1, _hi, x2, _lo,
+                     border_color=color.new(colBox, 50), bgcolor=colBox)
+    g_vahLine := line.new(x1, _vah, x2, _vah,
+                     color=colVAH, style=line.style_solid, width=2)
+    g_valLine := line.new(x1, _val, x2, _val,
+                     color=colVAL, style=line.style_solid, width=2)
+    g_pocLine := line.new(x1, _poc, x2, _poc,
+                     color=colPOC, style=line.style_solid, width=1)
+    g_vaFill  := linefill.new(g_vahLine, g_valLine, colVAFill)
+
+    float priceStep = (_hi - _lo) / numRows
+    if priceStep > 0
+        volArr2 = array.new<float>(numRows, 0.0)
+        for b = 0 to barsInBox
+            bH   = high[b]
+            bL   = low[b]
+            bV   = nz(volume[b])
+            bRng = bH - bL
+            for lvl = 0 to numRows - 1
+                lvlLo = _lo + lvl * priceStep
+                lvlHi = lvlLo + priceStep
+                if bH >= lvlLo and bL < lvlHi
+                    alloc = bRng > 0 ? bV * priceStep / bRng : bV
+                    array.set(volArr2, lvl, array.get(volArr2, lvl) + alloc)
+
+        maxVol = array.max(volArr2)
+        if maxVol > 0
+            for lvl = 0 to numRows - 1
+                vRat   = array.get(volArr2, lvl) / maxVol
+                bWidth = int(vRat * barsInBox * profWidth)
+                bCol   = (_lo + lvl * priceStep >= _val and _lo + (lvl + 1) * priceStep <= _vah) ? colVATow : colTower
+                if bWidth > 0
+                    t = box.new(x1, _lo + (lvl + 0.1) * priceStep,
+                                x1 + bWidth, _lo + (lvl + 0.9) * priceStep,
+                                border_color=color.new(bCol, 60), bgcolor=bCol)
+                    array.push(g_towers, t)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// EXITS — run FIRST (intrabar TP/SL, confirmed time exit)
+// ─────────────────────────────────────────────────────────────────────────────
+if g_inTrade
+    bool tpHit    = g_isLong ? high >= g_tp : low  <= g_tp
+    bool slHit    = g_isLong ? low  <= g_sl : high >= g_sl
+    bool timeExit = barstate.isconfirmed and (bar_index - entryBar) >= maxBars
+
+    if tpHit or slHit or timeExit
+        g_inTrade := false
+        if not na(g_tpLine)
+            line.delete(g_tpLine)
+            g_tpLine := na
+        if not na(g_slLine)
+            line.delete(g_slLine)
+            g_slLine := na
+
+        string exitTxt = tpHit ? " ✦ TP +" + str.tostring(tpPct, "#.##") + "% " : slHit ? " SL -" + str.tostring(slPct, "#.##") + "% " : " TIME " + str.tostring((g_isLong ? (close - entryPrice) / entryPrice : (entryPrice - close) / entryPrice) * 100, "#.##") + "% "
+        color exitCol  = tpHit ? C_TEAL : slHit ? C_BEAR : C_GOLD
+
+        label.new(bar_index, na, exitTxt,
+             yloc=g_isLong ? yloc.abovebar : yloc.belowbar,
+             style=g_isLong ? label.style_label_down : label.style_label_up,
+             color=color.new(exitCol, 75), textcolor=exitCol, size=size.small)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SIGNAL LOGIC
+// ─────────────────────────────────────────────────────────────────────────────
+bool cdOK      = bar_index - lastSigBar >= cooldown
+bool ready     = not g_inTrade and cdOK and barstate.isconfirmed and boxActive
+bool levelsSet = not na(g_vah) and not na(g_val)
+
+bool buySignal  = false
+bool sellSignal = false
+
+if ready and levelsSet
+    bool buyWasBelow = close[confirmB] < g_val
+    bool buyAllAbove = true
+    for _i = 0 to confirmB - 1
+        if close[_i] <= g_val
+            buyAllAbove := false
+    buySignal := buyWasBelow and buyAllAbove and rsi14 < rsiOB
+
+    bool sellWasAbove = close[confirmB] > g_vah
+    bool sellAllBelow = true
+    for _i = 0 to confirmB - 1
+        if close[_i] >= g_vah
+            sellAllBelow := false
+    sellSignal := sellWasAbove and sellAllBelow and rsi14 > rsiOS
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ENTRIES
+// ─────────────────────────────────────────────────────────────────────────────
+if buySignal and not g_inTrade
+    g_inTrade  := true
+    g_isLong   := true
+    entryBar   := bar_index
+    entryPrice := close
+    lastSigBar := bar_index
+    g_tp       := close * (1 + tpPct / 100)
+    g_sl       := close * (1 - slPct / 100)
+    if not na(g_tpLine)
+        line.delete(g_tpLine)
+    if not na(g_slLine)
+        line.delete(g_slLine)
+    if showTPSL
+        g_tpLine := line.new(bar_index, g_tp, bar_index + maxBars, g_tp,
+             color=color.new(C_TEAL, 25), style=line.style_dashed, width=2)
+        g_slLine := line.new(bar_index, g_sl, bar_index + maxBars, g_sl,
+             color=color.new(C_BEAR, 40), style=line.style_dashed, width=1)
+    if showSig
+        label.new(bar_index, na,
+             "▲ BUY  TP: " + str.tostring(g_tp, format.mintick) + "  SL: " + str.tostring(g_sl, format.mintick),
+             yloc=yloc.belowbar, style=label.style_label_up,
+             color=color.new(C_BULL, 65), textcolor=C_BULL, size=size.small)
+
+else if sellSignal and not g_inTrade
+    g_inTrade  := true
+    g_isLong   := false
+    entryBar   := bar_index
+    entryPrice := close
+    lastSigBar := bar_index
+    g_tp       := close * (1 - tpPct / 100)
+    g_sl       := close * (1 + slPct / 100)
+    if not na(g_tpLine)
+        line.delete(g_tpLine)
+    if not na(g_slLine)
+        line.delete(g_slLine)
+    if showTPSL
+        g_tpLine := line.new(bar_index, g_tp, bar_index + maxBars, g_tp,
+             color=color.new(C_TEAL, 25), style=line.style_dashed, width=2)
+        g_slLine := line.new(bar_index, g_sl, bar_index + maxBars, g_sl,
+             color=color.new(C_BEAR, 40), style=line.style_dashed, width=1)
+    if showSig
+        label.new(bar_index, na,
+             "▼ SELL  TP: " + str.tostring(g_tp, format.mintick) + "  SL: " + str.tostring(g_sl, format.mintick),
+             yloc=yloc.abovebar, style=label.style_label_down,
+             color=color.new(C_BEAR, 65), textcolor=C_BEAR, size=size.small)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// DASHBOARD — 9×4 cinema bar, bottom_center
+// ─────────────────────────────────────────────────────────────────────────────
+if showDash and barstate.islast
+    int barsInBox = boxStartBar >= 0 ? math.min(bar_index - boxStartBar, 999) : 0
+
+    bool aboveVAH = not na(g_vah) and close > g_vah
+    bool inVA     = not na(g_vah) and not na(g_val) and close >= g_val and close <= g_vah
+    bool belowVAL = not na(g_val) and close < g_val
+    float vaW     = not na(g_vah) and not na(g_val) ? math.abs(g_vah - g_val) : na
+    bool atPOC    = not na(g_poc) and not na(vaW) and math.abs(close - g_poc) < vaW * 0.05
+
+    string locTxt = atPOC ? "AT POC  ◈" : aboveVAH ? "ABOVE VAH ▲" : inVA ? "IN VALUE ◉" : belowVAL ? "BELOW VAL ▼" : "--"
+    color  locCol = atPOC ? C_GOLD : aboveVAH ? C_TEAL : inVA ? C_BULL : belowVAL ? C_BEAR : C_MUTED
+
+    string vahTxt  = na(g_vah) ? "--" : str.tostring(g_vah, format.mintick)
+    string valTxt  = na(g_val) ? "--" : str.tostring(g_val, format.mintick)
+    string pocTxt  = na(g_poc) ? "--" : str.tostring(g_poc, format.mintick)
+    string wideTxt = na(g_vah) or na(g_val) ? "--" : str.tostring(math.abs(g_vah - g_val), format.mintick) + " wide"
+
+    string posTxt = not g_inTrade ? "FLAT   --" : g_isLong ? "LONG   ▲" : "SHORT  ▼"
+    color  posCol = not g_inTrade ? C_MUTED : g_isLong ? C_BULL : C_BEAR
+    string tpTxt  = not g_inTrade or na(g_tp) ? "--" : str.tostring(g_tp, format.mintick)
+    string slTxt  = not g_inTrade or na(g_sl) ? "--" : str.tostring(g_sl, format.mintick)
+    int    cdBars = cooldown - (bar_index - lastSigBar)
+    string cdTxt  = g_inTrade ? "IN TRADE" : bar_index - lastSigBar < cooldown ? "CD " + str.tostring(cdBars) + "b" : "READY ✅"
+    color  cdCol  = g_inTrade ? C_GOLD : bar_index - lastSigBar < cooldown ? C_GOLD : C_BULL
+
+    float  volMA  = ta.sma(volume, 20)
+    float  vRatio = volMA > 0 ? volume / volMA : 1.0
+    color  vCol   = vRatio >= 2.0 ? C_TEAL : vRatio >= 1.0 ? C_GOLD : C_MUTED
+    string vTxt   = vRatio >= 2.0 ? "SURGE ▲▲" : vRatio >= 1.0 ? "ABOVE ▲" : "NORMAL"
+
+    var table dash = table.new(position.bottom_center, 9, 4,
+         bgcolor=C_COL_BG, border_width=1, border_color=color.new(C_TEAL, 55))
+
+    // ROW 0 — STRIPE
+    for _c = 0 to 8
+        table.cell(dash, _c, 0, "", bgcolor=C_STRIPE, text_size=size.tiny)
+    table.cell(dash, 0, 0, " ◈ VOLUME PROFILE PROJECTION BOX ◈ ",
+         text_color=C_TEAL, text_size=size.small, text_font_family=font.family_monospace, bgcolor=C_HDR_BG)
+    table.cell(dash, 8, 0, " CONFIRMED ◈ ",
+         text_color=C_TEAL, text_size=size.small, text_font_family=font.family_monospace, bgcolor=C_HDR_BG)
+
+    // ROW 1 — HEADERS
+    table.cell(dash, 0, 1, " ◈ SESSION ",   text_color=C_TEAL,  text_size=size.small, text_font_family=font.family_monospace, bgcolor=color.new(#001a14, 30))
+    table.cell(dash, 1, 1, " ◈ VAH ",       text_color=C_BULL,  text_size=size.small, text_font_family=font.family_monospace, bgcolor=color.new(#001a08, 30))
+    table.cell(dash, 2, 1, " ◈ POC ",       text_color=C_BEAR,  text_size=size.small, text_font_family=font.family_monospace, bgcolor=color.new(#1a0008, 30))
+    table.cell(dash, 3, 1, " ◈ VAL ",       text_color=C_BULL,  text_size=size.small, text_font_family=font.family_monospace, bgcolor=color.new(#001a08, 30))
+    table.cell(dash, 4, 1, " ◈ LOCATION ",  text_color=locCol,  text_size=size.small, text_font_family=font.family_monospace, bgcolor=color.new(#0d1117, 30))
+    table.cell(dash, 5, 1, " ◈ POSITION ",  text_color=posCol,  text_size=size.small, text_font_family=font.family_monospace, bgcolor=color.new(#0a0a20, 30))
+    table.cell(dash, 6, 1, " ◈ TP / SL ",   text_color=C_TEAL,  text_size=size.small, text_font_family=font.family_monospace, bgcolor=color.new(#001a14, 30))
+    table.cell(dash, 7, 1, " ◈ STATUS ",    text_color=cdCol,   text_size=size.small, text_font_family=font.family_monospace, bgcolor=color.new(#0a0a14, 30))
+    table.cell(dash, 8, 1, " ◈ VOLUME ",    text_color=vCol,    text_size=size.small, text_font_family=font.family_monospace, bgcolor=color.new(#0a0a14, 30))
+
+    // ROW 2 — PRIMARY DATA
+    table.cell(dash, 0, 2, " BARS  " + str.tostring(barsInBox),             text_color=C_TEAL,  text_size=size.small, text_font_family=font.family_monospace, bgcolor=color.new(#001a14, 40))
+    table.cell(dash, 1, 2, " VAH  " + vahTxt,                               text_color=C_BULL,  text_size=size.small, text_font_family=font.family_monospace, bgcolor=color.new(#001a08, 40))
+    table.cell(dash, 2, 2, " POC  " + pocTxt,                               text_color=C_BEAR,  text_size=size.small, text_font_family=font.family_monospace, bgcolor=color.new(#1a0008, 40))
+    table.cell(dash, 3, 2, " VAL  " + valTxt,                               text_color=C_BULL,  text_size=size.small, text_font_family=font.family_monospace, bgcolor=color.new(#001a08, 40))
+    table.cell(dash, 4, 2, " " + locTxt,                                    text_color=locCol,  text_size=size.small, text_font_family=font.family_monospace, bgcolor=color.new(#0d1117, 40))
+    table.cell(dash, 5, 2, " " + posTxt,                                    text_color=posCol,  text_size=size.small, text_font_family=font.family_monospace, bgcolor=color.new(#0a0a20, 40))
+    table.cell(dash, 6, 2, " TP  " + tpTxt,                                 text_color=C_TEAL,  text_size=size.small, text_font_family=font.family_monospace, bgcolor=color.new(#001a14, 40))
+    table.cell(dash, 7, 2, " " + cdTxt,                                     text_color=cdCol,   text_size=size.small, text_font_family=font.family_monospace, bgcolor=color.new(#0a0a14, 40))
+    table.cell(dash, 8, 2, " " + vTxt,                                      text_color=vCol,    text_size=size.small, text_font_family=font.family_monospace, bgcolor=color.new(#0a0a14, 40))
+
+    // ROW 3 — SECONDARY
+    table.cell(dash, 0, 3, " VA " + str.tostring(vaPercent, "#") + "%",                                                                   text_color=C_MUTED, text_size=size.tiny, text_font_family=font.family_monospace, bgcolor=C_COL_BG)
+    table.cell(dash, 1, 3, " CONF " + str.tostring(confirmB) + "b",                                                                       text_color=C_MUTED, text_size=size.tiny, text_font_family=font.family_monospace, bgcolor=C_COL_BG)
+    table.cell(dash, 2, 3, " RSI  " + str.tostring(rsi14, "#.#"),                                                                         text_color=rsi14 > rsiOB ? C_BEAR : rsi14 < rsiOS ? C_BULL : C_MUTED, text_size=size.tiny, text_font_family=font.family_monospace, bgcolor=C_COL_BG)
+    table.cell(dash, 3, 3, " " + wideTxt,                                                                                                 text_color=C_MUTED, text_size=size.tiny, text_font_family=font.family_monospace, bgcolor=C_COL_BG)
+    table.cell(dash, 4, 3, " ROWS " + str.tostring(numRows),                                                                              text_color=C_MUTED, text_size=size.tiny, text_font_family=font.family_monospace, bgcolor=C_COL_BG)
+    table.cell(dash, 5, 3, " ENTRY " + (not g_inTrade or na(entryPrice) ? "--" : str.tostring(entryPrice, format.mintick)),               text_color=C_MUTED, text_size=size.tiny, text_font_family=font.family_monospace, bgcolor=C_COL_BG)
+    table.cell(dash, 6, 3, " SL  " + slTxt,                                                                                               text_color=color.new(C_BEAR, 20), text_size=size.small, text_font_family=font.family_monospace, bgcolor=C_COL_BG)
+    table.cell(dash, 7, 3, " CD  " + str.tostring(cooldown) + "b  MAX " + str.tostring(maxBars) + "b",                                   text_color=C_MUTED, text_size=size.tiny, text_font_family=font.family_monospace, bgcolor=C_COL_BG)
+    table.cell(dash, 8, 3, " " + str.tostring(vRatio, "#.##") + "x avg",                                                                 text_color=vCol,    text_size=size.tiny, text_font_family=font.family_monospace, bgcolor=C_COL_BG)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ALERTS
+// ─────────────────────────────────────────────────────────────────────────────
+alertcondition(buySignal,  "Projection Box BUY",  "Volume Profile Projection Box — BUY: price broke up through VAL")
+alertcondition(sellSignal, "Projection Box SELL", "Volume Profile Projection Box — SELL: price broke down through VAH")
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Want to see this indicator built out as a full trading strategy? I've put
+//  together a step-by-step tutorial — check my profile signature for details!
+//
+//  For educational and informational purposes only. Not financial advice.
+//  Past performance does not guarantee future results. Always use proper
+//  risk management. 
+// ─────────────────────────────────────────────────────────────────────────────

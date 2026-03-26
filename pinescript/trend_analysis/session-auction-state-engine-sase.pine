@@ -1,0 +1,657 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © exlux
+
+//@version=6
+indicator("Session Auction State Engine (SASE) v4.0", overlay = true, max_labels_count = 500)
+
+//==============================================================================
+// CONFIG
+//==============================================================================
+group_sess = "Session"
+group_ib   = "Initial Balance"
+group_val  = "Value and Width"
+group_thr  = "State Logic"
+group_ui   = "UI"
+
+enum tz
+    exch = "Exchange"
+    ny   = "America/New_York"
+    chi  = "America/Chicago"
+    lon  = "Europe/London"
+    utc  = "UTC"
+
+enum value_anchor
+    auto_vwap_twap = "Auto VWAP then TWAP"
+    vwap_only      = "VWAP only"
+    twap_only      = "TWAP only"
+
+enum value_ref_mode
+    live         = "Live"
+    freeze_at_ib = "Freeze at IB"
+
+enum exp_mode
+    intraday_atr = "Intraday ATR"
+    daily_atr    = "Daily ATR"
+
+enum tbl_pos
+    top_right    = "Top right"
+    top_left     = "Top left"
+    bottom_right = "Bottom right"
+    bottom_left  = "Bottom left"
+
+enum ui_theme
+    dark  = "Dark"
+    light = "Light"
+
+enum marker_mode
+    off  = "Off"
+    key  = "Key only"
+    all  = "All changes"
+
+string sess_input = input.session("0930-1600", "Session", group = group_sess)
+tz     tz_input   = input.enum(tz.ny, "Session timezone", group = group_sess)
+bool   show_snapshot_when_closed = input.bool(true, "Show last session snapshot when closed", group = group_sess)
+
+int ib_minutes = input.int(60, "IB minutes", minval = 5, maxval = 240, group = group_ib)
+
+value_anchor   value_mode       = input.enum(value_anchor.auto_vwap_twap, "Value anchor", group = group_val)
+value_ref_mode value_ref_select = input.enum(value_ref_mode.freeze_at_ib, "Value reference", group = group_val)
+int            width_atr_len    = input.int(20, "Width ATR length", minval = 2, maxval = 200, group = group_val)
+float          width_mult       = input.float(0.80, "Width ATR multiplier", minval = 0.10, step = 0.05, group = group_val)
+
+exp_mode exp_range_mode = input.enum(exp_mode.daily_atr, "Expected range mode", group = group_val)
+int      exp_atr_len    = input.int(14, "Expected range ATR length", minval = 2, maxval = 200, group = group_val)
+
+float breakout_buf_mult = input.float(0.25, "Breakout buffer as width fraction", minval = 0.00, step = 0.05, group = group_thr)
+int   flip_confirm_bars = input.int(3, "Direction flip confirm bars", minval = 1, maxval = 20, group = group_thr)
+
+int   accept_ema_len     = input.int(30, "Acceptance EMA length", minval = 2, maxval = 500, group = group_thr)
+int   accept_streak_len  = input.int(6, "Acceptance streak bars", minval = 1, maxval = 50, group = group_thr)
+float accept_early_th    = input.float(0.35, "Early trend acceptance threshold", minval = 0.05, maxval = 0.95, step = 0.05, group = group_thr)
+float accept_trend_th    = input.float(0.55, "Trend continuation acceptance threshold", minval = 0.05, maxval = 0.95, step = 0.05, group = group_thr)
+
+int   balance_ema_len    = input.int(40, "Balance EMA length", minval = 2, maxval = 500, group = group_thr)
+float trend_balance_max  = input.float(0.45, "Trend continuation max balance", minval = 0.05, maxval = 0.95, step = 0.05, group = group_thr)
+float bal_balance_min    = input.float(0.60, "Balanced min balance", minval = 0.05, maxval = 0.95, step = 0.05, group = group_thr)
+
+float ext_early_th       = input.float(0.15, "Early trend extension threshold", minval = 0.01, maxval = 2.00, step = 0.01, group = group_thr)
+float ext_trend_th       = input.float(0.30, "Trend continuation extension threshold", minval = 0.01, maxval = 2.00, step = 0.01, group = group_thr)
+int   trend_confirm_bars = input.int(18, "Trend continuation min bars since breakout", minval = 1, maxval = 300, group = group_thr)
+
+int   fail_min_out_bars  = input.int(4, "Failed auction min outside value bars", minval = 1, maxval = 50, group = group_thr)
+int   fail_min_in_bars   = input.int(6, "Failed auction min inside value bars", minval = 1, maxval = 80, group = group_thr)
+int   fail_window_bars   = input.int(20, "Failed auction window bars", minval = 5, maxval = 200, group = group_thr)
+float fail_accept_max    = input.float(0.25, "Failed auction max acceptance", minval = 0.00, maxval = 0.95, step = 0.05, group = group_thr)
+float fail_balance_min   = input.float(0.60, "Failed auction min balance", minval = 0.05, maxval = 0.95, step = 0.05, group = group_thr)
+bool  req_back_in_ib     = input.bool(true, "Failed auction requires return inside IB", group = group_thr)
+
+int confirm_bars_generic = input.int(2, "State change confirm bars", minval = 1, maxval = 30, group = group_thr)
+int confirm_bars_to_bal  = input.int(6, "Return to Balanced confirm bars", minval = 1, maxval = 60, group = group_thr)
+int min_dwell_non_bal    = input.int(10, "Minimum bars to keep non Balanced state", minval = 0, maxval = 200, group = group_thr)
+
+ui_theme   theme_select = input.enum(ui_theme.dark, "Theme", group = group_ui)
+tbl_pos    ui_tbl_pos   = input.enum(tbl_pos.top_right, "Dashboard position", group = group_ui)
+marker_mode ui_markers  = input.enum(marker_mode.key, "Markers", group = group_ui)
+bool       ui_show_bg   = input.bool(false, "Chart background tint", group = group_ui)
+bool       ui_bar_color = input.bool(false, "Bar color by state", group = group_ui)
+
+bool dbg_show_ib    = input.bool(false, "Show IB lines", group = group_ui)
+bool dbg_show_value = input.bool(false, "Show value bands", group = group_ui)
+
+//==============================================================================
+// CONSTANTS
+//==============================================================================
+int STATE_BALANCED    = 1
+int STATE_EARLY_TREND = 2
+int STATE_TREND_CONT  = 3
+int STATE_FAILED      = 4
+
+//==============================================================================
+// HELPERS
+//==============================================================================
+f_clamp01(x) => math.max(0.0, math.min(1.0, x))
+
+f_tbl_position(p) =>
+    p == tbl_pos.top_right ? position.top_right :    p == tbl_pos.top_left ? position.top_left :    p == tbl_pos.bottom_right ? position.bottom_right :    position.bottom_left
+
+f_state_text(st) =>
+    st == STATE_BALANCED ? "Balanced" :    st == STATE_EARLY_TREND ? "Early trend" :    st == STATE_TREND_CONT ? "Trend continuation" :    st == STATE_FAILED ? "Failed auction" :    "Balanced"
+
+f_state_icon(st) =>
+    st == STATE_BALANCED ? "◼" :    st == STATE_EARLY_TREND ? "▲" :    st == STATE_TREND_CONT ? "▶" :    st == STATE_FAILED ? "↩" :    "◼"
+
+f_dir_text(d) => d == 1 ? "Up" : d == -1 ? "Down" : "None"
+
+f_state_color(st) =>
+    st == STATE_BALANCED ? color.rgb(120, 132, 140) :    st == STATE_EARLY_TREND ? color.rgb(255, 167, 38) :    st == STATE_TREND_CONT ? color.rgb(38, 198, 218) :    st == STATE_FAILED ? color.rgb(239, 83, 80) :    color.rgb(120, 132, 140)
+
+f_pct(x) => str.tostring(x * 100.0, "#.0") + "%"
+
+f_gauge(p, n) =>
+    float pc = na(p) ? 0.0 : f_clamp01(p)
+    int filled = int(math.round(pc * n))
+    filled := math.max(0, math.min(n, filled))
+    int empty = n - filled
+    str.repeat("█", filled, "") + str.repeat("░", empty, "")
+
+f_ok(b) => b ? "✓" : "×"
+
+// Theme palette
+color ui_bg     = theme_select == ui_theme.dark ? color.rgb(16, 18, 22)    : color.rgb(250, 250, 250)
+color ui_head   = theme_select == ui_theme.dark ? color.rgb(12, 14, 18)    : color.rgb(248, 248, 248)
+color ui_row_a  = theme_select == ui_theme.dark ? color.rgb(22, 24, 28)    : color.rgb(242, 244, 247)
+color ui_row_b  = theme_select == ui_theme.dark ? color.rgb(26, 28, 34)    : color.rgb(234, 236, 240)
+color ui_text   = theme_select == ui_theme.dark ? color.rgb(236, 240, 245) : color.rgb(22, 24, 28)
+color ui_muted  = theme_select == ui_theme.dark ? color.rgb(160, 170, 185) : color.rgb(90, 100, 115)
+color ui_frame  = theme_select == ui_theme.dark ? color.rgb(45, 50, 62)    : color.rgb(200, 205, 212)
+color ui_border = theme_select == ui_theme.dark ? color.rgb(34, 38, 48)    : color.rgb(210, 215, 222)
+
+color ok_bg   = theme_select == ui_theme.dark ? color.rgb(20, 60, 35)  : color.rgb(225, 245, 236)
+color bad_bg  = theme_select == ui_theme.dark ? color.rgb(80, 30, 30)  : color.rgb(255, 235, 238)
+color warn_bg = theme_select == ui_theme.dark ? color.rgb(70, 55, 20)  : color.rgb(255, 248, 225)
+
+f_row_bg(r) => (r % 2 == 0) ? ui_row_a : ui_row_b
+
+//==============================================================================
+// SESSION DETECTION
+//==============================================================================
+string tz_str = tz_input == tz.exch ? syminfo.timezone : str.tostring(tz_input)
+
+bool in_sess = not na(time(timeframe.period, sess_input, tz_str))
+int  prev_in_sess_i = nz(in_sess[1] ? 1 : 0, 0)
+bool new_sess = in_sess and prev_in_sess_i == 0
+bool end_sess = (not in_sess) and prev_in_sess_i == 1
+
+//==============================================================================
+// STATE STORAGE
+//==============================================================================
+var int   sess_start_time = na
+var float sess_high       = na
+var float sess_low        = na
+
+var float ib_high         = na
+var float ib_low          = na
+
+var float cum_pv          = na
+var float cum_v           = na
+var float cum_p           = na
+var int   cum_n           = na
+
+var float value_ref       = na
+var float width_ref       = na
+
+var int   breakout_dir    = 0
+var int   breakout_bar    = na
+var int   flip_consec     = 0
+
+var float accept_value_ema = 0.0
+var float accept_ib_ema    = 0.0
+var int   accept_streak    = 0
+var float balance_ema      = 0.0
+
+var bool  had_excursion    = false
+var int   outside_consec   = 0
+var int   inside_consec    = 0
+
+var int   sase_state       = STATE_BALANCED
+var int   state_start_bar  = na
+var int   pending_state    = na
+var int   pending_count    = 0
+
+// Snapshot (fixed using [1] on end_sess)
+var bool  have_last      = false
+var int   last_state     = na
+var int   last_dir       = 0
+var float last_accept    = na
+var float last_ext       = na
+var float last_bal       = na
+var float last_ready     = na
+var bool  last_exc       = false
+var int   last_return    = 0
+var float last_bars_since = na
+
+//==============================================================================
+// SESSION INIT AND UPDATE
+//==============================================================================
+if in_sess and (new_sess or na(sess_start_time))
+    sess_start_time := time
+    sess_high       := high
+    sess_low        := low
+
+    ib_high         := high
+    ib_low          := low
+
+    float v0        = nz(volume, 0.0)
+    float p0        = hlc3
+
+    cum_pv          := p0 * v0
+    cum_v           := v0
+    cum_p           := p0
+    cum_n           := 1
+
+    value_ref       := na
+    width_ref       := na
+
+    breakout_dir    := 0
+    breakout_bar    := na
+    flip_consec     := 0
+
+    accept_value_ema := 0.0
+    accept_ib_ema    := 0.0
+    accept_streak    := 0
+    balance_ema      := 0.0
+
+    had_excursion    := false
+    outside_consec   := 0
+    inside_consec    := 0
+
+    sase_state       := STATE_BALANCED
+    state_start_bar  := bar_index
+    pending_state    := na
+    pending_count    := 0
+
+if in_sess and not (new_sess or na(sess_start_time))
+    sess_high := math.max(nz(sess_high, high), high)
+    sess_low  := math.min(nz(sess_low, low), low)
+
+    float v = nz(volume, 0.0)
+    float p = hlc3
+    cum_pv += p * v
+    cum_v  += v
+    cum_p  += p
+    cum_n  += 1
+
+//==============================================================================
+// IB
+//==============================================================================
+int  ib_ms       = ib_minutes * 60 * 1000
+bool ib_complete = in_sess and not na(sess_start_time) and (time - sess_start_time) >= ib_ms
+bool ib_building = in_sess and not ib_complete
+
+if ib_building and not (new_sess or na(sess_start_time))
+    ib_high := math.max(nz(ib_high, high), high)
+    ib_low  := math.min(nz(ib_low, low), low)
+
+float ib_prog = in_sess and not na(sess_start_time) ? f_clamp01(float(time - sess_start_time) / float(ib_ms)) : na
+bool  ib_just_completed = ib_complete and nz(ib_complete[1] ? 1 : 0, 0) == 0
+
+//==============================================================================
+// VALUE AND WIDTH (freeze at IB optional)
+//==============================================================================
+float vwap_val = cum_v > 0.0 ? (cum_pv / cum_v) : na
+float twap_val = cum_n > 0 ? (cum_p / float(cum_n)) : na
+
+float value_live =
+     value_mode == value_anchor.vwap_only ? vwap_val :
+     value_mode == value_anchor.twap_only ? twap_val :
+     na(vwap_val) ? twap_val : vwap_val
+
+float width_live = nz(ta.atr(width_atr_len), 0.0) * width_mult
+bool  has_value_live = in_sess and not na(value_live) and width_live > 0.0
+
+if in_sess and ib_complete and has_value_live
+    if value_ref_select == value_ref_mode.live
+        value_ref := value_live
+        width_ref := width_live
+    else
+        if ib_just_completed or na(value_ref) or na(width_ref)
+            value_ref := value_live
+            width_ref := width_live
+
+float v_center = na(value_ref) ? value_live : value_ref
+float v_width  = na(width_ref) ? width_live : width_ref
+
+bool has_value = in_sess and not na(v_center) and v_width > 0.0
+bool in_value  = has_value and math.abs(close - v_center) <= v_width
+
+//==============================================================================
+// EXPECTED RANGE AND EXTENSION
+//==============================================================================
+float daily_atr = request.security(syminfo.tickerid, "1D", ta.atr(exp_atr_len), gaps = barmerge.gaps_off, lookahead = barmerge.lookahead_off)
+float exp_range = exp_range_mode == exp_mode.daily_atr ? daily_atr : ta.atr(exp_atr_len)
+float exp_safe  = math.max(nz(exp_range, 0.0), syminfo.mintick)
+
+float ext_up  = ib_complete ? math.max(0.0, nz(sess_high, high) - nz(ib_high, high)) : 0.0
+float ext_dn  = ib_complete ? math.max(0.0, nz(ib_low, low) - nz(sess_low, low)) : 0.0
+float ext_pts = math.max(ext_up, ext_dn)
+float ext_n   = ext_pts / exp_safe
+
+//==============================================================================
+// BREAKOUT AND FLIP (only before trend confirmation time)
+//==============================================================================
+float buffer = v_width * breakout_buf_mult
+
+if in_sess and ib_complete and breakout_dir == 0 and has_value
+    if close > nz(ib_high, high) + buffer
+        breakout_dir := 1
+        breakout_bar := bar_index
+    else if close < nz(ib_low, low) - buffer
+        breakout_dir := -1
+        breakout_bar := bar_index
+
+float bars_since_pre = breakout_dir == 0 ? na : float(bar_index - breakout_bar)
+bool  allow_flip = not na(bars_since_pre) and bars_since_pre < trend_confirm_bars
+
+bool flip_cond = false
+if in_sess and ib_complete and has_value and breakout_dir != 0 and allow_flip
+    flip_cond := breakout_dir == 1 ? (close < nz(ib_low, low) - buffer) : (close > nz(ib_high, high) + buffer)
+
+if in_sess and flip_cond
+    flip_consec += 1
+else if in_sess
+    flip_consec := 0
+
+if in_sess and flip_consec >= flip_confirm_bars
+    breakout_dir := -breakout_dir
+    breakout_bar := bar_index
+    flip_consec  := 0
+
+    accept_value_ema := 0.0
+    accept_ib_ema    := 0.0
+    accept_streak    := 0
+    had_excursion    := false
+    outside_consec   := 0
+    inside_consec    := 0
+
+float bars_since_breakout = breakout_dir == 0 ? na : float(bar_index - breakout_bar)
+
+//==============================================================================
+// ACCEPTANCE AND BALANCE
+//==============================================================================
+bool out_value_dir = false
+bool out_ib_dir    = false
+
+if in_sess and ib_complete and has_value and breakout_dir != 0
+    out_value_dir := breakout_dir == 1 ? (close > v_center + v_width) : (close < v_center - v_width)
+    out_ib_dir    := breakout_dir == 1 ? (close > nz(ib_high, high)) : (close < nz(ib_low, low))
+
+float alpha_acc = 2.0 / (accept_ema_len + 1.0)
+float alpha_bal = 2.0 / (balance_ema_len + 1.0)
+
+if in_sess and ib_complete
+    accept_value_ema := accept_value_ema + alpha_acc * ((out_value_dir ? 1.0 : 0.0) - accept_value_ema)
+    accept_ib_ema    := accept_ib_ema + alpha_acc * ((out_ib_dir ? 1.0 : 0.0) - accept_ib_ema)
+
+if in_sess and has_value
+    balance_ema := balance_ema + alpha_bal * ((in_value ? 1.0 : 0.0) - balance_ema)
+
+if in_sess and ib_complete and has_value and breakout_dir != 0
+    accept_streak := out_value_dir ? (accept_streak + 1) : 0
+else
+    accept_streak := 0
+
+float accept_core  = 0.60 * accept_value_ema + 0.40 * accept_ib_ema
+float accept_st_p  = f_clamp01(float(accept_streak) / float(accept_streak_len))
+float accept_trend = 0.70 * accept_core + 0.30 * accept_st_p
+
+//==============================================================================
+// FAILED AUCTION
+//==============================================================================
+bool back_in_ib = close <= nz(ib_high, high) and close >= nz(ib_low, low)
+
+if in_sess and ib_complete and has_value and breakout_dir != 0
+    if out_value_dir
+        outside_consec += 1
+        inside_consec := 0
+        if outside_consec >= fail_min_out_bars
+            had_excursion := true
+    else
+        outside_consec := 0
+        inside_consec := in_value ? (inside_consec + 1) : 0
+
+float out_f = out_value_dir ? 1.0 : 0.0
+float in_f  = in_value ? 1.0 : 0.0
+float accept_recent  = math.sum(out_f, fail_window_bars) / fail_window_bars
+float balance_recent = math.sum(in_f,  fail_window_bars) / fail_window_bars
+
+bool fail_confirm =
+     in_sess and ib_complete and has_value and breakout_dir != 0 and
+     had_excursion and
+     inside_consec >= fail_min_in_bars and
+     accept_recent <= fail_accept_max and
+     balance_recent >= fail_balance_min and
+     (req_back_in_ib ? back_in_ib : true)
+
+//==============================================================================
+// STATE CANDIDATES
+//==============================================================================
+bool can_trend =
+     in_sess and ib_complete and has_value and breakout_dir != 0 and
+     not na(bars_since_breakout) and
+     bars_since_breakout >= trend_confirm_bars and
+     accept_trend >= accept_trend_th and
+     ext_n >= ext_trend_th and
+     balance_ema <= trend_balance_max
+
+bool can_early =
+     in_sess and ib_complete and has_value and breakout_dir != 0 and
+     not fail_confirm and
+     not can_trend and
+     (accept_trend >= accept_early_th or ext_n >= ext_early_th)
+
+bool can_balanced =
+     in_sess and has_value and (
+         breakout_dir == 0 or
+         (balance_ema >= bal_balance_min and accept_trend < accept_early_th and ext_n < ext_early_th)
+     )
+
+int candidate =
+     not in_sess ? na :
+     not ib_complete ? STATE_BALANCED :
+     fail_confirm ? STATE_FAILED :
+     can_trend ? STATE_TREND_CONT :
+     can_early ? STATE_EARLY_TREND :
+     can_balanced ? STATE_BALANCED :
+     STATE_BALANCED
+
+int bars_in_state_now = in_sess and not na(state_start_bar) ? (bar_index - state_start_bar + 1) : 0
+bool block_to_bal = in_sess and (sase_state != STATE_BALANCED) and (candidate == STATE_BALANCED) and (bars_in_state_now < min_dwell_non_bal)
+if block_to_bal
+    candidate := sase_state
+
+//==============================================================================
+// HYSTERESIS
+//==============================================================================
+int need_confirm = candidate == STATE_BALANCED ? confirm_bars_to_bal : confirm_bars_generic
+
+if in_sess
+    if candidate == sase_state
+        pending_state := na
+        pending_count := 0
+    else
+        if pending_state != candidate
+            pending_state := candidate
+            pending_count := 1
+        else
+            pending_count += 1
+
+        if pending_count >= need_confirm
+            sase_state := candidate
+            pending_state := na
+            pending_count := 0
+            state_start_bar := bar_index
+
+if new_sess
+    state_start_bar := bar_index
+
+bool state_changed = in_sess and (sase_state != sase_state[1])
+
+//==============================================================================
+// OUTPUTS FOR UI AND STRATEGIES
+//==============================================================================
+int dir_live = (in_sess and sase_state != STATE_BALANCED) ? breakout_dir : 0
+
+bool time_ok = not na(bars_since_breakout) and bars_since_breakout >= trend_confirm_bars
+bool acc_ok  = accept_trend >= accept_trend_th
+bool ext_ok  = ext_n >= ext_trend_th
+
+float time_p  = na(bars_since_breakout) ? 0.0 : f_clamp01(bars_since_breakout / float(trend_confirm_bars))
+float acc_p   = f_clamp01(accept_trend / accept_trend_th)
+float ext_p   = f_clamp01(ext_n / ext_trend_th)
+float ready_p = f_clamp01(0.34 * time_p + 0.33 * acc_p + 0.33 * ext_p)
+float ret_p   = breakout_dir != 0 ? f_clamp01(float(inside_consec) / float(fail_min_in_bars)) : 0.0
+
+//==============================================================================
+// SNAPSHOT (fixed)
+//==============================================================================
+if end_sess
+    have_last       := true
+    last_state      := sase_state[1]
+    last_dir        := (last_state != STATE_BALANCED) ? breakout_dir[1] : 0
+    last_accept     := accept_trend[1]
+    last_ext        := ext_n[1]
+    last_bal        := balance_ema[1]
+    last_ready      := ready_p[1]
+    last_exc        := had_excursion[1]
+    last_return     := inside_consec[1]
+    last_bars_since := breakout_dir[1] == 0 ? na : float(bar_index[1] - breakout_bar[1])
+
+//==============================================================================
+// MARKERS
+//==============================================================================
+bool key_change = state_changed and (sase_state == STATE_TREND_CONT or sase_state == STATE_FAILED)
+bool show_marker = ui_markers == marker_mode.all ? state_changed : ui_markers == marker_mode.key ? key_change : false
+
+//==============================================================================
+// PLOTS (GLOBAL SCOPE ONLY)
+//==============================================================================
+color st_col = in_sess ? f_state_color(sase_state) : na
+bgcolor(ui_show_bg and in_sess ? color.new(st_col, 92) : na)
+barcolor(ui_bar_color and in_sess ? color.new(st_col, 35) : na)
+
+plotshape(show_marker, title = "SASE Marker", style = shape.circle, size = size.tiny, color = color.new(in_sess ? st_col : color.gray, 0), location = location.abovebar)
+
+plot(dbg_show_ib and in_sess and ib_complete ? ib_high : na, "IB High", style = plot.style_linebr, color = color.new(color.white, 35))
+plot(dbg_show_ib and in_sess and ib_complete ? ib_low  : na, "IB Low",  style = plot.style_linebr, color = color.new(color.white, 35))
+
+plot(dbg_show_value and in_sess and has_value ? v_center : na, "Value", style = plot.style_linebr, color = color.new(color.white, 0))
+plot(dbg_show_value and in_sess and has_value ? (v_center + v_width) : na, "Value Upper", style = plot.style_linebr, color = color.new(color.white, 65))
+plot(dbg_show_value and in_sess and has_value ? (v_center - v_width) : na, "Value Lower", style = plot.style_linebr, color = color.new(color.white, 65))
+
+plot(in_sess ? float(sase_state) : na, "SASE State Code", display = display.none)
+plot(in_sess ? float(dir_live) : na, "SASE Direction Code", display = display.none)
+plot(in_sess ? accept_trend : na, "SASE Acceptance", display = display.none)
+plot(in_sess ? ext_n : na, "SASE Extension", display = display.none)
+plot(in_sess ? balance_ema : na, "SASE Balance", display = display.none)
+plot(in_sess ? ready_p : na, "SASE Trend Ready", display = display.none)
+
+//==============================================================================
+// DASHBOARD (self explanatory)
+//==============================================================================
+var table dash = table.new(
+     position = f_tbl_position(ui_tbl_pos),
+     columns  = 4,
+     rows     = 10,
+     bgcolor  = ui_bg,
+     frame_color = ui_frame,
+     border_width = 1
+)
+
+if barstate.isfirst
+    table.set_border_color(dash, ui_border)
+    for r = 0 to 9
+        table.cell_set_text_font_family(dash, 2, r, font.family_monospace)
+
+if barstate.islast
+    bool show_live = in_sess
+    bool show_snap = (not in_sess) and show_snapshot_when_closed and have_last
+
+    int   ui_state = show_live ? sase_state : show_snap ? last_state : na
+    int   ui_dir   = show_live ? dir_live   : show_snap ? last_dir   : 0
+    float ui_acc   = show_live ? accept_trend : show_snap ? last_accept : na
+    float ui_ext   = show_live ? ext_n       : show_snap ? last_ext    : na
+    float ui_bal   = show_live ? balance_ema : show_snap ? last_bal    : na
+    float ui_rdy   = show_live ? ready_p     : show_snap ? last_ready  : na
+    bool  ui_exc   = show_live ? had_excursion : show_snap ? last_exc  : false
+    float ui_ret_p = show_live ? ret_p       : show_snap ? f_clamp01(float(last_return) / float(fail_min_in_bars)) : 0.0
+
+    bool ui_time_ok = show_live ? time_ok : show_snap ? (nz(last_bars_since, 0) >= trend_confirm_bars) : false
+    bool ui_acc_ok  = show_live ? acc_ok  : show_snap ? (not na(ui_acc) and ui_acc >= accept_trend_th) : false
+    bool ui_ext_ok  = show_live ? ext_ok  : show_snap ? (not na(ui_ext) and ui_ext >= ext_trend_th) : false
+
+    string mode_txt = show_live ? "LIVE" : show_snap ? "SNAP" : "SET"
+    string state_txt = na(float(ui_state)) ? "Set session" : f_state_text(ui_state)
+    string icon_txt  = na(float(ui_state)) ? " " : f_state_icon(ui_state)
+
+    color chip = na(float(ui_state)) ? ui_row_a : f_state_color(ui_state)
+    color chip_txt = theme_select == ui_theme.dark ? color.rgb(10, 10, 10) : color.rgb(250, 250, 250)
+
+    string action_txt =
+         mode_txt == "SET" ? "Set session hours to your trading window" :
+         not show_live and show_snap ? "Snapshot of last session" :
+         show_live and not ib_complete ? "Wait. IB building. Do nothing" :
+         ui_state == STATE_BALANCED ? "Balanced. Mean reversion only" :
+         ui_state == STATE_EARLY_TREND ? "Early trend. Wait for checklist" :
+         ui_state == STATE_TREND_CONT ? "Trend confirmed. Follow direction" :
+         "Failed auction. Fade back to value"
+
+    bool trend_allowed =
+         show_live and ib_complete and (ui_state == STATE_EARLY_TREND or ui_state == STATE_TREND_CONT)
+    bool mr_allowed =
+         show_live and ib_complete and (ui_state == STATE_BALANCED or ui_state == STATE_FAILED)
+
+    string checklist = "T" + f_ok(ui_time_ok) + " A" + f_ok(ui_acc_ok) + " E" + f_ok(ui_ext_ok)
+
+    // Row 0 header
+    table.cell(dash, 0, 0, "SASE", text_color = ui_text, bgcolor = ui_head, text_formatting = text.format_bold)
+    table.cell(dash, 1, 0, state_txt, text_color = chip_txt, bgcolor = chip, text_size = size.large, text_formatting = text.format_bold)
+    table.cell(dash, 2, 0, icon_txt + " " + f_dir_text(ui_dir), text_color = chip_txt, bgcolor = chip, text_size = size.large, text_halign = text.align_center, text_formatting = text.format_bold)
+    table.cell(dash, 3, 0, mode_txt, text_color = ui_muted, bgcolor = ui_head, text_halign = text.align_center)
+
+    // Row 1 action
+    table.cell(dash, 0, 1, "Action", text_color = ui_text, bgcolor = f_row_bg(1), text_formatting = text.format_bold)
+    table.cell(dash, 1, 1, action_txt, text_color = ui_text, bgcolor = f_row_bg(1))
+    table.cell(dash, 2, 1, "", text_color = ui_muted, bgcolor = f_row_bg(1))
+    table.cell(dash, 3, 1, "", text_color = ui_muted, bgcolor = f_row_bg(1))
+
+    // Row 2 permissions
+    table.cell(dash, 0, 2, "Use", text_color = ui_text, bgcolor = f_row_bg(2), text_formatting = text.format_bold)
+    table.cell(dash, 1, 2, "Trend", text_color = ui_text, bgcolor = trend_allowed ? ok_bg : bad_bg)
+    table.cell(dash, 2, 2, "MeanRev", text_color = ui_text, bgcolor = mr_allowed ? ok_bg : bad_bg)
+    table.cell(dash, 3, 2, "Dir only if not Balanced", text_color = ui_muted, bgcolor = f_row_bg(2), text_halign = text.align_center)
+
+    // Row 3 IB
+    table.cell(dash, 0, 3, "IB", text_color = ui_text, bgcolor = f_row_bg(3), text_formatting = text.format_bold)
+    table.cell(dash, 1, 3, show_live ? (ib_complete ? "Complete" : f_pct(ib_prog)) : show_snap ? "Closed" : "", text_color = ui_text, bgcolor = f_row_bg(3))
+    table.cell(dash, 2, 3, show_live ? f_gauge(ib_prog, 12) : "", text_color = ui_muted, bgcolor = f_row_bg(3))
+    table.cell(dash, 3, 3, show_live ? (ib_complete ? "OK" : "Wait") : "", text_color = ui_muted, bgcolor = f_row_bg(3), text_halign = text.align_center)
+
+    // Row 4 trend checklist
+    table.cell(dash, 0, 4, "Trend", text_color = ui_text, bgcolor = f_row_bg(4), text_formatting = text.format_bold)
+    table.cell(dash, 1, 4, na(ui_rdy) ? "" : "Ready " + f_pct(ui_rdy), text_color = ui_text, bgcolor = f_row_bg(4))
+    table.cell(dash, 2, 4, checklist, text_color = ui_text, bgcolor = f_row_bg(4))
+    table.cell(dash, 3, 4, (ui_time_ok and ui_acc_ok and ui_ext_ok) ? "All ✓" : "Not yet", text_color = ui_text, bgcolor = (ui_time_ok and ui_acc_ok and ui_ext_ok) ? ok_bg : warn_bg, text_halign = text.align_center)
+
+    // Row 5 Accept
+    bool pass_acc = not na(ui_acc) and ui_acc >= accept_trend_th
+    table.cell(dash, 0, 5, "Accept", text_color = ui_text, bgcolor = f_row_bg(5), text_formatting = text.format_bold)
+    table.cell(dash, 1, 5, na(ui_acc) ? "" : f_pct(ui_acc), text_color = ui_text, bgcolor = f_row_bg(5))
+    table.cell(dash, 2, 5, na(ui_acc) ? "" : f_gauge(ui_acc, 12), text_color = ui_text, bgcolor = f_row_bg(5))
+    table.cell(dash, 3, 5, pass_acc ? "OK" : "Need", text_color = ui_text, bgcolor = pass_acc ? ok_bg : warn_bg, text_halign = text.align_center)
+
+    // Row 6 Extend
+    bool pass_ext = not na(ui_ext) and ui_ext >= ext_trend_th
+    float ext_p_ui = na(ui_ext) ? 0.0 : f_clamp01(ui_ext / ext_trend_th)
+    table.cell(dash, 0, 6, "Extend", text_color = ui_text, bgcolor = f_row_bg(6), text_formatting = text.format_bold)
+    table.cell(dash, 1, 6, na(ui_ext) ? "" : f_pct(ui_ext), text_color = ui_text, bgcolor = f_row_bg(6))
+    table.cell(dash, 2, 6, na(ui_ext) ? "" : f_gauge(ext_p_ui, 12), text_color = ui_text, bgcolor = f_row_bg(6))
+    table.cell(dash, 3, 6, pass_ext ? "OK" : "Need", text_color = ui_text, bgcolor = pass_ext ? ok_bg : warn_bg, text_halign = text.align_center)
+
+    // Row 7 Balance
+    bool pass_bal = not na(ui_bal) and ui_bal <= trend_balance_max
+    table.cell(dash, 0, 7, "Balance", text_color = ui_text, bgcolor = f_row_bg(7), text_formatting = text.format_bold)
+    table.cell(dash, 1, 7, na(ui_bal) ? "" : f_pct(ui_bal), text_color = ui_text, bgcolor = f_row_bg(7))
+    table.cell(dash, 2, 7, na(ui_bal) ? "" : f_gauge(ui_bal, 12), text_color = ui_text, bgcolor = f_row_bg(7))
+    table.cell(dash, 3, 7, pass_bal ? "OK" : "High", text_color = ui_text, bgcolor = pass_bal ? ok_bg : bad_bg, text_halign = text.align_center)
+
+    // Row 8 Fail
+    table.cell(dash, 0, 8, "Fail", text_color = ui_text, bgcolor = f_row_bg(8), text_formatting = text.format_bold)
+    table.cell(dash, 1, 8, ui_exc ? "Excursion" : "No", text_color = ui_text, bgcolor = f_row_bg(8))
+    table.cell(dash, 2, 8, ui_exc ? f_gauge(ui_ret_p, 12) : "", text_color = ui_text, bgcolor = f_row_bg(8))
+    table.cell(dash, 3, 8, ui_exc ? "Return to value" : "", text_color = ui_muted, bgcolor = f_row_bg(8), text_halign = text.align_center)
+
+    // Row 9 legend
+    table.cell(dash, 0, 9, "Legend", text_color = ui_text, bgcolor = f_row_bg(9), text_formatting = text.format_bold)
+    table.cell(dash, 1, 9, "Balanced MR", text_color = ui_text, bgcolor = color.new(f_state_color(STATE_BALANCED), 75))
+    table.cell(dash, 2, 9, "Early Setup", text_color = ui_text, bgcolor = color.new(f_state_color(STATE_EARLY_TREND), 75))
+    table.cell(dash, 3, 9, "Trend Follow, Failed Fade", text_color = ui_text, bgcolor = f_row_bg(9), text_halign = text.align_center)

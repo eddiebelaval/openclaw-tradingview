@@ -1,0 +1,274 @@
+// This Pine Script™ code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © EmpArchitect
+// EQH/EQL detection adapted from AlgoAlpha's proven pattern
+// v6.1 — sweep markers, swept zone flash, dynamic lookback
+
+//@version=6
+indicator("Smart Liquidity Map [EmpArchitect]", overlay=true, max_boxes_count=500, max_lines_count=500, max_labels_count=500)
+
+// ==========================================
+// INPUTS
+// ==========================================
+
+tolerance    = input.float(0.05, "Equal Level Tolerance", minval=0.001, maxval=0.2, step=0.005, group="Detection", tooltip="How close highs/lows must match. Lower = stricter.")
+use_rsi      = input.bool(true, "Filter by RSI", group="Detection", tooltip="Only detect EQH when overbought, EQL when oversold")
+rsi_strength = input.int(5, "RSI Filter Strength", minval=1, maxval=30, group="Detection")
+expiryBars   = input.int(500, "Zone Expiry (bars)", minval=50, maxval=2000, group="Detection")
+sweepType    = input.string("body", "Sweep Type", options=["body", "wick"], group="Detection", tooltip="Body: close beyond level. Wick: any touch beyond.")
+
+showPDHL     = input.bool(true, "Show PDH/PDL", group="Levels")
+showPWHL     = input.bool(true, "Show PWH/PWL", group="Levels")
+levelLookback = input.int(200, "Level Line Lookback (bars)", minval=20, maxval=1000, group="Levels", tooltip="How far back the PDH/PDL/PWH/PWL lines extend.")
+
+bullColor  = input.color(#14B8A6, "Bullish (Teal)", group="Visual")
+bearColor  = input.color(#F59E0B, "Bearish (Amber)", group="Visual")
+sweptColor = input.color(#636363, "Swept (Gray)", group="Visual")
+showSweepLabels = input.bool(true, "Show Sweep Labels", group="Visual", tooltip="Mark bars where liquidity was swept.")
+
+// ==========================================
+// PDH / PDL / PWH / PWL
+// Lines created ONCE, updated EVERY BAR
+// ==========================================
+
+pdh = request.security(syminfo.tickerid, "D", high[1], lookahead=barmerge.lookahead_on)
+pdl = request.security(syminfo.tickerid, "D", low[1],  lookahead=barmerge.lookahead_on)
+pwh = request.security(syminfo.tickerid, "W", high[1], lookahead=barmerge.lookahead_on)
+pwl = request.security(syminfo.tickerid, "W", low[1],  lookahead=barmerge.lookahead_on)
+
+var line pdhLine = line.new(na, na, na, na, color=bearColor, style=line.style_dashed, width=1)
+var line pdlLine = line.new(na, na, na, na, color=bullColor, style=line.style_dashed, width=1)
+var line pwhLine = line.new(na, na, na, na, color=bearColor, style=line.style_solid, width=2)
+var line pwlLine = line.new(na, na, na, na, color=bullColor, style=line.style_solid, width=2)
+
+var label pdhLbl = na
+var label pdlLbl = na
+var label pwhLbl = na
+var label pwlLbl = na
+
+// Update every bar
+if showPDHL and not na(pdh)
+    line.set_xy1(pdhLine, bar_index - levelLookback, pdh)
+    line.set_xy2(pdhLine, bar_index, pdh)
+    line.set_xy1(pdlLine, bar_index - levelLookback, pdl)
+    line.set_xy2(pdlLine, bar_index, pdl)
+
+if showPWHL and not na(pwh)
+    line.set_xy1(pwhLine, bar_index - levelLookback, pwh)
+    line.set_xy2(pwhLine, bar_index, pwh)
+    line.set_xy1(pwlLine, bar_index - levelLookback, pwl)
+    line.set_xy2(pwlLine, bar_index, pwl)
+
+// Labels — right-edge only
+if barstate.islast
+    if showPDHL
+        label.delete(pdhLbl)
+        label.delete(pdlLbl)
+        pdhLbl := label.new(bar_index + 1, pdh, "PDH", style=label.style_none, textcolor=bearColor, size=size.small)
+        pdlLbl := label.new(bar_index + 1, pdl, "PDL", style=label.style_none, textcolor=bullColor, size=size.small)
+    if showPWHL
+        label.delete(pwhLbl)
+        label.delete(pwlLbl)
+        pwhLbl := label.new(bar_index + 1, pwh, "PWH", style=label.style_none, textcolor=bearColor, size=size.small)
+        pwlLbl := label.new(bar_index + 1, pwl, "PWL", style=label.style_none, textcolor=bullColor, size=size.small)
+
+// ==========================================
+// EQH / EQL DETECTION
+// ==========================================
+
+varian    = math.avg(math.abs(high - high[1]), math.abs(low - low[1]))
+smoothvar = ta.ema(varian, 500)
+rsiVal    = ta.rsi(close, 14)
+
+eqh_raw = math.abs(high - high[1]) < smoothvar * tolerance
+eql_raw = math.abs(low - low[1]) < smoothvar * tolerance
+
+rsi_eqh = use_rsi ? rsiVal > 50 + rsi_strength : true
+rsi_eql = use_rsi ? rsiVal < 50 - rsi_strength : true
+
+create_eqh = eqh_raw and rsi_eqh and not eqh_raw[1]
+create_eql = eql_raw and rsi_eql and not eql_raw[1]
+
+// ==========================================
+// ZONE ARRAYS — boxes
+// ==========================================
+
+var array<box>   eqhBoxes  = array.new<box>()
+var array<float>  eqhLevels = array.new<float>()
+var array<int>    eqhBars   = array.new<int>()
+
+var array<box>   eqlBoxes  = array.new<box>()
+var array<float>  eqlLevels = array.new<float>()
+var array<int>    eqlBars   = array.new<int>()
+
+// --- Create new EQH zone ---
+if create_eqh
+    float wickLevel = math.max(high, high[1])
+    float bodyLevel = math.max(open, open[1], close, close[1])
+    b = box.new(bar_index - 1, wickLevel, bar_index + 1, bodyLevel,
+         border_color=bearColor, bgcolor=color.new(bearColor, 80), border_width=1)
+    eqhBoxes.push(b)
+    eqhLevels.push(wickLevel)
+    eqhBars.push(bar_index)
+
+// --- Create new EQL zone ---
+if create_eql
+    float wickLevel = math.min(low, low[1])
+    float bodyLevel = math.min(open, open[1], close, close[1])
+    b = box.new(bar_index - 1, bodyLevel, bar_index + 1, wickLevel,
+         border_color=bullColor, bgcolor=color.new(bullColor, 80), border_width=1)
+    eqlBoxes.push(b)
+    eqlLevels.push(wickLevel)
+    eqlBars.push(bar_index)
+
+// Plot markers
+plotchar(create_eqh ? 1 : na, "EQH", "▼", location.abovebar, size=size.tiny, color=bearColor)
+plotchar(create_eql ? 1 : na, "EQL", "▲", location.belowbar, size=size.tiny, color=bullColor)
+
+// ==========================================
+// PROCESS ZONES: extend, mitigate, or sweep
+// ==========================================
+
+var int sweepsToday = 0
+if ta.change(time("D")) != 0
+    sweepsToday := 0
+
+bool bullSweepBar = false
+bool bearSweepBar = false
+
+// --- Process EQH zones ---
+if eqhBoxes.size() > 0
+    for i = eqhBoxes.size() - 1 to 0
+        if i < eqhBoxes.size()
+            float yL  = eqhLevels.get(i)
+            int   age = bar_index - eqhBars.get(i)
+
+            bool useBody = sweepType == "body"
+            bool crossBody = close > yL
+            bool crossWick = high > yL
+            bool mitigated = useBody ? crossBody : crossWick
+
+            if mitigated or age > expiryBars
+                if high > yL and close < yL
+                    // Sweep — flash zone gray before removing
+                    box.set_border_color(eqhBoxes.get(i), sweptColor)
+                    box.set_bgcolor(eqhBoxes.get(i), color.new(sweptColor, 85))
+                    box.set_right(eqhBoxes.get(i), bar_index)
+                    bearSweepBar := true
+                    sweepsToday += 1
+                    if showSweepLabels
+                        label.new(bar_index, high, "⚡", style=label.style_none, textcolor=bearColor, size=size.tiny)
+                else
+                    box.delete(eqhBoxes.get(i))
+                eqhBoxes.remove(i)
+                eqhLevels.remove(i)
+                eqhBars.remove(i)
+            else
+                box.set_right(eqhBoxes.get(i), bar_index + 1)
+
+// --- Process EQL zones ---
+if eqlBoxes.size() > 0
+    for i = eqlBoxes.size() - 1 to 0
+        if i < eqlBoxes.size()
+            float yL  = eqlLevels.get(i)
+            int   age = bar_index - eqlBars.get(i)
+
+            bool useBody = sweepType == "body"
+            bool crossBody = close < yL
+            bool crossWick = low < yL
+            bool mitigated = useBody ? crossBody : crossWick
+
+            if mitigated or age > expiryBars
+                if low < yL and close > yL
+                    // Sweep — flash zone gray before removing
+                    box.set_border_color(eqlBoxes.get(i), sweptColor)
+                    box.set_bgcolor(eqlBoxes.get(i), color.new(sweptColor, 85))
+                    box.set_right(eqlBoxes.get(i), bar_index)
+                    bullSweepBar := true
+                    sweepsToday += 1
+                    if showSweepLabels
+                        label.new(bar_index, low, "⚡", style=label.style_none, textcolor=bullColor, size=size.tiny)
+                else
+                    box.delete(eqlBoxes.get(i))
+                eqlBoxes.remove(i)
+                eqlLevels.remove(i)
+                eqlBars.remove(i)
+            else
+                box.set_right(eqlBoxes.get(i), bar_index + 1)
+
+// ==========================================
+// PDH/PDL/PWH/PWL SWEEP DETECTION
+// ==========================================
+
+var bool pdhSwept = false
+var bool pdlSwept = false
+var bool pwhSwept = false
+var bool pwlSwept = false
+
+if ta.change(time("D")) != 0
+    pdhSwept := false
+    pdlSwept := false
+if ta.change(time("W")) != 0
+    pwhSwept := false
+    pwlSwept := false
+
+if showPDHL and not pdhSwept and not na(pdh) and high > pdh and close < pdh
+    bearSweepBar := true
+    sweepsToday += 1
+    pdhSwept := true
+    if showSweepLabels
+        label.new(bar_index, high, "⚡PDH", style=label.style_none, textcolor=bearColor, size=size.tiny)
+
+if showPDHL and not pdlSwept and not na(pdl) and low < pdl and close > pdl
+    bullSweepBar := true
+    sweepsToday += 1
+    pdlSwept := true
+    if showSweepLabels
+        label.new(bar_index, low, "⚡PDL", style=label.style_none, textcolor=bullColor, size=size.tiny)
+
+if showPWHL and not pwhSwept and not na(pwh) and high > pwh and close < pwh
+    bearSweepBar := true
+    sweepsToday += 1
+    pwhSwept := true
+    if showSweepLabels
+        label.new(bar_index, high, "⚡PWH", style=label.style_none, textcolor=bearColor, size=size.tiny)
+
+if showPWHL and not pwlSwept and not na(pwl) and low < pwl and close > pwl
+    bullSweepBar := true
+    sweepsToday += 1
+    pwlSwept := true
+    if showSweepLabels
+        label.new(bar_index, low, "⚡PWL", style=label.style_none, textcolor=bullColor, size=size.tiny)
+
+// ==========================================
+// BARCOLOR
+// ==========================================
+
+sweepBarCol = bullSweepBar ? bullColor : bearSweepBar ? bearColor : na
+barcolor(sweepBarCol)
+
+// ==========================================
+// DASHBOARD
+// ==========================================
+
+var table dash = table.new(position.top_right, 2, 5, bgcolor=color.new(color.black, 82), border_width=0)
+
+if barstate.islast
+    table.cell(dash, 0, 0, "Smart Liquidity Map", text_color=color.white, text_size=size.normal, text_halign=text.align_left)
+    table.cell(dash, 1, 0, "", text_color=color.white, text_size=size.normal)
+    table.cell(dash, 0, 1, "EQH: " + str.tostring(eqhBoxes.size()), text_color=bearColor, text_size=size.small, text_halign=text.align_left)
+    table.cell(dash, 1, 1, "EQL: " + str.tostring(eqlBoxes.size()), text_color=bullColor, text_size=size.small, text_halign=text.align_left)
+    table.cell(dash, 0, 2, "Sweeps Today: " + str.tostring(sweepsToday), text_color=color.white, text_size=size.small, text_halign=text.align_left)
+    table.cell(dash, 1, 2, "", text_color=color.white, text_size=size.small)
+    table.cell(dash, 0, 3, "PDH: " + str.tostring(pdh, format.mintick), text_color=bearColor, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(dash, 1, 3, "PDL: " + str.tostring(pdl, format.mintick), text_color=bullColor, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(dash, 0, 4, "PWH: " + str.tostring(pwh, format.mintick), text_color=bearColor, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(dash, 1, 4, "PWL: " + str.tostring(pwl, format.mintick), text_color=bullColor, text_size=size.tiny, text_halign=text.align_left)
+
+// ==========================================
+// ALERTS
+// ==========================================
+
+alertcondition(create_eqh, "New EQH Formed", "Equal High zone detected")
+alertcondition(create_eql, "New EQL Formed", "Equal Low zone detected")
+alertcondition(bearSweepBar, "Bearish Sweep", "Liquidity swept above a level")
+alertcondition(bullSweepBar, "Bullish Sweep", "Liquidity swept below a level")

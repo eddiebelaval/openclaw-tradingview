@@ -1,0 +1,533 @@
+//@version=6
+//------------------------------------------------------------------------------
+// AG Pro Failed Break Quality [AGPro Series] V1.0
+//------------------------------------------------------------------------------
+indicator("AG Pro Failed Break Quality [AGPro Series]", overlay=true, max_labels_count=400, max_lines_count=100)
+
+//------------------------------------------------------------------------------
+// INPUTS
+//------------------------------------------------------------------------------
+groupLevels   = "Levels"
+groupProfiles = "Profiles"
+groupLogic    = "Failed Break Logic"
+groupScore    = "Score"
+groupVisuals  = "Visuals"
+
+pivotLenBase         = input.int(4, "Base Pivot Length", minval=2, maxval=20, group=groupLevels)
+atrLen               = input.int(14, "ATR Length", minval=5, maxval=100, group=groupLevels)
+levelTolATRBase      = input.float(0.20, "Base Level Match Tolerance (ATR)", minval=0.05, maxval=1.0, step=0.01, group=groupLevels)
+minTouchesBase       = input.int(2, "Base Minimum Touches", minval=2, maxval=5, group=groupLevels)
+maxLevelAgeBase      = input.int(220, "Base Maximum Level Age (Bars)", minval=50, maxval=1000, group=groupLevels)
+
+useAutoProfiles      = input.bool(true, "Use Auto Profiles (recommended)", group=groupProfiles)
+
+minBreakATRBase      = input.float(0.08, "Base Minimum Break Depth (ATR)", minval=0.02, maxval=1.0, step=0.01, group=groupLogic)
+reclaimBarsBase      = input.int(6, "Base Maximum Bars Allowed For Reclaim", minval=1, maxval=30, group=groupLogic)
+followBarsBase       = input.int(1, "Base Follow-Through Bars", minval=0, maxval=20, group=groupLogic)
+reclaimBufferATRBase = input.float(0.01, "Base Reclaim Buffer (ATR)", minval=0.0, maxval=0.5, step=0.01, group=groupLogic)
+followThroughATRBase = input.float(0.05, "Base Minimum Follow-Through (ATR)", minval=0.0, maxval=1.0, step=0.01, group=groupLogic)
+maxAdverseATRBase    = input.float(0.45, "Base Maximum Adverse Move (ATR)", minval=0.05, maxval=2.0, step=0.01, group=groupLogic)
+rearmDistanceATRBase = input.float(1.35, "Base Re-arm Distance (ATR)", minval=0.10, maxval=5.0, step=0.05, group=groupLogic)
+familyResetATRBase   = input.float(0.55, "Base Family Reset Band (ATR)", minval=0.05, maxval=3.0, step=0.05, group=groupLogic)
+
+minScoreToPrintBase  = input.int(62, "Base Minimum Score To Print", minval=0, maxval=100, group=groupScore)
+weightLevel          = input.float(0.20, "Weight - Level Integrity", minval=0.0, maxval=1.0, step=0.05, group=groupScore)
+weightBreak          = input.float(0.20, "Weight - Break Weakness", minval=0.0, maxval=1.0, step=0.05, group=groupScore)
+weightSpeed          = input.float(0.20, "Weight - Reclaim Speed", minval=0.0, maxval=1.0, step=0.05, group=groupScore)
+weightReject         = input.float(0.20, "Weight - Rejection Strength", minval=0.0, maxval=1.0, step=0.05, group=groupScore)
+weightFollow         = input.float(0.20, "Weight - Follow-Through", minval=0.0, maxval=1.0, step=0.05, group=groupScore)
+
+showSupportResistance = input.bool(true, "Show Confirmed Levels", group=groupVisuals)
+showLevelZones        = input.bool(true, "Show Narrow Level Zones", group=groupVisuals)
+showStructureTags     = input.bool(true, "Show Structure Tags", group=groupVisuals)
+showDebugMarkers      = input.bool(false, "Show Debug Markers", group=groupVisuals)
+labelSizeInput        = input.string("Normal", "Signal Label Size", options=["Tiny", "Small", "Normal", "Large"], group=groupVisuals)
+structureTagSizeInput = input.string("Normal", "Structure Tag Size", options=["Tiny", "Small", "Normal", "Large"], group=groupVisuals)
+structureTagBarsForward = input.int(4, "Structure Tag Bars Forward", minval=1, maxval=20, group=groupVisuals)
+signalOffsetATR       = input.float(0.16, "Signal Label Offset (ATR)", minval=0.01, maxval=2.0, step=0.01, group=groupVisuals)
+
+//------------------------------------------------------------------------------
+// HELPERS
+//------------------------------------------------------------------------------
+f_clamp(_x, _lo, _hi) =>
+    math.max(_lo, math.min(_hi, _x))
+
+f_size(_s) =>
+    _s == "Tiny" ? size.tiny : _s == "Small" ? size.small : _s == "Large" ? size.large : size.normal
+
+f_line_color(_isSupport) =>
+    _isSupport ? color.new(color.teal, 0) : color.new(color.orange, 0)
+
+f_zone_color(_isSupport) =>
+    _isSupport ? color.new(color.teal, 87) : color.new(color.orange, 87)
+
+f_signal_bg(_isBullish) =>
+    _isBullish ? color.new(color.teal, 0) : color.new(color.red, 0)
+
+f_structure_bg(_isSupport) =>
+    _isSupport ? color.new(color.teal, 78) : color.new(color.orange, 78)
+
+f_structure_text(_isSupport) =>
+    _isSupport ? color.teal : color.orange
+
+f_reject_score_bull(_o, _h, _l, _c) =>
+    _rng = math.max(_h - _l, syminfo.mintick)
+    _lowerWick = math.max(math.min(_o, _c) - _l, 0.0)
+    _closePos = (_c - _l) / _rng
+    _body = math.abs(_c - _o) / _rng
+    f_clamp((_lowerWick / _rng) * 45.0 + _closePos * 35.0 + _body * 20.0, 0.0, 100.0)
+
+f_reject_score_bear(_o, _h, _l, _c) =>
+    _rng = math.max(_h - _l, syminfo.mintick)
+    _upperWick = math.max(_h - math.max(_o, _c), 0.0)
+    _closePos = (_h - _c) / _rng
+    _body = math.abs(_c - _o) / _rng
+    f_clamp((_upperWick / _rng) * 45.0 + _closePos * 35.0 + _body * 20.0, 0.0, 100.0)
+
+f_final_score(_s1, _s2, _s3, _s4, _s5, _w1, _w2, _w3, _w4, _w5) =>
+    _sumW = _w1 + _w2 + _w3 + _w4 + _w5
+    _sumW <= 0 ? 0.0 : ((_s1 * _w1) + (_s2 * _w2) + (_s3 * _w3) + (_s4 * _w4) + (_s5 * _w5)) / _sumW
+
+//------------------------------------------------------------------------------
+// PROFILE LOGIC
+//------------------------------------------------------------------------------
+tfMinutes = timeframe.isintraday ? timeframe.multiplier : timeframe.isdaily ? 1440 : timeframe.isweekly ? 10080 : timeframe.ismonthly ? 43200 : 60
+isHourlyProfile = tfMinutes <= 90
+isH4Profile = tfMinutes > 90 and tfMinutes <= 240
+isSwingProfile = tfMinutes > 240
+
+tolMult         = useAutoProfiles ? (isHourlyProfile ? 1.08 : isH4Profile ? 1.00 : 1.45) : 1.00
+breakMult       = useAutoProfiles ? (isHourlyProfile ? 0.88 : isH4Profile ? 1.00 : 1.50) : 1.00
+reclaimMult     = useAutoProfiles ? (isHourlyProfile ? 1.25 : isH4Profile ? 1.00 : 2.00) : 1.00
+followBarsEff   = useAutoProfiles ? (isSwingProfile ? math.max(followBarsBase, 2) : followBarsBase) : followBarsBase
+bufferMult      = useAutoProfiles ? (isHourlyProfile ? 0.82 : isH4Profile ? 1.00 : 1.35) : 1.00
+followMult      = useAutoProfiles ? (isHourlyProfile ? 0.82 : isH4Profile ? 1.00 : 1.35) : 1.00
+adverseMult     = useAutoProfiles ? (isHourlyProfile ? 1.12 : isH4Profile ? 1.00 : 1.25) : 1.00
+rearmMult       = useAutoProfiles ? (isHourlyProfile ? 1.00 : isH4Profile ? 1.00 : 1.45) : 1.00
+familyMult      = useAutoProfiles ? (isHourlyProfile ? 1.30 : isH4Profile ? 1.00 : 1.45) : 1.00
+scoreAdj        = useAutoProfiles ? (isHourlyProfile ? -3 : isH4Profile ? 0 : -1) : 0
+touchesExtra    = useAutoProfiles ? (isHourlyProfile ? 0 : 0) : 0
+
+pivotLen         = pivotLenBase
+minTouchesEff    = minTouchesBase + touchesExtra
+maxLevelAgeEff   = int(math.max(50.0, math.round(maxLevelAgeBase * (useAutoProfiles ? (isSwingProfile ? 1.30 : 1.00) : 1.00))))
+levelTolATR      = levelTolATRBase * tolMult
+minBreakATR      = minBreakATRBase * breakMult
+reclaimBars      = int(math.max(1.0, math.round(reclaimBarsBase * reclaimMult)))
+followBars       = followBarsEff
+reclaimBufferATR = reclaimBufferATRBase * bufferMult
+followThroughATR = followThroughATRBase * followMult
+maxAdverseATR    = maxAdverseATRBase * adverseMult
+rearmDistanceATR = rearmDistanceATRBase * rearmMult
+familyResetATR   = familyResetATRBase * familyMult
+minScoreToPrint  = minScoreToPrintBase + scoreAdj
+
+//------------------------------------------------------------------------------
+// CORE SERIES
+//------------------------------------------------------------------------------
+atr = ta.atr(atrLen)
+levelTol = atr * levelTolATR
+breakDepth = atr * minBreakATR
+reclaimBuffer = atr * reclaimBufferATR
+followReq = atr * followThroughATR
+rearmDistance = atr * rearmDistanceATR
+familyResetBand = atr * familyResetATR
+sigOffset = atr * signalOffsetATR
+lblSize = f_size(labelSizeInput)
+structureTagSize = f_size(structureTagSizeInput)
+
+ph = ta.pivothigh(high, pivotLen, pivotLen)
+pl = ta.pivotlow(low, pivotLen, pivotLen)
+
+//------------------------------------------------------------------------------
+// LEVEL BUILDING - SUPPORT
+//------------------------------------------------------------------------------
+var float supportCandidatePrice = na
+var int   supportCandidateTouches = 0
+var int   supportCandidateLastBar = na
+
+var float confirmedSupport = na
+var int   confirmedSupportTouches = 0
+var int   confirmedSupportBar = na
+var int   supportFamilyId = 0
+
+if not na(pl)
+    pivotBar = bar_index - pivotLen
+    pivotPrice = pl
+
+    if na(supportCandidatePrice) or na(supportCandidateLastBar) or (pivotBar - supportCandidateLastBar > maxLevelAgeEff)
+        supportCandidatePrice := pivotPrice
+        supportCandidateTouches := 1
+        supportCandidateLastBar := pivotBar
+    else
+        if math.abs(pivotPrice - supportCandidatePrice) <= levelTol
+            supportCandidatePrice := (supportCandidatePrice * supportCandidateTouches + pivotPrice) / (supportCandidateTouches + 1)
+            supportCandidateTouches += 1
+            supportCandidateLastBar := pivotBar
+        else
+            supportCandidatePrice := pivotPrice
+            supportCandidateTouches := 1
+            supportCandidateLastBar := pivotBar
+
+    if supportCandidateTouches >= minTouchesEff
+        isNewFamily = na(confirmedSupport) or math.abs(supportCandidatePrice - confirmedSupport) > familyResetBand
+        confirmedSupport := supportCandidatePrice
+        confirmedSupportTouches := supportCandidateTouches
+        confirmedSupportBar := supportCandidateLastBar
+        if isNewFamily
+            supportFamilyId += 1
+
+if not na(confirmedSupportBar) and bar_index - confirmedSupportBar > maxLevelAgeEff
+    confirmedSupport := na
+    confirmedSupportTouches := 0
+    confirmedSupportBar := na
+
+//------------------------------------------------------------------------------
+// LEVEL BUILDING - RESISTANCE
+//------------------------------------------------------------------------------
+var float resistanceCandidatePrice = na
+var int   resistanceCandidateTouches = 0
+var int   resistanceCandidateLastBar = na
+
+var float confirmedResistance = na
+var int   confirmedResistanceTouches = 0
+var int   confirmedResistanceBar = na
+var int   resistanceFamilyId = 0
+
+if not na(ph)
+    pivotBar = bar_index - pivotLen
+    pivotPrice = ph
+
+    if na(resistanceCandidatePrice) or na(resistanceCandidateLastBar) or (pivotBar - resistanceCandidateLastBar > maxLevelAgeEff)
+        resistanceCandidatePrice := pivotPrice
+        resistanceCandidateTouches := 1
+        resistanceCandidateLastBar := pivotBar
+    else
+        if math.abs(pivotPrice - resistanceCandidatePrice) <= levelTol
+            resistanceCandidatePrice := (resistanceCandidatePrice * resistanceCandidateTouches + pivotPrice) / (resistanceCandidateTouches + 1)
+            resistanceCandidateTouches += 1
+            resistanceCandidateLastBar := pivotBar
+        else
+            resistanceCandidatePrice := pivotPrice
+            resistanceCandidateTouches := 1
+            resistanceCandidateLastBar := pivotBar
+
+    if resistanceCandidateTouches >= minTouchesEff
+        isNewFamily = na(confirmedResistance) or math.abs(resistanceCandidatePrice - confirmedResistance) > familyResetBand
+        confirmedResistance := resistanceCandidatePrice
+        confirmedResistanceTouches := resistanceCandidateTouches
+        confirmedResistanceBar := resistanceCandidateLastBar
+        if isNewFamily
+            resistanceFamilyId += 1
+
+if not na(confirmedResistanceBar) and bar_index - confirmedResistanceBar > maxLevelAgeEff
+    confirmedResistance := na
+    confirmedResistanceTouches := 0
+    confirmedResistanceBar := na
+
+//------------------------------------------------------------------------------
+// LEVEL VISUALS
+//------------------------------------------------------------------------------
+var line supportLine = na
+var line resistanceLine = na
+var label supportTag = na
+var label resistanceTag = na
+
+if showSupportResistance
+    if not na(confirmedSupport)
+        if na(supportLine)
+            supportLine := line.new(confirmedSupportBar, confirmedSupport, bar_index + 2, confirmedSupport, extend=extend.right, color=f_line_color(true), width=2)
+        else
+            line.set_xy1(supportLine, confirmedSupportBar, confirmedSupport)
+            line.set_xy2(supportLine, bar_index + 2, confirmedSupport)
+            line.set_extend(supportLine, extend.right)
+            line.set_width(supportLine, 2)
+            line.set_color(supportLine, f_line_color(true))
+    else
+        if not na(supportLine)
+            line.delete(supportLine)
+            supportLine := na
+
+    if not na(confirmedResistance)
+        if na(resistanceLine)
+            resistanceLine := line.new(confirmedResistanceBar, confirmedResistance, bar_index + 2, confirmedResistance, extend=extend.right, color=f_line_color(false), width=2)
+        else
+            line.set_xy1(resistanceLine, confirmedResistanceBar, confirmedResistance)
+            line.set_xy2(resistanceLine, bar_index + 2, confirmedResistance)
+            line.set_extend(resistanceLine, extend.right)
+            line.set_width(resistanceLine, 2)
+            line.set_color(resistanceLine, f_line_color(false))
+    else
+        if not na(resistanceLine)
+            line.delete(resistanceLine)
+            resistanceLine := na
+
+supportZoneTop = showLevelZones and not na(confirmedSupport) ? confirmedSupport + levelTol * 0.50 : na
+supportZoneBot = showLevelZones and not na(confirmedSupport) ? confirmedSupport - levelTol * 0.50 : na
+resZoneTop     = showLevelZones and not na(confirmedResistance) ? confirmedResistance + levelTol * 0.50 : na
+resZoneBot     = showLevelZones and not na(confirmedResistance) ? confirmedResistance - levelTol * 0.50 : na
+
+pSupTop = plot(supportZoneTop, color=color.new(color.teal, 100))
+pSupBot = plot(supportZoneBot, color=color.new(color.teal, 100))
+fill(pSupTop, pSupBot, color=showLevelZones ? f_zone_color(true) : color.new(color.teal, 100))
+
+pResTop = plot(resZoneTop, color=color.new(color.orange, 100))
+pResBot = plot(resZoneBot, color=color.new(color.orange, 100))
+fill(pResTop, pResBot, color=showLevelZones ? f_zone_color(false) : color.new(color.orange, 100))
+
+zonesClose = not na(confirmedSupport) and not na(confirmedResistance) and math.abs(confirmedResistance - confirmedSupport) <= atr * 1.10
+
+if showStructureTags
+    if not na(confirmedSupport)
+        tagY = confirmedSupport + (zonesClose ? math.max(levelTol * 1.50, atr * 0.45) : math.max(levelTol * 0.80, atr * 0.25))
+        if na(supportTag)
+            supportTag := label.new(bar_index + structureTagBarsForward, tagY, "Support Zone", xloc=xloc.bar_index, yloc=yloc.price, style=label.style_label_left, color=f_structure_bg(true), textcolor=f_structure_text(true), size=structureTagSize)
+        else
+            label.set_xy(supportTag, bar_index + structureTagBarsForward, tagY)
+            label.set_text(supportTag, "Support Zone")
+            label.set_style(supportTag, label.style_label_left)
+            label.set_color(supportTag, f_structure_bg(true))
+            label.set_textcolor(supportTag, f_structure_text(true))
+            label.set_size(supportTag, structureTagSize)
+    else
+        if not na(supportTag)
+            label.delete(supportTag)
+            supportTag := na
+
+    if not na(confirmedResistance)
+        tagY = confirmedResistance - (zonesClose ? math.max(levelTol * 1.50, atr * 0.45) : math.max(levelTol * 0.80, atr * 0.25))
+        if na(resistanceTag)
+            resistanceTag := label.new(bar_index + structureTagBarsForward, tagY, "Resistance Zone", xloc=xloc.bar_index, yloc=yloc.price, style=label.style_label_left, color=f_structure_bg(false), textcolor=f_structure_text(false), size=structureTagSize)
+        else
+            label.set_xy(resistanceTag, bar_index + structureTagBarsForward, tagY)
+            label.set_text(resistanceTag, "Resistance Zone")
+            label.set_style(resistanceTag, label.style_label_left)
+            label.set_color(resistanceTag, f_structure_bg(false))
+            label.set_textcolor(resistanceTag, f_structure_text(false))
+            label.set_size(resistanceTag, structureTagSize)
+    else
+        if not na(resistanceTag)
+            label.delete(resistanceTag)
+            resistanceTag := na
+else
+    if not na(supportTag)
+        label.delete(supportTag)
+        supportTag := na
+    if not na(resistanceTag)
+        label.delete(resistanceTag)
+        resistanceTag := na
+
+//------------------------------------------------------------------------------
+// FAMILY LOCKS
+//------------------------------------------------------------------------------
+var int   bullLockedFamilyId = na
+var float bullLockedLevel = na
+
+var int   bearLockedFamilyId = na
+var float bearLockedLevel = na
+
+if not na(bullLockedFamilyId)
+    canReleaseByNewFamily = supportFamilyId != bullLockedFamilyId
+    if canReleaseByNewFamily
+        bullLockedFamilyId := na
+        bullLockedLevel := na
+
+if not na(bearLockedFamilyId)
+    canReleaseByNewFamily = resistanceFamilyId != bearLockedFamilyId
+    if canReleaseByNewFamily
+        bearLockedFamilyId := na
+        bearLockedLevel := na
+
+//------------------------------------------------------------------------------
+// BULLISH RECLAIM STATE
+//------------------------------------------------------------------------------
+var int   bullState = 0
+var float bullLevel = na
+var int   bullBreakBar = na
+var int   bullReclaimBar = na
+var float bullBreakExtreme = na
+var int   bullBreakOutsideCloses = 0
+var int   bullTouchesAtBreak = 0
+var float bullATRAtBreak = na
+var float bullRejectScore = na
+var float bullMaxHighAfterReclaim = na
+var float bullMinLowAfterReclaim = na
+var float bullReclaimLow = na
+var float bullReclaimRange = na
+var int   bullEventFamilyId = na
+
+canStartBull = not na(confirmedSupport) and bullState == 0 and (na(bullLockedFamilyId) or supportFamilyId != bullLockedFamilyId)
+
+if canStartBull
+    bullBreakCond = low < confirmedSupport - breakDepth
+    if bullBreakCond
+        bullState := 1
+        bullLevel := confirmedSupport
+        bullBreakBar := bar_index
+        bullReclaimBar := na
+        bullBreakExtreme := low
+        bullBreakOutsideCloses := close < confirmedSupport ? 1 : 0
+        bullTouchesAtBreak := confirmedSupportTouches
+        bullATRAtBreak := atr
+        bullRejectScore := na
+        bullMaxHighAfterReclaim := na
+        bullMinLowAfterReclaim := na
+        bullReclaimLow := na
+        bullReclaimRange := na
+        bullEventFamilyId := supportFamilyId
+
+if bullState == 1
+    bullBreakExtreme := math.min(bullBreakExtreme, low)
+    bullBreakOutsideCloses += close < bullLevel ? 1 : 0
+
+    timedOut = bar_index - bullBreakBar > reclaimBars
+    familyChanged = supportFamilyId != bullEventFamilyId
+    reclaimCond = close > bullLevel + reclaimBuffer
+
+    if reclaimCond
+        bullState := 2
+        bullReclaimBar := bar_index
+        bullRejectScore := f_reject_score_bull(open, high, low, close)
+        bullMaxHighAfterReclaim := high
+        bullMinLowAfterReclaim := low
+        bullReclaimLow := low
+        bullReclaimRange := high - low
+    else
+        if timedOut or familyChanged
+            bullState := 0
+
+if bullState == 2
+    bullMaxHighAfterReclaim := math.max(bullMaxHighAfterReclaim, high)
+    bullMinLowAfterReclaim := math.min(bullMinLowAfterReclaim, low)
+
+//------------------------------------------------------------------------------
+// BEARISH RECLAIM STATE
+//------------------------------------------------------------------------------
+var int   bearState = 0
+var float bearLevel = na
+var int   bearBreakBar = na
+var int   bearReclaimBar = na
+var float bearBreakExtreme = na
+var int   bearBreakOutsideCloses = 0
+var int   bearTouchesAtBreak = 0
+var float bearATRAtBreak = na
+var float bearRejectScore = na
+var float bearMaxHighAfterReclaim = na
+var float bearMinLowAfterReclaim = na
+var float bearReclaimHigh = na
+var float bearReclaimRange = na
+var int   bearEventFamilyId = na
+
+canStartBear = not na(confirmedResistance) and bearState == 0 and (na(bearLockedFamilyId) or resistanceFamilyId != bearLockedFamilyId)
+
+if canStartBear
+    bearBreakCond = high > confirmedResistance + breakDepth
+    if bearBreakCond
+        bearState := 1
+        bearLevel := confirmedResistance
+        bearBreakBar := bar_index
+        bearReclaimBar := na
+        bearBreakExtreme := high
+        bearBreakOutsideCloses := close > confirmedResistance ? 1 : 0
+        bearTouchesAtBreak := confirmedResistanceTouches
+        bearATRAtBreak := atr
+        bearRejectScore := na
+        bearMaxHighAfterReclaim := na
+        bearMinLowAfterReclaim := na
+        bearReclaimHigh := na
+        bearReclaimRange := na
+        bearEventFamilyId := resistanceFamilyId
+
+if bearState == 1
+    bearBreakExtreme := math.max(bearBreakExtreme, high)
+    bearBreakOutsideCloses += close > bearLevel ? 1 : 0
+
+    timedOut = bar_index - bearBreakBar > reclaimBars
+    familyChanged = resistanceFamilyId != bearEventFamilyId
+    reclaimCond = close < bearLevel - reclaimBuffer
+
+    if reclaimCond
+        bearState := 2
+        bearReclaimBar := bar_index
+        bearRejectScore := f_reject_score_bear(open, high, low, close)
+        bearMaxHighAfterReclaim := high
+        bearMinLowAfterReclaim := low
+        bearReclaimHigh := high
+        bearReclaimRange := high - low
+    else
+        if timedOut or familyChanged
+            bearState := 0
+
+if bearState == 2
+    bearMaxHighAfterReclaim := math.max(bearMaxHighAfterReclaim, high)
+    bearMinLowAfterReclaim := math.min(bearMinLowAfterReclaim, low)
+
+//------------------------------------------------------------------------------
+// SCORE + SIGNALS
+//------------------------------------------------------------------------------
+var bool signalBull = false
+var bool signalBear = false
+signalBull := false
+signalBear := false
+
+if bullState == 2 and not na(bullReclaimBar) and bar_index - bullReclaimBar >= followBars
+    bullPenATR = math.abs(bullLevel - bullBreakExtreme) / math.max(bullATRAtBreak, syminfo.mintick)
+    bullLevelScore = f_clamp(45 + (bullTouchesAtBreak - minTouchesEff) * 18, 0, 100)
+    bullBreakScore = f_clamp(100 - (bullPenATR * 45) - ((bullBreakOutsideCloses - 1) * 10), 0, 100)
+    bullSpeedScore = f_clamp(100 - ((bullReclaimBar - bullBreakBar) * (100.0 / math.max(reclaimBars, 1))), 0, 100)
+
+    bullFavATR = (bullMaxHighAfterReclaim - bullLevel) / math.max(bullATRAtBreak, syminfo.mintick)
+    bullAdvATR = (bullLevel - bullMinLowAfterReclaim) / math.max(bullATRAtBreak, syminfo.mintick)
+    bullFollowScore = f_clamp(55 + (bullFavATR * 28) - (bullAdvATR * 30), 0, 100)
+
+    bullFollowOk = bullMaxHighAfterReclaim >= bullLevel + followReq and bullAdvATR <= maxAdverseATR
+    bullFinalScore = f_final_score(bullLevelScore, bullBreakScore, bullSpeedScore, bullRejectScore, bullFollowScore, weightLevel, weightBreak, weightSpeed, weightReject, weightFollow)
+    bullPrint = bullFinalScore >= minScoreToPrint and bullFollowOk
+
+    if bullPrint
+        bullDynOffset = math.max(sigOffset, nz(bullReclaimRange, 0.0) * 0.35)
+        bullBaseY = math.min(bullReclaimLow, bullLevel - levelTol * 0.35)
+        label.new(bullReclaimBar, bullBaseY - bullDynOffset, "Bullish Reclaim\n" + str.tostring(math.round(bullFinalScore)), xloc=xloc.bar_index, yloc=yloc.price, style=label.style_label_up, color=f_signal_bg(true), textcolor=color.white, size=lblSize)
+        signalBull := true
+        bullLockedFamilyId := bullEventFamilyId
+        bullLockedLevel := bullLevel
+
+    bullState := 0
+
+if bearState == 2 and not na(bearReclaimBar) and bar_index - bearReclaimBar >= followBars
+    bearPenATR = math.abs(bearBreakExtreme - bearLevel) / math.max(bearATRAtBreak, syminfo.mintick)
+    bearLevelScore = f_clamp(45 + (bearTouchesAtBreak - minTouchesEff) * 18, 0, 100)
+    bearBreakScore = f_clamp(100 - (bearPenATR * 45) - ((bearBreakOutsideCloses - 1) * 10), 0, 100)
+    bearSpeedScore = f_clamp(100 - ((bearReclaimBar - bearBreakBar) * (100.0 / math.max(reclaimBars, 1))), 0, 100)
+
+    bearFavATR = (bearLevel - bearMinLowAfterReclaim) / math.max(bearATRAtBreak, syminfo.mintick)
+    bearAdvATR = (bearMaxHighAfterReclaim - bearLevel) / math.max(bearATRAtBreak, syminfo.mintick)
+    bearFollowScore = f_clamp(55 + (bearFavATR * 28) - (bearAdvATR * 30), 0, 100)
+
+    bearFollowOk = bearMinLowAfterReclaim <= bearLevel - followReq and bearAdvATR <= maxAdverseATR
+    bearFinalScore = f_final_score(bearLevelScore, bearBreakScore, bearSpeedScore, bearRejectScore, bearFollowScore, weightLevel, weightBreak, weightSpeed, weightReject, weightFollow)
+    bearPrint = bearFinalScore >= minScoreToPrint and bearFollowOk
+
+    if bearPrint
+        bearDynOffset = math.max(sigOffset, nz(bearReclaimRange, 0.0) * 0.35)
+        bearBaseY = math.max(bearReclaimHigh, bearLevel + levelTol * 0.35)
+        label.new(bearReclaimBar, bearBaseY + bearDynOffset, "Bearish Reclaim\n" + str.tostring(math.round(bearFinalScore)), xloc=xloc.bar_index, yloc=yloc.price, style=label.style_label_down, color=f_signal_bg(false), textcolor=color.white, size=lblSize)
+        signalBear := true
+        bearLockedFamilyId := bearEventFamilyId
+        bearLockedLevel := bearLevel
+
+    bearState := 0
+
+//------------------------------------------------------------------------------
+// DEBUG
+//------------------------------------------------------------------------------
+plotshape(showDebugMarkers and bullState == 1, title="Bull Break Seen", style=shape.circle, location=location.belowbar, color=color.new(color.teal, 0), size=size.tiny)
+plotshape(showDebugMarkers and bullState == 2, title="Bull Reclaim Seen", style=shape.circle, location=location.belowbar, color=color.new(color.green, 0), size=size.tiny)
+plotshape(showDebugMarkers and bearState == 1, title="Bear Break Seen", style=shape.circle, location=location.abovebar, color=color.new(color.orange, 0), size=size.tiny)
+plotshape(showDebugMarkers and bearState == 2, title="Bear Reclaim Seen", style=shape.circle, location=location.abovebar, color=color.new(color.red, 0), size=size.tiny)
+
+//------------------------------------------------------------------------------
+// ALERTS
+//------------------------------------------------------------------------------
+alertcondition(signalBull, title="Bullish Reclaim", message="AG Pro Failed Break Reclaim Quality - Bullish reclaim confirmed")
+alertcondition(signalBear, title="Bearish Reclaim", message="AG Pro Failed Break Reclaim Quality - Bearish reclaim confirmed")

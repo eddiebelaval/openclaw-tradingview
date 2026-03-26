@@ -1,0 +1,302 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © Rumiancev
+
+//@version=5
+indicator("Liquidation Heatmap by Rumiancev",
+     overlay=true, max_boxes_count=500, max_lines_count=1, max_labels_count=1, max_bars_back=5000)
+
+//──────────────────────────────────────────────────────────────────────────────
+// INPUTS
+//──────────────────────────────────────────────────────────────────────────────
+groupSrc = "Source"
+srcMode = input.string("AUTO", "Source Mode", options=["AUTO","VOL","OI"], group=groupSrc,
+     tooltip="AUTO: uses OI (delta) if available, otherwise Volume.\nVOL: volume-only.\nOI: uses futures Open Interest delta.")
+oiOverride = input.string("", "OI Symbol Override", group=groupSrc,
+     tooltip="Example:\nBINANCE:BTCUSDT.P_OI\nBYBIT:BTCUSDT.P_OI\n\nLeave empty for auto: BINANCE:BASEUSDT.P_OI")
+
+groupEvent = "Event (Spike) Filter"
+lookback  = input.int(100, "Spike Lookback", minval=20, maxval=2000, group=groupEvent)
+sens      = input.int(10, "Sensitivity (1=more, 20=less)", minval=1, maxval=20, group=groupEvent)
+useWicks  = input.bool(true, "Use high/low for touch test", group=groupEvent)
+minBarGap = input.int(0, "Min bars between events (0=off)", minval=0, maxval=500, group=groupEvent,
+     tooltip="Debounce: prevents creating clusters too frequently.")
+
+groupLevels = "Liquidation Levels (bins)"
+refPL = input.string("close", "Reference Price", options=["open","close","oc2","hl2","hlc3","ohlc4","hlcc4"], group=groupLevels)
+lev1  = input.int(100, "Leverage 1", minval=0, group=groupLevels)
+lev2  = input.int(50,  "Leverage 2", minval=0, group=groupLevels)
+lev3  = input.int(25,  "Leverage 3", minval=0, group=groupLevels)
+
+scaleTicks = input.int(600, "Bin Scale (ticks)", minval=10, maxval=50000, group=groupLevels,
+     tooltip="Bin height = syminfo.mintick * scaleTicks. Larger = fewer, thicker bins.")
+extendBars = input.int(100, "Extend (bars)", minval=10, maxval=2000, group=groupLevels)
+storage    = input.int(240, "Max active bins per side", minval=20, maxval=260, group=groupLevels,
+     tooltip="Active long bins + active short bins. Frozen bins stay on chart but stop updating.")
+dispPct = input.float(20, "Dispersion (%)", minval=0, maxval=100, step=1, group=groupLevels,
+     tooltip="Splits part of flow to opposite side to mimic mixed positioning (0..100).") / 100.0
+
+localOnly = input.bool(false, "Keep only local range bins", group=groupLevels,
+     tooltip="Deletes active bins far away from recent range.")
+localBars = input.int(250, "Local range lookback", minval=50, maxval=2000, group=groupLevels)
+
+groupVis = "Visual"
+topColor = input.color(color.rgb(187, 255, 0), "High density", group=groupVis)
+btmColor = input.color(#228B22, "Low density", group=groupVis)
+frozenAlpha = input.int(80, "Frozen alpha (0..100)", minval=0, maxval=100, group=groupVis)
+showLegend = input.bool(false, "Show legend", group=groupVis)
+showSpikeMarker = input.bool(false, "Show spike marker (debug)", group=groupVis)
+
+//──────────────────────────────────────────────────────────────────────────────
+// HELPERS
+//──────────────────────────────────────────────────────────────────────────────
+f_gSRC(_s) =>
+    switch _s
+        "open"  => open
+        "close" => close
+        "hl2"   => hl2
+        "oc2"   => math.avg(open, close)
+        "hlc3"  => hlc3
+        "ohlc4" => ohlc4
+        "hlcc4" => hlcc4
+
+// longs liquidate below entry:  p*(1 - 1/lev)
+// shorts liquidate above entry: p*(1 + 1/lev)
+f_liq_price(_ref, _lev, _isLongSide) =>
+    _lev <= 0 ? na :
+     _isLongSide ? _ref * (1.0 - 1.0 / _lev) : _ref * (1.0 + 1.0 / _lev)
+
+f_step() =>
+    syminfo.mintick * scaleTicks
+
+f_bin_extremes(_price) =>
+    step = f_step()
+    btm  = math.floor(_price / step) * step
+    top  = btm + step
+    [top, btm]
+
+f_grad(_w, _maxW) =>
+    _maxW <= 0 ? color.new(btmColor, 85) :
+     color.from_gradient(_w, 0.0, _maxW, color.new(btmColor, 85), color.new(topColor, 15))
+
+f_touches(_top, _btm) =>
+    hi = useWicks ? high : close
+    lo = useWicks ? low  : close
+    (hi > _btm and lo < _top)
+
+//──────────────────────────────────────────────────────────────────────────────
+// SOURCE: OI (delta) + VOL fallback
+//──────────────────────────────────────────────────────────────────────────────
+base = syminfo.basecurrency
+autoOiSym = "BINANCE:" + base + "USDT.P_OI"
+oiSym = (str.length(oiOverride) > 0) ? oiOverride : autoOiSym
+
+oiClose = request.security(oiSym, timeframe.period, close, ignore_invalid_symbol=true)
+oiDelta = oiClose - nz(oiClose[1])
+haveOI  = not na(oiClose) and not na(oiDelta)
+
+refP = f_gSRC(refPL)
+
+// Decide which stream to use
+useOI   = srcMode == "OI" ? true : srcMode == "VOL" ? false : haveOI
+stream  = useOI ? oiDelta : volume
+streamAbs = math.abs(stream)
+
+// Spike threshold mapping: sens 1 -> 1.0, sens 20 -> 3.0
+thr = 1.0 + (sens - 1) * (2.0 / 19.0)
+
+// Z-score-ish
+mu  = ta.sma(streamAbs, lookback)
+sd  = ta.stdev(streamAbs, lookback)
+z   = sd > 0 ? (streamAbs - mu) / sd : 0.0
+
+// Debounce events
+var int lastEventBar = na
+canEvent = na(lastEventBar) ? true : (minBarGap <= 0 ? true : (bar_index - lastEventBar >= minBarGap))
+
+isSpike = canEvent and z > thr
+if isSpike
+    lastEventBar := bar_index
+
+w = na(streamAbs) ? 0.0 : streamAbs
+
+// Flow split by candle direction + dispersion
+isUp = close >= open
+mainFrac = 1.0 - dispPct
+altFrac  = dispPct
+
+longW  = (isUp ? w * mainFrac : w * altFrac)
+shortW = (isUp ? w * altFrac  : w * mainFrac)
+
+//──────────────────────────────────────────────────────────────────────────────
+// DATA STRUCTS (active bins)
+//──────────────────────────────────────────────────────────────────────────────
+var float[] L_prices = array.new_float()
+var float[] L_w      = array.new_float()
+var box[]   L_box    = array.new_box()
+
+var float[] S_prices = array.new_float()
+var float[] S_w      = array.new_float()
+var box[]   S_box    = array.new_box()
+
+var int frozenCount = 0
+
+f_maxW(_wArr) =>
+    mx = 0.0
+    if array.size(_wArr) > 0
+        for i = 0 to array.size(_wArr) - 1
+            mx := math.max(mx, array.get(_wArr, i))
+    mx
+
+f_update_colors(_wArr, _bArr) =>
+    if array.size(_wArr) > 0 and array.size(_bArr) > 0
+        mx = f_maxW(_wArr)
+        for i = 0 to array.size(_wArr) - 1
+            ww = array.get(_wArr, i)
+            bb = array.get(_bArr, i)
+            col = f_grad(ww, mx)
+            box.set_bgcolor(bb, col)
+            box.set_border_color(bb, col)
+
+// add/update one bin (key = top)
+// returns int: 1 if added/updated, 0 otherwise
+f_add_bin(_prices, _wArr, _bArr, _priceTop, _priceBtm, _weight) =>
+    int changed = 0
+    if _weight > 0
+        key = _priceTop
+        idx = array.indexof(_prices, key)
+        if idx >= 0
+            array.set(_wArr, idx, array.get(_wArr, idx) + _weight)
+            bb = array.get(_bArr, idx)
+            box.set_right(bb, bar_index + extendBars)
+            changed := 1
+        else
+            if array.size(_prices) >= storage
+                old = array.shift(_bArr)
+                array.shift(_prices)
+                array.shift(_wArr)
+                box.delete(old)
+
+            col = f_grad(_weight, _weight)
+            bb = box.new(bar_index, _priceTop, bar_index + extendBars, _priceBtm,
+                 border_color=col, bgcolor=col, border_width=1)
+
+            array.push(_prices, key)
+            array.push(_wArr, _weight)
+            array.push(_bArr, bb)
+            changed := 1
+    changed
+
+// Freeze bins on touch: stop updating + dotted border + transparency
+f_freeze_touched(_prices, _wArr, _bArr) =>
+    int frozenN = 0
+    if array.size(_prices) > 0 and array.size(_bArr) > 0
+        for i = array.size(_prices) - 1 to 0
+            bb  = array.get(_bArr, i)
+            top = box.get_top(bb)
+            btm = box.get_bottom(bb)
+            if f_touches(top, btm)
+                box.set_right(bb, bar_index)
+                box.set_bgcolor(bb, color.new(chart.fg_color, frozenAlpha))
+                box.set_border_color(bb, color.new(chart.fg_color, frozenAlpha))
+                box.set_border_style(bb, line.style_dotted)
+
+                array.remove(_prices, i)
+                array.remove(_wArr, i)
+                array.remove(_bArr, i)
+
+                frozenN += 1
+    frozenN
+
+f_extend_active(_bArr) =>
+    if array.size(_bArr) > 0
+        for i = 0 to array.size(_bArr) - 1
+            bb = array.get(_bArr, i)
+            box.set_right(bb, bar_index + extendBars)
+
+f_local_trim(_prices, _wArr, _bArr) =>
+    if localOnly and array.size(_prices) > 0 and array.size(_bArr) > 0
+        hi = ta.highest(high, localBars)
+        lo = ta.lowest(low, localBars)
+        for i = array.size(_prices) - 1 to 0
+            bb = array.get(_bArr, i)
+            y  = box.get_top(bb)
+            if y < lo or y > hi
+                box.delete(bb)
+                array.remove(_prices, i)
+                array.remove(_wArr, i)
+                array.remove(_bArr, i)
+
+//──────────────────────────────────────────────────────────────────────────────
+// BUILD LEVELS ON EVENT
+//──────────────────────────────────────────────────────────────────────────────
+if isSpike
+    lp1 = f_liq_price(refP, lev1, true)
+    lp2 = f_liq_price(refP, lev2, true)
+    lp3 = f_liq_price(refP, lev3, true)
+
+    sp1 = f_liq_price(refP, lev1, false)
+    sp2 = f_liq_price(refP, lev2, false)
+    sp3 = f_liq_price(refP, lev3, false)
+
+    levCount = (lev1 > 0 ? 1 : 0) + (lev2 > 0 ? 1 : 0) + (lev3 > 0 ? 1 : 0)
+    perLevLong  = levCount > 0 ? (longW  / levCount) : 0.0
+    perLevShort = levCount > 0 ? (shortW / levCount) : 0.0
+
+    if lev1 > 0
+        [t1, b1] = f_bin_extremes(lp1)
+        f_add_bin(L_prices, L_w, L_box, t1, b1, perLevLong)
+        [t2, b2] = f_bin_extremes(sp1)
+        f_add_bin(S_prices, S_w, S_box, t2, b2, perLevShort)
+
+    if lev2 > 0
+        [t3, b3] = f_bin_extremes(lp2)
+        f_add_bin(L_prices, L_w, L_box, t3, b3, perLevLong)
+        [t4, b4] = f_bin_extremes(sp2)
+        f_add_bin(S_prices, S_w, S_box, t4, b4, perLevShort)
+
+    if lev3 > 0
+        [t5, b5] = f_bin_extremes(lp3)
+        f_add_bin(L_prices, L_w, L_box, t5, b5, perLevLong)
+        [t6, b6] = f_bin_extremes(sp3)
+        f_add_bin(S_prices, S_w, S_box, t6, b6, perLevShort)
+
+//──────────────────────────────────────────────────────────────────────────────
+// UPDATE: extend, freeze on touch, recolor, trim
+//──────────────────────────────────────────────────────────────────────────────
+f_extend_active(L_box)
+f_extend_active(S_box)
+
+frozenCount += f_freeze_touched(L_prices, L_w, L_box)
+frozenCount += f_freeze_touched(S_prices, S_w, S_box)
+
+f_local_trim(L_prices, L_w, L_box)
+f_local_trim(S_prices, S_w, S_box)
+
+f_update_colors(L_w, L_box)
+f_update_colors(S_w, S_box)
+
+//──────────────────────────────────────────────────────────────────────────────
+// LEGEND (table.clear signature safe)
+//──────────────────────────────────────────────────────────────────────────────
+if showLegend and barstate.islast
+    var table leg = table.new(position.middle_right, 1, 10)
+    table.clear(leg, 0, 0, 0, 9)
+
+    lmx = f_maxW(L_w)
+    smx = f_maxW(S_w)
+    mx  = math.max(lmx, smx)
+
+    table.cell(leg, 0, 0, useOI ? "(OI)" : "RUM Liq Map (VOL)",
+         text_color=chart.fg_color, bgcolor=color.new(color.black, 100))
+    table.cell(leg, 0, 1, "S > " + str.tostring(thr, format.mintick),
+         text_color=color.new(chart.fg_color, 25), bgcolor=color.new(color.black, 100))
+
+    for i = 0 to 6
+        wv  = mx * (6 - i) / 6.0
+        col = f_grad(wv, mx)
+        table.cell(leg, 0, i + 2, i == 0 ? "MAX" : i == 6 ? "MIN" : "",
+             bgcolor=col, text_color=chart.fg_color)
+
+// Debug marker (optional)
+plotchar(showSpikeMarker and isSpike ? 1 : na, title="Spike", char="•",
+     location=location.top, size=size.tiny, color=color.new(chart.fg_color, 0))

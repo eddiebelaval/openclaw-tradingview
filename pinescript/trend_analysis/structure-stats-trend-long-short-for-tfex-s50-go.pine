@@ -1,0 +1,137 @@
+//@version=6
+indicator("Structure Stats Trend (Long & Short) [for Tfex S50 GO]", shorttitle="SST [TFEX/GO]", overlay=true)
+
+// --- Inputs ---
+anchor_tf   = input.string("W", "AVWAP Anchor", options=["D", "W", "M"])
+entry_sd    = input.float(1.5, "Entry Band (จุดเข้า)", step=0.1)
+exit_sd     = input.float(3.0, "Exit Band (จุดปิดทำกำไร)", step=0.1)
+swing_len   = input.int(3, "Current TF Swing Strength (จุดเข้า)")
+memory_len  = input.int(15, "Memory Length (เวลาจำหลังแตะ Band)")
+
+// ⭐️ ระบบ Warm-up
+warmup_bars = input.int(1, "Warm-up Bars (ข้ามกี่แท่งแรกของรอบ)", minval=0)
+
+// --- HTF Bias Inputs ---
+htf_res     = input.timeframe("60", "HTF Bias (เช่น 240=4ชม., 60=1ชม.)")
+htf_swing   = input.int(3, "HTF Swing Strength (หา CHoCH TF ใหญ่)")
+
+// --- 1. Multi-Timeframe Structure Bias (แอบดู TF ใหญ่) ---
+f_htf_trend() =>
+    var int trend = 1 
+    var float ht_ph = na
+    var float ht_pl = na
+    
+    ph = ta.pivothigh(high, htf_swing, htf_swing)
+    pl = ta.pivotlow(low, htf_swing, htf_swing)
+    
+    if not na(ph)
+        ht_ph := ph
+    if not na(pl)
+        ht_pl := pl
+        
+    if ta.crossover(close, ht_ph)
+        trend := 1
+    if ta.crossunder(close, ht_pl)
+        trend := -1
+    trend
+
+htf_bias = request.security(syminfo.tickerid, htf_res, f_htf_trend())
+bias_long = (htf_bias == 1)
+bias_short = (htf_bias == -1)
+
+bgcolor(bias_long ? color.new(color.green, 95) : color.new(color.red, 95), title="HTF Bias Background")
+
+// --- 2. AVWAP & Multi-Bands ---
+is_new_period = ta.change(time(anchor_tf)) != 0
+
+// ⭐️ ระบบนับแท่ง Warm-up
+var int bars_in_period = 0
+if is_new_period
+    bars_in_period := 0
+else
+    bars_in_period += 1
+    
+is_warmed_up = bars_in_period >= warmup_bars
+
+var float sum_src_vol = 0.0, var float sum_vol = 0.0, var float sum_src_src_vol = 0.0
+if is_new_period
+    sum_src_vol := 0.0, sum_vol := 0.0, sum_src_src_vol := 0.0
+
+sum_src_vol += hlc3 * volume
+sum_vol += volume
+sum_src_src_vol += hlc3 * hlc3 * volume
+
+vwap_val = sum_src_vol / sum_vol
+variance = (sum_src_src_vol / sum_vol) - (vwap_val * vwap_val)
+stdev = math.sqrt(math.max(0, variance))
+
+up_entry = vwap_val + (entry_sd * stdev)
+dn_entry = vwap_val - (entry_sd * stdev)
+up_exit  = vwap_val + (exit_sd * stdev)
+dn_exit  = vwap_val - (exit_sd * stdev)
+
+// --- 3. SMC Structure (Current TF Pivot High/Low) ---
+var float last_ph = na, var float last_pl = na
+curr_ph = ta.pivothigh(high, swing_len, swing_len)
+curr_pl = ta.pivotlow(low, swing_len, swing_len)
+
+if not na(curr_ph)
+    last_ph := curr_ph
+if not na(curr_pl)
+    last_pl := curr_pl
+
+bull_choch = ta.crossover(close, last_ph)
+bear_choch = ta.crossunder(close, last_pl)
+
+// --- 4. Memory Logic ---
+var int mem_up_entry = 999, var int mem_dn_entry = 999
+var int mem_up_exit  = 999, var int mem_dn_exit  = 999
+
+mem_up_entry += 1, mem_dn_entry += 1
+mem_up_exit  += 1, mem_dn_exit  += 1
+
+if low <= dn_entry and is_warmed_up
+    mem_dn_entry := 0
+if high >= up_entry and is_warmed_up
+    mem_up_entry := 0
+if low <= dn_exit and is_warmed_up
+    mem_dn_exit := 0
+if high >= up_exit and is_warmed_up
+    mem_up_exit := 0
+
+// --- 5. State Machine (Execution) + HTF Bias ---
+var int state = 0 
+bool open_l = false, bool open_s = false, bool close_l = false, bool close_s = false
+
+if state == 0
+    if mem_dn_entry <= memory_len and bull_choch and bias_long
+        open_l := true
+        state := 1
+        mem_dn_entry := 999
+        
+    else if mem_up_entry <= memory_len and bear_choch and bias_short
+        open_s := true
+        state := -1
+        mem_up_entry := 999
+
+if state == 1 and mem_up_exit <= memory_len and bear_choch
+    close_l := true
+    state := 0
+    mem_up_exit := 999
+
+if state == -1 and mem_dn_exit <= memory_len and bull_choch
+    close_s := true
+    state := 0
+    mem_dn_exit := 999
+
+// --- Plotting ---
+plot(up_exit, title="Exit Top (3SD)", color=color.new(color.red, 30), linewidth=1)
+plot(dn_exit, title="Exit Bottom (3SD)", color=color.new(color.green, 30), linewidth=1)
+plot(up_entry, title="Entry Top (2SD)", color=color.new(color.red, 60), linewidth=1, style=plot.style_circles)
+plot(dn_entry, title="Entry Bottom (2SD)", color=color.new(color.green, 60), linewidth=1, style=plot.style_circles)
+plot(vwap_val, title="AVWAP", color=color.new(color.orange, 20), linewidth=2)
+
+plotshape(open_l, title="Long", style=shape.labelup, location=location.belowbar, color=color.new(color.aqua, 0), text="OPEN LONG", textcolor=color.black, size=size.small)
+plotshape(open_s, title="Short", style=shape.labeldown, location=location.abovebar, color=color.new(color.red, 0), text="OPEN SHORT", textcolor=color.white, size=size.small)
+plotshape(close_l, title="Close Long", style=shape.labeldown, location=location.abovebar, color=color.gray, text="END TREND", textcolor=color.white, size=size.small)
+plotshape(close_s, title="Close Short", style=shape.labelup, location=location.belowbar, color=color.gray, text="END TREND", textcolor=color.white, size=size.small)

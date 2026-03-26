@@ -1,0 +1,1526 @@
+//@version=5
+indicator("AG Pro Swap Engine - Pair Rotation (Z-Score) V25", overlay=true, max_labels_count=500)
+
+//====================
+// Inputs (Premium UX)
+//====================
+
+//--- BASIC (keep the first 3 groups extremely clean)
+grpPairs = "01) BASIC - Pair & Data"
+grpZ     = "02) BASIC - Signals (Z-Score)"
+grpSize  = "03) BASIC - Tier Sizing"
+
+//--- ADVANCED (power user / fine tuning)
+grpFilt  = "11) ADV - Filters & Safety"
+grpExec  = "12) ADV - Execution Model"
+grpViz   = "13) ADV - Visuals"
+grpPanel = "20) ADV - Status Panel"
+grpSync  = "30) ADV - Sync / Recovery"
+
+//====================
+// Pair selection
+//====================
+pairASymbol = input.symbol("BINANCE:BTCUSDT", "Pair A", group=grpPairs, inline="pair",
+     tooltip="Select the first asset of the rotation pair.\nTip: Prefer same quote currency as Pair B (e.g., both USDT) to keep the ratio meaningful.")
+pairBSymbol = input.symbol("BINANCE:ETHUSDT", "Pair B", group=grpPairs, inline="pair",
+     tooltip="Select the second asset of the rotation pair.\nTip: Prefer same quote currency as Pair A (e.g., both USDT) to keep the ratio meaningful.")
+
+tf  = input.timeframe("240", "Engine TF", group=grpPairs, inline="tf",
+     tooltip="Timeframe used to compute ratio, z-score and ALL decisions.\nHigher TF = fewer, cleaner signals. Lower TF = more signals/noise.\nRecommendation: 240 (4H).")
+len = input.int(180, "Lookback", group=grpPairs, inline="tf", minval=60, maxval=500,
+     tooltip="Lookback length in Engine TF bars for mean & stdev (z-score).\nIncrease = smoother, fewer flips. Decrease = faster, more sensitive (more churn).")
+
+// Pair name helper (used in labels/panel)
+f_strip_suffix(_s, _suf) =>
+    str.endswith(_s, _suf) ? str.substring(_s, 0, str.length(_s) - str.length(_suf)) : _s
+
+f_pair_name(_sym) =>
+    parts = str.split(_sym, ":")
+    raw   = array.size(parts) > 1 ? array.get(parts, 1) : _sym
+    raw := f_strip_suffix(raw, "USDT")
+    raw := f_strip_suffix(raw, "USD")
+    raw := f_strip_suffix(raw, "PERP")
+    raw
+
+pairA = f_pair_name(pairASymbol)
+pairB = f_pair_name(pairBSymbol)
+
+f_quote_hint(_sym) =>
+    _rawParts = str.split(_sym, ":")
+    _raw = array.size(_rawParts) > 1 ? array.get(_rawParts, 1) : _sym
+    _q = str.endswith(_raw, "USDT") ? "USDT" :
+         str.endswith(_raw, "USDC") ? "USDC" :
+         str.endswith(_raw, "BUSD") ? "BUSD" :
+         str.endswith(_raw, "USD") ? "USD" :
+         str.endswith(_raw, "BTC") ? "BTC" :
+         str.endswith(_raw, "ETH") ? "ETH" :
+         "?"
+    _q
+
+f_market_hint(_sym) =>
+    str.contains(str.upper(_sym), "PERP") ? "PERP" : "SPOT/OTHER"
+
+pairAQuote = f_quote_hint(pairASymbol)
+pairBQuote = f_quote_hint(pairBSymbol)
+pairAMkt   = f_market_hint(pairASymbol)
+pairBMkt   = f_market_hint(pairBSymbol)
+
+//====================
+// Signal thresholds (Z-Score)
+//====================
+// Entry thresholds (z-score): lower = more frequent entries; higher = rarer/stronger extremes.
+zE1 = input.float(1.7, "Entry Z1", group=grpZ, inline="zE", step=0.1,
+     tooltip="Tier-1 entry threshold (absolute z-score).\nLower = more signals, but noisier. Higher = fewer signals, stronger extremes.")
+zE2 = input.float(2.3, "Z2", group=grpZ, inline="zE", step=0.1,
+     tooltip="Tier-2 entry threshold (absolute z-score).\nKeep Z2 > Z1 for a clean tier ladder.")
+zE3 = input.float(2.9, "Z3", group=grpZ, inline="zE", step=0.1,
+     tooltip="Tier-3 entry threshold (absolute z-score).\nHigher values reduce over-trading but can miss early extremes.")
+
+// Exit thresholds (z-score) (hysteresis): higher = exit earlier; lower = hold longer (may wait in trend).
+zX1 = input.float(0.9, "Exit Z1", group=grpZ, inline="zX", step=0.1,
+     tooltip="Tier-1 exit threshold (absolute z-score).\nHigher = faster de-risk / more churn. Lower = hold longer (may take longer to revert).")
+zX2 = input.float(0.6, "Z2", group=grpZ, inline="zX", step=0.1,
+     tooltip="Tier-2 exit threshold (absolute z-score).\nUsually Z2 < Z1 to require a deeper mean reversion for larger exposure.")
+zX3 = input.float(0.3, "Z3", group=grpZ, inline="zX", step=0.1,
+     tooltip="Tier-3 exit threshold (absolute z-score).\nToo low can keep you exposed during strong trends; too high can cause frequent flips.")
+
+// Exit mapping mode (defval must match options exactly)
+exitMode = input.string("Reverse (recommended)", "Exit logic", group=grpZ,
+     options=["Classic (Z1 closes Tier1)", "Reverse (recommended)"],
+     tooltip="Classic: each tier closes at its own exit threshold.\nReverse (recommended): close the largest tier first to reduce risk sooner during a revert.")
+
+//====================
+// Tier sizing (% of ACTIVE pool)
+//====================
+// Percent of ACTIVE pool to rotate per tier. Higher = more exposure and more turnover cost.
+t1pct = input.float(12.5, "T1 %", group=grpSize, inline="tier", step=0.5, minval=0.1,
+     tooltip="Tier-1 position size as % of ACTIVE pool rotated on an entry/exit.\nHigher = faster scaling, higher cost/variance.")
+t2pct = input.float(17.5, "T2 %", group=grpSize, inline="tier", step=0.5, minval=0.1,
+     tooltip="Tier-2 position size as % of ACTIVE pool rotated.\nKeep tiers increasing for a smooth ladder (e.g., T1 < T2 < T3).")
+t3pct = input.float(22.5, "T3 %", group=grpSize, inline="tier", step=0.5, minval=0.1,
+     tooltip="Tier-3 position size as % of ACTIVE pool rotated.\nLargest exposure: validate costs + drawdown tolerance before increasing.")
+
+//====================
+// Validation (config health)
+//====================
+samePairSelected = pairASymbol == pairBSymbol
+
+entryOrderOk = (zE1 > 0) and (zE2 > zE1) and (zE3 > zE2)
+exitOrderOk  = (zX1 > zX2) and (zX2 > zX3) and (zX3 >= 0)
+
+// Soft warning: tier order can be equal/increasing, but decreasing tiers usually indicate a weak ladder design
+tierOrderOk  = (t1pct > 0) and (t2pct > 0) and (t3pct > 0) and (t2pct >= t1pct) and (t3pct >= t2pct)
+tierPctTotal = t1pct + t2pct + t3pct
+tierTotalWarn = tierPctTotal > 95.0
+
+quoteMismatchWarn = (pairAQuote != "?" and pairBQuote != "?" and pairAQuote != pairBQuote)
+marketTypeWarn    = pairAMkt != pairBMkt
+
+configHardInvalid = samePairSelected or not entryOrderOk or not exitOrderOk
+configWarn        = (not tierOrderOk) or tierTotalWarn or quoteMismatchWarn or marketTypeWarn
+
+//====================
+// Filters & Safety
+//====================
+// Trend regime filter: blocks entries when z-score stays one-sided for long enough.
+trendBars = input.int(10, "Trend bars", group=grpFilt, minval=6, maxval=30,
+     tooltip="Trend Regime detector length (in Engine TF bars).\nHigher = stricter trend gate (blocks more entries). Lower = looser (allows more mean-reversion entries).")
+
+// Cost filter (roundtrip = two swaps)
+roundtripCost = input.float(0.006, "Roundtrip cost", group=grpFilt, inline="cost", step=0.001, minval=0.0,
+     tooltip="Estimated roundtrip cost (fees + slippage) for TWO swaps.\nIncrease if your exchange costs are higher to avoid over-trading.")
+costMultiple  = input.float(4.0, "Min edge x", group=grpFilt, inline="cost", step=0.5, minval=1.0,
+     tooltip="Minimum expected edge required as a multiple of roundtrip cost.\nHigher = fewer, higher-quality actions. Lower = more actions but more cost leakage.")
+
+// Execution safety
+onlyOnNewTF   = input.bool(true, "Only new TF bar", group=grpFilt, inline="eval",
+     tooltip="When ON, decisions are evaluated only when a NEW Engine TF bar starts.\nReduces noise and improves stability.")
+onlyOnClose   = input.bool(true, "Only bar close", group=grpFilt, inline="eval",
+     tooltip="When ON, actions are only taken on confirmed bar close.\nReduces false intrabar flips (recommended).")
+
+cooldownHTF   = input.int(1, "Cooldown TF bars", group=grpFilt, inline="safe", minval=0, maxval=10,
+     tooltip="Minimum number of Engine TF bars between actions.\nIncrease to prevent rapid flip-flops in choppy regimes.")
+maxActPerDay  = input.int(6, "Max/day", group=grpFilt, inline="safe", minval=1, maxval=50,
+     tooltip="Hard limit on total actions per day (entries + exits).\nProtects against excessive churn in extreme volatility.")
+
+// Tier jump (ENTRY)
+allowTierJump = input.bool(false, "Allow tier jump", group=grpFilt,
+     tooltip="When ON, the engine may jump directly to the target tier in a single action (aggressive).\nWhen OFF, scaling is step-by-step (more controlled).")
+
+tradeProfile = input.string("Balanced", "Trade profile", group=grpFilt, inline="prof",
+     options=["Custom","Conservative","Balanced","Aggressive","Volatile Alt","High-Cost"],
+     tooltip="Preset behavior profile. Custom uses your raw filter inputs. Other profiles can tighten/loosen engine gates.")
+applyTradeProfile = input.bool(true, "Apply", group=grpFilt, inline="prof",
+     tooltip="When ON, selected Trade profile modifies effective trend/cost/cooldown/max-day behavior without changing your visible base inputs.")
+
+//====================
+// Visuals
+//====================
+showLabels      = input.bool(true, "Show labels", group=grpViz, inline="lbl",
+     tooltip="Show swap suggestion labels on the price chart.")
+labelMode       = input.string("Minimal", "Detail", group=grpViz, inline="lbl", options=["Minimal","Detailed"],
+     tooltip="Label verbosity. Detailed shows more diagnostics; Minimal stays clean.")
+useAboveBelow   = input.bool(true, "Above/Below", group=grpViz, inline="lbl2",
+     tooltip="Place labels above/below bars for readability. Turn OFF if labels overlap with your other indicators.")
+showTrendBg     = input.bool(true, "Trend BG", group=grpViz, inline="lbl2",
+     tooltip="Highlight Trend Regime periods on the chart background.")
+showOppWarning  = input.bool(true, "Opposite warning", group=grpViz,
+     tooltip="Warns when a new signal appears in the opposite direction while a position is still open.")
+
+visualPreset = input.string("Institutional", "Visual preset", group=grpViz, options=["Institutional","Neon Pro","Stealth"],
+     tooltip="Visual style preset: Institutional, Neon Pro, or Stealth.")
+labelTextSize = input.string("Normal", "Signal label size", group=grpViz, inline="visx", options=["Tiny","Small","Normal","Large"],
+     tooltip="Signal label text size (entry/exit/pending signal labels). Tiny adds ultra-compact mode.")
+showSignalMarkers = input.bool(true, "Signal markers", group=grpViz, inline="visx",
+     tooltip="Adds clean entry/exit/pending markers for fast visual reading.")
+
+// Global typography (granular routing to prevent cross-component coupling)
+statusRibbonLabelTextSize = input.string("Small", "Status ribbon size", group=grpViz, inline="ty1", options=["Tiny","Small","Normal","Large"],
+     tooltip="Text size for the Status Ribbon label.")
+brandTagLabelTextSize = input.string("Small", "Brand tag size", group=grpViz, inline="ty1", options=["Tiny","Small","Normal","Large"],
+     tooltip="Text size for the Brand Tag label.")
+miniHudLabelTextSize = input.string("Small", "Mini HUD size", group=grpViz, inline="ty2", options=["Tiny","Small","Normal","Large"],
+     tooltip="Text size for the Mini HUD label.")
+tfWarnLabelTextSize = input.string("Small", "TF warn size", group=grpViz, inline="ty2", options=["Tiny","Small","Normal","Large"],
+     tooltip="Text size for chart TF > engine TF warning label.")
+syncLabelTextSize = input.string("Small", "SYNC label size", group=grpViz, inline="ty3", options=["Tiny","Small","Normal","Large"],
+     tooltip="Text size for SYNC APPLIED label.")
+oppWarnLabelTextSize = input.string("Small", "Opposite warn size", group=grpViz, inline="ty3", options=["Tiny","Small","Normal","Large"],
+     tooltip="Text size for opposite-signal ignored warning label.")
+showStatusRibbon = input.bool(true, "Status ribbon", group=grpViz,
+     tooltip="Shows last-bar status ribbon (READY/PENDING/REGIME/WAIT/BLOCKED).")
+
+showBrandTag = input.bool(true, "Brand tag", group=grpViz, inline="hudx",
+     tooltip="Shows a premium top-of-chart brand tag with pair/preset/profile context.")
+showMiniHUD = input.bool(true, "Mini HUD", group=grpViz, inline="hudx",
+     tooltip="Shows a compact last-bar diagnostics HUD (Q/PH/RC/state).")
+
+showHudAntiOverlap = input.bool(true, "HUD anti-overlap", group=grpViz, inline="hudsp",
+     tooltip="Automatically increases vertical spacing between top labels based on their text sizes.")
+hudTopYOffsetATR = input.float(0.00, "Top Y", group=grpViz, inline="hudsp", minval=-1.0, maxval=3.0, step=0.05,
+     tooltip="Additional ATR-based vertical offset for top HUD labels (Status Ribbon + Brand Tag).")
+hudTopGapATR = input.float(0.18, "Top gap", group=grpViz, inline="hudsp2", minval=0.00, maxval=2.0, step=0.02,
+     tooltip="Extra ATR-based spacing between Status Ribbon and Brand Tag.")
+brandTagXShiftBars = input.int(1, "Brand X shift", group=grpViz, inline="hudsp2", minval=-20, maxval=20,
+     tooltip="Horizontal shift (bars) for the Brand Tag to reduce overlap with the Status Ribbon.")
+miniHudYOffsetATR = input.float(0.10, "Mini HUD Y", group=grpViz, inline="hudsp3", minval=0.00, maxval=3.0, step=0.05,
+     tooltip="Additional ATR-based downward offset for the Mini HUD label.")
+miniHudXShiftBars = input.int(0, "Mini HUD X shift", group=grpViz, inline="hudsp3", minval=-20, maxval=20,
+     tooltip="Horizontal shift (bars) for the Mini HUD label.")
+
+topHudLayoutMode = input.string("Split", "Top HUD layout", group=grpViz, inline="hudlay", options=["Stacked","Split","Compact","Minimal"],
+     tooltip="Split = safest anti-overlap. Compact/Minimal = cleaner premium screenshot look. Stacked = classic vertical stack.")
+showcaseMode = input.bool(false, "Showcase mode", group=grpViz, inline="hudlay",
+     tooltip="Screenshot/publish focused visual mode: shorter HUD texts and cleaner chart presentation.")
+autoHideMiniHudWithPanel = input.bool(true, "Auto-hide Mini HUD if panel", group=grpViz, inline="hudlay2",
+     tooltip="When Showcase mode is ON and panel is visible, hides Mini HUD to reduce visual clutter.")
+topHudComposeMode = input.string("Auto Unified", "Top HUD compose", group=grpViz, inline="hudlay2",
+     options=["Separate","Auto Unified","Always Unified"],
+     tooltip="Controls whether Status Ribbon and Brand Tag stay separate or merge into a single ribbon. Auto Unified merges only in high-overlap layouts.")
+
+
+maxSignalLabels = input.int(120, "Max signal labels", group=grpViz, minval=20, maxval=500,
+     tooltip="Maximum number of swap-related labels kept on chart. Older labels are deleted automatically to prevent clutter and resource build-up.")
+
+var label[] sigLabelBuf = array.new_label()
+
+f_push_sig_label(_id) =>
+    array.push(sigLabelBuf, _id)
+    if array.size(sigLabelBuf) > maxSignalLabels
+        _old = array.shift(sigLabelBuf)
+        if not na(_old)
+            label.delete(_old)
+
+f_label_size(_s) =>
+    _s == "Tiny" ? size.tiny : _s == "Small" ? size.small : _s == "Large" ? size.large : size.normal
+
+f_label_size_mult(_s) =>
+    _s == "Tiny" ? 0.68 : _s == "Small" ? 0.90 : _s == "Large" ? 1.55 : 1.20
+
+_sigLblSz = f_label_size(labelTextSize)
+_ribbonLblSz = f_label_size(statusRibbonLabelTextSize)
+_brandLblSz  = f_label_size(brandTagLabelTextSize)
+_miniHudLblSz = f_label_size(miniHudLabelTextSize)
+_tfWarnLblSz = f_label_size(tfWarnLabelTextSize)
+_syncLblSz   = f_label_size(syncLabelTextSize)
+_oppLblSz    = f_label_size(oppWarnLabelTextSize)
+
+f_q_bucket_color(_q) =>
+    _q >= 85 ? color.lime :
+     _q >= 70 ? color.rgb(95, 220, 120) :
+     _q >= 55 ? color.yellow :
+     _q >= 40 ? color.orange :
+     color.red
+
+f_status_chip(_pending, _cfgBad, _regimeOn, _canAct) =>
+    _cfgBad ? "BLOCKED" :
+     _pending ? "PENDING" :
+     (_regimeOn and _canAct ? "REGIME" : (_canAct ? "READY" : "WAIT"))
+
+f_visual_preset_tag(_p) =>
+    _p == "Institutional" ? "INST" : _p == "Neon Pro" ? "NEON" : "STLTH"
+
+f_profile_short(_p, _apply) =>
+    not _apply or _p == "Custom" ? "CSTM" :
+     _p == "Conservative" ? "CONS" :
+     _p == "Balanced" ? "BAL" :
+     _p == "Aggressive" ? "AGGR" :
+     _p == "Volatile Alt" ? "V-ALT" :
+     _p == "High-Cost" ? "H-COST" : "CSTM"
+
+// Label time
+tzLabel = input.string("Europe/Istanbul", "Label timezone", group=grpViz,
+     tooltip="Time zone used only for label timestamps. Does not change calculations.")
+
+//====================
+// Execution Model (IMPORTANT)
+//====================
+// ASSUME      : Update internal tier/dir state immediately.
+// CONFIRM     : Signal becomes PENDING; you manually confirm/skip via counters (recommended).
+// SIGNAL_ONLY : Only show signals/labels; never updates internal state.
+execModel = input.string("CONFIRM", "Mode", group=grpExec,
+     options=["ASSUME", "CONFIRM", "SIGNAL_ONLY"],
+     tooltip="ASSUME: auto-advance state on signal.\nCONFIRM: create a PENDING signal and wait for your manual confirm/skip.\nSIGNAL_ONLY: no state changes (signals only).")
+
+confirmCount = input.int(0, "CONFIRM +1", group=grpExec, inline="cs", minval=0,
+     tooltip="CONFIRM mode only: increase this value by 1 to COMMIT the current PENDING signal (one-time).\nIgnored in ASSUME / SIGNAL_ONLY.\nTip: You can reset back to 0; it works as an edge-trigger counter.")
+skipCount    = input.int(0, "SKIP +1", group=grpExec, inline="cs", minval=0,
+     tooltip="CONFIRM mode only: increase this value by 1 to SKIP (discard) the current PENDING signal (one-time).\nIgnored in ASSUME / SIGNAL_ONLY.\nTip: You can reset back to 0; it works as an edge-trigger counter.")
+
+pendingExpire      = input.int(12, "Pending expire", group=grpExec, inline="pend", minval=1, maxval=200,
+     tooltip="Auto-clear PENDING signal after N Engine TF bars.\nIncrease if you want more time to decide; decrease to avoid stale pending.")
+freezeWhilePending = input.bool(true, "Freeze while pending", group=grpExec, inline="pend",
+     tooltip="When ON, no new signals are accepted while a PENDING exists.\nPrevents rapid overrides and keeps workflow deterministic.")
+
+//====================
+// Pending Status Panel
+//====================
+showPendingPanel = input.bool(true, "Show panel", group=grpPanel,
+     tooltip="Show the premium status panel with current tier/dir, gates and pending info.")
+panelPos = input.string("Top Right", "Position", group=grpPanel,
+     options=["Top Right","Top Left","Bottom Right","Bottom Left"],
+     tooltip="Panel location on the chart.")
+panelTheme = input.string("Light Pro", "Theme", group=grpPanel,
+     options=["Auto","Dark Pro","Light Pro"],
+     tooltip="Panel theme (visual only).")
+panelAccent = input.string("Teal", "Accent", group=grpPanel,
+     options=["Teal","Blue","Amber","Purple"],
+     tooltip="Accent color for highlights (visual only).")
+panelTextSize = input.string("Normal", "Text Size", group=grpPanel,
+     options=["Tiny","Small","Normal","Large"],
+     tooltip="Panel text size. Tiny = ultra-compact, Large = easier reading.")
+panelTransp = input.int(15, "Transparency", group=grpPanel, minval=0, maxval=80,
+     tooltip="Panel background transparency. Lower = more solid (best readability). Higher = more see-through.")
+panelDensity = input.string("Detailed", "Panel Density", group=grpPanel,
+     options=["Compact","Detailed"],
+     tooltip="Compact = fewer rows / cleaner panel. Detailed = explainability-first premium view.")
+showHowToLine = input.bool(true, "Show How-To line", group=grpPanel, inline="pnlx",
+     tooltip="Adds a short reading guide row in the panel (helpful for first-time users).")
+showRCLegendLine = input.bool(true, "Show RC legend", group=grpPanel, inline="pnlx",
+     tooltip="Shows compact reason-code legend in the panel (E=entry, X=exit, B=blocked, D=duplicate).")
+panelWidthProfile = input.string("Balanced", "Width Profile", group=grpPanel,
+     options=["Compact","Balanced","Wide"],
+     tooltip="Panel label-column width profile. Compact = less empty space. Balanced = premium default. Wide = longer row titles.")
+
+//====================
+// SYNC MODE (manual state alignment)
+//====================
+syncEnable  = input.bool(false, "Enable SYNC", group=grpSync,
+     tooltip="Use only after refresh/reload if you need to manually align internal tier/dir to your real position.")
+syncTierIn  = input.int(0, "Tier (0-3)", group=grpSync, inline="sync", minval=0, maxval=3,
+     tooltip="Target tier to force on the last bar when SYNC is enabled.")
+syncDirIn   = input.int(0, "Dir", group=grpSync, inline="sync", minval=-1, maxval=1,
+     tooltip="Direction to force: +1 A→B, -1 B→A, 0 FLAT.")
+syncShowLbl = input.bool(true, "Show SYNC label", group=grpSync,
+     tooltip="Show a label on the chart when SYNC is applied.")
+
+//====================
+// Fetch prices (2 security calls only)
+// (2 security calls only)
+//====================
+aPx   = request.security(pairASymbol,   tf, close, barmerge.gaps_off, barmerge.lookahead_off)
+bPx = request.security(pairBSymbol, tf, close, barmerge.gaps_off, barmerge.lookahead_off)
+
+// Defensive ratio/log
+ratio = (aPx > 0 and bPx > 0) ? (aPx / bPx) : na
+L     = (ratio > 0) ? math.log(ratio) : na
+
+// Stats
+mu = ta.sma(L, len)
+sd = ta.stdev(L, len)
+z  = (sd > 0 and not na(sd)) ? (L - mu) / sd : na
+absz = math.abs(z)
+
+//====================
+// Helpers
+//====================
+// Rolling sum helper (compat fallback for environments where ta.sum is unavailable)
+f_rollsum(x, n) =>
+    c = ta.cum(x)
+    c - nz(c[n])
+
+f_sizeDelta(fromTier, toTier) =>
+    s1 = t1pct
+    s2 = t2pct
+    s3 = t3pct
+    d = 0.0
+    if toTier > fromTier
+        if fromTier < 1 and toTier >= 1
+            d += s1
+        if fromTier < 2 and toTier >= 2
+            d += s2
+        if fromTier < 3 and toTier >= 3
+            d += s3
+    if toTier < fromTier
+        if fromTier >= 3 and toTier < 3
+            d += s3
+        if fromTier >= 2 and toTier < 2
+            d += s2
+        if fromTier >= 1 and toTier < 1
+            d += s1
+    d
+
+f_expectedMoveToExit(_zExit, _dir) =>
+    L_exit = mu + _dir * _zExit * sd
+    dL = math.abs(L - L_exit)
+    math.exp(dL) - 1.0
+
+f_exit_thr_by_tier(_t) =>
+    _t == 3 ? (exitMode == "Classic (Z1 closes Tier1)" ? zX3 : zX1) :
+     _t == 2 ? zX2 :
+     (exitMode == "Classic (Z1 closes Tier1)" ? zX1 : zX3)
+
+f_tier_tag(_t) =>
+    _t == 3 ? "T3" : _t == 2 ? "T2" : _t == 1 ? "T1" : "T0"
+
+f_action_tag(_a) =>
+    _a == 1 ? "ENTRY" : _a == -1 ? "EXIT" : "NONE"
+
+f_reason_id(_aType, _toTier, _isDup, _cfgBad, _badTf, _coolOk, _dayOk, _freeze, _trend, _dirOk) =>
+    int _id = 0
+    if _isDup
+        _id := 900
+    else if _cfgBad
+        _id := 801
+    else if _badTf
+        _id := 802
+    else if not _coolOk
+        _id := 803
+    else if not _dayOk
+        _id := 804
+    else if _freeze
+        _id := 805
+    else if _trend
+        _id := 806
+    else if not _dirOk
+        _id := 807
+    else if _aType == 1
+        _id := _toTier == 3 ? 103 : _toTier == 2 ? 102 : 101
+    else if _aType == -1
+        _id := 201
+    _id
+
+f_reason_text(_rid) =>
+    _rid == 101 ? "ENTRY Z1" :
+     _rid == 102 ? "ENTRY Z2" :
+     _rid == 103 ? "ENTRY Z3" :
+     _rid == 201 ? "EXIT (tier reduce)" :
+     _rid == 801 ? "Blocked: invalid config" :
+     _rid == 802 ? "Blocked: chart TF > engine TF" :
+     _rid == 803 ? "Blocked: cooldown" :
+     _rid == 804 ? "Blocked: max/day limit" :
+     _rid == 805 ? "Blocked: pending freeze" :
+     _rid == 806 ? "Blocked: trend regime" :
+     _rid == 807 ? "Blocked: opposite direction while positioned" :
+     _rid == 900 ? "Duplicate signal suppressed" :
+     "No signal"
+
+f_reason_code(_rid) =>
+    _rid == 101 ? "E1" :
+     _rid == 102 ? "E2" :
+     _rid == 103 ? "E3" :
+     _rid == 201 ? "X" :
+     _rid == 801 ? "B-CFG" :
+     _rid == 802 ? "B-TF" :
+     _rid == 803 ? "B-CD" :
+     _rid == 804 ? "B-DAY" :
+     _rid == 805 ? "B-PEND" :
+     _rid == 806 ? "B-TREND" :
+     _rid == 807 ? "B-OPP" :
+     _rid == 900 ? "DUP" :
+     "-"
+
+f_quality_bucket(_q) =>
+    na(_q) ? "N/A" :
+     _q >= 85 ? "A+" :
+     _q >= 75 ? "A" :
+     _q >= 65 ? "B" :
+     _q >= 50 ? "C" :
+     _q >= 35 ? "D" : "E"
+
+f_trade_profile_tag(_p, _apply) =>
+    (_apply and _p != "Custom") ? (_p + " · ON") : (_p + " · OFF")
+
+f_trade_profile_note(_p, _apply) =>
+    not _apply or _p == "Custom" ? "Base filters" :
+     _p == "Conservative" ? "Stricter gates · lower churn" :
+     _p == "Balanced" ? "Balanced premium defaults" :
+     _p == "Aggressive" ? "Faster entries · higher churn" :
+     _p == "Volatile Alt" ? "Volatility-tolerant gating" :
+     _p == "High-Cost" ? "Cost-protective gating" :
+     "Base filters"
+
+// Effective behavior profile (commercial finish)
+profActive = applyTradeProfile and tradeProfile != "Custom"
+
+trendBarsEff =
+     not profActive ? trendBars :
+     tradeProfile == "Conservative" ? math.min(30, trendBars + 2) :
+     tradeProfile == "Aggressive"   ? math.max(6, trendBars - 2) :
+     tradeProfile == "Volatile Alt" ? math.max(6, trendBars - 1) :
+     tradeProfile == "High-Cost"    ? math.min(30, trendBars + 3) :
+     trendBars
+
+costMultipleEff =
+     not profActive ? costMultiple :
+     tradeProfile == "Conservative" ? math.max(1.0, costMultiple + 1.0) :
+     tradeProfile == "Aggressive"   ? math.max(1.0, costMultiple - 0.5) :
+     tradeProfile == "Volatile Alt" ? math.max(1.0, costMultiple + 0.25) :
+     tradeProfile == "High-Cost"    ? math.max(1.0, costMultiple + 2.0) :
+     costMultiple
+
+cooldownHTFEff =
+     not profActive ? cooldownHTF :
+     tradeProfile == "Conservative" ? math.min(10, cooldownHTF + 1) :
+     tradeProfile == "Aggressive"   ? math.max(0, cooldownHTF - 1) :
+     tradeProfile == "Volatile Alt" ? math.max(0, cooldownHTF) :
+     tradeProfile == "High-Cost"    ? math.min(10, cooldownHTF + 3) :
+     cooldownHTF
+
+maxActPerDayEff =
+     not profActive ? maxActPerDay :
+     tradeProfile == "Conservative" ? math.max(1, maxActPerDay - 1) :
+     tradeProfile == "Aggressive"   ? math.min(50, maxActPerDay + 2) :
+     tradeProfile == "Volatile Alt" ? math.min(50, maxActPerDay + 3) :
+     tradeProfile == "High-Cost"    ? math.max(1, maxActPerDay - 3) :
+     maxActPerDay
+
+minEdge = costMultipleEff * roundtripCost
+
+//====================
+// Trend regime detection
+//====================
+sameSide =
+     f_rollsum(z > 0 ? 1.0 : 0.0, trendBarsEff) >= trendBarsEff or
+     f_rollsum(z < 0 ? 1.0 : 0.0, trendBarsEff) >= trendBarsEff
+
+hitsE1 =
+     f_rollsum(absz >= zE1 ? 1.0 : 0.0, trendBarsEff) >= math.floor(trendBarsEff * 0.6)
+
+trendRegime = sameSide and hitsE1
+
+//====================
+// Execution gates
+//====================
+htfStamp = time(tf)
+isNewTF  = ta.change(htfStamp) != 0
+evalTF  = onlyOnNewTF ? isNewTF : true
+evalBar = onlyOnClose ? barstate.isconfirmed : true
+
+// Safety: chart TF must be <= swap TF
+tfSec    = timeframe.in_seconds(tf)
+chartSec = timeframe.in_seconds(timeframe.period)
+badChartTF = not na(tfSec) and not na(chartSec) and chartSec > tfSec
+
+// One persistent warning label (no spam / low churn)
+var label tfWarn = na
+if barstate.islast
+    if badChartTF
+        _warnTxt = "WARNING: Chart TF > Swap TF (" + tf + ").\nChart TF must be <= " + tf + "."
+        _warnAtr = nz(ta.atr(14), math.max(high - low, syminfo.mintick))
+        _warnY = high + _warnAtr * 0.30
+        _warnCol = visualPreset == "Neon Pro" ? color.rgb(255, 118, 98) : visualPreset == "Stealth" ? color.rgb(192, 100, 100) : color.red
+        if na(tfWarn)
+            tfWarn := label.new(bar_index, _warnY, _warnTxt,
+              style=label.style_label_down, color=color.new(_warnCol, 0), textcolor=color.white, size=_tfWarnLblSz)
+        else
+            label.set_xy(tfWarn, bar_index, _warnY)
+            label.set_text(tfWarn, _warnTxt)
+            label.set_style(tfWarn, label.style_label_down)
+            label.set_color(tfWarn, color.new(_warnCol, 0))
+            label.set_textcolor(tfWarn, color.white)
+            label.set_size(tfWarn, _tfWarnLblSz)
+    else
+        if not na(tfWarn)
+            label.delete(tfWarn)
+            tfWarn := na
+
+ready = evalTF and evalBar and not na(z) and sd > 0 and not na(mu) and not na(L)
+
+// TF counter (cooldown & pending expire)
+var int tfCount = 0
+if isNewTF
+    tfCount += 1
+
+var int lastActTf = na
+coolOk = cooldownHTFEff == 0 or na(lastActTf) or (tfCount - lastActTf >= cooldownHTFEff)
+
+var int actToday = 0
+if ta.change(time("D"))
+    actToday := 0
+dayOk = actToday < maxActPerDayEff
+
+//====================
+// STATE (actual executed state)
+//====================
+var int posDir = 0   // +1: A->B, -1: B->A, 0: flat
+var int tier   = 0   // 0..3
+var bool oppLatched = false
+
+//====================
+// SYNC APPLY (one time on last bar)
+//====================
+var bool _synced = false
+
+syncPrev = bar_index > 0 ? syncEnable[1] : false
+syncEdgeOn = syncEnable and not syncPrev
+if syncEdgeOn
+    _synced := false
+
+syncApplied = false
+if syncEnable and not _synced and barstate.islast
+    _t = syncTierIn
+    _d = syncDirIn
+    if _t > 0 and _d == 0
+        _t := 0
+        _d := 0
+    tier := _t
+    posDir := tier == 0 ? 0 : _d
+    oppLatched := false
+    _synced := true
+    syncApplied := true
+
+    if syncShowLbl
+        _syncLbl = label.new(bar_index, high,
+          "SYNC APPLIED\nTier=" + str.tostring(tier) + " | Dir=" + str.tostring(posDir),
+          style=label.style_label_down, color=color.new(color.blue, 0), textcolor=color.white, size=_syncLblSz)
+        f_push_sig_label(_syncLbl)
+
+//====================
+// Pending payload (for CONFIRM mode)
+//====================
+var bool  pending      = false
+var int   p_actionType = 0
+var int   p_swapDir    = 0
+var int   p_fromTier   = 0
+var int   p_toTier     = 0
+var float p_deltaPct   = 0.0
+var float p_z          = na
+var float p_ratio      = na
+var float p_a          = na
+var float p_b          = na
+var int   p_ts         = na
+var int   p_tfCount    = na
+
+// Cached pending diagnostics (freeze original signal context for panel/confirm labels)
+var int   p_reasonId       = 0
+var string p_reasonTxt     = "No signal"
+var string p_reasonCode    = "-"
+var float p_signalQuality  = na
+var string p_qualityBucket = "N/A"
+var string p_whyTxt        = "-"
+var float p_edgeEstPct     = na
+var float p_pairHealth   = na
+
+// Pending / signal lifecycle flags (V15 router)
+pendingCreated = false
+pendingExpired = false
+pendingSkipped = false
+pendingConfirmed = false
+pendingActiveBefore = pending
+
+// Track confirm/skip counters (increment-only edge on last bar)
+var int lastConfirmSeen = 0
+var int lastSkipSeen    = 0
+
+confirmDelta = confirmCount - lastConfirmSeen
+skipDelta    = skipCount    - lastSkipSeen
+
+confirmTrig = barstate.islast and execModel == "CONFIRM" and (confirmDelta > 0)
+skipTrig    = barstate.islast and execModel == "CONFIRM" and (skipDelta > 0)
+
+if barstate.islast
+    // Prevent accidental triggers when switching modes
+    if execModel != "CONFIRM"
+        lastConfirmSeen := confirmCount
+        lastSkipSeen    := skipCount
+    else
+        // If user manually resets counters down, re-baseline without triggering
+        if confirmCount < lastConfirmSeen
+            lastConfirmSeen := confirmCount
+        if skipCount < lastSkipSeen
+            lastSkipSeen := skipCount
+
+        if confirmTrig
+            lastConfirmSeen := confirmCount
+        if skipTrig
+            lastSkipSeen := skipCount
+
+//====================
+// Direction & thresholds
+//====================
+sigDir = z > 0 ? 1 : z < 0 ? -1 : 0
+
+thrT1 = exitMode == "Classic (Z1 closes Tier1)" ? zX1 : zX3
+thrT2 = zX2
+thrT3 = exitMode == "Classic (Z1 closes Tier1)" ? zX3 : zX1
+
+// Timestamp aligned to HTF CLOSE used by request.security(..., close)
+// (robust, and does NOT use reserved identifiers)
+tsUse = onlyOnNewTF ? (time(tf) - 1) : time_close
+
+//====================
+// ACTION ENGINE (suggestion layer)
+//====================
+actionType = 0   // 0 none, 1 ENTRY, -1 EXIT
+swapDir    = 0   // +1 sell A buy B, -1 sell B buy A
+fromTier   = tier
+toTier     = tier
+deltaPct   = 0.0
+
+freeze = (execModel == "CONFIRM") and freezeWhilePending and pending
+baseCanAct = ready and not badChartTF and coolOk and dayOk and not syncApplied and not freeze
+canAct = baseCanAct and not configHardInvalid
+
+// 1) EXIT first (one-tier only)
+if canAct and tier > 0 and posDir != 0
+    newTier = tier
+    if tier >= 3 and absz <= thrT3
+        newTier := 2
+    else if tier >= 2 and absz <= thrT2
+        newTier := 1
+    else if tier >= 1 and absz <= thrT1
+        newTier := 0
+
+    if newTier < tier
+        actionType := -1
+        fromTier   := tier
+        toTier     := newTier
+        deltaPct   := f_sizeDelta(fromTier, toTier)
+        swapDir    := -posDir
+
+// 2) ENTRY (only if no exit)
+if canAct and actionType == 0 and sigDir != 0 and not trendRegime
+    dirOk = (posDir == 0) or (posDir == sigDir)
+    if dirOk
+        tgt = 0
+
+        if absz >= zE3
+            edge3 = f_expectedMoveToExit(thrT3, sigDir)
+            tgt := edge3 >= minEdge ? 3 : 0
+        else if absz >= zE2
+            edge2 = f_expectedMoveToExit(thrT2, sigDir)
+            tgt := edge2 >= minEdge ? 2 : 0
+        else if absz >= zE1
+            edge1 = f_expectedMoveToExit(thrT1, sigDir)
+            tgt := edge1 >= minEdge ? 1 : 0
+
+        if not allowTierJump
+            tgt := math.min(tgt, tier + 1)
+
+        if tgt > tier
+            actionType := 1
+            fromTier   := tier
+            toTier     := tgt
+            deltaPct   := f_sizeDelta(fromTier, toTier)
+            swapDir    := sigDir
+
+didSignalRaw = actionType != 0 and swapDir != 0 and deltaPct > 0
+
+var string lastSignalKey = ""
+sigKey = str.tostring(htfStamp) + "|" +
+         str.tostring(actionType) + "|" +
+         str.tostring(swapDir) + "|" +
+         str.tostring(fromTier) + "|" +
+         str.tostring(toTier)
+
+isDupSignal = didSignalRaw and (sigKey == lastSignalKey)
+didSignal   = didSignalRaw and not isDupSignal
+
+if didSignal
+    lastSignalKey := sigKey
+
+//====================
+// CONFIRM layer: create pending / expire / skip / commit
+//====================
+if execModel == "CONFIRM"
+    if (not pending) and didSignal
+        pending      := true
+        pendingCreated := true
+        p_actionType := actionType
+        p_swapDir    := swapDir
+        p_fromTier   := fromTier
+        p_toTier     := toTier
+        p_deltaPct   := deltaPct
+        p_z          := z
+        p_ratio      := ratio
+        p_a          := aPx
+        p_b          := bPx
+        p_ts         := tsUse
+        p_tfCount    := tfCount
+
+    if pending and isNewTF and not na(p_tfCount) and (tfCount - p_tfCount >= pendingExpire)
+        pending := false
+        pendingExpired := true
+
+    if pending and skipTrig
+        pending := false
+        pendingSkipped := true
+
+didCommit = (execModel == "ASSUME" and didSignal) or (execModel == "CONFIRM" and pending and confirmTrig)
+
+if execModel == "SIGNAL_ONLY"
+    didCommit := false
+
+pendingConfirmed := (execModel == "CONFIRM" and pendingActiveBefore and confirmTrig and didCommit)
+
+//====================
+// Diagnostics V3 (reason / quality / explainability)
+//====================
+entryDirOkNow = (posDir == 0) or (posDir == sigDir)
+
+entryEdgeEst = 0.0
+if actionType == 1 and didSignalRaw and toTier > 0 and sigDir != 0
+    _thrDiag = toTier == 3 ? thrT3 : toTier == 2 ? thrT2 : thrT1
+    entryEdgeEst := f_expectedMoveToExit(_thrDiag, sigDir)
+
+edgeEstNow = actionType == 1 ? entryEdgeEst : 0.0
+edgePassNow = actionType == 1 ? (edgeEstNow >= minEdge) : (actionType == -1 ? true : false)
+
+blockReasonNow = ""
+if configHardInvalid
+    blockReasonNow := "Invalid config"
+else if badChartTF
+    blockReasonNow := "Chart TF > Engine TF"
+else if freeze
+    blockReasonNow := "Pending freeze"
+else if not coolOk
+    blockReasonNow := "Cooldown"
+else if not dayOk
+    blockReasonNow := "Max/day"
+else if actionType == 0 and trendRegime and sigDir != 0 and ((posDir == 0) or (posDir == sigDir))
+    blockReasonNow := "Trend regime"
+else if actionType == 0 and sigDir != 0 and not entryDirOkNow and tier > 0
+    blockReasonNow := "Opposite direction while position open"
+else if isDupSignal
+    blockReasonNow := "Duplicate suppressed"
+else
+    blockReasonNow := "-"
+
+reasonIdNow = f_reason_id(actionType, toTier, isDupSignal, configHardInvalid, badChartTF, coolOk, dayOk, freeze, trendRegime and actionType == 0, entryDirOkNow)
+reasonTxtNow = f_reason_text(reasonIdNow)
+
+zStrengthScore = na(absz) or zE1 <= 0 ? 0.0 : math.min(45.0, (absz / zE3) * 45.0)
+edgeStrengthScore = actionType == 1 and minEdge > 0 ? math.min(40.0, (edgeEstNow / minEdge) * 20.0) : (actionType == -1 ? 25.0 : 0.0)
+qualityPenalty = (isDupSignal ? 25.0 : 0.0) + (trendRegime and actionType == 0 ? 15.0 : 0.0) + (configHardInvalid ? 30.0 : 0.0)
+signalQuality = math.max(0.0, math.min(100.0, zStrengthScore + edgeStrengthScore + (didSignal ? 15.0 : 0.0) - qualityPenalty))
+
+reasonCodeNow = f_reason_code(reasonIdNow)
+qualityBucketNow = f_quality_bucket(signalQuality)
+
+cfgHealthShort = configHardInvalid ? "INVALID" : (configWarn ? "WARN" : "OK")
+cfgHealthDetail = configHardInvalid ? "Invalid threshold order or same pair selected" :
+     (quoteMismatchWarn and marketTypeWarn ? "Quote + market mismatch risk" :
+      quoteMismatchWarn ? "Quote mismatch risk (" + pairAQuote + " vs " + pairBQuote + ")" :
+      marketTypeWarn ? "Market type mismatch (" + pairAMkt + " vs " + pairBMkt + ")" :
+      tierTotalWarn ? "Tier total high (" + str.tostring(tierPctTotal, "#.#") + "%)" :
+      not tierOrderOk ? "Tier ladder non-progressive" : "Configuration healthy")
+
+nextEntryTierWanted = absz >= zE3 ? 3 : absz >= zE2 ? 2 : absz >= zE1 ? 1 : 0
+nextEntryGateTxt = nextEntryTierWanted == 0 ? ("Need |z| ≥ " + str.tostring(zE1, "#.##")) :
+     ("Entry zone hit: Z" + str.tostring(nextEntryTierWanted))
+nextExitThrNow = tier > 0 ? f_exit_thr_by_tier(tier) : na
+nextExitTxt = tier > 0 ? ("Exit trigger |z| ≤ " + str.tostring(nextExitThrNow, "#.##")) : "No exit trigger (flat)"
+nextActionPreview = tier > 0 ? nextExitTxt :
+     (nextEntryTierWanted > 0 ? ("Potential ENTRY T" + str.tostring(nextEntryTierWanted) + " if gates pass") : nextEntryGateTxt)
+
+pairHealthScore = math.max(0.0, math.min(100.0,
+     100.0
+     - (quoteMismatchWarn ? 18.0 : 0.0)
+     - (marketTypeWarn ? 16.0 : 0.0)
+     - (configHardInvalid ? 35.0 : 0.0)
+     - (configWarn and not configHardInvalid ? 10.0 : 0.0)
+     - (na(sd) or sd <= 0 ? 20.0 : 0.0)
+     - (len < 120 ? 8.0 : 0.0)))
+
+whySignalTxtNow = didSignal ? ("RC " + reasonCodeNow + " · " + reasonTxtNow + " · Q " + str.tostring(signalQuality, "#") + "/100 (" + qualityBucketNow + ")") :
+     (blockReasonNow == "-" ? "No active trigger" : ("Blocked: " + blockReasonNow + " · RC " + reasonCodeNow))
+
+// Freeze diagnostics at pending creation so CONFIRM labels/panel reflect the original signal context
+if pendingCreated and pending
+    p_reasonId       := reasonIdNow
+    p_reasonTxt      := reasonTxtNow
+    p_reasonCode     := reasonCodeNow
+    p_signalQuality  := signalQuality
+    p_qualityBucket  := qualityBucketNow
+    p_whyTxt         := whySignalTxtNow
+    p_edgeEstPct     := (actionType == 1 ? edgeEstNow : 0.0) * 100.0
+    p_pairHealth     := pairHealthScore
+
+var int    lastReasonId = 0
+var string lastReasonTxt = "No signal"
+var string lastReasonCode = "-"
+var string lastBlockReason = "-"
+var string lastSignalSummary = "No signal yet"
+var float  lastSignalQuality = na
+var string lastQualityBucket = "N/A"
+var float  lastPairHealth = na
+var float  lastEdgeEstPct = na
+
+if didSignal or pendingCreated or pendingConfirmed or pendingSkipped or pendingExpired
+    lastReasonId := reasonIdNow
+    lastReasonTxt := reasonTxtNow
+    lastReasonCode := reasonCodeNow
+    lastBlockReason := blockReasonNow
+    _actTag = pendingCreated ? "PENDING " + f_action_tag(p_actionType) : f_action_tag(actionType)
+    _tierFrom = pendingCreated ? p_fromTier : fromTier
+    _tierTo   = pendingCreated ? p_toTier   : toTier
+    _dirUse   = pendingCreated ? p_swapDir  : swapDir
+    _dirTxtUse = _dirUse == 1 ? (pairA + "→" + pairB) : _dirUse == -1 ? (pairB + "→" + pairA) : "FLAT"
+    lastSignalSummary := _actTag + " " + f_tier_tag(_tierFrom) + "→" + f_tier_tag(_tierTo) + " | " + _dirTxtUse
+    lastSignalQuality := signalQuality
+    lastQualityBucket := qualityBucketNow
+    lastPairHealth := pairHealthScore
+    lastEdgeEstPct := (actionType == 1 ? edgeEstNow : 0.0) * 100.0
+else if actionType == 0
+    lastBlockReason := blockReasonNow
+    lastPairHealth := pairHealthScore
+
+//====================
+// APPLY STATE UPDATE (commit only)
+//====================
+didAction = didCommit
+
+if didCommit
+    _aType = execModel == "CONFIRM" ? p_actionType : actionType
+    _sDir  = execModel == "CONFIRM" ? p_swapDir    : swapDir
+    _toT   = execModel == "CONFIRM" ? p_toTier     : toTier
+
+    if _aType == 1 and posDir == 0
+        posDir := _sDir
+
+    tier := _toT
+
+    if tier == 0
+        posDir := 0
+        oppLatched := false
+
+    lastActTf := tfCount
+    actToday += 1
+
+    if execModel == "CONFIRM"
+        pending := false
+
+//====================
+// Opposite warning (latched)
+//====================
+opp = showOppWarning and canAct and tier > 0 and sigDir != 0 and posDir != 0 and sigDir != posDir
+if opp and evalTF and evalBar and not oppLatched
+    _oppAtr = nz(ta.atr(14), math.max(high - low, syminfo.mintick))
+    _oppY = high + _oppAtr * 0.18
+    _oppBg = visualPreset == "Neon Pro" ? color.rgb(86, 96, 118) : visualPreset == "Stealth" ? color.rgb(80, 84, 92) : color.gray
+    _oppLbl = label.new(bar_index, _oppY, "OPPOSITE SIGNAL IGNORED\n(Wait for EXIT)",
+      style=label.style_label_down, color=color.new(_oppBg, 0), textcolor=color.white, size=_oppLblSz)
+    f_push_sig_label(_oppLbl)
+    oppLatched := true
+
+//====================
+// Labels (swap box)
+//====================
+needLabel =
+     (execModel == "ASSUME" and didSignal) or
+     (execModel == "SIGNAL_ONLY" and didSignal) or
+     (execModel == "CONFIRM" and didSignal) or
+     (execModel == "CONFIRM" and didCommit)
+
+f_dir_arrow(_dir) =>
+    _dir == 1 ? (pairA + "→" + pairB) :
+     _dir == -1 ? (pairB + "→" + pairA) :
+     "FLAT"
+
+// Cluster-aware signal label polish: when multiple signals appear in a short span,
+// auto-compact the label and add a little extra vertical breathing room.
+// V23 final freeze polish: cluster spacing + calmer BG shading + semantic BG clarity.
+var int _lastSigLabelBar = na
+
+if showLabels and needLabel
+    isConfirmLabel = (execModel == "CONFIRM" and didCommit)
+
+    _aType2 = isConfirmLabel ? p_actionType : actionType
+    _sDir2  = isConfirmLabel ? p_swapDir    : swapDir
+    _fT2    = isConfirmLabel ? p_fromTier   : fromTier
+    _tT2    = isConfirmLabel ? p_toTier     : toTier
+    _dPct2  = isConfirmLabel ? p_deltaPct   : deltaPct
+    _z2     = isConfirmLabel ? p_z          : z
+    _r2     = isConfirmLabel ? p_ratio      : ratio
+    _a2     = isConfirmLabel ? p_a          : aPx
+    _b2     = isConfirmLabel ? p_b          : bPx
+    _ts2    = isConfirmLabel ? p_ts         : tsUse
+
+    isAtoB = _sDir2 == 1
+    _lblAtr = nz(ta.atr(14), math.max(high - low, syminfo.mintick))
+    _sigMul = f_label_size_mult(labelTextSize)
+    _clusterWindowBars = labelTextSize == "Tiny" ? 14 : (showcaseMode ? 12 : 8)
+    _labelCluster = not na(_lastSigLabelBar) and (bar_index - _lastSigLabelBar <= _clusterWindowBars)
+    yUp = useAboveBelow ? (high + _lblAtr * (0.12 + 0.05 * _sigMul)) : close
+    yDn = useAboveBelow ? (low  - _lblAtr * (0.12 + 0.05 * _sigMul)) : close
+    y   = isAtoB ? yUp : yDn
+    _sigYBoost = useAboveBelow ? (_lblAtr * ((execModel == "CONFIRM" and _aType2 != 0) ? (0.05 + 0.02 * _sigMul) : 0.0)) : 0.0
+    _sigYBoost := _sigYBoost + (useAboveBelow and _labelCluster ? (_lblAtr * (0.07 + 0.015 * _sigMul)) : 0.0)
+    y := isAtoB ? (y + _sigYBoost) : (y - _sigYBoost)
+    sty = isAtoB ? label.style_label_down : label.style_label_up
+    _baseRed   = visualPreset == "Neon Pro" ? color.rgb(255, 90, 110) : visualPreset == "Stealth" ? color.rgb(195, 95, 95) : color.rgb(220, 75, 75)
+    _baseGreen = visualPreset == "Neon Pro" ? color.rgb(20, 235, 170) : visualPreset == "Stealth" ? color.rgb(95, 180, 130) : color.rgb(55, 205, 115)
+    _baseAmber = visualPreset == "Neon Pro" ? color.rgb(255, 196, 70) : color.rgb(230, 170, 65)
+    _basePend  = visualPreset == "Neon Pro" ? color.rgb(255, 232, 102) : visualPreset == "Stealth" ? color.rgb(212, 188, 102) : color.rgb(245, 210, 92)
+    _baseConf  = visualPreset == "Neon Pro" ? color.rgb(64, 228, 220) : visualPreset == "Stealth" ? color.rgb(92, 166, 160) : color.rgb(58, 182, 174)
+    _baseSig   = _aType2 == -1 ? _baseAmber : (isAtoB ? _baseRed : _baseGreen)
+    _pendingVisual = (execModel == "CONFIRM" and not isConfirmLabel and _aType2 != 0)
+    _confirmVisual = (isConfirmLabel and _aType2 != 0)
+    _sigLabelAlpha = _confirmVisual ? (showcaseMode ? 14 : 10) : (_pendingVisual ? (showcaseMode ? 24 : 18) : (_aType2 == -1 ? 12 : 8))
+    _sigLabelAlpha := _labelCluster ? math.min(48, _sigLabelAlpha + (showcaseMode ? 10 : 8)) : _sigLabelAlpha
+    _sigLabelAlpha := visualPreset == "Stealth" ? math.min(35, _sigLabelAlpha + 4) : _sigLabelAlpha
+    col = color.new(_confirmVisual ? _baseConf : (_pendingVisual ? _basePend : _baseSig), _sigLabelAlpha)
+    _lblTextCol = _pendingVisual ? color.black : color.white
+
+    actTxt  = _aType2 == 1 ? "ENTRY" : _aType2 == -1 ? "EXIT" : "SIGNAL"
+    tierTxt = "T" + str.tostring(_fT2) + "→" + str.tostring(_tT2)
+    sizeTxt = "Δ" + str.tostring(_dPct2, "#.##") + "% (active)"
+    zTxt    = "z=" + str.tostring(_z2, "#.##")
+    rTxt    = "R(A/B)=" + str.tostring(_r2, "#.######")
+
+    trig = _aType2 == 1 ? (_tT2 == 3 ? "Z3" : _tT2 == 2 ? "Z2" : "Z1") : "EXIT"
+
+    statusShort =
+         execModel == "CONFIRM" ? (isConfirmLabel ? "CONFIRMED" : "PENDING") :
+         execModel == "SIGNAL_ONLY" ? "SIGNAL_ONLY" :
+         ""
+
+    _rcLbl = (execModel == "CONFIRM" and p_reasonCode != "-") ? p_reasonCode : reasonCodeNow
+    _qLbl  = (execModel == "CONFIRM" and not na(p_signalQuality)) ? p_signalQuality : signalQuality
+    _qbLbl = (execModel == "CONFIRM" and p_qualityBucket != "N/A") ? p_qualityBucket : qualityBucketNow
+    _phLbl = (execModel == "CONFIRM" and not na(p_pairHealth)) ? p_pairHealth : pairHealthScore
+    _qColor = f_q_bucket_color(_qLbl)
+    _badge = isConfirmLabel ? "CONFIRMED" : (execModel == "CONFIRM" ? "PENDING" : execModel)
+
+    // Minimal vs Detailed label text
+    _labelModeEff = (showcaseMode or _labelCluster) ? "Minimal" : labelMode
+    txt = ""
+    _compactSignalLabel = showcaseMode or labelTextSize == "Tiny" or _labelCluster
+    if _labelModeEff == "Minimal"
+        if _compactSignalLabel
+            txt := "AGP · " + actTxt + " [" + trig + "]" + (statusShort != "" ? " · " + statusShort : "") + "\n" +
+                   f_dir_arrow(_sDir2) + " · " + tierTxt + " · Δ" + str.tostring(_dPct2, "#.#") + "%\n" +
+                   (_labelCluster ? ("z " + str.tostring(_z2, "#.##") + " · Q " + str.tostring(_qLbl, "#") + " · RC " + _rcLbl) : ("z " + str.tostring(_z2, "#.##") + " · Q " + str.tostring(_qLbl, "#") + " · PH " + str.tostring(_phLbl, "#") + " · RC " + _rcLbl))
+        else
+            txt := "AGP SWAP · " + actTxt + " [" + trig + "]\n" +
+                   f_dir_arrow(_sDir2) + "\n" +
+                   tierTxt + " | " + sizeTxt + "\n" +
+                   zTxt + " | RC " + _rcLbl + " | Q " + str.tostring(_qLbl, "#") + " (" + _qbLbl + ") | PH " + str.tostring(_phLbl, "#") + "/100" +
+                   (statusShort != "" ? "\n" + statusShort : "")
+    else
+        aTxt   = pairA + "=" + str.tostring(_a2, "#.######")
+        bTxt   = pairB + "=" + str.tostring(_b2, "#.######")
+        tsTxt  = "TIME=" + str.format_time(_ts2, "yyyy-MM-dd HH:mm", tzLabel)
+        status =
+             execModel == "CONFIRM" ? (isConfirmLabel ? "STATUS=CONFIRMED" : "STATUS=PENDING") :
+             execModel == "SIGNAL_ONLY" ? "STATUS=SIGNAL_ONLY" :
+             "STATUS=ASSUMED"
+
+        txt := "AGP SWAP ENGINE · " + actTxt + " (" + trig + ")\n" +
+               "BADGE=" + _badge + " | RC=" + _rcLbl + " | Q=" + str.tostring(_qLbl, "#") + " (" + _qbLbl + ") | PH=" + str.tostring(_phLbl, "#") + "/100\n" +
+               tierTxt + " | " + sizeTxt + "\n" +
+               "DIR=" + f_dir_arrow(_sDir2) + "\n" +
+               zTxt + " | " + rTxt + "\n" +
+               aTxt + " | " + bTxt + "\n" +
+               tsTxt + "\n" + status
+
+    _lblSz = _sigLblSz
+    _sigLbl = label.new(bar_index, y, txt, style=sty, color=col, textcolor=_lblTextCol, size=_lblSz)
+    _lastSigLabelBar := bar_index
+    f_push_sig_label(_sigLbl)
+
+//====================
+//====================
+// Premium signal markers (commercial finish)
+//====================
+_mEntryAB = showSignalMarkers and didSignal and actionType == 1 and swapDir == 1
+_mEntryBA = showSignalMarkers and didSignal and actionType == 1 and swapDir == -1
+_mExitAB  = showSignalMarkers and didSignal and actionType == -1 and swapDir == 1
+_mExitBA  = showSignalMarkers and didSignal and actionType == -1 and swapDir == -1
+_mPend    = showSignalMarkers and pendingCreated and not showcaseMode
+_mConf    = showSignalMarkers and pendingConfirmed and not showcaseMode
+_mSkip    = showSignalMarkers and pendingSkipped and not showcaseMode
+_mExp     = showSignalMarkers and pendingExpired and not showcaseMode
+
+// Preset-aware marker palette (premium visual grammar)
+_mkBear = visualPreset == "Neon Pro" ? color.rgb(255, 86, 122) : visualPreset == "Stealth" ? color.rgb(198, 104, 104) : color.rgb(230, 85, 85)
+_mkBull = visualPreset == "Neon Pro" ? color.rgb(35, 232, 177) : visualPreset == "Stealth" ? color.rgb(112, 188, 142) : color.rgb(60, 215, 120)
+_mkExit = visualPreset == "Neon Pro" ? color.rgb(255, 193, 84) : visualPreset == "Stealth" ? color.rgb(214, 166, 90) : color.rgb(240, 172, 68)
+_mkPend = visualPreset == "Neon Pro" ? color.rgb(255, 230, 95) : color.rgb(242, 208, 92)
+_mkConf = visualPreset == "Neon Pro" ? color.rgb(74, 228, 218) : color.rgb(68, 184, 176)
+_mkSkip = visualPreset == "Neon Pro" ? color.rgb(150, 156, 170) : color.rgb(130, 136, 148)
+_mkExpC = visualPreset == "Neon Pro" ? color.rgb(255, 120, 132) : color.rgb(220, 95, 95)
+
+// Plot budget hotfix: use one marker set (const size) to stay under Pine 64-plot limit.
+// Signal markers use fixed premium sizes (plot-budget safe). Label/HUD text sizes are adjustable via Visuals inputs.
+plotshape(_mEntryAB, title="AGP Entry A->B", style=shape.triangledown, location=location.abovebar, color=color.new(_mkBear, 0), size=size.normal, text="E")
+plotshape(_mEntryBA, title="AGP Entry B->A", style=shape.triangleup, location=location.belowbar, color=color.new(_mkBull, 0), size=size.normal, text="E")
+plotshape(_mExitAB,  title="AGP Exit A->B",  style=shape.circle, location=location.abovebar, color=color.new(_mkExit, 0), size=size.tiny, text="X")
+plotshape(_mExitBA,  title="AGP Exit B->A",  style=shape.circle, location=location.belowbar, color=color.new(_mkExit, 0), size=size.tiny, text="X")
+plotshape(_mPend,    title="AGP Pending Created",   style=shape.diamond, location=location.abovebar, color=color.new(_mkPend, 0), size=size.normal, text="P")
+plotshape(_mConf,    title="AGP Pending Confirmed", style=shape.square,  location=location.abovebar, color=color.new(_mkConf, 0), size=size.normal, text="C")
+plotshape(_mSkip,    title="AGP Pending Skipped",   style=shape.square,  location=location.belowbar, color=color.new(_mkSkip, 5), size=size.tiny, text="S")
+plotshape(_mExp,     title="AGP Pending Expired",   style=shape.square,  location=location.belowbar, color=color.new(_mkExpC, 5), size=size.tiny, text="EX")
+
+//====================
+// Pending Status Panel V4 (seller-grade final polish merge)
+//====================
+f_panel_pos(_s) =>
+    _s == "Top Left" ? position.top_left :
+     _s == "Bottom Right" ? position.bottom_right :
+     _s == "Bottom Left" ? position.bottom_left :
+     position.top_right
+
+f_panel_accent(_s) =>
+    _s == "Teal" ? color.teal :
+     _s == "Blue" ? color.blue :
+     _s == "Amber" ? color.orange :
+     color.purple
+
+f_is_dark_bg() =>
+    float r = color.r(chart.bg_color)
+    float g = color.g(chart.bg_color)
+    float b = color.b(chart.bg_color)
+    (r + g + b) / 3.0 < 120.0
+
+bool  pnlIsDark  = panelTheme == "Auto" ? f_is_dark_bg() : (panelTheme == "Dark Pro")
+color pnlAccentManual = f_panel_accent(panelAccent)
+color pnlAccent  = visualPreset == "Neon Pro" ? color.rgb(0, 214, 201) : visualPreset == "Stealth" ? color.rgb(126, 134, 150) : pnlAccentManual
+
+pnlTxtSz  = panelTextSize == "Tiny" ? size.tiny : panelTextSize == "Small" ? size.small : panelTextSize == "Large" ? size.large : size.normal
+pnlHeadSz = panelTextSize == "Large" ? size.large : panelTextSize == "Tiny" ? size.small : size.normal
+
+color pnlText    = pnlIsDark ? color.rgb(245, 246, 250) : color.rgb(20, 20, 22)
+color pnlMuted   = pnlIsDark ? color.rgb(170, 176, 188) : color.rgb(85, 85, 95)
+
+// Opaque "card" style base (avoid chart bleed-through)
+_baseDark = visualPreset == "Neon Pro" ? color.rgb(10, 14, 18) : visualPreset == "Stealth" ? color.rgb(16, 18, 22) : color.rgb(18, 20, 24)
+_rowDark  = visualPreset == "Neon Pro" ? color.rgb(14, 20, 26) : visualPreset == "Stealth" ? color.rgb(20, 22, 26) : color.rgb(22, 24, 28)
+_baseLite = visualPreset == "Stealth" ? color.rgb(246, 246, 248) : color.rgb(250, 250, 252)
+_rowLite  = visualPreset == "Stealth" ? color.rgb(240, 240, 243) : color.rgb(244, 244, 246)
+
+color pnlBaseBg  = color.new(pnlIsDark ? _baseDark : _baseLite, panelTransp)
+color pnlRowA    = pnlBaseBg
+color pnlRowB    = color.new(pnlIsDark ? _rowDark : _rowLite, math.max(0, panelTransp - (showcaseMode ? 3 : 2)))
+
+// Header + frame
+color pnlHeadBg  = color.new(pnlAccent, visualPreset == "Neon Pro" ? 0 : (pnlIsDark ? 10 : 12))
+color pnlFrame   = color.new(pnlAccent, visualPreset == "Neon Pro" ? 15 : (pnlIsDark ? 35 : 45))
+color pnlBorder  = color.new(pnlIsDark ? color.black : color.gray, visualPreset == "Neon Pro" ? 45 : (pnlIsDark ? 60 : 70))
+
+// Semantic text colors (use text color instead of pastel row backgrounds)
+color pnlGood    = visualPreset == "Neon Pro" ? color.rgb(30, 235, 170) : color.lime
+color pnlWarn    = visualPreset == "Stealth" ? color.rgb(214, 156, 56) : color.orange
+color pnlBad     = visualPreset == "Neon Pro" ? color.rgb(255, 92, 110) : color.red
+color pnlInfo    = pnlAccent
+
+
+f_row_bg(_r) =>
+    _r % 2 == 0 ? pnlRowA : pnlRowB
+
+var table  pnl          = na
+var string pnlPosLast   = panelPos
+var int    pnlRowsLast  = na
+
+if barstate.islast and not showPendingPanel and not na(pnl)
+    table.delete(pnl)
+    pnl := na
+    pnlRowsLast := na
+
+// Auto-compact panel:
+// - ASSUME / SIGNAL_ONLY  => 7 rows (header + 6 lines)
+// - CONFIRM (no pending)  => 9 rows (header + 8 lines)
+// - CONFIRM (pending)     => 13 rows (full details)
+
+_pnlTopSpacerRows = 1  // leave one blank row above the large HUD panel header (premium breathing room)
+
+if barstate.isfirst and showPendingPanel
+    int rowsInitBase = execModel == "CONFIRM" ? (panelDensity == "Detailed" ? (pending ? 19 : 14) : (pending ? 18 : 12)) : (panelDensity == "Detailed" ? 12 : 11)
+    int rowsInit = rowsInitBase + _pnlTopSpacerRows
+    pnl := table.new(f_panel_pos(panelPos), 2, rowsInit, bgcolor=pnlBaseBg, frame_color=pnlFrame, border_color=pnlBorder, frame_width=1, border_width=1)
+    pnlPosLast  := panelPos
+    pnlRowsLast := rowsInit
+
+_pnlKeyWBase = panelWidthProfile == "Compact" ? 14 : panelWidthProfile == "Wide" ? 22 : 18
+_pnlKeyW = showcaseMode ? math.max(12, _pnlKeyWBase - 2) : _pnlKeyWBase
+_pnlHeaderLeft = showcaseMode ? "AGP SWAP · SELLER-GRADE" : "AGP SWAP ENGINE · SELLER-GRADE"
+
+f_set_kv(_row, _k, _v, _bg, _kcol, _vcol) =>
+    _rowAdj = _row + _pnlTopSpacerRows
+    table.cell(pnl, 0, _rowAdj, _k, width=_pnlKeyW, text_color=_kcol, bgcolor=_bg, text_size=pnlTxtSz, text_halign=text.align_left)
+    table.cell(pnl, 1, _rowAdj, _v, text_color=_vcol, bgcolor=_bg, text_size=pnlTxtSz, text_halign=text.align_left)
+
+f_set_header(_l, _r) =>
+    // Top spacer row (blank line) for cleaner premium separation from chart edge
+    table.cell(pnl, 0, 0, " ", width=_pnlKeyW, text_color=color.new(pnlText, 100), bgcolor=pnlBaseBg, text_size=pnlTxtSz, text_halign=text.align_left)
+    table.cell(pnl, 1, 0, " ", text_color=color.new(pnlText, 100), bgcolor=pnlBaseBg, text_size=pnlTxtSz, text_halign=text.align_left)
+    table.cell(pnl, 0, 1, _l, width=_pnlKeyW, text_color=color.white, bgcolor=pnlHeadBg, text_size=pnlHeadSz, text_halign=text.align_left)
+    table.cell(pnl, 1, 1, _r, text_color=color.white, bgcolor=pnlHeadBg, text_size=pnlHeadSz, text_halign=text.align_right)
+
+if showPendingPanel and barstate.islast
+    int rowsNowBase = execModel == "CONFIRM" ? (panelDensity == "Detailed" ? (pending ? 19 : 14) : (pending ? 18 : 12)) : (panelDensity == "Detailed" ? 12 : 11)
+    int rowsNow = rowsNowBase + _pnlTopSpacerRows
+    if na(pnl) or pnlPosLast != panelPos or pnlRowsLast != rowsNow
+        if not na(pnl)
+            table.delete(pnl)
+        pnl := table.new(f_panel_pos(panelPos), 2, rowsNow, bgcolor=pnlBaseBg, frame_color=pnlFrame, border_color=pnlBorder, frame_width=1, border_width=1)
+        pnlPosLast  := panelPos
+        pnlRowsLast := rowsNow
+
+    // Header (commercial finish / status-aware)
+    _hdrState = f_status_chip(pending, configHardInvalid, trendRegime, baseCanAct)
+    _hdrRight = pairA + " ↔ " + pairB + " · " + _hdrState
+    f_set_header(_pnlHeaderLeft, _hdrRight)
+
+    // --- NOW snapshot (always visible) ---
+    dirNow =
+         execModel == "SIGNAL_ONLY" ? "NOT TRACKED" :
+         posDir == 1 ? (pairA + "→" + pairB) :
+         posDir == -1 ? (pairB + "→" + pairA) :
+         "FLAT"
+
+    tierNow = execModel == "SIGNAL_ONLY" ? 0 : tier
+
+    zNow = na(z) ? "na" : str.tostring(z, "#.##")
+
+    minEdgePct = minEdge * 100.0
+    minEdgeTxt = str.tostring(minEdgePct, "#.##") + "%"
+
+    // Cooldown remaining (tf bars)
+    coolRem = (cooldownHTFEff == 0 or na(lastActTf)) ? 0 : math.max(0, cooldownHTFEff - (tfCount - lastActTf))
+
+    gatesTxt =
+         (coolOk ? "Cooldown: OK" : "Cooldown: WAIT " + str.tostring(coolRem)) + " | " +
+         (dayOk  ? "Day: OK (" + str.tostring(maxActPerDayEff - actToday) + " left)" : "Day: LIMIT")
+
+    // Base lines
+    f_set_kv(1, "Mode / Preset", execModel + " | " + visualPreset + " | " + f_trade_profile_tag(tradeProfile, applyTradeProfile), f_row_bg(1), pnlMuted, pnlText)
+    f_set_kv(2, "Now Tier / Dir", "T" + str.tostring(tierNow) + " | " + dirNow, f_row_bg(2), pnlMuted, pnlText)
+    f_set_kv(3, "Now z / Quality", "z=" + zNow + " | Q=" + str.tostring(signalQuality, "#") + " (" + qualityBucketNow + ") | PairHealth=" + str.tostring(pairHealthScore, "#") + "/100", f_row_bg(3), pnlMuted, signalQuality >= 70 ? pnlGood : signalQuality >= 40 ? pnlWarn : pnlBad)
+
+    regTx = trendRegime ? "ON · entries blocked" : "OFF · mean-reversion allowed"
+    _actability = canAct ? "ACTIONABLE" : (baseCanAct ? "BLOCKED (config)" : "WAIT")
+    f_set_kv(4, "Verdict / Regime", _actability + " | " + regTx + " | " + f_trade_profile_note(tradeProfile, applyTradeProfile), f_row_bg(4), pnlMuted, trendRegime ? pnlWarn : (canAct ? pnlGood : pnlWarn))
+
+    cfgTxt  = configHardInvalid ? "CFG: INVALID" : (configWarn ? "CFG: WARN" : "CFG: OK")
+    gatesOk = (coolOk and dayOk and not badChartTF and not configHardInvalid)
+    gatesV  = configHardInvalid ? "BLOCKED · Invalid config (" + cfgTxt + ")" :
+          badChartTF ? "BLOCKED · Chart TF > Swap TF (" + cfgTxt + ")" :
+          (gatesTxt + " | " + cfgTxt)
+
+    _gEff = "eff[t=" + str.tostring(trendBarsEff) + ", cd=" + str.tostring(cooldownHTFEff) + ", day=" + str.tostring(maxActPerDayEff) + ", costx=" + str.tostring(costMultipleEff, "#.##") + "]"
+    _gLine = panelDensity == "Detailed" ? (gatesV + "\n" + _gEff + " | " + cfgHealthDetail) : gatesV
+    f_set_kv(5, "Gates / Health", _gLine, f_row_bg(5), pnlMuted, gatesOk ? pnlGood : (configHardInvalid ? pnlBad : pnlWarn))
+
+    // --- Status / details ---
+    if execModel == "CONFIRM"
+        if pending
+            actP = p_actionType == 1 ? "ENTER" : p_actionType == -1 ? "EXIT" : "FLAT"
+            dirP = p_swapDir == 1 ? (pairA + "→" + pairB) : p_swapDir == -1 ? (pairB + "→" + pairA) : "N/A"
+            rem  = (not na(p_tfCount)) ? math.max(0, pendingExpire - (tfCount - p_tfCount)) : pendingExpire
+
+            f_set_kv(6, "Status", "PENDING REVIEW · AutoClear in " + str.tostring(rem) + " tf bars", f_row_bg(6), pnlMuted, pnlWarn)
+            f_set_kv(7, "Action", actP, f_row_bg(7), pnlMuted, pnlText)
+            f_set_kv(8, "Direction", dirP, f_row_bg(8), pnlMuted, pnlText)
+            f_set_kv(9, "Tier / Delta%", str.tostring(p_fromTier) + "→" + str.tostring(p_toTier) + " | " + str.tostring(p_deltaPct, "#.##") + "%", f_row_bg(9), pnlMuted, pnlText)
+            f_set_kv(10, "z / Ratio", str.tostring(p_z, "#.##") + " | " + str.tostring(p_ratio, "#.#####"), f_row_bg(10), pnlMuted, pnlText)
+            f_set_kv(11, pairA, str.tostring(p_a, "#.#####"), f_row_bg(11), pnlMuted, pnlText)
+            f_set_kv(12, pairB, str.tostring(p_b, "#.#####"), f_row_bg(12), pnlMuted, pnlText)
+            _pEdge = p_actionType == 1 ? nz(p_edgeEstPct, 0.0) : 0.0
+            f_set_kv(13, "Reason / RC", p_reasonTxt + " | " + p_reasonCode + " (#" + str.tostring(p_reasonId) + ")", f_row_bg(13), pnlMuted, pnlInfo)
+            f_set_kv(14, "Why this signal?", p_whyTxt, f_row_bg(14), pnlMuted, pnlText)
+            f_set_kv(15, "Next Action", nextActionPreview, f_row_bg(15), pnlMuted, pnlText)
+            f_set_kv(16, "Edge est / Min", str.tostring(_pEdge, "#.##") + "% | " + str.tostring(minEdgePct, "#.##") + "%", f_row_bg(16), pnlMuted, _pEdge >= minEdgePct ? pnlGood : pnlWarn)
+            if panelDensity == "Detailed"
+                _howTxt = showHowToLine ? (pending ? "Use CONFIRM +1 to commit | SKIP +1 to discard" : "Wait for next valid signal or lower filters") : "-"
+                _rcLegend = showRCLegendLine ? "RC: E1/E2/E3=Entry | X=Exit | B-*=Blocked | DUP=Duplicate" : "-"
+                f_set_kv(17, "Quality / Health", str.tostring(p_signalQuality, "#") + "/100 (" + p_qualityBucket + ") | PairHealth=" + str.tostring(nz(p_pairHealth, pairHealthScore), "#") + "/100", f_row_bg(17), pnlMuted, p_signalQuality >= 70 ? pnlGood : p_signalQuality >= 40 ? pnlWarn : pnlBad)
+                _howLegendLine = _howTxt + "\n" + _rcLegend
+                f_set_kv(18, "How-To / Legend", _howLegendLine, f_row_bg(18), pnlMuted, pnlText)
+            else
+                f_set_kv(17, "Quality", str.tostring(p_signalQuality, "#") + "/100 (" + p_qualityBucket + ") | PairHealth=" + str.tostring(nz(p_pairHealth, pairHealthScore), "#") + "/100", f_row_bg(17), pnlMuted, p_signalQuality >= 70 ? pnlGood : p_signalQuality >= 40 ? pnlWarn : pnlBad)
+        else
+            f_set_kv(6, "Status", "NO PENDING", f_row_bg(6), pnlMuted, pnlGood)
+            f_set_kv(7, "Engine State", "Monitoring pair for next valid premium signal...", f_row_bg(7), pnlMuted, pnlText)
+            f_set_kv(8, "Next Action", nextActionPreview, f_row_bg(8), pnlMuted, pnlText)
+            f_set_kv(9, "Last Signal", lastSignalSummary, f_row_bg(9), pnlMuted, pnlText)
+            f_set_kv(10, "Last Block", lastBlockReason, f_row_bg(10), pnlMuted, lastBlockReason == "-" ? pnlText : pnlWarn)
+            f_set_kv(11, "Last RC / Q", lastReasonCode + " · " + lastReasonTxt + " | " + str.tostring(lastSignalQuality, "#") + "/100 (" + lastQualityBucket + ")", f_row_bg(11), pnlMuted, pnlInfo)
+            if panelDensity == "Detailed"
+                f_set_kv(12, "Config Health", cfgHealthShort + " | " + cfgHealthDetail + " | Prof=" + f_trade_profile_tag(tradeProfile, applyTradeProfile), f_row_bg(12), pnlMuted, configHardInvalid ? pnlBad : (configWarn ? pnlWarn : pnlGood))
+                _howTxt2 = showHowToLine ? "CONFIRM mode: act only when a pending appears" : "-"
+                _rcLegend2 = showRCLegendLine ? "RC " + lastReasonCode + " | PairHealth=" + str.tostring(lastPairHealth, "#") + "/100" : "-"
+                _howLegendLine2 = _howTxt2 + "\n" + _rcLegend2
+                f_set_kv(13, "How-To / Legend", _howLegendLine2, f_row_bg(13), pnlMuted, pnlText)
+    else
+        st = execModel == "ASSUME" ? "AUTO-ADVANCE (state assumed)" : "SIGNALS ONLY (no state)"
+        f_set_kv(6, "Status", st, f_row_bg(6), pnlMuted, pnlInfo)
+        f_set_kv(7, "Last Signal", lastSignalSummary, f_row_bg(7), pnlMuted, pnlText)
+        f_set_kv(8, "Next Action", nextActionPreview, f_row_bg(8), pnlMuted, pnlText)
+        f_set_kv(9, "Block / Why", lastBlockReason, f_row_bg(9), pnlMuted, lastBlockReason == "-" ? pnlText : pnlWarn)
+        f_set_kv(10, "RC / Quality", lastReasonCode + " · " + lastReasonTxt + " | " + str.tostring(lastSignalQuality, "#") + "/100 (" + lastQualityBucket + ")", f_row_bg(10), pnlMuted, pnlInfo)
+        if panelDensity == "Detailed"
+            f_set_kv(11, "Pair / Config", "PairHealth=" + str.tostring(pairHealthScore, "#") + "/100 | CFG " + cfgHealthShort, f_row_bg(11), pnlMuted, configHardInvalid ? pnlBad : (configWarn ? pnlWarn : pnlGood))
+
+// Hidden plots for alerts
+// plot_0=z, plot_1=deltaPct, plot_2=toTier, plot_3=swapDir, plot_4=actionType, plot_5=ratio, plot_6=aPx, plot_7=bPx
+//====================
+plot(z,                 "Z-Score",     display=display.none) // plot_0
+plot(deltaPct,          "DeltaPct",    display=display.none) // plot_1
+plot(float(toTier),     "ToTier",      display=display.none) // plot_2
+plot(float(swapDir),    "SwapDir",     display=display.none) // plot_3
+plot(float(actionType), "ActionType",  display=display.none) // plot_4
+plot(ratio,             "Ratio",       display=display.none) // plot_5
+plot(aPx,               "A_tf",      display=display.none) // plot_6
+plot(bPx,             "B_tf",    display=display.none) // plot_7
+plot(signalQuality,     "SignalQuality", display=display.none) // plot_8
+plot(float(reasonIdNow),"ReasonID",      display=display.none) // plot_9
+plot(pairHealthScore,     "PairHealth",    display=display.none) // plot_10
+
+// Semantic background grammar (clearer distinction):
+// - REGIME  = cool teal/blue family
+// - PENDING = warm amber family (higher priority overlay)
+_trendBgAlpha = visualPreset == "Neon Pro" ? 94 : visualPreset == "Stealth" ? 97 : 92
+_pendingBgAlpha = visualPreset == "Neon Pro" ? 96 : visualPreset == "Stealth" ? 97 : 95
+_bgTrendBase = visualPreset == "Neon Pro" ? color.rgb(64, 184, 194) : visualPreset == "Stealth" ? color.rgb(84, 128, 134) : color.rgb(76, 170, 176)
+_bgPendingBase = visualPreset == "Neon Pro" ? color.rgb(255, 194, 76) : visualPreset == "Stealth" ? color.rgb(206, 166, 92) : color.rgb(242, 188, 76)
+_bgTrend = showTrendBg and trendRegime ? color.new(_bgTrendBase, _trendBgAlpha) : na
+_bgPending = showStatusRibbon and execModel == "CONFIRM" and pending ? color.new(_bgPendingBase, _pendingBgAlpha) : na
+bgcolor(not na(_bgPending) ? _bgPending : _bgTrend, title="Trend/Pending Background")
+
+_ribbonState = f_status_chip(pending, configHardInvalid, trendRegime, baseCanAct)
+_rbReady = visualPreset == "Neon Pro" ? color.rgb(48, 238, 180) : color.lime
+_rbPend  = visualPreset == "Neon Pro" ? color.rgb(255, 228, 90) : color.yellow
+_rbBlock = visualPreset == "Neon Pro" ? color.rgb(255, 136, 92) : color.orange
+_rbCfg   = visualPreset == "Neon Pro" ? color.rgb(255, 96, 118) : color.red
+_rbReg   = visualPreset == "Neon Pro" ? color.rgb(255, 178, 74) : color.orange
+
+// Plot-budget safe premium HUD: labels instead of extra plotshapes.
+var label _statusRibbonLbl = na
+var label _brandTagLbl = na
+var label _miniHudLbl = na
+if barstate.islast
+    _atr = ta.atr(14)
+    _atrSafe = na(_atr) ? (high - low) * 0.5 : _atr
+    _topSlot = 0.20
+    _topGap = 0.18
+    _rbColor = _ribbonState == "READY" ? _rbReady : _ribbonState == "PENDING" ? _rbPend : _ribbonState == "REGIME" ? _rbReg : _ribbonState == "BLOCKED" ? _rbCfg : _rbBlock
+    _rbTextColor = _ribbonState == "PENDING" ? color.black : color.white
+    _bgLegend = not na(_bgPending) ? "BG PEND" : (not na(_bgTrend) ? "BG REG" : "BG OFF")
+    _rbAlpha = showcaseMode ? 6 : 2
+    _brandAlpha = showcaseMode ? 4 : 10
+
+    _rbMul = f_label_size_mult(statusRibbonLabelTextSize)
+    _brandMul = f_label_size_mult(brandTagLabelTextSize)
+    _stackGap = showHudAntiOverlap ? math.max(_topGap, ((_rbMul + _brandMul) * 0.16) + hudTopGapATR) : _topGap
+    _tfWarnLift = badChartTF ? 0.48 : 0.0
+    _pendingLift = (execModel == "CONFIRM" and pending) ? 0.05 : 0.0
+    _topBase = _topSlot + hudTopYOffsetATR + _tfWarnLift + _pendingLift
+
+    _layoutStacked = topHudLayoutMode == "Stacked"
+    _layoutSplit = topHudLayoutMode == "Split"
+    _layoutCompact = topHudLayoutMode == "Compact"
+    _layoutMinimal = topHudLayoutMode == "Minimal"
+
+    _autoRibbonShift = showHudAntiOverlap and showBrandTag ? 1 : 0
+    _autoBrandShift  = showHudAntiOverlap and showStatusRibbon ? int(math.ceil((_rbMul + _brandMul) * 1.50)) : 0
+    if _layoutSplit
+        _autoRibbonShift := _autoRibbonShift + int(math.ceil(_rbMul * 1.20))
+        _autoBrandShift  := _autoBrandShift + int(math.ceil((_rbMul + _brandMul) * 2.20))
+    else if _layoutCompact
+        _autoRibbonShift := 0
+        _autoBrandShift  := _autoBrandShift + int(math.ceil((_rbMul + _brandMul) * 0.80))
+        _stackGap := math.max(0.08, _stackGap * 0.85)
+    else if _layoutMinimal
+        _autoRibbonShift := _autoRibbonShift + int(math.ceil(_rbMul * 1.60))
+        _autoBrandShift  := _autoBrandShift + int(math.ceil((_rbMul + _brandMul) * 2.60))
+        _stackGap := math.max(0.18, _stackGap * 1.10)
+    _rbX = bar_index - _autoRibbonShift
+    _rbY = high + _atrSafe * _topBase
+    _rbTxt = "AGP SWAP · " + _ribbonState + " · Q " + str.tostring(signalQuality, "#") + " · " + qualityBucketNow + " · " + _bgLegend
+    if _layoutCompact
+        _rbTxt := "AGP · " + _ribbonState + " · Q " + str.tostring(signalQuality, "#") + " · " + qualityBucketNow + " · " + _bgLegend
+    if _layoutMinimal
+        _rbTxt := "AGP · " + _ribbonState + " · Q " + str.tostring(signalQuality, "#") + " · " + _bgLegend
+    if showStatusRibbon
+        if na(_statusRibbonLbl)
+            _statusRibbonLbl := label.new(_rbX, _rbY, _rbTxt, style=label.style_label_down, color=color.new(_rbColor, _rbAlpha), textcolor=_rbTextColor, size=_ribbonLblSz)
+        else
+            label.set_xy(_statusRibbonLbl, _rbX, _rbY)
+            label.set_text(_statusRibbonLbl, _rbTxt)
+            label.set_style(_statusRibbonLbl, label.style_label_down)
+            label.set_color(_statusRibbonLbl, color.new(_rbColor, _rbAlpha))
+            label.set_textcolor(_statusRibbonLbl, _rbTextColor)
+            label.set_size(_statusRibbonLbl, _ribbonLblSz)
+    else
+        if not na(_statusRibbonLbl)
+            label.delete(_statusRibbonLbl)
+            _statusRibbonLbl := na
+
+    _brandX = bar_index + brandTagXShiftBars + _autoBrandShift
+    _brandY = high + _atrSafe * (showStatusRibbon ? (_topBase + _stackGap + (showHudAntiOverlap ? (0.05 * (_rbMul + _brandMul)) : 0.0)) : _topBase)
+    _brandTxt = "AG PRO SWAP ENGINE  ·  " + pairA + "↔" + pairB + "  ·  " + f_visual_preset_tag(visualPreset) + "  ·  " + f_profile_short(tradeProfile, applyTradeProfile) + "  ·  TF " + tf
+    if showcaseMode or _layoutCompact
+        _brandTxt := "AGP SWAP  ·  " + pairA + "↔" + pairB + "  ·  " + f_visual_preset_tag(visualPreset) + "  ·  " + f_profile_short(tradeProfile, applyTradeProfile) + "  ·  " + tf
+    if _layoutMinimal
+        _brandTxt := pairA + "↔" + pairB + " · " + f_profile_short(tradeProfile, applyTradeProfile) + " · " + tf
+    _brandBg = visualPreset == "Neon Pro" ? color.rgb(12, 22, 28) : visualPreset == "Stealth" ? color.rgb(20, 22, 25) : color.rgb(16, 24, 28)
+    _brandTc = visualPreset == "Neon Pro" ? color.rgb(120, 255, 232) : color.rgb(215, 226, 236)
+    if _layoutSplit and showStatusRibbon and showBrandTag
+        _rbY := high + _atrSafe * (_topBase + (showHudAntiOverlap ? (0.03 * _rbMul) : 0.0))
+        _brandY := high + _atrSafe * (_topBase + _stackGap + (showHudAntiOverlap ? (0.08 * (_rbMul + _brandMul)) : 0.02))
+    if _layoutMinimal and showStatusRibbon and showBrandTag
+        _rbY := high + _atrSafe * (_topBase + (showHudAntiOverlap ? (0.05 * _rbMul) : 0.01))
+        _brandY := high + _atrSafe * (_topBase + _stackGap + (showHudAntiOverlap ? (0.10 * (_rbMul + _brandMul)) : 0.04))
+    _showBrandTagEff = showBrandTag and not (_layoutMinimal and showStatusRibbon and showcaseMode)
+    // Absolute overlap fallback: collapse top HUD into a single ribbon when risk is high
+    _topHudForceUnified = topHudComposeMode == "Always Unified"
+    _topHudAutoUnified = topHudComposeMode == "Auto Unified"
+    _topHudUnifiedFallback = _topHudForceUnified or (_topHudAutoUnified and showHudAntiOverlap and showStatusRibbon and _showBrandTagEff and (showcaseMode or topHudLayoutMode == "Split" or topHudLayoutMode == "Minimal" or topHudLayoutMode == "Compact"))
+    if _topHudUnifiedFallback
+        _showBrandTagEff := false
+        _rbX := bar_index - int(math.ceil(2.4 + 1.35 * _rbMul))
+        _rbTxt := "AGP · " + _ribbonState + " · Q " + str.tostring(signalQuality, "#") + " · " + _bgLegend + " · " + pairA + "↔" + pairB + " · TF " + tf
+        if topHudComposeMode == "Always Unified" and not showcaseMode and topHudLayoutMode == "Stacked"
+            _rbTxt := "AGP SWAP · " + _ribbonState + " · Q " + str.tostring(signalQuality, "#") + " · " + _bgLegend + " · " + pairA + "↔" + pairB + " · " + f_profile_short(tradeProfile, applyTradeProfile) + " · TF " + tf
+    // Hard collision guard (final pass): force clear lane separation for top HUD labels
+    if showHudAntiOverlap and showStatusRibbon and _showBrandTagEff
+        _hardSep = math.max(_stackGap, 0.30 + 0.11 * (_rbMul + _brandMul))
+        _rbX := bar_index - int(math.ceil(2.0 + 1.20 * _rbMul))
+        _brandX := bar_index + brandTagXShiftBars + int(math.ceil(7.0 + 2.00 * _brandMul + 1.80 * _rbMul))
+        _rbY := high + _atrSafe * (_topBase + (showcaseMode ? 0.01 : 0.00))
+        _brandY := high + _atrSafe * (_topBase + _hardSep + 0.16 * (_rbMul + _brandMul))
+        if topHudLayoutMode == "Minimal" or topHudLayoutMode == "Compact" or showcaseMode
+            _brandTxt := pairA + "↔" + pairB + " · " + tf
+    // IMPORTANT: hard guard runs after initial ribbon draw, so re-apply ribbon position/text here
+    if showHudAntiOverlap and showStatusRibbon and not na(_statusRibbonLbl)
+        label.set_xy(_statusRibbonLbl, _rbX, _rbY)
+        label.set_text(_statusRibbonLbl, _rbTxt)
+        label.set_style(_statusRibbonLbl, label.style_label_down)
+        label.set_color(_statusRibbonLbl, color.new(_rbColor, _rbAlpha))
+        label.set_textcolor(_statusRibbonLbl, _rbTextColor)
+        label.set_size(_statusRibbonLbl, _ribbonLblSz)
+    if _showBrandTagEff
+        if na(_brandTagLbl)
+            _brandTagLbl := label.new(_brandX, _brandY, _brandTxt, style=label.style_label_down, color=color.new(_brandBg, _brandAlpha), textcolor=_brandTc, size=_brandLblSz)
+        else
+            label.set_xy(_brandTagLbl, _brandX, _brandY)
+            label.set_text(_brandTagLbl, _brandTxt)
+            label.set_style(_brandTagLbl, label.style_label_down)
+            label.set_color(_brandTagLbl, color.new(_brandBg, _brandAlpha))
+            label.set_textcolor(_brandTagLbl, _brandTc)
+            label.set_size(_brandTagLbl, _brandLblSz)
+    else
+        if not na(_brandTagLbl)
+            label.delete(_brandTagLbl)
+            _brandTagLbl := na
+
+    _miniX = bar_index + miniHudXShiftBars
+    _miniY = low - _atrSafe * (0.22 + miniHudYOffsetATR)
+    _miniRc = pending and execModel == "CONFIRM" and p_reasonCode != "-" ? p_reasonCode : reasonCodeNow
+    _miniPh = pending and execModel == "CONFIRM" and not na(p_pairHealth) ? p_pairHealth : pairHealthScore
+    _miniQ = pending and execModel == "CONFIRM" and not na(p_signalQuality) ? p_signalQuality : signalQuality
+    _miniQb = pending and execModel == "CONFIRM" and p_qualityBucket != "N/A" ? p_qualityBucket : qualityBucketNow
+    _miniTxt = "AGP HUD  ·  Q " + str.tostring(_miniQ, "#") + " (" + _miniQb + ")  ·  PH " + str.tostring(_miniPh, "#") + "/100  ·  RC " + _miniRc + "  ·  " + _ribbonState + "  ·  " + _bgLegend
+    if _layoutCompact or showcaseMode
+        _miniTxt := "AGP HUD · Q " + str.tostring(_miniQ, "#") + " · PH " + str.tostring(_miniPh, "#") + " · " + _ribbonState + " · " + _bgLegend
+    if _layoutMinimal
+        _miniTxt := "Q " + str.tostring(_miniQ, "#") + " · PH " + str.tostring(_miniPh, "#") + " · " + _miniRc + " · " + _bgLegend
+    _showMiniHUDEff = showMiniHUD and not ((_layoutMinimal and showStatusRibbon) or (showcaseMode and autoHideMiniHudWithPanel and showPendingPanel))
+    if _topHudUnifiedFallback and showcaseMode and topHudLayoutMode == "Minimal"
+        _showMiniHUDEff := false
+    _miniBgAlpha = showcaseMode ? 0 : (visualPreset == "Neon Pro" ? 2 : visualPreset == "Stealth" ? 6 : 4)
+    _miniBgAlpha := (not na(_bgPending) or not na(_bgTrend)) ? math.min(18, _miniBgAlpha + 4) : _miniBgAlpha
+    _miniBg = color.new(pnlIsDark ? color.rgb(18, 20, 24) : color.rgb(248, 248, 250), _miniBgAlpha)
+    _miniTc = _miniQ >= 70 ? pnlGood : _miniQ >= 40 ? pnlWarn : pnlBad
+    if _showMiniHUDEff
+        if na(_miniHudLbl)
+            _miniHudLbl := label.new(_miniX, _miniY, _miniTxt, style=label.style_label_up, color=_miniBg, textcolor=_miniTc, size=_miniHudLblSz)
+        else
+            label.set_xy(_miniHudLbl, _miniX, _miniY)
+            label.set_text(_miniHudLbl, _miniTxt)
+            label.set_style(_miniHudLbl, label.style_label_up)
+            label.set_color(_miniHudLbl, _miniBg)
+            label.set_textcolor(_miniHudLbl, _miniTc)
+            label.set_size(_miniHudLbl, _miniHudLblSz)
+    else
+        if not na(_miniHudLbl)
+            label.delete(_miniHudLbl)
+            _miniHudLbl := na
+
+prevTrendRegime   = bar_index > 0 ? trendRegime[1] : false
+trendRegimeOnEdge  = evalTF and evalBar and trendRegime and not prevTrendRegime
+trendRegimeOffEdge = evalTF and evalBar and not trendRegime and prevTrendRegime
+
+// Diagnostics alert edges (avoid repeated alert spam on persistent states)
+prevDupSupp = bar_index > 0 ? isDupSignal[1] : false
+dupSuppEdge = isDupSignal and not prevDupSupp
+cfgWarnOnly = configWarn and not configHardInvalid
+prevCfgWarnOnly = bar_index > 0 ? cfgWarnOnly[1] : false
+cfgWarnEdge = cfgWarnOnly and not prevCfgWarnOnly
+prevCfgInvalid = bar_index > 0 ? configHardInvalid[1] : false
+cfgInvalidEdge = configHardInvalid and not prevCfgInvalid
+
+//====================
+// Alerts V2 (router: suggestion + lifecycle + diagnostics)
+//====================
+alertcondition(didSignal and actionType == 1 and swapDir == 1, "[AGP] SWAP ENTRY A->B",
+     "[AGP][SWAP][ENTRY][A>B] SELLER-GRADE | z={{plot_0}} | dPct%={{plot_1}} | T={{plot_2}} | Q={{plot_8}} | PH={{plot_10}} | R={{plot_5}}")
+
+alertcondition(didSignal and actionType == 1 and swapDir == -1, "[AGP] SWAP ENTRY B->A",
+     "[AGP][SWAP][ENTRY][B>A] SELLER-GRADE | z={{plot_0}} | dPct%={{plot_1}} | T={{plot_2}} | Q={{plot_8}} | PH={{plot_10}} | R={{plot_5}}")
+
+alertcondition(didSignal and actionType == -1 and swapDir == 1, "[AGP] SWAP EXIT A->B",
+     "[AGP][SWAP][EXIT][A>B] SELLER-GRADE | z={{plot_0}} | dPct%={{plot_1}} | T={{plot_2}} | Q={{plot_8}} | PH={{plot_10}} | R={{plot_5}}")
+
+alertcondition(didSignal and actionType == -1 and swapDir == -1, "[AGP] SWAP EXIT B->A",
+     "[AGP][SWAP][EXIT][B>A] SELLER-GRADE | z={{plot_0}} | dPct%={{plot_1}} | T={{plot_2}} | Q={{plot_8}} | PH={{plot_10}} | R={{plot_5}}")
+
+alertcondition(trendRegimeOnEdge, "[AGP] Trend Regime ON",
+     "[AGP][REGIME][ON] entries blocked | z={{plot_0}} | PH={{plot_10}} | R={{plot_5}}")
+
+alertcondition(trendRegimeOffEdge, "[AGP] Trend Regime OFF",
+     "[AGP][REGIME][OFF] entries unblocked | z={{plot_0}} | PH={{plot_10}} | R={{plot_5}}")
+
+// V15 Alert Router (pending lifecycle + diagnostics)
+alertcondition(pendingCreated, "[AGP] Pending Created",
+     "[AGP][PENDING][CREATED] z={{plot_0}} | dPct%={{plot_1}} | toTier={{plot_2}} | Q={{plot_8}} | RC={{plot_9}} | PH={{plot_10}}")
+
+alertcondition(pendingConfirmed, "[AGP] Pending Confirmed",
+     "[AGP][PENDING][CONFIRMED] z={{plot_0}} | dPct%={{plot_1}} | toTier={{plot_2}} | Q={{plot_8}} | RC={{plot_9}} | PH={{plot_10}}")
+
+alertcondition(pendingSkipped, "[AGP] Pending Skipped",
+     "[AGP][PENDING][SKIPPED] z={{plot_0}} | Q={{plot_8}} | RC={{plot_9}} | PH={{plot_10}}")
+
+alertcondition(pendingExpired, "[AGP] Pending Expired",
+     "[AGP][PENDING][EXPIRED] z={{plot_0}} | Q={{plot_8}} | RC={{plot_9}} | PH={{plot_10}}")
+
+alertcondition(dupSuppEdge, "[AGP] Duplicate Suppressed",
+     "[AGP][DIAG][DUP] duplicate suppressed | z={{plot_0}} | RC={{plot_9}} | Q={{plot_8}}")
+
+alertcondition(cfgWarnEdge, "[AGP] Config Warning",
+     "[AGP][CONFIG][WARN] quote/market/tier warning | RC={{plot_9}} | PH={{plot_10}} | Review inputs/profile")
+
+alertcondition(cfgInvalidEdge, "[AGP] Config Invalid",
+     "[AGP][CONFIG][INVALID] check thresholds / pair selection | RC={{plot_9}} | PH={{plot_10}} | Engine blocked")

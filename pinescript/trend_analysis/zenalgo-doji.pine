@@ -1,0 +1,192 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © ZenAlgo_Official
+
+//@version=5
+indicator("ZenAlgo – Doji", overlay = true, max_labels_count = 500)
+
+//────────────────────────────────────────────
+// 1) INPUTS
+//────────────────────────────────────────────
+string grpMain = "DOJI + PVSRA"
+
+showLabels = input.bool(true, "Show DOJI labels", group = grpMain)
+
+// Geometry presets + PVSRA
+string dojiPreset = input.string(
+     "CUSTOM",
+     "Preset",
+     options = ["REVERSAL", "CLASSIC", "LOOSE", "CUSTOM"],
+     group   = grpMain)
+
+// DOJI geometry (custom values only used when preset = CUSTOM)
+float dojiBodyPct_input  = input.float(0.35, "Max body % of range",  minval = 0.0, maxval = 0.5, step = 0.01, group = grpMain)
+float dojiWickLong_input = input.float(0.30, "Long wick % of range", minval = 0.0, maxval = 1.0, step = 0.05, group = grpMain)
+float dojiWickTiny_input = input.float(0.15, "Tiny wick % of range", minval = 0.0, maxval = 0.5, step = 0.01, group = grpMain)
+
+// PVSRA (volume multiple vs last N bars) - custom values
+int   pvsraLen_input     = input.int(10, "PVSRA lookback (bars)", minval = 2, group = grpMain)
+float pvsraMultThr_input = input.float(1.3, "Min PVSRA multiple", step = 0.1, group = grpMain)
+usePvsraFilter           = input.bool(true, "Require PVSRA spike", group = grpMain)
+
+//────────────────────────────────────────────
+// 1b) PRESET MAPPING -> EFFECTIVE VALUES
+//────────────────────────────────────────────
+float dojiBodyPct =
+      dojiPreset == "REVERSAL" ? 0.05 :
+      dojiPreset == "CLASSIC"  ? 0.10 :
+      dojiPreset == "LOOSE"    ? 0.20 :
+                                 dojiBodyPct_input
+
+float dojiWickLong =
+     dojiPreset == "REVERSAL" ? 0.60 :
+     dojiPreset == "CLASSIC"  ? 0.40 :
+     dojiPreset == "LOOSE"    ? 0.30 :
+                                 dojiWickLong_input
+
+float dojiWickTiny =
+     dojiPreset == "REVERSAL" ? 0.05 :
+     dojiPreset == "CLASSIC"  ? 0.10 :
+     dojiPreset == "LOOSE"    ? 0.10 :
+                                 dojiWickTiny_input
+
+int pvsraLen =
+     dojiPreset == "REVERSAL" ? 20 :
+     dojiPreset == "CLASSIC"  ? 10 :
+     dojiPreset == "LOOSE"    ? 8  :
+                                 pvsraLen_input
+
+float pvsraMultThr =
+     dojiPreset == "REVERSAL" ? 2.5 :
+     dojiPreset == "CLASSIC"  ? 2.0 :
+     dojiPreset == "LOOSE"    ? 1.5 :
+                                 pvsraMultThr_input
+
+// Delta proxy (using close change)
+useAbsDeltaThr = input.bool(false, "Require |Δ| > 0", group = grpMain)
+useDivFilter   = false  //input.bool(false, "Require Δ divergence vs price", group = grpMain)
+
+//────────────────────────────────────────────
+// 2) DOJI - candle types
+//────────────────────────────────────────────
+float barRange = high - low
+float body     = math.abs(close - open)
+float bodyPct  = barRange > 0 ? body / barRange : 0.0
+float upperW   = high - math.max(open, close)
+float lowerW   = math.min(open, close) - low
+float upperPct = barRange > 0 ? upperW / barRange : 0.0
+float lowerPct = barRange > 0 ? lowerW / barRange : 0.0
+
+bool isDojiBase = barRange > 0 and bodyPct <= dojiBodyPct
+
+bool isDragonfly    = isDojiBase and upperPct <= dojiWickTiny and lowerPct >= dojiWickLong
+bool isGravestone   = isDojiBase and lowerPct <= dojiWickTiny and upperPct >= dojiWickLong
+bool isLongLegged   = isDojiBase and upperPct >= dojiWickLong and lowerPct >= dojiWickLong
+bool isStandardDoji = isDojiBase and not (isDragonfly or isGravestone or isLongLegged)
+
+string dojiType =
+     isDragonfly    ? "Dragonfly DOJI"
+   : isGravestone   ? "Gravestone DOJI"
+   : isLongLegged   ? "Long-legged DOJI"
+   : isStandardDoji ? "Standard DOJI"
+   :                  ""
+
+//────────────────────────────────────────────
+// 3) PVSRA - volume multiple (volume vs SMA)
+//────────────────────────────────────────────
+float volAvg    = ta.sma(volume, pvsraLen)
+float pvsraMult = volAvg > 0 ? volume / volAvg : na
+bool  pvsraSpike = not na(pvsraMult) and pvsraMult >= pvsraMultThr
+
+//────────────────────────────────────────────
+// 4) DeltaZ - calculation + sign flip + divergence
+//    % close change -> EMA -> Z-score
+//────────────────────────────────────────────
+int   lbZDelta    = 48
+int   deltaEmaLen = 10
+
+float deltaRaw      = na(close[1]) ? na : 100.0 * (close / close[1] - 1.0)
+float deltaSmoothed = ta.ema(deltaRaw, deltaEmaLen)
+float deltaMean     = ta.sma(deltaSmoothed, lbZDelta)
+float deltaStdev    = ta.stdev(deltaSmoothed, lbZDelta)
+float deltaZ        = deltaStdev > 0 ? (deltaSmoothed - deltaMean) / deltaStdev : 0.0
+
+float dNow  = deltaZ
+float dPrev = nz(deltaZ[1])
+
+bool deltaNonZeroNow  = not na(dNow)  and (not useAbsDeltaThr or math.abs(dNow)  > 0)
+bool deltaNonZeroPrev = not na(dPrev) and (not useAbsDeltaThr or math.abs(dPrev) > 0)
+
+bool deltaFlip = deltaNonZeroNow and deltaNonZeroPrev and math.sign(dNow) != math.sign(dPrev)
+
+// Divergence Δ vs price (simple 2-bar divergence)
+// BULL: price makes a lower close, Δ rises
+// BEAR: price makes a higher close, Δ falls
+bool priceDown = close < close[1]
+bool priceUp   = close > close[1]
+bool deltaUp   = dNow > dPrev
+bool deltaDown = dNow < dPrev
+
+bool bullDivAll = priceDown and deltaUp
+bool bearDivAll = priceUp   and deltaDown
+
+bool divFilter =
+     not useDivFilter
+  or (dNow > 0 and bullDivAll)
+  or (dNow < 0 and bearDivAll)
+
+//────────────────────────────────────────────
+// 5) FINAL CONDITION + LABEL
+//────────────────────────────────────────────
+bool isDojiHere  = isDojiBase
+bool isDojiPrev  = bar_index > 0 ? isDojiBase[1] : false
+bool usePrevDoji = not isDojiHere and isDojiPrev
+
+// DOJI can be on the current or previous candle
+bool cond = showLabels and (isDojiHere or isDojiPrev) and (not usePvsraFilter or pvsraSpike) and deltaFlip and divFilter
+
+//────────────────────────────────────────────
+// 6) ALERT CONDITIONS
+//────────────────────────────────────────────
+// Generic alert (any doji)
+alertcondition(cond, title = "DOJI Alert", message = "ZenAlgo DOJI: Alert (Doji+PVSRA+DeltaFlip).")
+
+// Bull/bear split (only when alert is present)
+bool condBull = cond and dNow > 0
+bool condBear = cond and dNow < 0
+
+alertcondition(condBull, title = "DOJI Bull", message = "ZenAlgo DOJI: BULL alert (Doji+PVSRA+DeltaFlip).")
+alertcondition(condBear, title = "DOJI Bear", message = "ZenAlgo DOJI: BEAR alert (Doji+PVSRA+DeltaFlip).")
+
+//────────────────────────────────────────────
+// 7) LABEL DRAWING
+//────────────────────────────────────────────
+if cond
+    bool   isBull   = dNow > 0
+    string bullBear = isBull ? "BULL" : "BEAR"
+    string dojiTxt  = usePrevDoji ? dojiType[1] : dojiType
+    string sType    = dojiTxt != "" ? dojiTxt : "DOJI"
+    string sPvsra   = "PVSRA x" + str.tostring(pvsraMult, "#.0") + " (" + str.tostring(pvsraLen) + ")"
+
+    string txt = sType + "\n" + bullBear + "\n" + sPvsra
+
+    float yDojiHigh = usePrevDoji ? high[1] : high
+    float yDojiLow  = usePrevDoji ? low[1]  : low
+    float y         = isBull ? yDojiLow : yDojiHigh
+    int   xIndex    = usePrevDoji ? bar_index - 1 : bar_index
+
+    // Colors: BULL = lime background, BEAR = red background
+    color colBg  = isBull ? color.new(color.lime, 0) : color.new(color.red, 0)
+    color colTxt = isBull ? color.black              : color.white
+
+    // Empty visual label, info shown only in tooltip
+    string tooltipTxt = txt
+
+    label.new(
+         xIndex,
+         y,
+         text      = "",
+         style     = isBull ? label.style_label_up : label.style_label_down,
+         color     = colBg,
+         textcolor = colTxt,
+         size      = size.tiny,
+         tooltip   = tooltipTxt)

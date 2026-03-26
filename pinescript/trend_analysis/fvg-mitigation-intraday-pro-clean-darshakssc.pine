@@ -1,0 +1,315 @@
+//@version=6
+indicator("FVG Mitigation Intraday PRO Clean", overlay=true, max_boxes_count=200, max_labels_count=200)
+
+// Educational tool only. Not financial advice.
+
+//=============================================================================
+// Inputs
+//=============================================================================
+grpFVG = "FVG Detection"
+extendBars      = input.int(220, "Extend FVG boxes (bars)", minval=20, maxval=2000, group=grpFVG)
+maxBoxesDrawn   = input.int(8, "Max boxes visible on chart", minval=1, maxval=50, group=grpFVG)
+maxStoredZones  = input.int(120, "Max stored zones (internal)", minval=30, maxval=200, group=grpFVG)
+minGapTicks     = input.int(6, "Min gap size (ticks)", minval=0, maxval=200, group=grpFVG)
+minGapPct       = input.float(0.05, "Min gap size (% of price)", minval=0.0, maxval=5.0, step=0.05, group=grpFVG)
+useWickTouch    = input.bool(true, "Mitigation uses wick touch (else close-in-zone)", group=grpFVG)
+hideMitigated   = input.bool(true, "Hide mitigated FVGs", group=grpFVG)
+showOnlyNearest = input.bool(true, "Show only nearest FVG (ultra clean)", group=grpFVG)
+
+grpConfirm = "A+ Signal Filter (Price Only)"
+requireRejection = input.bool(true, "Require rejection candle", group=grpConfirm)
+minBodyToRange   = input.float(0.55, "Rejection min body/range", minval=0.10, maxval=0.95, step=0.05, group=grpConfirm)
+closeThroughMid  = input.bool(true, "Close must pass zone midpoint", group=grpConfirm)
+cooldownBars     = input.int(12, "Cooldown after signal (bars)", minval=0, maxval=200, group=grpConfirm)
+
+grpVisual = "Visuals (Clean)"
+theme = input.string("Dark", "Theme", options=["Dark","Light"], group=grpVisual)
+showSignalLabel  = input.bool(true, "Show ONE minimal signal label", group=grpVisual)
+showSignalMarker = input.bool(true, "Show small signal marker", group=grpVisual)
+boxOpacity       = input.int(92, "Box fill opacity (0–100)", minval=0, maxval=100, group=grpVisual)
+borderOpacity    = input.int(70, "Border opacity (0–100)", minval=0, maxval=100, group=grpVisual)
+
+grpDash = "Dashboard"
+dashOn      = input.bool(true, "Show dashboard", group=grpDash)
+dashPos     = input.string("Top Right", "Dashboard Position", options=[
+    "Top Left","Top Center","Top Right",
+    "Middle Left","Middle Center","Middle Right",
+    "Bottom Left","Bottom Center","Bottom Right"
+], group=grpDash)
+dashSize    = input.string("Normal", "Dashboard Size", options=["Small","Normal","Large"], group=grpDash)
+dashOpacity = input.int(75, "Dashboard Opacity (0–100)", minval=0, maxval=100, group=grpDash)
+
+//=============================================================================
+// Helpers
+//=============================================================================
+f_pos(_p) =>
+    switch _p
+        "Top Left"      => position.top_left
+        "Top Center"    => position.top_center
+        "Top Right"     => position.top_right
+        "Middle Left"   => position.middle_left
+        "Middle Center" => position.middle_center
+        "Middle Right"  => position.middle_right
+        "Bottom Left"   => position.bottom_left
+        "Bottom Center" => position.bottom_center
+        => position.bottom_right
+
+f_txtSize(_s) =>
+    switch _s
+        "Small"  => size.small
+        "Large"  => size.large
+        => size.normal
+
+f_abs(_x) => _x < 0 ? -_x : _x
+f_naToStr(_v) => na(_v) ? "—" : str.tostring(_v, format.mintick)
+
+// Theme palette
+bullFill = theme == "Dark" ? color.new(color.lime, boxOpacity) : color.new(color.green, boxOpacity)
+bearFill = theme == "Dark" ? color.new(color.red,  boxOpacity) : color.new(color.maroon, boxOpacity)
+brdCol   = theme == "Dark" ? color.new(color.silver, borderOpacity) : color.new(color.gray, borderOpacity)
+
+bgDark  = color.new(color.black, 100 - dashOpacity)
+bgLight = color.new(color.white, 100 - dashOpacity)
+bgDash  = theme == "Dark" ? bgDark : bgLight
+fgDash  = theme == "Dark" ? color.new(color.white, 0) : color.new(color.black, 0)
+muted   = theme == "Dark" ? color.new(color.silver, 0) : color.new(color.gray, 0)
+
+// Candle stats for rejection (price-only)
+rng = math.max(high - low, syminfo.mintick)
+body = f_abs(close - open)
+bodyRatio = body / rng
+rejBull = close > open and bodyRatio >= minBodyToRange
+rejBear = close < open and bodyRatio >= minBodyToRange
+
+//=============================================================================
+// Arrays
+//=============================================================================
+var box[]   boxes = array.new_box()
+var float[] tops  = array.new_float()
+var float[] bots  = array.new_float()
+var int[]   dirs  = array.new_int()   // +1 bullish, -1 bearish
+var int[]   born  = array.new_int()
+var bool[]  miti  = array.new_bool()
+
+f_removeAt(_idx) =>
+    bx = array.get(boxes, _idx)
+    if not na(bx)
+        box.delete(bx)
+    array.remove(boxes, _idx)
+    array.remove(tops,  _idx)
+    array.remove(bots,  _idx)
+    array.remove(dirs,  _idx)
+    array.remove(born,  _idx)
+    array.remove(miti,  _idx)
+
+//=============================================================================
+// FVG Definition (3-candle imbalance)
+//=============================================================================
+bullFVG = low > high[2]
+bearFVG = high < low[2]
+
+gapBull = bullFVG ? (low - high[2]) : 0.0
+gapBear = bearFVG ? (low[2] - high) : 0.0
+
+minGapAbs = minGapTicks * syminfo.mintick
+minGapPctAbs = (minGapPct > 0) ? (close * (minGapPct / 100.0)) : 0.0
+minNeed = math.max(minGapAbs, minGapPctAbs)
+
+bullOk = bullFVG and (gapBull >= minNeed)
+bearOk = bearFVG and (gapBear >= minNeed)
+
+//=============================================================================
+// 1) Create zones
+//=============================================================================
+if bullOk
+    zTop = low
+    zBot = high[2]
+    bx = box.new(bar_index - 2, zTop, bar_index, zBot, bgcolor=bullFill, border_color=brdCol)
+    array.unshift(boxes, bx), array.unshift(tops, zTop), array.unshift(bots, zBot)
+    array.unshift(dirs, 1), array.unshift(born, bar_index), array.unshift(miti, false)
+
+if bearOk
+    zTop = low[2]
+    zBot = high
+    bx = box.new(bar_index - 2, zTop, bar_index, zBot, bgcolor=bearFill, border_color=brdCol)
+    array.unshift(boxes, bx), array.unshift(tops, zTop), array.unshift(bots, zBot)
+    array.unshift(dirs, -1), array.unshift(born, bar_index), array.unshift(miti, false)
+
+// Cap stored zones (reverse-safe trimming)
+while array.size(boxes) > maxStoredZones
+    f_removeAt(array.size(boxes) - 1)
+
+//=============================================================================
+// 2) Expire old zones (REVERSE LOOP SAFE)
+//=============================================================================
+int n0 = array.size(boxes)
+if n0 > 0
+    for i = n0 - 1 to 0
+        b0 = array.get(born, i)
+        if (bar_index - b0) > extendBars
+            f_removeAt(i)
+
+// Recompute size after removals
+int n = array.size(boxes)
+
+//=============================================================================
+// 3) Find nearest unhidden zone index
+//=============================================================================
+int nearestIdx = na
+if n > 0
+    float bestDist = na
+    for k = 0 to n - 1
+        mm = array.get(miti, k)
+        if not (hideMitigated and mm)
+            t = array.get(tops, k)
+            b = array.get(bots, k)
+            mid = (t + b) * 0.5
+            dist = f_abs(close - mid)
+            if na(bestDist) or dist < bestDist
+                bestDist := dist
+                nearestIdx := k
+
+//=============================================================================
+// 4) Update box visuals (NO deletions here)
+//=============================================================================
+if n > 0
+    int shown = 0
+    for i = 0 to n - 1
+        bx  = array.get(boxes, i)
+        top = array.get(tops,  i)
+        bot = array.get(bots,  i)
+        d   = array.get(dirs,  i)
+        mm  = array.get(miti,  i)
+
+        // Decide visibility
+        bool visible = true
+        if hideMitigated and mm
+            visible := false
+
+        if showOnlyNearest
+            visible := visible and (not na(nearestIdx)) and (i == nearestIdx)
+        else
+            if visible
+                shown += 1
+                visible := shown <= maxBoxesDrawn
+
+        // Extend + style
+        if not na(bx)
+            box.set_right(bx, bar_index)
+            box.set_top(bx, top)
+            box.set_bottom(bx, bot)
+
+            if visible
+                box.set_bgcolor(bx, d == 1 ? bullFill : bearFill)
+                box.set_border_color(bx, brdCol)
+            else
+                box.set_bgcolor(bx, color.new(color.black, 100))
+                box.set_border_color(bx, color.new(color.black, 100))
+
+//=============================================================================
+// 5) Mitigation signals (evaluate ONLY nearest zone to reduce spam)
+//=============================================================================
+var int cooldown = 0
+cooldown := math.max(cooldown - 1, 0)
+
+bullSig = false
+bearSig = false
+var string lastEvent = "None"
+
+if n > 0 and not na(nearestIdx) and nearestIdx >= 0 and nearestIdx < n
+    t = array.get(tops, nearestIdx)
+    b = array.get(bots, nearestIdx)
+    d = array.get(dirs, nearestIdx)
+    mm = array.get(miti, nearestIdx)
+
+    inWick  = (low <= t) and (high >= b)
+    inClose = (close <= t) and (close >= b)
+    touched = useWickTouch ? inWick : inClose
+    mid = (t + b) * 0.5
+
+    if cooldown == 0 and not mm and touched
+        bullPass = (d == 1) and (requireRejection ? rejBull : true) and (closeThroughMid ? close > mid : close > t)
+        bearPass = (d == -1) and (requireRejection ? rejBear : true) and (closeThroughMid ? close < mid : close < b)
+
+        if bullPass
+            bullSig := true
+            lastEvent := "Bull FVG Mitigation"
+            array.set(miti, nearestIdx, true)
+            cooldown := cooldownBars
+
+        if bearPass
+            bearSig := true
+            lastEvent := "Bear FVG Mitigation"
+            array.set(miti, nearestIdx, true)
+            cooldown := cooldownBars
+
+//=============================================================================
+// 6) Minimal label + markers
+//=============================================================================
+if showSignalLabel
+    if bullSig
+        label.new(bar_index, low, "FVG ↑", style=label.style_label_up, textcolor=color.white, color=color.new(color.lime, 0), size=size.tiny)
+    if bearSig
+        label.new(bar_index, high, "FVG ↓", style=label.style_label_down, textcolor=color.white, color=color.new(color.red, 0), size=size.tiny)
+
+plotshape(showSignalMarker and bullSig, title="Bull FVG Mitigation", style=shape.triangleup, size=size.tiny, location=location.belowbar, color=color.new(color.lime, 0))
+plotshape(showSignalMarker and bearSig, title="Bear FVG Mitigation", style=shape.triangledown, size=size.tiny, location=location.abovebar, color=color.new(color.red, 0))
+
+//=============================================================================
+// Alerts (neutral)
+//=============================================================================
+alertcondition(bullSig, title="Bull FVG Mitigation", message="Bullish FVG mitigation signal (price-action confirmation).")
+alertcondition(bearSig, title="Bear FVG Mitigation", message="Bearish FVG mitigation signal (price-action confirmation).")
+
+//=============================================================================
+// Dashboard (movable, clean)
+//=============================================================================
+var table dash = na
+var string _lp = ""
+var string _ls = ""
+
+visibleStr = showOnlyNearest ? "Nearest only" : ("Up to " + str.tostring(maxBoxesDrawn))
+tfHint = timeframe.isintraday ? "5m–1h ready" : "Intraday optimized"
+
+nearestStr = "—"
+if n > 0 and not na(nearestIdx) and nearestIdx >= 0 and nearestIdx < n
+    t = array.get(tops, nearestIdx)
+    b = array.get(bots, nearestIdx)
+    d = array.get(dirs, nearestIdx)
+    mid = (t + b) * 0.5
+    nearestStr := (d == 1 ? "Bull @ " : "Bear @ ") + str.tostring(mid, format.mintick)
+
+if dashOn
+    if na(dash) or _lp != dashPos or _ls != dashSize
+        if not na(dash)
+            table.delete(dash)
+        dash := table.new(f_pos(dashPos), 2, 7, border_width=1)
+        _lp := dashPos
+        _ls := dashSize
+
+    table.cell(dash, 0, 0, "FVG Mitigation PRO", text_color=fgDash, bgcolor=bgDash, text_size=f_txtSize(dashSize))
+    table.cell(dash, 1, 0, tfHint,              text_color=muted, bgcolor=bgDash, text_size=f_txtSize(dashSize))
+
+    table.cell(dash, 0, 1, "Visible", text_color=muted, bgcolor=bgDash, text_size=f_txtSize(dashSize))
+    table.cell(dash, 1, 1, visibleStr, text_color=fgDash, bgcolor=bgDash, text_size=f_txtSize(dashSize))
+
+    table.cell(dash, 0, 2, "Stored", text_color=muted, bgcolor=bgDash, text_size=f_txtSize(dashSize))
+    table.cell(dash, 1, 2, str.tostring(n), text_color=fgDash, bgcolor=bgDash, text_size=f_txtSize(dashSize))
+
+    table.cell(dash, 0, 3, "Nearest", text_color=muted, bgcolor=bgDash, text_size=f_txtSize(dashSize))
+    table.cell(dash, 1, 3, nearestStr, text_color=fgDash, bgcolor=bgDash, text_size=f_txtSize(dashSize))
+
+    table.cell(dash, 0, 4, "Min Gap", text_color=muted, bgcolor=bgDash, text_size=f_txtSize(dashSize))
+    table.cell(dash, 1, 4, str.tostring(minGapTicks) + " ticks / " + str.tostring(minGapPct, "#.##") + "%", text_color=fgDash, bgcolor=bgDash, text_size=f_txtSize(dashSize))
+
+    table.cell(dash, 0, 5, "Confirm", text_color=muted, bgcolor=bgDash, text_size=f_txtSize(dashSize))
+    table.cell(dash, 1, 5, (requireRejection ? "Rejection" : "Touch") + (closeThroughMid ? " + Mid" : ""), text_color=fgDash, bgcolor=bgDash, text_size=f_txtSize(dashSize))
+
+    table.cell(dash, 0, 6, "Last", text_color=muted, bgcolor=bgDash, text_size=f_txtSize(dashSize))
+    table.cell(dash, 1, 6, lastEvent, text_color=fgDash, bgcolor=bgDash, text_size=f_txtSize(dashSize))
+else
+    if not na(dash)
+        table.delete(dash)
+        dash := na
+        _lp := ""
+        _ls := ""

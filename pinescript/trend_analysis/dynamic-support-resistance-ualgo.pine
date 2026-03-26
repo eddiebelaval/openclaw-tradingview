@@ -1,0 +1,207 @@
+// This work is licensed under Creative Commons Attribution-NonCommercial-ShareAlike 4.0 International  
+// https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © UAlgo
+//@version=6
+indicator("Dynamic Support & Resistance [UAlgo]", overlay=true, max_lines_count=500)
+
+// -----------------------------------------------------------------------------
+// 1. Data Structures (UDTs)
+// -----------------------------------------------------------------------------
+type SRLevel
+    float price
+    int count
+    int role            // 1 = Support, -1 = Resistance
+    bool active
+    line ln = na        // Visualization line (Midline)
+    box bx = na         // Visualization channel
+    label lbl = na      // Label for strength info
+    int start_idx       // Where the level started
+
+// -----------------------------------------------------------------------------
+// 2. Input Parameters
+// -----------------------------------------------------------------------------
+grp_pivot   = "Pivot Settings"
+grp_strength= "Strength & Zone"
+grp_style   = "Visuals"
+
+int pivotLen    = input.int(10,"Pivot Length", minval=3, group=grp_pivot)
+int minStrength = input.int(3, "Minimum Touches", minval=2, group=grp_strength)
+float zonePct   = input.float(0.618, "Zone Tolerance (%)", minval=0.01, step=0.1, group=grp_strength) / 100.0
+float breakPct  = input.float(1.0, "Invalidation Break (%)", minval=0.01, step=0.1, group=grp_strength) / 100.0
+
+color colSup    = input.color(color.new(color.green, 80), "Support Channel", group=grp_style)
+color colRes    = input.color(color.new(color.red, 80), "Resistance Channel", group=grp_style)
+color colTxt    = input.color(color.white, "Text Color", group=grp_style)
+
+// -----------------------------------------------------------------------------
+// Global Storage
+// -----------------------------------------------------------------------------
+var array<SRLevel> supports = array.new<SRLevel>()
+var array<SRLevel> resistances = array.new<SRLevel>()
+
+// -----------------------------------------------------------------------------
+// 3. Methods & Logic
+// -----------------------------------------------------------------------------
+
+// Method to update visual appearance of a level
+method updateVisuals(SRLevel this) =>
+    if this.active and this.count >= minStrength
+        color c = this.role == 1 ? colSup : colRes
+        // Calculate channel width based on Zone Tolerance
+        float tolerance = this.price * zonePct
+        float top = this.price + tolerance
+        float bot = this.price - tolerance
+        
+        // Create Channel (Box) - Borders dotted
+        if na(this.bx)
+            this.bx := box.new(
+                 left=this.start_idx, 
+                 top=top, 
+                 right=bar_index, 
+                 bottom=bot, 
+                 border_color=color.new(c, 0), 
+                 border_style=line.style_dotted,
+                 bgcolor=color.new(c, 80), 
+                 extend=extend.right
+            )
+        else
+            this.bx.set_top(top)
+            this.bx.set_bottom(bot)
+        
+        // Create Mid Line - Solid
+        if na(this.ln)
+            this.ln := line.new(
+                 x1=this.start_idx, 
+                 y1=this.price, 
+                 x2=bar_index, 
+                 y2=this.price, 
+                 color=c, 
+                 width=1,
+                 extend=extend.right
+            )
+        else
+            this.ln.set_y1(this.price)
+            this.ln.set_y2(this.price)
+
+        // Create/Update Label - "Support - Price" format
+        string txt = str.format("{0} - {1,number,#.##}", this.role == 1 ? "Support" : "Resistance", this.price)
+        if na(this.lbl)
+            this.lbl := label.new(
+                x=bar_index, 
+                y=this.price, 
+                text=txt, 
+                style=label.style_label_left, 
+                color=color.new(color.black, 100), 
+                textcolor=colTxt,
+                size=size.small
+            )
+        else
+            this.lbl.set_xy(bar_index, this.price)
+            this.lbl.set_text(txt)
+
+        true // Force return bool
+
+    else if not this.active
+        // Invalidate visuals - Remove completely
+        if not na(this.bx)
+            this.bx.delete()
+            this.bx := na
+            
+        if not na(this.ln)
+            this.ln.delete()
+            this.ln := na
+
+        if not na(this.lbl)
+            this.lbl.delete()
+            this.lbl := na
+        true
+    else
+        false
+
+// Method to handle a new potential point
+method processPoint(array<SRLevel> levels, float price, int role, int idx) =>
+    bool found = false
+    
+    // Check if this point belongs to an existing level
+    // We iterate backwards to prioritize recent levels or just check all active ones
+    for [i, lvl] in levels
+        if lvl.active
+            float tolerance = lvl.price * zonePct
+            if math.abs(price - lvl.price) <= tolerance
+                // Match found!
+                // Update price (Weighted average or simple average? Let's keep it sticky or average)
+                // Averaging slightly shifts the level to the center of activity
+                lvl.price := (lvl.price * lvl.count + price) / (lvl.count + 1)
+                lvl.count += 1
+                lvl.updateVisuals()
+                found := true
+                break // Assigned to one level, stop searching
+    
+    if not found
+        // Create new level
+        // Correctly passing arguments: ln=na, bx=na, lbl=na, start_idx=idx
+        // Using explicit naming for safety or correct order based on type definition
+        SRLevel newLvl = SRLevel.new(price, 1, role, true, na, na, na, idx)
+        levels.push(newLvl)
+        // We don't draw immediately if minStrength > 1
+
+// Method to check invalidations
+method checkInvalidation(array<SRLevel> levels, float currentPrice) =>
+    for [i, lvl] in levels
+        if lvl.active
+            float threshold = lvl.price * breakPct
+            bool broken = false
+            
+            if lvl.role == 1 // Support
+                // Broken if price closes significantly below
+                if currentPrice < lvl.price - threshold
+                    broken := true
+            else // Resistance
+                // Broken if price closes significantly above
+                if currentPrice > lvl.price + threshold
+                    broken := true
+            
+            if broken
+                lvl.active := false
+                lvl.updateVisuals() // Refresh visuals to apply broken style
+
+// Method to cleanup inactive levels to maintain performance
+method cleanup(array<SRLevel> levels) =>
+    // We create a new array with only active levels to replace the old one
+    // Or we can use array.remove() in a reverse loop
+    int n = levels.size()
+    if n > 0
+        for i = n - 1 to 0
+            SRLevel lvl = levels.get(i)
+            if not lvl.active
+                levels.remove(i)
+
+// -----------------------------------------------------------------------------
+// Main Execution
+// -----------------------------------------------------------------------------
+
+float ph = ta.pivothigh(high, pivotLen, pivotLen)
+float pl = ta.pivotlow(low, pivotLen, pivotLen)
+
+int pIdx = bar_index - pivotLen
+
+if not na(ph)
+    resistances.processPoint(ph, -1, pIdx)
+
+if not na(pl)
+    supports.processPoint(pl, 1, pIdx)
+
+supports.checkInvalidation(close)
+resistances.checkInvalidation(close)
+
+if barstate.islast
+    for lvl in supports
+        if lvl.active and not na(lvl.lbl)
+            lvl.lbl.set_x(bar_index + 5) // Slightly offset for readability
+            
+    for lvl in resistances
+        if lvl.active and not na(lvl.lbl)
+            lvl.lbl.set_x(bar_index + 5)
+
+supports.cleanup()
+resistances.cleanup()

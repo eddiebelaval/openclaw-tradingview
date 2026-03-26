@@ -1,0 +1,124 @@
+//@version=5
+// @description 该系统融合了动态平滑算法(DMA)与乖离回归逻辑，构建了一个自适应的波动率通道。
+// @description 包含实时看板(Dashboard)，展示关键的阻力位、支撑位及动态止盈止损区间。
+// @description 核心逻辑：利用价格偏离度作为DMA的衰减因子，实现灵敏度随波动率自动调节的趋势捕捉。
+indicator("动态波动率与乖离看板系统 [MSVO-Main Pro]", shorttitle="MSVO_Main_Pro", overlay=true, precision=2)
+
+// ==========================================
+// 1. 系统参数配置 (User Inputs)
+// ==========================================
+grp_calc = "核心算法参数"
+len_mom   = input.int(34, "动能回顾周期", minval=1, group=grp_calc)
+len_vol   = input.int(20, "波动率基准周期", minval=1, group=grp_calc)
+len_bias  = input.int(18, "乖离参考周期", minval=1, group=grp_calc)
+vol_mult  = input.float(0.07, "动态边界偏差系数", step=0.01, group=grp_calc)
+
+grp_visual = "视觉与UI配置"
+show_dashboard = input.bool(true, "显示数据看板", group=grp_visual)
+dash_pos       = input.string("Top Right", "看板位置", options=["Top Right", "Bottom Right", "Top Left", "Bottom Left"], group=grp_visual)
+bull_color     = input.color(color.red, "多头色", group=grp_visual)
+bear_color     = input.color(#00FFFF, "空头色", group=grp_visual)
+
+// ==========================================
+// 2. 核心量化引擎 (Logic Engine)
+// ==========================================
+
+// --- 动态平滑算法 (DMA) ---
+// 逻辑还原：$$DMA(X, \alpha) = \alpha \cdot X + (1 - \alpha) \cdot Y_{prev}$$
+dma_engine(src, alpha) =>
+    var float dma_val = na
+    dma_val := alpha * src + (1 - alpha) * nz(dma_val[1], src)
+    dma_val
+
+// --- 阶段 A: 归一化动能震荡器 (Trend Momentum) ---
+weighted_price  = (2 * close + high + low) / 4
+lookback_low    = ta.lowest(low, len_mom)
+lookback_high   = ta.highest(high, len_mom)
+// 动能平滑计算
+trend_oscillator = ta.ema((weighted_price - lookback_low) / math.max(lookback_high - lookback_low, 0.001) * 100, 3)
+trend_signal     = ta.ema(trend_oscillator, 3)
+is_bullish       = (trend_oscillator - trend_signal) >= 0
+
+// --- 阶段 B: 动态波动率支撑/阻力 ---
+base_sma_20    = ta.sma(close, len_vol)
+vol_deviation  = math.abs(weighted_price - base_sma_20) / base_sma_20
+dma_floor_base = dma_engine(close, vol_deviation)
+
+dynamic_floor   = (1 - vol_mult) * dma_floor_base
+dynamic_ceiling = (1 + vol_mult) * dma_floor_base
+
+// --- 阶段 C: 结构化乖离回归通道 ---
+reference_ma  = ta.sma(close, len_bias)
+bias_skew     = math.abs(weighted_price - reference_ma) / reference_ma
+central_bias  = dma_engine(close, bias_skew)
+
+// 止盈/止损边界矩阵
+tp_inner_limit = central_bias * 1.06
+sl_inner_limit = central_bias * 0.94
+tp_outer_limit = tp_inner_limit * 1.05
+sl_outer_limit = sl_inner_limit * 0.95
+
+// ==========================================
+// 3. 视觉渲染系统 (Visualization)
+// ==========================================
+
+// 3.1 核心通道与填充 (Bands & Fills)
+p_tp_out = plot(tp_outer_limit, "TP Outer Limit", color=color.new(#640064, 50))
+p_tp_in  = plot(tp_inner_limit, "TP Inner Limit", color=color.new(color.yellow, 20))
+p_mid    = plot(central_bias,    "Central Bias",    color=color.new(#9B009B, 0))
+p_sl_in  = plot(sl_inner_limit, "SL Inner Limit", color=color.new(color.green, 20))
+p_sl_out = plot(sl_outer_limit, "SL Outer Limit", color=color.new(#005000, 50))
+
+fill(p_tp_in,  p_mid,   color.new(color.blue, 85), title="多头回归区间")
+fill(p_mid,    p_sl_in, color.new(#9B009B, 90),    title="空头回归区间")
+fill(p_tp_out, p_tp_in, color.new(#640064, 70),    title="极端过热区(超买)")
+fill(p_sl_in,  p_sl_out, color.new(color.green, 80), title="极端冷缩区(超卖)")
+
+// 3.2 加权重心线 (CoG)
+cog_ma5 = ta.wma(ta.wma(weighted_price, 2), 5)
+plot(cog_ma5, "重心 MA5", color = cog_ma5 > cog_ma5[1] ? color.red : color.green, linewidth=2)
+
+// 3.3 趋势状态信号
+bull_cross = is_bullish and not is_bullish[1]
+bear_cross = not is_bullish and is_bullish[1]
+plotshape(bull_cross, style=shape.labelup,   location=location.belowbar, color=color.red,   size=size.small, text="B", textcolor=color.white)
+plotshape(bear_cross, style=shape.labeldown, location=location.abovebar, color=color.green, size=size.small, text="S", textcolor=color.white)
+
+// 3.4 增强型K线染色
+is_up_momentum = close > open or (close == open and close > close[1])
+base_bar_color = is_up_momentum ? color.new(color.red, 0) : color.new(bear_color, 0)
+if open >= close
+    base_bar_color := color.new(#00FF00, 0)
+barcolor(base_bar_color)
+
+// ==========================================
+// 4. 实时分析看板 (Analytics Dashboard)
+// ==========================================
+dash_y_pos = dash_pos == "Top Right" or dash_pos == "Top Left" ? position.top_right : position.bottom_right
+dash_final_pos = dash_pos == "Top Left" ? position.top_left : dash_pos == "Bottom Left" ? position.bottom_left : dash_y_pos
+
+var table analytics_dash = table.new(dash_final_pos, 2, 7, bgcolor=color.new(color.black, 15), border_color=color.gray, border_width=1)
+
+if barstate.islast and show_dashboard
+    // 表头定义
+    table.cell(analytics_dash, 0, 0, "指标维度 (Metrics)", text_color=color.white, text_size=size.small)
+    table.cell(analytics_dash, 1, 0, "实时参考值", text_color=color.white, text_size=size.small)
+    
+    // 动态边界数据
+    table.cell(analytics_dash, 0, 1, "动态阻力 (Resistance)", text_color=#676767, text_halign=text.align_left)
+    table.cell(analytics_dash, 1, 1, str.tostring(dynamic_ceiling, "#.##"), text_color=#676767)
+    
+    table.cell(analytics_dash, 0, 2, "止盈区间 (Target)", text_color=color.yellow, text_halign=text.align_left)
+    table.cell(analytics_dash, 1, 2, str.tostring(tp_outer_limit, "#.##") + " / " + str.tostring(tp_inner_limit, "#.##"), text_color=color.yellow)
+    
+    table.cell(analytics_dash, 0, 3, "乖离回归中轴", text_color=#9B009B, text_halign=text.align_left)
+    table.cell(analytics_dash, 1, 3, str.tostring(central_bias, "#.##"), text_color=#9B009B)
+    
+    table.cell(analytics_dash, 0, 4, "止损区间 (Support)", text_color=color.green, text_halign=text.align_left)
+    table.cell(analytics_dash, 1, 4, str.tostring(sl_inner_limit, "#.##") + " / " + str.tostring(sl_outer_limit, "#.##"), text_color=color.green)
+    
+    table.cell(analytics_dash, 0, 5, "动态支撑 (Floor)", text_color=#FF0080, text_halign=text.align_left)
+    table.cell(analytics_dash, 1, 5, str.tostring(dynamic_floor, "#.##"), text_color=#FF0080)
+
+    table.cell(analytics_dash, 0, 6, "核心重心 MA5", text_color=color.white, text_halign=text.align_left)
+    table.cell(analytics_dash, 1, 6, str.tostring(cog_ma5, "#.##"), text_color=cog_ma5 > cog_ma5[1] ? color.red : color.green)

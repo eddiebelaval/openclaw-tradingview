@@ -1,0 +1,1511 @@
+// This Pine Script™ code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © alphachart_tv
+// AlphaChart — Smart Confluence v1.0 [FREE]
+// SMC-based confluence trading system — simplified edition.
+
+// ╔══════════════════════════════════════════════════════════════════╗
+// ║  HOW IT WORKS                                                    ║
+// ║                                                                  ║
+// ║  Smart Confluence identifies high-probability trade setups       ║
+// ║  by combining multiple Smart Money Concept (SMC) signals         ║
+// ║  into a single confluence score:                                 ║
+// ║                                                                  ║
+// ║  CORE TRIGGERS (required for any signal):                        ║
+// ║  - Change of Character (CHOCH): Trend reversal detection         ║
+// ║  - Liquidity Sweeps: Stop-hunt & reversal patterns               ║
+// ║  - EQH/EQL Grabs: Liquidity pool sweeps                         ║
+// ║                                                                  ║
+// ║  CONFLUENCE CONFIRMATIONS (add points to the score):             ║
+// ║  - Order Blocks: Institutional supply/demand zones               ║
+// ║  - Fair Value Gaps (FVG): Price imbalances                       ║
+// ║  - Premium/Discount Zones: Buy cheap, sell expensive             ║
+// ║  - Higher Timeframe Trend: Trade with the bigger picture         ║
+// ║  - Volume Confirmation: Institutional activity                   ║
+// ║  - RSI Divergence: Momentum exhaustion                           ║
+// ║  - EMA Trend Filter: Structural trend alignment                  ║
+// ║  - ATR Volatility: Market activity confirmation                  ║
+// ║                                                                  ║
+// ║  When enough confirmations align (min. confluence threshold),    ║
+// ║  a BUY or SELL signal fires with Entry Zone, Stop Loss,          ║
+// ║  and 3 Take Profit levels.                                       ║
+// ║                                                                  ║
+// ║  PRO version adds: Signal Profiles (Scalping/Swing/etc.),        ║
+// ║  Asset Auto-Detection, A/B/C Grading, Risk Management,           ║
+// ║  Session Filter, Funding Rate, Trailing SL & more.               ║
+// ║                                                                  ║
+// ║  DISCLAIMER: This indicator is for educational purposes only.    ║
+// ║  It does not constitute financial advice. Always do your own     ║
+// ║  research and use proper risk management.                        ║
+// ╚══════════════════════════════════════════════════════════════════╝
+
+//@version=6
+indicator("AlphaChart — Smart Confluence [SC]", shorttitle="SC", overlay=true,
+         max_labels_count=200, max_boxes_count=100, max_lines_count=100)
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// 🛠 UTILITY FUNCTIONS
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+f_dashPosition(_s) =>
+    switch _s
+        "Top Right"    => position.top_right
+        "Top Left"     => position.top_left
+        "Bottom Right"  => position.bottom_right
+        "Bottom Left"   => position.bottom_left
+        => position.top_right
+
+f_dashSize(_s) =>
+    switch _s
+        "Tiny"   => size.tiny
+        "Small"  => size.small
+        "Normal" => size.normal
+        => size.small
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// 🛠 TIMEFRAME DETECTION
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+tfInMinutes = timeframe.in_seconds() / 60
+
+isTF_1m_3m  = tfInMinutes >= 1 and tfInMinutes < 5
+isTF_5m     = tfInMinutes >= 5 and tfInMinutes < 15
+isTF_15m    = tfInMinutes >= 15 and tfInMinutes < 30
+isTF_30m    = tfInMinutes >= 30 and tfInMinutes < 60
+isTF_1H     = tfInMinutes >= 60 and tfInMinutes < 120
+isTF_2H     = tfInMinutes >= 120 and tfInMinutes < 240
+isTF_4H     = tfInMinutes >= 240 and tfInMinutes < 480
+isTF_8H_12H = tfInMinutes >= 480 and tfInMinutes < 1440
+isTF_1D     = tfInMinutes >= 1440 and tfInMinutes < 10080
+isTF_1W     = tfInMinutes >= 10080 and tfInMinutes < 43200
+isTF_1M     = tfInMinutes >= 43200
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// 📊 INPUTS — Mode
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+grpMode = "📊 Mode"
+autoMode = input.bool(true, "Auto-Timeframe Adjustment", group=grpMode,
+     tooltip="Auto-adjusts ALL parameters to your chart timeframe. Supports: 1m to Monthly.")
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// 📊 INPUTS — Signal Settings
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+grpSignal = "📊 Signal Settings"
+minConfluenceManual = input.int(4, "Min Confluence (Manual)", minval=2, maxval=8, group=grpSignal,
+     tooltip="Minimum score for a valid signal. Higher = fewer but stronger signals.")
+signalCooldownManual = input.int(15, "Cooldown (Manual)", minval=5, maxval=100, group=grpSignal,
+     tooltip="Minimum bars between signals. Prevents signal spam.")
+requireConfirmation = input.bool(true, "Signal Confirmation (Wait 1 Candle)", group=grpSignal,
+     tooltip="ON = Waits for confirmation candle (safer). OFF = Immediate signal.")
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// 🔀 INPUTS — Market Structure
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+grpStructure = "🔀 Market Structure"
+swingLengthManual = input.int(5, "Swing Length (Manual)", minval=3, maxval=30, group=grpStructure,
+     tooltip="Bars for Swing High/Low detection. Higher = fewer but more significant swings.")
+showCHOCH = input.bool(true, "Show CHOCH", group=grpStructure,
+     tooltip="Change of Character — trend reversal signal.\nBullish CHOCH = Price breaks above last Swing High.\nBearish CHOCH = Price breaks below last Swing Low.")
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// 🌐 INPUTS — Smart Money
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+grpSMC = "🌐 Smart Money"
+showOrderBlocks = input.bool(true, "Order Blocks", group=grpSMC,
+     tooltip="Institutional buy/sell zones. OB adds +1 confluence point.")
+obLookbackManual = input.int(20, "OB Lookback (Manual)", minval=10, maxval=100, group=grpSMC,
+     tooltip="How many bars back to search for Order Blocks.")
+showFVG = input.bool(true, "Fair Value Gaps (FVG)", group=grpSMC,
+     tooltip="Price gaps that often get filled. FVG adds +1 confluence point.")
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// 📋 INPUTS — S/R Zones
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+grpSR = "📋 Support/Resistance Zones"
+i_showSRZones   = input.bool(true, "Show S/R Zones", group=grpSR,
+     tooltip="Shows auto-detected Support/Resistance zones with strength scoring.")
+i_srClusterATR  = input.float(0.5, "Cluster Tolerance (ATR)", minval=0.2, maxval=2.0, step=0.1, group=grpSR,
+     tooltip="How close levels must be to cluster together.")
+i_srMinStrength = input.int(2, "Min. Strength for Display", minval=1, maxval=5, group=grpSR,
+     tooltip="Minimum strength for zone display (1-5).")
+i_srMaxZones    = input.int(2, "Max. Zones per Direction", minval=1, maxval=2, group=grpSR)
+i_srZoneWidth   = input.float(0.3, "Zone Width (ATR)", minval=0.1, maxval=1.0, step=0.1, group=grpSR)
+i_srShowLabels  = input.bool(true, "Show Strength Labels", group=grpSR)
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// 📋 INPUTS — EQH/EQL
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+grpEQ = "📋 Equal Highs/Lows (EQH/EQL)"
+i_showEQ       = input.bool(true, "Show EQH/EQL", group=grpEQ,
+     tooltip="Equal Highs/Lows = liquidity pools. Sweep = strong reversal signal.")
+i_eqTolerance  = input.float(0.05, "Tolerance (ATR Factor)", minval=0.01, maxval=0.5, step=0.01, group=grpEQ)
+i_eqMinTouches = input.int(2, "Min. Touches", minval=2, maxval=5, group=grpEQ)
+i_eqMaxAge     = input.int(200, "Max. Age (Bars)", minval=50, maxval=500, group=grpEQ)
+i_grabBuffer   = input.float(0.1, "Grab Buffer (ATR Factor)", minval=0.01, maxval=0.5, step=0.01, group=grpEQ)
+i_eqGrabPoints = input.int(3, "Points for EQ-Grab", minval=1, maxval=5, group=grpEQ)
+i_eqhColor     = input.color(color.new(color.orange, 20), "EQH Color", group=grpEQ)
+i_eqlColor     = input.color(color.new(color.aqua, 20), "EQL Color", group=grpEQ)
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// 📋 INPUTS — Premium / Discount
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+grpPD = "📋 Premium / Discount Zones"
+i_showPD          = input.bool(true, "Show Premium/Discount", group=grpPD,
+     tooltip="Shows if price is in Premium (expensive) or Discount (cheap) zone.")
+i_showEqLine      = input.bool(true, "Equilibrium Line (50%)", group=grpPD)
+i_showPDBackground = input.bool(false, "Background Color", group=grpPD)
+i_pdConfluence    = input.bool(true, "Include in Confluence", group=grpPD)
+i_pdOTEBonus      = input.bool(true, "OTE Bonus Point", group=grpPD)
+i_eqColor         = input.color(color.new(color.yellow, 30), "Equilibrium Color", group=grpPD)
+i_premiumColor    = input.color(color.new(color.red, 85), "Premium Color", group=grpPD)
+i_discountColor   = input.color(color.new(color.green, 85), "Discount Color", group=grpPD)
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// 📋 INPUTS — Stop Loss
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+grpSL = "📋 Stop Loss"
+i_slMode      = input.string("Entry-Based", "SL Mode", options=["Entry-Based", "Swing", "ATR", "SMC"], group=grpSL,
+     tooltip="How the Stop Loss is calculated:\nEntry-Based: SL below/above Entry Zone + Buffer\nSwing: SL at last Swing Low/High\nATR: Fixed ATR distance\nSMC: SL below/above active OB or FVG")
+i_slATRBuffer = input.float(0.5, "SL: ATR Buffer", minval=0.2, maxval=2.0, step=0.1, group=grpSL)
+i_slMaxATR    = input.float(3.0, "SL: Max ATR Distance", minval=1.5, maxval=5.0, step=0.5, group=grpSL)
+i_minRR       = input.float(1.5, "Minimum R:R for Signal", minval=1.0, maxval=3.0, step=0.1, group=grpSL)
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// 📋 INPUTS — Take Profit
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+grpTP = "📋 Take Profit"
+i_tpMode = input.string("Hybrid", "TP Mode", options=["Structure", "Fixed R:R", "ATR", "Hybrid"], group=grpTP,
+     tooltip="How Take Profits are calculated:\nStructure: Next Swing High/Low\nFixed R:R: Fixed Risk-Reward\nATR: ATR-based distances\nHybrid: Structure if good, else R:R")
+i_tp1RR  = input.float(1.5, "TP1: Risk-Reward", minval=1.0, maxval=3.0, step=0.5, group=grpTP)
+i_tp2RR  = input.float(2.5, "TP2: Risk-Reward", minval=1.5, maxval=5.0, step=0.5, group=grpTP)
+i_tp3RR  = input.float(3.0, "TP3: Risk-Reward", minval=2.0, maxval=8.0, step=0.5, group=grpTP)
+i_tp1ATR = input.float(2.0, "TP1: ATR Multiplier", minval=1.0, maxval=4.0, step=0.5, group=grpTP)
+i_tp2ATR = input.float(4.0, "TP2: ATR Multiplier", minval=2.0, maxval=8.0, step=0.5, group=grpTP)
+i_tp3ATR = input.float(6.0, "TP3: ATR Multiplier", minval=3.0, maxval=12.0, step=0.5, group=grpTP)
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// 📋 INPUTS — Partial TP
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+grpPartial = "📋 Partial Take Profit"
+i_usePartialTP = input.bool(true, "Enable Partial TP", group=grpPartial,
+     tooltip="Shows percentage distribution for staged exits.")
+i_partialMode  = input.string("50/30/20", "Distribution", options=["50/30/20", "33/33/34", "40/40/20", "60/30/10"], group=grpPartial)
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// 🎨 INPUTS — Visuals
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+grpVisual = "🎨 Visuals"
+showEntryZones = input.bool(true, "Show Entry/SL/TP", group=grpVisual)
+i_setupMaxBars = input.int(50, "Setup Valid for X Bars", minval=10, maxval=200, group=grpVisual)
+bullColor      = input.color(color.new(#00E676, 0), "Bullish", group=grpVisual)
+bearColor      = input.color(color.new(#FF5252, 0), "Bearish", group=grpVisual)
+slColor        = input.color(color.new(#FF5252, 0), "Stop Loss", group=grpVisual)
+tpColor        = input.color(color.new(#00E676, 0), "Take Profit", group=grpVisual)
+entryColor     = input.color(color.new(#2196F3, 0), "Entry Zone", group=grpVisual)
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// 📋 INPUTS — Dashboard
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+grpDash = "📋 Dashboard"
+showDashboard  = input.bool(true, "Show Dashboard", group=grpDash,
+     tooltip="Display the real-time status dashboard.")
+i_dashPos  = input.string("Top Right", "Position", options=["Top Right", "Top Left", "Bottom Right", "Bottom Left"], group=grpDash)
+i_dashSize = input.string("Small", "Size", options=["Tiny", "Small", "Normal"], group=grpDash)
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// 🔔 INPUTS — Confirmations
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+grpConfirm = "🔔 Confirmations"
+useVolumeConfirm = input.bool(true, "Volume Confirmation", group=grpConfirm,
+     tooltip="High volume adds +1 confluence point.")
+volMultiplier    = input.float(1.5, "Volume Multiplier", minval=1.2, maxval=3.0, group=grpConfirm)
+useRSIDivergence = input.bool(true, "RSI Divergence", group=grpConfirm,
+     tooltip="RSI Divergence adds +2 confluence points. Very strong reversal signal!")
+rsiLen           = input.int(14, "RSI Length", group=grpConfirm)
+useEMAFilter     = input.bool(true, "EMA Trend Filter", group=grpConfirm,
+     tooltip="EMA alignment adds +1 confluence point.")
+useATRFilter     = input.bool(true, "ATR Volatility Filter", group=grpConfirm)
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// 🌐 INPUTS — Higher Timeframe
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+grpHTF = "🌐 Higher Timeframe"
+useHTF    = input.bool(true, "HTF Confirmation", group=grpHTF,
+     tooltip="Higher Timeframe trend confirmation adds +1 point.")
+htfManual = input.timeframe("240", "HTF (Manual)", group=grpHTF)
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// 📋 PARTIAL TP PERCENTAGES
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+float partialTP1Pct = i_partialMode == "50/30/20" ? 50 : i_partialMode == "33/33/34" ? 33 : i_partialMode == "40/40/20" ? 40 : 60
+float partialTP2Pct = i_partialMode == "50/30/20" ? 30 : i_partialMode == "33/33/34" ? 33 : i_partialMode == "40/40/20" ? 40 : 30
+float partialTP3Pct = i_partialMode == "50/30/20" ? 20 : i_partialMode == "33/33/34" ? 34 : i_partialMode == "40/40/20" ? 20 : 10
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// 🛠 AUTO TIMEFRAME VALUES
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+autoSwingLength = isTF_1m_3m ? 2 : isTF_5m ? 3 : isTF_15m ? 3 : isTF_30m ? 4 : isTF_1H ? 4 : isTF_2H ? 5 : isTF_4H ? 6 : isTF_8H_12H ? 8 : isTF_1D ? 12 : isTF_1W ? 18 : isTF_1M ? 24 : 5
+swingLength = autoMode ? autoSwingLength : swingLengthManual
+
+autoCooldown = isTF_1m_3m ? 5 : isTF_5m ? 6 : isTF_15m ? 8 : isTF_30m ? 10 : isTF_1H ? 12 : isTF_2H ? 15 : isTF_4H ? 18 : isTF_8H_12H ? 22 : isTF_1D ? 28 : isTF_1W ? 40 : isTF_1M ? 50 : 15
+signalCooldown = autoMode ? autoCooldown : signalCooldownManual
+
+autoOBLookback = isTF_1m_3m ? 10 : isTF_5m ? 12 : isTF_15m ? 15 : isTF_30m ? 18 : isTF_1H ? 18 : isTF_2H ? 22 : isTF_4H ? 25 : isTF_8H_12H ? 35 : isTF_1D ? 45 : isTF_1W ? 70 : isTF_1M ? 80 : 20
+obLookback = autoMode ? autoOBLookback : obLookbackManual
+
+autoMinConfluence = isTF_1m_3m ? 3 : isTF_5m ? 3 : isTF_15m ? 4 : isTF_30m ? 4 : isTF_1H ? 4 : isTF_2H ? 4 : isTF_4H ? 5 : isTF_8H_12H ? 5 : isTF_1D ? 5 : isTF_1W ? 6 : isTF_1M ? 6 : 4
+minConfluence = autoMode ? autoMinConfluence : minConfluenceManual
+
+autoHTF = isTF_1m_3m ? "15" : isTF_5m ? "60" : isTF_15m ? "60" : isTF_30m ? "240" : isTF_1H ? "240" : isTF_2H ? "D" : isTF_4H ? "D" : isTF_8H_12H ? "D" : isTF_1D ? "W" : isTF_1W ? "M" : isTF_1M ? "3M" : "240"
+htfTimeframe = autoMode ? autoHTF : htfManual
+
+autoSLBuffer = isTF_1m_3m ? 0.3 : isTF_5m ? 0.3 : isTF_15m ? 0.4 : isTF_30m ? 0.4 : isTF_1H ? 0.5 : isTF_2H ? 0.5 : isTF_4H ? 0.5 : isTF_8H_12H ? 0.6 : isTF_1D ? 0.7 : isTF_1W ? 0.8 : isTF_1M ? 1.0 : 0.5
+slATRBuffer = autoMode ? autoSLBuffer : i_slATRBuffer
+
+autoMinRR = isTF_1m_3m ? 1.2 : isTF_5m ? 1.2 : isTF_15m ? 1.3 : isTF_30m ? 1.5 : isTF_1H ? 1.5 : isTF_2H ? 1.5 : isTF_4H ? 2.0 : isTF_8H_12H ? 2.0 : isTF_1D ? 2.0 : isTF_1W ? 2.5 : isTF_1M ? 3.0 : 1.5
+minRR = autoMode ? autoMinRR : i_minRR
+
+autoEQTolerance = isTF_1m_3m ? 0.03 : isTF_5m ? 0.03 : isTF_15m ? 0.04 : isTF_30m ? 0.04 : isTF_1H ? 0.05 : isTF_2H ? 0.05 : isTF_4H ? 0.06 : isTF_8H_12H ? 0.07 : isTF_1D ? 0.08 : isTF_1W ? 0.10 : isTF_1M ? 0.12 : 0.05
+eqTolerance = autoMode ? autoEQTolerance : i_eqTolerance
+
+autoEQMaxAge = isTF_1m_3m ? 50 : isTF_5m ? 80 : isTF_15m ? 100 : isTF_30m ? 150 : isTF_1H ? 200 : isTF_2H ? 200 : isTF_4H ? 250 : isTF_8H_12H ? 300 : isTF_1D ? 150 : isTF_1W ? 100 : isTF_1M ? 60 : 200
+eqMaxAge = autoMode ? autoEQMaxAge : i_eqMaxAge
+
+autoSetupMaxBars = isTF_1m_3m ? 20 : isTF_5m ? 25 : isTF_15m ? 30 : isTF_30m ? 40 : isTF_1H ? 50 : isTF_2H ? 50 : isTF_4H ? 40 : isTF_8H_12H ? 30 : isTF_1D ? 20 : isTF_1W ? 12 : isTF_1M ? 6 : 50
+setupMaxBars = autoMode ? autoSetupMaxBars : i_setupMaxBars
+
+autoSRCluster = isTF_1m_3m ? 0.3 : isTF_5m ? 0.3 : isTF_15m ? 0.4 : isTF_30m ? 0.4 : isTF_1H ? 0.5 : isTF_2H ? 0.5 : isTF_4H ? 0.5 : isTF_8H_12H ? 0.6 : isTF_1D ? 0.7 : isTF_1W ? 0.8 : isTF_1M ? 1.0 : 0.5
+srClusterTolerance = autoMode ? autoSRCluster : i_srClusterATR
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// 📈 GLOBAL CALCULATIONS
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+ema21 = ta.ema(close, 21)
+ema50 = ta.ema(close, 50)
+ema200 = ta.ema(close, 200)
+
+rsi = ta.rsi(close, rsiLen)
+
+volSMA = ta.sma(volume, 20)
+highVolume = volume > volSMA * volMultiplier
+veryHighVolume = volume > volSMA * 2
+
+atr = ta.atr(14)
+atrSMA = ta.sma(atr, 20)
+highVolatility = atr > atrSMA * 1.2
+lowVolatility = atr < atrSMA * 0.8
+
+swingHigh = ta.pivothigh(high, swingLength, swingLength)
+swingLow = ta.pivotlow(low, swingLength, swingLength)
+
+recentLow = ta.lowest(low, obLookback)[1]
+recentHigh = ta.highest(high, obLookback)[1]
+
+// RSI Divergence
+divLookback = math.round(swingLength * 2)
+lowestLowDiv = ta.lowest(low[1], divLookback)
+lowestRsiDiv = ta.lowest(rsi, divLookback)[1]
+highestHighDiv = ta.highest(high[1], divLookback)
+highestRsiDiv = ta.highest(rsi, divLookback)[1]
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// 🌐 HTF TREND & LEVELS
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+[htfEMA21, htfEMA50, htfClose, htfHigh, htfLow] = request.security(syminfo.tickerid, htfTimeframe, [ta.ema(close, 21), ta.ema(close, 50), close[1], ta.highest(high, 20)[1], ta.lowest(low, 20)[1]], lookahead=barmerge.lookahead_off)
+
+htfBullish = useHTF ? htfClose > htfEMA21 and htfEMA21 > htfEMA50 : true
+htfBearish = useHTF ? htfClose < htfEMA21 and htfEMA21 < htfEMA50 : true
+
+htfResistance = htfHigh
+htfSupport = htfLow
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// 🎨 EMA PLOTS
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+plot(useEMAFilter ? ema21 : na, "EMA 21", color=color.new(#26C6DA, 60), linewidth=1)
+plot(useEMAFilter ? ema50 : na, "EMA 50", color=color.new(#FF9800, 50), linewidth=1)
+plot(useEMAFilter ? ema200 : na, "EMA 200", color=color.new(#9E9E9E, 50), linewidth=2)
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// 🔀 MARKET STRUCTURE
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+var float lastSwingHigh = na
+var float lastSwingLow = na
+var float prevSwingHigh = na
+var float prevSwingLow = na
+var int lastSwingHighBar = na
+var int lastSwingLowBar = na
+var bool isUptrend = true
+
+var array<float> swingHighHistory = array.new_float(10, na)
+var array<float> swingLowHistory = array.new_float(10, na)
+
+isHH = false
+isHL = false
+isLH = false
+isLL = false
+
+if not na(swingHigh)
+    prevSwingHigh := lastSwingHigh
+    lastSwingHigh := swingHigh
+    lastSwingHighBar := bar_index - swingLength
+    if not na(prevSwingHigh)
+        isHH := swingHigh > prevSwingHigh
+        isLH := swingHigh <= prevSwingHigh
+    array.unshift(swingHighHistory, swingHigh)
+    if array.size(swingHighHistory) > 10
+        array.pop(swingHighHistory)
+
+if not na(swingLow)
+    prevSwingLow := lastSwingLow
+    lastSwingLow := swingLow
+    lastSwingLowBar := bar_index - swingLength
+    if not na(prevSwingLow)
+        isLL := swingLow < prevSwingLow
+        isHL := swingLow >= prevSwingLow
+    array.unshift(swingLowHistory, swingLow)
+    if array.size(swingLowHistory) > 10
+        array.pop(swingLowHistory)
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// 📋 PREMIUM / DISCOUNT ZONES
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+var float pdRangeHigh = na
+var float pdRangeLow = na
+
+if not na(swingHigh) and not na(lastSwingLow)
+    pdRangeHigh := swingHigh
+    if na(pdRangeLow) or lastSwingLow < pdRangeHigh
+        pdRangeLow := lastSwingLow
+
+if not na(swingLow) and not na(lastSwingHigh)
+    pdRangeLow := swingLow
+    if na(pdRangeHigh) or lastSwingHigh > pdRangeLow
+        pdRangeHigh := lastSwingHigh
+
+float pdRange = na(pdRangeHigh) or na(pdRangeLow) ? na : pdRangeHigh - pdRangeLow
+float pdEquilibrium = na(pdRange) ? na : pdRangeLow + (pdRange * 0.5)
+float pdPositionPct = na(pdRange) or pdRange == 0 ? na : ((close - pdRangeLow) / pdRange) * 100
+
+bool inDiscount = not na(pdPositionPct) and pdPositionPct < 50
+bool inPremium = not na(pdPositionPct) and pdPositionPct >= 50
+bool inDeepDiscount = not na(pdPositionPct) and pdPositionPct < 25
+bool inDeepPremium = not na(pdPositionPct) and pdPositionPct > 75
+bool inOTE_Long = not na(pdPositionPct) and pdPositionPct >= 21 and pdPositionPct <= 38
+bool inOTE_Short = not na(pdPositionPct) and pdPositionPct >= 62 and pdPositionPct <= 79
+bool atEquilibrium = not na(pdPositionPct) and pdPositionPct >= 45 and pdPositionPct <= 55
+
+plot(i_showPD and i_showEqLine ? pdEquilibrium : na, "Equilibrium (50%)", color=i_eqColor, style=plot.style_linebr, linewidth=2)
+bgcolor(i_showPD and i_showPDBackground and inPremium and not atEquilibrium ? i_premiumColor : na, title="Premium Background")
+bgcolor(i_showPD and i_showPDBackground and inDiscount and not atEquilibrium ? i_discountColor : na, title="Discount Background")
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// 🔀 TREND & CHOCH
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+if isHH or isHL
+    isUptrend := true
+if isLL or isLH
+    isUptrend := false
+
+bullishCHOCH = false
+bearishCHOCH = false
+
+if not na(lastSwingHigh) and not na(prevSwingHigh)
+    if not isUptrend[1] and close > lastSwingHigh and close[1] <= lastSwingHigh
+        bullishCHOCH := true
+        isUptrend := true
+
+if not na(lastSwingLow) and not na(prevSwingLow)
+    if isUptrend[1] and close < lastSwingLow and close[1] >= lastSwingLow
+        bearishCHOCH := true
+        isUptrend := false
+
+plotshape(showCHOCH and bullishCHOCH, title="CHOCH Bull", style=shape.circle, location=location.belowbar, color=bullColor, size=size.tiny)
+plotshape(showCHOCH and bearishCHOCH, title="CHOCH Bear", style=shape.circle, location=location.abovebar, color=bearColor, size=size.tiny)
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// 🌐 LIQUIDITY SWEEP
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+bullishSweep = low < recentLow and close > recentLow and close > open
+bearishSweep = high > recentHigh and close < recentHigh and close < open
+
+plotshape(bullishSweep, title="Bull Sweep", style=shape.diamond, location=location.belowbar, color=color.new(bullColor, 20), size=size.tiny)
+plotshape(bearishSweep, title="Bear Sweep", style=shape.diamond, location=location.abovebar, color=color.new(bearColor, 20), size=size.tiny)
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// 📋 EQH/EQL DETECTION
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+var array<float> eqhPrices = array.new_float(0)
+var array<int> eqhBars = array.new_int(0)
+var array<int> eqhTouches = array.new_int(0)
+var array<bool> eqhSwept = array.new_bool(0)
+
+var array<float> eqlPrices = array.new_float(0)
+var array<int> eqlBars = array.new_int(0)
+var array<int> eqlTouches = array.new_int(0)
+var array<bool> eqlSwept = array.new_bool(0)
+
+float eqToleranceAbs = atr * eqTolerance
+float grabBufferAbs = atr * i_grabBuffer
+
+eqhGrabSignal = false
+eqlGrabSignal = false
+
+if i_showEQ and barstate.isconfirmed
+    if not na(swingHigh)
+        float shPrice = high[swingLength]
+        int shBar = bar_index - swingLength
+        bool foundMatch = false
+
+        if array.size(eqhPrices) > 0
+            for i = 0 to array.size(eqhPrices) - 1
+                if not array.get(eqhSwept, i)
+                    float existingPrice = array.get(eqhPrices, i)
+                    if math.abs(shPrice - existingPrice) <= eqToleranceAbs
+                        int newTouches = array.get(eqhTouches, i) + 1
+                        array.set(eqhTouches, i, newTouches)
+                        float avgPrice = (existingPrice * (newTouches - 1) + shPrice) / newTouches
+                        array.set(eqhPrices, i, avgPrice)
+                        foundMatch := true
+                        break
+
+        if not foundMatch
+            array.push(eqhPrices, shPrice)
+            array.push(eqhBars, shBar)
+            array.push(eqhTouches, 1)
+            array.push(eqhSwept, false)
+
+    if not na(swingLow)
+        float slPrice = low[swingLength]
+        int slBar = bar_index - swingLength
+        bool foundMatch = false
+
+        if array.size(eqlPrices) > 0
+            for i = 0 to array.size(eqlPrices) - 1
+                if not array.get(eqlSwept, i)
+                    float existingPrice = array.get(eqlPrices, i)
+                    if math.abs(slPrice - existingPrice) <= eqToleranceAbs
+                        int newTouches = array.get(eqlTouches, i) + 1
+                        array.set(eqlTouches, i, newTouches)
+                        float avgPrice = (existingPrice * (newTouches - 1) + slPrice) / newTouches
+                        array.set(eqlPrices, i, avgPrice)
+                        foundMatch := true
+                        break
+
+        if not foundMatch
+            array.push(eqlPrices, slPrice)
+            array.push(eqlBars, slBar)
+            array.push(eqlTouches, 1)
+            array.push(eqlSwept, false)
+
+    // Cleanup
+    if array.size(eqhPrices) > 0
+        for i = array.size(eqhPrices) - 1 to 0
+            int age = bar_index - array.get(eqhBars, i)
+            if array.get(eqhSwept, i) or age > eqMaxAge
+                array.remove(eqhPrices, i)
+                array.remove(eqhBars, i)
+                array.remove(eqhTouches, i)
+                array.remove(eqhSwept, i)
+
+    if array.size(eqlPrices) > 0
+        for i = array.size(eqlPrices) - 1 to 0
+            int age = bar_index - array.get(eqlBars, i)
+            if array.get(eqlSwept, i) or age > eqMaxAge
+                array.remove(eqlPrices, i)
+                array.remove(eqlBars, i)
+                array.remove(eqlTouches, i)
+                array.remove(eqlSwept, i)
+
+    while array.size(eqhPrices) > 10
+        array.shift(eqhPrices)
+        array.shift(eqhBars)
+        array.shift(eqhTouches)
+        array.shift(eqhSwept)
+
+    while array.size(eqlPrices) > 10
+        array.shift(eqlPrices)
+        array.shift(eqlBars)
+        array.shift(eqlTouches)
+        array.shift(eqlSwept)
+
+// EQH/EQL Grab Detection
+if i_showEQ and barstate.isconfirmed
+    if array.size(eqhPrices) > 0
+        for i = 0 to array.size(eqhPrices) - 1
+            if not array.get(eqhSwept, i) and array.get(eqhTouches, i) >= i_eqMinTouches
+                float lvlPrice = array.get(eqhPrices, i)
+                if close > lvlPrice + grabBufferAbs and close[1] <= lvlPrice
+                    array.set(eqhSwept, i, true)
+                    eqhGrabSignal := true
+
+    if array.size(eqlPrices) > 0
+        for i = 0 to array.size(eqlPrices) - 1
+            if not array.get(eqlSwept, i) and array.get(eqlTouches, i) >= i_eqMinTouches
+                float lvlPrice = array.get(eqlPrices, i)
+                if close < lvlPrice - grabBufferAbs and close[1] >= lvlPrice
+                    array.set(eqlSwept, i, true)
+                    eqlGrabSignal := true
+
+plotshape(eqhGrabSignal, title="EQH Grab", style=shape.triangledown, location=location.abovebar, color=i_eqhColor, size=size.small)
+plotshape(eqlGrabSignal, title="EQL Grab", style=shape.triangleup, location=location.belowbar, color=i_eqlColor, size=size.small)
+
+int activeEqhCount = 0
+int activeEqlCount = 0
+if array.size(eqhPrices) > 0
+    for i = 0 to array.size(eqhPrices) - 1
+        if not array.get(eqhSwept, i) and array.get(eqhTouches, i) >= i_eqMinTouches
+            activeEqhCount += 1
+if array.size(eqlPrices) > 0
+    for i = 0 to array.size(eqlPrices) - 1
+        if not array.get(eqlSwept, i) and array.get(eqlTouches, i) >= i_eqMinTouches
+            activeEqlCount += 1
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// 🌐 ORDER BLOCKS
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+var float bullOBTop = na
+var float bullOBBottom = na
+var float bearOBTop = na
+var float bearOBBottom = na
+var bool bullOBActive = false
+var bool bearOBActive = false
+var int bullOBBar = na
+var int bearOBBar = na
+
+obMaxAge = obLookback * 3
+
+bullishOBSignal = close[1] < open[1] and close > open and close > high[1] and highVolume
+bearishOBSignal = close[1] > open[1] and close < open and close < low[1] and highVolume
+
+if showOrderBlocks and bullishOBSignal
+    bullOBTop := high[1]
+    bullOBBottom := low[1]
+    bullOBActive := true
+    bullOBBar := bar_index
+
+if showOrderBlocks and bearishOBSignal
+    bearOBTop := high[1]
+    bearOBBottom := low[1]
+    bearOBActive := true
+    bearOBBar := bar_index
+
+if bullOBActive
+    if close < bullOBBottom or (bar_index - bullOBBar > obMaxAge)
+        bullOBActive := false
+
+if bearOBActive
+    if close > bearOBTop or (bar_index - bearOBBar > obMaxAge)
+        bearOBActive := false
+
+inBullOB = bullOBActive and low <= bullOBTop and high >= bullOBBottom
+inBearOB = bearOBActive and low <= bearOBTop and high >= bearOBBottom
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// 🌐 FAIR VALUE GAPS
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+var float bullFVGTop = na
+var float bullFVGBottom = na
+var float bearFVGTop = na
+var float bearFVGBottom = na
+var bool bullFVGActive = false
+var bool bearFVGActive = false
+var int bullFVGBar = na
+var int bearFVGBar = na
+
+bullishFVGSignal = low > high[2] and close > open
+bullFVGGap = low - high[2]
+
+bearishFVGSignal = high < low[2] and close < open
+bearFVGGap = low[2] - high
+
+if showFVG and bullishFVGSignal and bullFVGGap > atr * 0.3
+    bullFVGTop := low
+    bullFVGBottom := high[2]
+    bullFVGActive := true
+    bullFVGBar := bar_index
+
+if showFVG and bearishFVGSignal and bearFVGGap > atr * 0.3
+    bearFVGTop := low[2]
+    bearFVGBottom := high
+    bearFVGActive := true
+    bearFVGBar := bar_index
+
+if bullFVGActive
+    if close < bullFVGBottom or (bar_index - bullFVGBar > obMaxAge)
+        bullFVGActive := false
+
+if bearFVGActive
+    if close > bearFVGTop or (bar_index - bearFVGBar > obMaxAge)
+        bearFVGActive := false
+
+inBullFVG = bullFVGActive and low <= bullFVGTop and high >= bullFVGBottom
+inBearFVG = bearFVGActive and low <= bearFVGTop and high >= bearFVGBottom
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// 📋 S/R ZONES
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+float clusterTol = atr * srClusterTolerance
+float zoneHalfWidth = atr * i_srZoneWidth / 2
+
+var float sup1Price = na
+var float sup2Price = na
+var int sup1Strength = 0
+var int sup2Strength = 0
+
+var float res1Price = na
+var float res2Price = na
+var int res1Strength = 0
+var int res2Strength = 0
+
+if i_showSRZones and barstate.isconfirmed
+    var array<float> tempSupPrices = array.new_float(0)
+    var array<int> tempSupStrengths = array.new_int(0)
+    var array<float> tempResPrices = array.new_float(0)
+    var array<int> tempResStrengths = array.new_int(0)
+
+    array.clear(tempSupPrices)
+    array.clear(tempSupStrengths)
+    array.clear(tempResPrices)
+    array.clear(tempResStrengths)
+
+    // 1. Swing Highs -> Resistance
+    for i = 0 to array.size(swingHighHistory) - 1
+        float sh = array.get(swingHighHistory, i)
+        if not na(sh) and sh > close
+            bool found = false
+            if array.size(tempResPrices) > 0
+                for j = 0 to array.size(tempResPrices) - 1
+                    if math.abs(array.get(tempResPrices, j) - sh) <= clusterTol
+                        array.set(tempResStrengths, j, math.min(array.get(tempResStrengths, j) + 1, 5))
+                        array.set(tempResPrices, j, (array.get(tempResPrices, j) + sh) / 2)
+                        found := true
+                        break
+            if not found
+                array.push(tempResPrices, sh)
+                array.push(tempResStrengths, 1)
+
+    // 2. Swing Lows -> Support
+    for i = 0 to array.size(swingLowHistory) - 1
+        float sl = array.get(swingLowHistory, i)
+        if not na(sl) and sl < close
+            bool found = false
+            if array.size(tempSupPrices) > 0
+                for j = 0 to array.size(tempSupPrices) - 1
+                    if math.abs(array.get(tempSupPrices, j) - sl) <= clusterTol
+                        array.set(tempSupStrengths, j, math.min(array.get(tempSupStrengths, j) + 1, 5))
+                        array.set(tempSupPrices, j, (array.get(tempSupPrices, j) + sl) / 2)
+                        found := true
+                        break
+            if not found
+                array.push(tempSupPrices, sl)
+                array.push(tempSupStrengths, 1)
+
+    // 3. Order Blocks
+    if bullOBActive and not na(bullOBTop) and bullOBTop < close
+        float obMid = (bullOBTop + bullOBBottom) / 2
+        bool found = false
+        if array.size(tempSupPrices) > 0
+            for j = 0 to array.size(tempSupPrices) - 1
+                if math.abs(array.get(tempSupPrices, j) - obMid) <= clusterTol
+                    array.set(tempSupStrengths, j, math.min(array.get(tempSupStrengths, j) + 1, 5))
+                    found := true
+                    break
+        if not found
+            array.push(tempSupPrices, obMid)
+            array.push(tempSupStrengths, 1)
+
+    if bearOBActive and not na(bearOBTop) and bearOBBottom > close
+        float obMid = (bearOBTop + bearOBBottom) / 2
+        bool found = false
+        if array.size(tempResPrices) > 0
+            for j = 0 to array.size(tempResPrices) - 1
+                if math.abs(array.get(tempResPrices, j) - obMid) <= clusterTol
+                    array.set(tempResStrengths, j, math.min(array.get(tempResStrengths, j) + 1, 5))
+                    found := true
+                    break
+        if not found
+            array.push(tempResPrices, obMid)
+            array.push(tempResStrengths, 1)
+
+    // 4. FVGs
+    if bullFVGActive and not na(bullFVGTop) and bullFVGTop < close
+        float fvgMid = (bullFVGTop + bullFVGBottom) / 2
+        bool found = false
+        if array.size(tempSupPrices) > 0
+            for j = 0 to array.size(tempSupPrices) - 1
+                if math.abs(array.get(tempSupPrices, j) - fvgMid) <= clusterTol
+                    array.set(tempSupStrengths, j, math.min(array.get(tempSupStrengths, j) + 1, 5))
+                    found := true
+                    break
+        if not found
+            array.push(tempSupPrices, fvgMid)
+            array.push(tempSupStrengths, 1)
+
+    if bearFVGActive and not na(bearFVGTop) and bearFVGBottom > close
+        float fvgMid = (bearFVGTop + bearFVGBottom) / 2
+        bool found = false
+        if array.size(tempResPrices) > 0
+            for j = 0 to array.size(tempResPrices) - 1
+                if math.abs(array.get(tempResPrices, j) - fvgMid) <= clusterTol
+                    array.set(tempResStrengths, j, math.min(array.get(tempResStrengths, j) + 1, 5))
+                    found := true
+                    break
+        if not found
+            array.push(tempResPrices, fvgMid)
+            array.push(tempResStrengths, 1)
+
+    // 5. EQH/EQL
+    if array.size(eqhPrices) > 0
+        for i = 0 to array.size(eqhPrices) - 1
+            if not array.get(eqhSwept, i) and array.get(eqhTouches, i) >= i_eqMinTouches
+                float eqhP = array.get(eqhPrices, i)
+                if eqhP > close
+                    bool found = false
+                    if array.size(tempResPrices) > 0
+                        for j = 0 to array.size(tempResPrices) - 1
+                            if math.abs(array.get(tempResPrices, j) - eqhP) <= clusterTol
+                                array.set(tempResStrengths, j, math.min(array.get(tempResStrengths, j) + 2, 5))
+                                found := true
+                                break
+                    if not found
+                        array.push(tempResPrices, eqhP)
+                        array.push(tempResStrengths, 2)
+
+    if array.size(eqlPrices) > 0
+        for i = 0 to array.size(eqlPrices) - 1
+            if not array.get(eqlSwept, i) and array.get(eqlTouches, i) >= i_eqMinTouches
+                float eqlP = array.get(eqlPrices, i)
+                if eqlP < close
+                    bool found = false
+                    if array.size(tempSupPrices) > 0
+                        for j = 0 to array.size(tempSupPrices) - 1
+                            if math.abs(array.get(tempSupPrices, j) - eqlP) <= clusterTol
+                                array.set(tempSupStrengths, j, math.min(array.get(tempSupStrengths, j) + 2, 5))
+                                found := true
+                                break
+                    if not found
+                        array.push(tempSupPrices, eqlP)
+                        array.push(tempSupStrengths, 2)
+
+    // 6. HTF Levels
+    if not na(htfSupport) and htfSupport < close
+        bool found = false
+        if array.size(tempSupPrices) > 0
+            for j = 0 to array.size(tempSupPrices) - 1
+                if math.abs(array.get(tempSupPrices, j) - htfSupport) <= clusterTol
+                    array.set(tempSupStrengths, j, math.min(array.get(tempSupStrengths, j) + 1, 5))
+                    found := true
+                    break
+        if not found
+            array.push(tempSupPrices, htfSupport)
+            array.push(tempSupStrengths, 1)
+
+    if not na(htfResistance) and htfResistance > close
+        bool found = false
+        if array.size(tempResPrices) > 0
+            for j = 0 to array.size(tempResPrices) - 1
+                if math.abs(array.get(tempResPrices, j) - htfResistance) <= clusterTol
+                    array.set(tempResStrengths, j, math.min(array.get(tempResStrengths, j) + 1, 5))
+                    found := true
+                    break
+        if not found
+            array.push(tempResPrices, htfResistance)
+            array.push(tempResStrengths, 1)
+
+    // Sort Support by strength
+    sup1Price := na
+    sup2Price := na
+    sup1Strength := 0
+    sup2Strength := 0
+
+    if array.size(tempSupPrices) > 1
+        for i = 0 to array.size(tempSupPrices) - 2
+            for j = i + 1 to array.size(tempSupPrices) - 1
+                if array.get(tempSupStrengths, j) > array.get(tempSupStrengths, i)
+                    float tempP = array.get(tempSupPrices, i)
+                    int tempS = array.get(tempSupStrengths, i)
+                    array.set(tempSupPrices, i, array.get(tempSupPrices, j))
+                    array.set(tempSupStrengths, i, array.get(tempSupStrengths, j))
+                    array.set(tempSupPrices, j, tempP)
+                    array.set(tempSupStrengths, j, tempS)
+
+    int supCount = 0
+    if array.size(tempSupPrices) > 0
+        for i = 0 to array.size(tempSupPrices) - 1
+            if supCount >= i_srMaxZones
+                break
+            int str2 = array.get(tempSupStrengths, i)
+            if str2 >= i_srMinStrength
+                float p = array.get(tempSupPrices, i)
+                if supCount == 0
+                    sup1Price := p
+                    sup1Strength := str2
+                else if supCount == 1
+                    sup2Price := p
+                    sup2Strength := str2
+                supCount += 1
+
+    // Sort Resistance by strength
+    res1Price := na
+    res2Price := na
+    res1Strength := 0
+    res2Strength := 0
+
+    if array.size(tempResPrices) > 1
+        for i = 0 to array.size(tempResPrices) - 2
+            for j = i + 1 to array.size(tempResPrices) - 1
+                if array.get(tempResStrengths, j) > array.get(tempResStrengths, i)
+                    float tempP = array.get(tempResPrices, i)
+                    int tempS = array.get(tempResStrengths, i)
+                    array.set(tempResPrices, i, array.get(tempResPrices, j))
+                    array.set(tempResStrengths, i, array.get(tempResStrengths, j))
+                    array.set(tempResPrices, j, tempP)
+                    array.set(tempResStrengths, j, tempS)
+
+    int resCount = 0
+    if array.size(tempResPrices) > 0
+        for i = 0 to array.size(tempResPrices) - 1
+            if resCount >= i_srMaxZones
+                break
+            int str2 = array.get(tempResStrengths, i)
+            if str2 >= i_srMinStrength
+                float p = array.get(tempResPrices, i)
+                if resCount == 0
+                    res1Price := p
+                    res1Strength := str2
+                else if resCount == 1
+                    res2Price := p
+                    res2Strength := str2
+                resCount += 1
+
+// S/R Zone Visualization
+color sup1Col = sup1Strength >= 5 ? color.new(#00E676, 50) : sup1Strength >= 4 ? color.new(#00E676, 60) : sup1Strength >= 3 ? color.new(#00E676, 70) : color.new(#00E676, 80)
+color sup2Col = sup2Strength >= 5 ? color.new(#00E676, 50) : sup2Strength >= 4 ? color.new(#00E676, 60) : sup2Strength >= 3 ? color.new(#00E676, 70) : color.new(#00E676, 80)
+color res1Col = res1Strength >= 5 ? color.new(#FF5252, 50) : res1Strength >= 4 ? color.new(#FF5252, 60) : res1Strength >= 3 ? color.new(#FF5252, 70) : color.new(#FF5252, 80)
+color res2Col = res2Strength >= 5 ? color.new(#FF5252, 50) : res2Strength >= 4 ? color.new(#FF5252, 60) : res2Strength >= 3 ? color.new(#FF5252, 70) : color.new(#FF5252, 80)
+
+sup1Top = plot(i_showSRZones and not na(sup1Price) ? sup1Price + zoneHalfWidth : na, "Sup1 Top", color=na, display=display.none)
+sup1Bot = plot(i_showSRZones and not na(sup1Price) ? sup1Price - zoneHalfWidth : na, "Sup1 Bot", color=na, display=display.none)
+fill(sup1Top, sup1Bot, color=i_showSRZones and not na(sup1Price) ? sup1Col : na, title="Support Zone 1")
+
+sup2Top = plot(i_showSRZones and not na(sup2Price) ? sup2Price + zoneHalfWidth : na, "Sup2 Top", color=na, display=display.none)
+sup2Bot = plot(i_showSRZones and not na(sup2Price) ? sup2Price - zoneHalfWidth : na, "Sup2 Bot", color=na, display=display.none)
+fill(sup2Top, sup2Bot, color=i_showSRZones and not na(sup2Price) ? sup2Col : na, title="Support Zone 2")
+
+res1Top = plot(i_showSRZones and not na(res1Price) ? res1Price + zoneHalfWidth : na, "Res1 Top", color=na, display=display.none)
+res1Bot = plot(i_showSRZones and not na(res1Price) ? res1Price - zoneHalfWidth : na, "Res1 Bot", color=na, display=display.none)
+fill(res1Top, res1Bot, color=i_showSRZones and not na(res1Price) ? res1Col : na, title="Resistance Zone 1")
+
+res2Top = plot(i_showSRZones and not na(res2Price) ? res2Price + zoneHalfWidth : na, "Res2 Top", color=na, display=display.none)
+res2Bot = plot(i_showSRZones and not na(res2Price) ? res2Price - zoneHalfWidth : na, "Res2 Bot", color=na, display=display.none)
+fill(res2Top, res2Bot, color=i_showSRZones and not na(res2Price) ? res2Col : na, title="Resistance Zone 2")
+
+// S/R Labels
+var label sup1Label = na
+var label sup2Label = na
+var label res1Label = na
+var label res2Label = na
+
+if i_showSRZones and i_srShowLabels and barstate.islast
+    label.delete(sup1Label)
+    label.delete(sup2Label)
+    label.delete(res1Label)
+    label.delete(res2Label)
+
+    if not na(sup1Price)
+        sup1Label := label.new(bar_index + 5, sup1Price, "S" + str.tostring(sup1Strength), color=color.new(color.white, 100), textcolor=color.new(#00E676, 30), style=label.style_label_left, size=size.small)
+    if not na(sup2Price)
+        sup2Label := label.new(bar_index + 5, sup2Price, "S" + str.tostring(sup2Strength), color=color.new(color.white, 100), textcolor=color.new(#00E676, 50), style=label.style_label_left, size=size.small)
+    if not na(res1Price)
+        res1Label := label.new(bar_index + 5, res1Price, "R" + str.tostring(res1Strength), color=color.new(color.white, 100), textcolor=color.new(#FF5252, 30), style=label.style_label_left, size=size.small)
+    if not na(res2Price)
+        res2Label := label.new(bar_index + 5, res2Price, "R" + str.tostring(res2Strength), color=color.new(color.white, 100), textcolor=color.new(#FF5252, 50), style=label.style_label_left, size=size.small)
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// 📈 RSI DIVERGENCE & PATTERNS
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+priceMakingLL = low < lowestLowDiv
+rsiMakingHL = rsi > lowestRsiDiv
+bullishDivergence = priceMakingLL and rsiMakingHL and rsi < 40
+
+priceMakingHH = high > highestHighDiv
+rsiMakingLH = rsi < highestRsiDiv
+bearishDivergence = priceMakingHH and rsiMakingLH and rsi > 60
+
+bullishEngulfing = close[1] < open[1] and close > open and close > high[1] and open < low[1]
+bearishEngulfing = close[1] > open[1] and close < open and close < low[1] and open > high[1]
+
+bodySize = math.abs(close - open)
+upperWick = high - math.max(close, open)
+lowerWick = math.min(close, open) - low
+hammer = lowerWick > bodySize * 2 and upperWick < bodySize * 0.5 and close > open
+shootingStar = upperWick > bodySize * 2 and lowerWick < bodySize * 0.5 and close < open
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// 🛠 HELPER FUNCTIONS
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+findNextSwingHighAbove(float currentPrice) =>
+    float result = na
+    for i = 0 to array.size(swingHighHistory) - 1
+        float sh = array.get(swingHighHistory, i)
+        if not na(sh) and sh > currentPrice
+            if na(result) or sh < result
+                result := sh
+    result
+
+findNextSwingLowBelow(float currentPrice) =>
+    float result = na
+    for i = 0 to array.size(swingLowHistory) - 1
+        float sl2 = array.get(swingLowHistory, i)
+        if not na(sl2) and sl2 < currentPrice
+            if na(result) or sl2 > result
+                result := sl2
+    result
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// 📈 CONFLUENCE SCORING
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+bullConfluence = 0
+bearConfluence = 0
+
+hasBullCoreTrigger = bullishCHOCH or bullishSweep or eqlGrabSignal
+hasBearCoreTrigger = bearishCHOCH or bearishSweep or eqhGrabSignal
+
+// BULLISH
+if bullishCHOCH
+    bullConfluence += 2
+if bullishSweep
+    bullConfluence += 2
+if eqlGrabSignal
+    bullConfluence += i_eqGrabPoints
+if isHL
+    bullConfluence += 1
+if inBullOB
+    bullConfluence += 1
+if inBullFVG
+    bullConfluence += 1
+if useRSIDivergence and bullishDivergence
+    bullConfluence += 2
+if useVolumeConfirm and highVolume and close > open
+    bullConfluence += 1
+if useVolumeConfirm and veryHighVolume and close > open
+    bullConfluence += 1
+if bullishEngulfing or hammer
+    bullConfluence += 1
+if useEMAFilter and close > ema21 and ema21 > ema50
+    bullConfluence += 1
+if useEMAFilter and close > ema200
+    bullConfluence += 1
+if useATRFilter and highVolatility and close > open
+    bullConfluence += 1
+if useATRFilter and lowVolatility
+    bullConfluence -= 1
+if htfBullish
+    bullConfluence += 1
+if i_pdConfluence and inDiscount
+    bullConfluence += 1
+if i_pdConfluence and i_pdOTEBonus and inOTE_Long
+    bullConfluence += 1
+if i_pdConfluence and inDeepDiscount
+    bullConfluence += 1
+
+// BEARISH
+if bearishCHOCH
+    bearConfluence += 2
+if bearishSweep
+    bearConfluence += 2
+if eqhGrabSignal
+    bearConfluence += i_eqGrabPoints
+if isLH
+    bearConfluence += 1
+if inBearOB
+    bearConfluence += 1
+if inBearFVG
+    bearConfluence += 1
+if useRSIDivergence and bearishDivergence
+    bearConfluence += 2
+if useVolumeConfirm and highVolume and close < open
+    bearConfluence += 1
+if useVolumeConfirm and veryHighVolume and close < open
+    bearConfluence += 1
+if bearishEngulfing or shootingStar
+    bearConfluence += 1
+if useEMAFilter and close < ema21 and ema21 < ema50
+    bearConfluence += 1
+if useEMAFilter and close < ema200
+    bearConfluence += 1
+if useATRFilter and highVolatility and close < open
+    bearConfluence += 1
+if useATRFilter and lowVolatility
+    bearConfluence -= 1
+if htfBearish
+    bearConfluence += 1
+if i_pdConfluence and inPremium
+    bearConfluence += 1
+if i_pdConfluence and i_pdOTEBonus and inOTE_Short
+    bearConfluence += 1
+if i_pdConfluence and inDeepPremium
+    bearConfluence += 1
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// 📈 SIGNAL GENERATION
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+var int lastBullSignalBar = -999
+var int lastBearSignalBar = -999
+var bool pendingBullSignal = false
+var bool pendingBearSignal = false
+var int pendingBullBar = 0
+var int pendingBearBar = 0
+
+bullCooldownOK = bar_index - lastBullSignalBar >= signalCooldown
+bearCooldownOK = bar_index - lastBearSignalBar >= signalCooldown
+
+// Entry Zone Pre-calc
+float preBullEntryTop = bullOBActive and not na(bullOBTop) ? bullOBTop : (bullFVGActive and not na(bullFVGTop) ? bullFVGTop : high)
+float preBullEntryBottom = bullOBActive and not na(bullOBBottom) ? bullOBBottom : (bullFVGActive and not na(bullFVGBottom) ? bullFVGBottom : low)
+float preBullEntryMid = (preBullEntryTop + preBullEntryBottom) / 2
+
+float preBearEntryTop = bearOBActive and not na(bearOBTop) ? bearOBTop : (bearFVGActive and not na(bearFVGTop) ? bearFVGTop : high)
+float preBearEntryBottom = bearOBActive and not na(bearOBBottom) ? bearOBBottom : (bearFVGActive and not na(bearFVGBottom) ? bearFVGBottom : low)
+float preBearEntryMid = (preBearEntryTop + preBearEntryBottom) / 2
+
+// SL Calculation
+float smcBullSL = bullOBActive and not na(bullOBBottom) ? bullOBBottom - atr * slATRBuffer : bullFVGActive and not na(bullFVGBottom) ? bullFVGBottom - atr * slATRBuffer : preBullEntryBottom - atr * slATRBuffer
+float smcBearSL = bearOBActive and not na(bearOBTop) ? bearOBTop + atr * slATRBuffer : bearFVGActive and not na(bearFVGTop) ? bearFVGTop + atr * slATRBuffer : preBearEntryTop + atr * slATRBuffer
+float preBullSL = i_slMode == "Entry-Based" ? preBullEntryBottom - atr * slATRBuffer : i_slMode == "Swing" ? (not na(lastSwingLow) ? lastSwingLow - atr * slATRBuffer : low - atr * slATRBuffer) : i_slMode == "SMC" ? smcBullSL : close - atr * 2
+float preBearSL = i_slMode == "Entry-Based" ? preBearEntryTop + atr * slATRBuffer : i_slMode == "Swing" ? (not na(lastSwingHigh) ? lastSwingHigh + atr * slATRBuffer : high + atr * slATRBuffer) : i_slMode == "SMC" ? smcBearSL : close + atr * 2
+
+// R:R Check
+float bullRisk = preBullEntryMid - preBullSL
+float bearRisk = preBearSL - preBearEntryMid
+
+float bullFirstStructureTP = findNextSwingHighAbove(preBullEntryMid)
+if na(bullFirstStructureTP) and not na(pdEquilibrium) and pdEquilibrium > preBullEntryMid
+    bullFirstStructureTP := pdEquilibrium
+
+float bearFirstStructureTP = findNextSwingLowBelow(preBearEntryMid)
+if na(bearFirstStructureTP) and not na(pdEquilibrium) and pdEquilibrium < preBearEntryMid
+    bearFirstStructureTP := pdEquilibrium
+
+float bullActualReward = not na(bullFirstStructureTP) ? bullFirstStructureTP - preBullEntryMid : bullRisk * i_tp1RR
+float bullActualRR = bullRisk > 0 ? bullActualReward / bullRisk : 0
+
+float bearActualReward = not na(bearFirstStructureTP) ? preBearEntryMid - bearFirstStructureTP : bearRisk * i_tp1RR
+float bearActualRR = bearRisk > 0 ? bearActualReward / bearRisk : 0
+
+bool bullSLTooFar = bullRisk > atr * i_slMaxATR
+bool bearSLTooFar = bearRisk > atr * i_slMaxATR
+
+bool bullRRValid = bullActualRR >= minRR and not bullSLTooFar and bullRisk > 0
+bool bearRRValid = bearActualRR >= minRR and not bearSLTooFar and bearRisk > 0
+
+rawBullSignal = bullConfluence >= minConfluence and bullConfluence > bearConfluence and bullCooldownOK and hasBullCoreTrigger
+rawBearSignal = bearConfluence >= minConfluence and bearConfluence > bullConfluence and bearCooldownOK and hasBearCoreTrigger
+
+rawBullSignalWithRR = rawBullSignal and bullRRValid
+rawBearSignalWithRR = rawBearSignal and bearRRValid
+
+var bool confirmedBullSignal = false
+var bool confirmedBearSignal = false
+var bool lastSignalRRValid = true
+var float lastSignalRR = 0.0
+
+confirmedBullSignal := false
+confirmedBearSignal := false
+
+if requireConfirmation
+    if rawBullSignalWithRR and not pendingBullSignal
+        pendingBullSignal := true
+        pendingBullBar := bar_index
+
+    if rawBearSignalWithRR and not pendingBearSignal
+        pendingBearSignal := true
+        pendingBearBar := bar_index
+
+    if pendingBullSignal and bar_index > pendingBullBar
+        if close > open and close > close[1]
+            confirmedBullSignal := true
+            pendingBullSignal := false
+            lastBullSignalBar := bar_index
+            lastSignalRRValid := bullRRValid
+            lastSignalRR := bullActualRR
+        else if bar_index > pendingBullBar + 2
+            pendingBullSignal := false
+
+    if pendingBearSignal and bar_index > pendingBearBar
+        if close < open and close < close[1]
+            confirmedBearSignal := true
+            pendingBearSignal := false
+            lastBearSignalBar := bar_index
+            lastSignalRRValid := bearRRValid
+            lastSignalRR := bearActualRR
+        else if bar_index > pendingBearBar + 2
+            pendingBearSignal := false
+else
+    if rawBullSignalWithRR
+        confirmedBullSignal := true
+        lastBullSignalBar := bar_index
+        lastSignalRRValid := bullRRValid
+        lastSignalRR := bullActualRR
+
+    if rawBearSignalWithRR
+        confirmedBearSignal := true
+        lastBearSignalBar := bar_index
+        lastSignalRRValid := bearRRValid
+        lastSignalRR := bearActualRR
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// 📈 SETUP STATE & TP CALCULATION
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+var float activeEntryTop = na
+var float activeEntryBottom = na
+var float activeSL = na
+var float activeTP1 = na
+var float activeTP2 = na
+var float activeTP3 = na
+var bool activeIsLong = true
+var int activeSetupBar = na
+var bool activeSetup = false
+var bool activeRRValid = true
+var float activeRR = 0.0
+var string activeSLType = ""
+var string activeTP1Type = ""
+var string activeTP2Type = ""
+var string activeTP3Type = ""
+
+calcTPsForSetup(bool isLong, float entryMid, float risk) =>
+    float tp1 = na
+    float tp2 = na
+    float tp3 = na
+    string t1Type = ""
+    string t2Type = ""
+    string t3Type = ""
+
+    if i_tpMode == "Fixed R:R"
+        tp1 := isLong ? entryMid + risk * i_tp1RR : entryMid - risk * i_tp1RR
+        tp2 := isLong ? entryMid + risk * i_tp2RR : entryMid - risk * i_tp2RR
+        tp3 := isLong ? entryMid + risk * i_tp3RR : entryMid - risk * i_tp3RR
+        t1Type := str.tostring(i_tp1RR, "#.#") + "R"
+        t2Type := str.tostring(i_tp2RR, "#.#") + "R"
+        t3Type := str.tostring(i_tp3RR, "#.#") + "R"
+    else if i_tpMode == "ATR"
+        tp1 := isLong ? entryMid + atr * i_tp1ATR : entryMid - atr * i_tp1ATR
+        tp2 := isLong ? entryMid + atr * i_tp2ATR : entryMid - atr * i_tp2ATR
+        tp3 := isLong ? entryMid + atr * i_tp3ATR : entryMid - atr * i_tp3ATR
+        t1Type := str.tostring(i_tp1ATR, "#") + "ATR"
+        t2Type := str.tostring(i_tp2ATR, "#") + "ATR"
+        t3Type := str.tostring(i_tp3ATR, "#") + "ATR"
+    else if i_tpMode == "Structure"
+        float swingTP = isLong ? findNextSwingHighAbove(entryMid) : findNextSwingLowBelow(entryMid)
+        tp1 := not na(swingTP) ? swingTP : (isLong ? entryMid + risk * i_tp1RR : entryMid - risk * i_tp1RR)
+        t1Type := not na(swingTP) ? "Swing" : str.tostring(i_tp1RR, "#.#") + "R"
+        tp2 := isLong ? entryMid + risk * i_tp2RR : entryMid - risk * i_tp2RR
+        t2Type := str.tostring(i_tp2RR, "#.#") + "R"
+        tp3 := isLong ? entryMid + risk * i_tp3RR : entryMid - risk * i_tp3RR
+        t3Type := str.tostring(i_tp3RR, "#.#") + "R"
+    else // Hybrid
+        float minTP1 = isLong ? entryMid + risk * i_tp1RR : entryMid - risk * i_tp1RR
+        float minTP2 = isLong ? entryMid + risk * i_tp2RR : entryMid - risk * i_tp2RR
+        float minTP3 = isLong ? entryMid + risk * i_tp3RR : entryMid - risk * i_tp3RR
+        float swingTP = isLong ? findNextSwingHighAbove(entryMid) : findNextSwingLowBelow(entryMid)
+
+        if isLong
+            tp1 := not na(swingTP) and swingTP >= minTP1 ? swingTP : minTP1
+            t1Type := not na(swingTP) and swingTP >= minTP1 ? "Swing" : str.tostring(i_tp1RR, "#.#") + "R"
+        else
+            tp1 := not na(swingTP) and swingTP <= minTP1 ? swingTP : minTP1
+            t1Type := not na(swingTP) and swingTP <= minTP1 ? "Swing" : str.tostring(i_tp1RR, "#.#") + "R"
+        tp2 := minTP2
+        t2Type := str.tostring(i_tp2RR, "#.#") + "R"
+        tp3 := minTP3
+        t3Type := str.tostring(i_tp3RR, "#.#") + "R"
+
+    [tp1, tp2, tp3, t1Type, t2Type, t3Type]
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// 📈 SETUP ACTIVATION
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+// LONG Setup
+if confirmedBullSignal and showEntryZones
+    activeSetupBar := bar_index
+    activeIsLong := true
+    activeSetup := true
+    activeRRValid := lastSignalRRValid
+    activeRR := lastSignalRR
+
+    activeEntryTop := bullOBActive and not na(bullOBTop) ? bullOBTop : (bullFVGActive and not na(bullFVGTop) ? bullFVGTop : high)
+    activeEntryBottom := bullOBActive and not na(bullOBBottom) ? bullOBBottom : (bullFVGActive and not na(bullFVGBottom) ? bullFVGBottom : low)
+
+    float smcSL = bullOBActive and not na(bullOBBottom) ? bullOBBottom - atr * slATRBuffer : bullFVGActive and not na(bullFVGBottom) ? bullFVGBottom - atr * slATRBuffer : activeEntryBottom - atr * slATRBuffer
+    activeSL := i_slMode == "Entry-Based" ? activeEntryBottom - atr * slATRBuffer : i_slMode == "Swing" ? (not na(lastSwingLow) ? lastSwingLow - atr * slATRBuffer : low - atr * slATRBuffer) : i_slMode == "SMC" ? smcSL : close - atr * 2
+    activeSLType := i_slMode == "Entry-Based" ? "Entry" : i_slMode == "Swing" ? "Swing" : i_slMode == "SMC" ? "SMC" : "ATR"
+
+    float entryMid = (activeEntryTop + activeEntryBottom) / 2
+    float risk = entryMid - activeSL
+
+    [tp1, tp2, tp3, t1, t2, t3] = calcTPsForSetup(true, entryMid, risk)
+    activeTP1 := tp1
+    activeTP2 := tp2
+    activeTP3 := tp3
+    activeTP1Type := t1
+    activeTP2Type := t2
+    activeTP3Type := t3
+
+// SHORT Setup
+if confirmedBearSignal and showEntryZones
+    activeSetupBar := bar_index
+    activeIsLong := false
+    activeSetup := true
+    activeRRValid := lastSignalRRValid
+    activeRR := lastSignalRR
+
+    activeEntryTop := bearOBActive and not na(bearOBTop) ? bearOBTop : (bearFVGActive and not na(bearFVGTop) ? bearFVGTop : high)
+    activeEntryBottom := bearOBActive and not na(bearOBBottom) ? bearOBBottom : (bearFVGActive and not na(bearFVGBottom) ? bearFVGBottom : low)
+
+    float smcSL = bearOBActive and not na(bearOBTop) ? bearOBTop + atr * slATRBuffer : bearFVGActive and not na(bearFVGTop) ? bearFVGTop + atr * slATRBuffer : activeEntryTop + atr * slATRBuffer
+    activeSL := i_slMode == "Entry-Based" ? activeEntryTop + atr * slATRBuffer : i_slMode == "Swing" ? (not na(lastSwingHigh) ? lastSwingHigh + atr * slATRBuffer : high + atr * slATRBuffer) : i_slMode == "SMC" ? smcSL : close + atr * 2
+    activeSLType := i_slMode == "Entry-Based" ? "Entry" : i_slMode == "Swing" ? "Swing" : i_slMode == "SMC" ? "SMC" : "ATR"
+
+    float entryMid = (activeEntryTop + activeEntryBottom) / 2
+    float risk = activeSL - entryMid
+
+    [tp1, tp2, tp3, t1, t2, t3] = calcTPsForSetup(false, entryMid, risk)
+    activeTP1 := tp1
+    activeTP2 := tp2
+    activeTP3 := tp3
+    activeTP1Type := t1
+    activeTP2Type := t2
+    activeTP3Type := t3
+
+// Setup Invalidation
+if activeSetup and bar_index > activeSetupBar
+    bool hitSL = activeIsLong ? close < activeSL : close > activeSL
+    bool tooOld = bar_index - activeSetupBar > setupMaxBars
+    bool hitTP3 = not na(activeTP3) and (activeIsLong ? close >= activeTP3 : close <= activeTP3)
+
+    if hitSL or tooOld or hitTP3
+        activeSetup := false
+        activeEntryTop := na
+        activeEntryBottom := na
+        activeSL := na
+        activeTP1 := na
+        activeTP2 := na
+        activeTP3 := na
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// 🎨 VISUALIZATION — Lines Mode
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+plot(showEntryZones and activeSetup ? activeEntryTop : na, "Entry Top", color=color.new(entryColor, 30), style=plot.style_linebr, linewidth=2)
+plot(showEntryZones and activeSetup ? activeEntryBottom : na, "Entry Bottom", color=color.new(entryColor, 30), style=plot.style_linebr, linewidth=2)
+plot(showEntryZones and activeSetup ? activeSL : na, "SL", color=slColor, style=plot.style_linebr, linewidth=2)
+plot(showEntryZones and activeSetup ? activeTP1 : na, "TP1", color=tpColor, style=plot.style_linebr, linewidth=1)
+plot(showEntryZones and activeSetup ? activeTP2 : na, "TP2", color=color.new(tpColor, 30), style=plot.style_linebr, linewidth=1)
+plot(showEntryZones and activeSetup ? activeTP3 : na, "TP3", color=color.new(tpColor, 50), style=plot.style_linebr, linewidth=1)
+
+// Signal Shapes
+plotshape(confirmedBullSignal, title="BUY", style=shape.triangleup, location=location.belowbar, color=bullColor, size=size.small)
+plotshape(confirmedBearSignal, title="SELL", style=shape.triangledown, location=location.abovebar, color=bearColor, size=size.small)
+
+// Signal Labels
+if confirmedBullSignal
+    label.new(bar_index, low - atr * 0.4, str.tostring(bullConfluence), color=color.new(color.white, 100), textcolor=color.new(#00E676, 0), style=label.style_label_up, size=size.normal)
+if confirmedBearSignal
+    label.new(bar_index, high + atr * 0.4, str.tostring(bearConfluence), color=color.new(color.white, 100), textcolor=color.new(#FF5252, 0), style=label.style_label_down, size=size.normal)
+
+// Signal Background
+bgcolor(confirmedBullSignal ? color.new(bullColor, 90) : na, title="BUY BG")
+bgcolor(confirmedBearSignal ? color.new(bearColor, 90) : na, title="SELL BG")
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// 📋 DASHBOARD
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+_dPos  = f_dashPosition(i_dashPos)
+_dSize = f_dashSize(i_dashSize)
+var table dash = table.new(_dPos, 3, 20, border_width=1)
+
+tfText = isTF_1m_3m ? "1-3m" : isTF_5m ? "5m" : isTF_15m ? "15m" : isTF_30m ? "30m" : isTF_1H ? "1H" : isTF_2H ? "2H" : isTF_4H ? "4H" : isTF_8H_12H ? "8-12H" : isTF_1D ? "1D" : isTF_1W ? "1W" : isTF_1M ? "1M" : "Other"
+
+if showDashboard and barstate.islast
+    color hdr_bg  = color.new(#0d1117, 0)
+    color row_bg  = color.new(#161b22, 0)
+    color txt     = color.white
+    color dim_txt = color.new(color.white, 40)
+
+    // Row 0 — Header
+    table.cell(dash, 0, 0, "SC  v1.0", bgcolor=hdr_bg, text_color=color.new(#00e5ff, 0), text_size=_dSize, text_halign=text.align_left)
+    table.cell(dash, 1, 0, "FREE", bgcolor=hdr_bg, text_color=color.new(#ffd740, 0), text_size=_dSize)
+    table.cell(dash, 2, 0, autoMode ? "AUTO " + tfText : "MANUAL", bgcolor=hdr_bg, text_color=autoMode ? color.new(#ffd740, 0) : dim_txt, text_size=_dSize, text_halign=text.align_right)
+
+    // Row 1 — Trend
+    table.cell(dash, 0, 1, "Trend", bgcolor=row_bg, text_color=dim_txt, text_size=_dSize, text_halign=text.align_left)
+    table.cell(dash, 1, 1, isUptrend ? "BULL" : "BEAR", bgcolor=row_bg, text_color=isUptrend ? bullColor : bearColor, text_size=_dSize)
+    table.cell(dash, 2, 1, "", bgcolor=row_bg, text_color=dim_txt, text_size=_dSize)
+
+    // Row 2 — HTF
+    table.cell(dash, 0, 2, "HTF", bgcolor=row_bg, text_color=dim_txt, text_size=_dSize, text_halign=text.align_left)
+    table.cell(dash, 1, 2, htfBullish ? "BULL" : htfBearish ? "BEAR" : "NEUT", bgcolor=row_bg, text_color=htfBullish ? bullColor : htfBearish ? bearColor : dim_txt, text_size=_dSize)
+    table.cell(dash, 2, 2, "", bgcolor=row_bg, text_color=dim_txt, text_size=_dSize)
+
+    // Row 3 — Zone
+    string zoneText = na(pdPositionPct) ? "N/A" : inDeepDiscount ? "DEEP DISC" : inDeepPremium ? "DEEP PREM" : inDiscount ? "DISCOUNT" : inPremium ? "PREMIUM" : "EQ"
+    color zoneColor = na(pdPositionPct) ? dim_txt : inDeepDiscount ? color.lime : inDeepPremium ? color.red : inDiscount ? bullColor : inPremium ? bearColor : i_eqColor
+    table.cell(dash, 0, 3, "Zone", bgcolor=row_bg, text_color=dim_txt, text_size=_dSize, text_halign=text.align_left)
+    table.cell(dash, 1, 3, zoneText, bgcolor=row_bg, text_color=zoneColor, text_size=_dSize)
+    table.cell(dash, 2, 3, "", bgcolor=row_bg, text_color=dim_txt, text_size=_dSize)
+
+    // Row 4 — S/R Section Header
+    table.cell(dash, 0, 4, "S/R Zones", bgcolor=hdr_bg, text_color=dim_txt, text_size=_dSize, text_halign=text.align_left)
+    table.cell(dash, 1, 4, "", bgcolor=hdr_bg, text_color=dim_txt, text_size=_dSize)
+    table.cell(dash, 2, 4, "", bgcolor=hdr_bg, text_color=dim_txt, text_size=_dSize)
+
+    // Row 5 — Support
+    string s1Text = not na(sup1Price) ? str.tostring(sup1Price, "#.#") : "-"
+    string s1Str  = not na(sup1Price) ? "S" + str.tostring(sup1Strength) : ""
+    table.cell(dash, 0, 5, "Sup1", bgcolor=row_bg, text_color=dim_txt, text_size=_dSize, text_halign=text.align_left)
+    table.cell(dash, 1, 5, s1Text, bgcolor=row_bg, text_color=color.new(#00E676, 30), text_size=_dSize)
+    table.cell(dash, 2, 5, s1Str, bgcolor=row_bg, text_color=color.new(#00E676, 30), text_size=_dSize, text_halign=text.align_right)
+
+    // Row 6 — Resistance
+    string r1Text = not na(res1Price) ? str.tostring(res1Price, "#.#") : "-"
+    string r1Str  = not na(res1Price) ? "R" + str.tostring(res1Strength) : ""
+    table.cell(dash, 0, 6, "Res1", bgcolor=row_bg, text_color=dim_txt, text_size=_dSize, text_halign=text.align_left)
+    table.cell(dash, 1, 6, r1Text, bgcolor=row_bg, text_color=color.new(#FF5252, 30), text_size=_dSize)
+    table.cell(dash, 2, 6, r1Str, bgcolor=row_bg, text_color=color.new(#FF5252, 30), text_size=_dSize, text_halign=text.align_right)
+
+    // Row 7 — Confluence Section Header
+    table.cell(dash, 0, 7, "Confluence", bgcolor=hdr_bg, text_color=dim_txt, text_size=_dSize, text_halign=text.align_left)
+    table.cell(dash, 1, 7, "", bgcolor=hdr_bg, text_color=dim_txt, text_size=_dSize)
+    table.cell(dash, 2, 7, "", bgcolor=hdr_bg, text_color=dim_txt, text_size=_dSize)
+
+    // Row 8 — Bull Confluence
+    table.cell(dash, 0, 8, "Bull", bgcolor=row_bg, text_color=dim_txt, text_size=_dSize, text_halign=text.align_left)
+    table.cell(dash, 1, 8, str.tostring(bullConfluence) + "/" + str.tostring(minConfluence), bgcolor=row_bg, text_color=bullConfluence >= minConfluence ? bullColor : dim_txt, text_size=_dSize)
+    table.cell(dash, 2, 8, "", bgcolor=row_bg, text_color=dim_txt, text_size=_dSize)
+
+    // Row 9 — Bear Confluence
+    table.cell(dash, 0, 9, "Bear", bgcolor=row_bg, text_color=dim_txt, text_size=_dSize, text_halign=text.align_left)
+    table.cell(dash, 1, 9, str.tostring(bearConfluence) + "/" + str.tostring(minConfluence), bgcolor=row_bg, text_color=bearConfluence >= minConfluence ? bearColor : dim_txt, text_size=_dSize)
+    table.cell(dash, 2, 9, "", bgcolor=row_bg, text_color=dim_txt, text_size=_dSize)
+
+    // Row 10 — EQH/EQL
+    table.cell(dash, 0, 10, "EQH/EQL", bgcolor=row_bg, text_color=dim_txt, text_size=_dSize, text_halign=text.align_left)
+    table.cell(dash, 1, 10, str.tostring(activeEqhCount) + "/" + str.tostring(activeEqlCount), bgcolor=row_bg, text_color=txt, text_size=_dSize)
+    table.cell(dash, 2, 10, "", bgcolor=row_bg, text_color=dim_txt, text_size=_dSize)
+
+    // Row 11 — Setup Section Header
+    table.cell(dash, 0, 11, "Active Setup", bgcolor=hdr_bg, text_color=dim_txt, text_size=_dSize, text_halign=text.align_left)
+    table.cell(dash, 1, 11, "", bgcolor=hdr_bg, text_color=dim_txt, text_size=_dSize)
+    table.cell(dash, 2, 11, "", bgcolor=hdr_bg, text_color=dim_txt, text_size=_dSize)
+
+    // Row 12 — Setup
+    setupText = activeSetup ? (activeIsLong ? "LONG" : "SHORT") : "none"
+    setupCol = activeSetup ? (activeIsLong ? bullColor : bearColor) : dim_txt
+    table.cell(dash, 0, 12, "Setup", bgcolor=row_bg, text_color=dim_txt, text_size=_dSize, text_halign=text.align_left)
+    table.cell(dash, 1, 12, setupText, bgcolor=row_bg, text_color=setupCol, text_size=_dSize)
+    table.cell(dash, 2, 12, "", bgcolor=row_bg, text_color=dim_txt, text_size=_dSize)
+
+    // Row 13 — R:R
+    rrText = activeSetup ? str.tostring(activeRR, "#.#") + ":1" : "-"
+    rrColor = activeSetup ? (activeRRValid ? tpColor : dim_txt) : dim_txt
+    table.cell(dash, 0, 13, "R:R", bgcolor=row_bg, text_color=dim_txt, text_size=_dSize, text_halign=text.align_left)
+    table.cell(dash, 1, 13, rrText, bgcolor=row_bg, text_color=rrColor, text_size=_dSize)
+    table.cell(dash, 2, 13, "", bgcolor=row_bg, text_color=dim_txt, text_size=_dSize)
+
+    // Row 14 — Entry / SL
+    entryText = activeSetup ? str.tostring(activeEntryBottom, "#.#") + "-" + str.tostring(activeEntryTop, "#.#") : "-"
+    slText = activeSetup ? activeSLType + " " + str.tostring(activeSL, "#.#") : "-"
+    table.cell(dash, 0, 14, "Entry", bgcolor=row_bg, text_color=dim_txt, text_size=_dSize, text_halign=text.align_left)
+    table.cell(dash, 1, 14, entryText, bgcolor=row_bg, text_color=entryColor, text_size=_dSize)
+    table.cell(dash, 2, 14, slText, bgcolor=row_bg, text_color=slColor, text_size=_dSize, text_halign=text.align_right)
+
+    // Row 15 — TP1
+    tp1Text = activeSetup ? activeTP1Type + " " + str.tostring(activeTP1, "#.#") : "-"
+    if activeSetup and i_usePartialTP
+        tp1Text := tp1Text + " (" + str.tostring(partialTP1Pct, "#") + "%)"
+    table.cell(dash, 0, 15, "TP1", bgcolor=row_bg, text_color=dim_txt, text_size=_dSize, text_halign=text.align_left)
+    table.cell(dash, 1, 15, tp1Text, bgcolor=row_bg, text_color=tpColor, text_size=_dSize)
+    table.cell(dash, 2, 15, "", bgcolor=row_bg, text_color=dim_txt, text_size=_dSize)
+
+    // Row 16 — TP2
+    tp2Text = activeSetup ? activeTP2Type + " " + str.tostring(activeTP2, "#.#") : "-"
+    if activeSetup and i_usePartialTP
+        tp2Text := tp2Text + " (" + str.tostring(partialTP2Pct, "#") + "%)"
+    table.cell(dash, 0, 16, "TP2", bgcolor=row_bg, text_color=dim_txt, text_size=_dSize, text_halign=text.align_left)
+    table.cell(dash, 1, 16, tp2Text, bgcolor=row_bg, text_color=tpColor, text_size=_dSize)
+    table.cell(dash, 2, 16, "", bgcolor=row_bg, text_color=dim_txt, text_size=_dSize)
+
+    // Row 17 — TP3
+    tp3Text = activeSetup ? activeTP3Type + " " + str.tostring(activeTP3, "#.#") : "-"
+    if activeSetup and i_usePartialTP
+        tp3Text := tp3Text + " (" + str.tostring(partialTP3Pct, "#") + "%)"
+    table.cell(dash, 0, 17, "TP3", bgcolor=row_bg, text_color=dim_txt, text_size=_dSize, text_halign=text.align_left)
+    table.cell(dash, 1, 17, tp3Text, bgcolor=row_bg, text_color=tpColor, text_size=_dSize)
+    table.cell(dash, 2, 17, "", bgcolor=row_bg, text_color=dim_txt, text_size=_dSize)
+
+    // Row 18 — Config
+    table.cell(dash, 0, 18, "SL/TP", bgcolor=row_bg, text_color=dim_txt, text_size=_dSize, text_halign=text.align_left)
+    table.cell(dash, 1, 18, i_slMode + "/" + i_tpMode, bgcolor=row_bg, text_color=color.new(#ffd740, 0), text_size=_dSize)
+    table.cell(dash, 2, 18, i_usePartialTP ? i_partialMode : "OFF", bgcolor=row_bg, text_color=i_usePartialTP ? color.new(#ffd740, 0) : dim_txt, text_size=_dSize, text_halign=text.align_right)
+
+    // Row 19 — PRO Hint
+    table.cell(dash, 0, 19, "", bgcolor=hdr_bg, text_color=dim_txt, text_size=_dSize)
+    table.cell(dash, 1, 19, "PRO: +Grades +RM +Trail", bgcolor=hdr_bg, text_color=color.new(#42A5F5, 40), text_size=_dSize)
+    table.cell(dash, 2, 19, "", bgcolor=hdr_bg, text_color=dim_txt, text_size=_dSize)
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// 🔔 ALERTS
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+// Dynamic alerts with details
+if confirmedBullSignal and bullRRValid
+    alert("SC BUY | " + syminfo.ticker + " | Confluence: " + str.tostring(bullConfluence) + " | Entry: " + str.tostring(preBullEntryBottom, "#.##") + "-" + str.tostring(preBullEntryTop, "#.##") + " | SL: " + str.tostring(preBullSL, "#.##") + " | R:R: " + str.tostring(bullActualRR, "#.#") + ":1", alert.freq_once_per_bar_close)
+if confirmedBearSignal and bearRRValid
+    alert("SC SELL | " + syminfo.ticker + " | Confluence: " + str.tostring(bearConfluence) + " | Entry: " + str.tostring(preBearEntryBottom, "#.##") + "-" + str.tostring(preBearEntryTop, "#.##") + " | SL: " + str.tostring(preBearSL, "#.##") + " | R:R: " + str.tostring(bearActualRR, "#.#") + ":1", alert.freq_once_per_bar_close)
+
+// alertcondition for TradingView UI
+alertcondition(confirmedBullSignal and bullRRValid, title="BUY Signal", message="SC BUY on {{ticker}} | R:R OK")
+alertcondition(confirmedBearSignal and bearRRValid, title="SELL Signal", message="SC SELL on {{ticker}} | R:R OK")
+alertcondition(bullishCHOCH, title="Bullish CHOCH", message="Bullish CHOCH on {{ticker}} - Potential trend change!")
+alertcondition(bearishCHOCH, title="Bearish CHOCH", message="Bearish CHOCH on {{ticker}} - Potential trend change!")
+alertcondition(eqhGrabSignal, title="EQH Grab", message="EQH Liquidity Grab on {{ticker}} - Watch for reversal!")
+alertcondition(eqlGrabSignal, title="EQL Grab", message="EQL Liquidity Grab on {{ticker}} - Watch for reversal!")
+alertcondition(bullishSweep, title="Bullish Sweep", message="Bullish Sweep on {{ticker}}")
+alertcondition(bearishSweep, title="Bearish Sweep", message="Bearish Sweep on {{ticker}}")
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// END OF SCRIPT
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━

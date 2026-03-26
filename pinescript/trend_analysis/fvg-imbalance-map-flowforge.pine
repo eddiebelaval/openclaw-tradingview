@@ -1,0 +1,225 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0
+// © FVG Imbalance Map
+//@version=6
+indicator("FVG Imbalance Map [FlowForge]", shorttitle="FVG Imbalance Map [FlowForge]", overlay=true, max_boxes_count=2000, max_labels_count=500, max_lines_count=500)
+
+// ─────────────────────────────────────────────
+// INPUTS
+// ─────────────────────────────────────────────
+
+// ── Theme ─────────────────────────────────────
+themeChoice = input.string("Colorful", "Theme", group="Theme",
+     options=["Colorful", "Synthwave", "Sunny", "Neon", "Monochrome", "Arctic", "Dusk"],
+     tooltip="Colorful   = standard green/red.\nSynthwave  = cyan bullish, magenta bearish.\nSunny      = amber bullish, terracotta bearish.\nNeon       = neon green bullish, neon red bearish.\nMonochrome = white bullish, dark grey bearish.\nArctic     = ice blue bullish, navy bearish.\nDusk       = pink bullish, deep purple bearish.")
+applyTheme  = input.bool(true, "Apply theme to FVGs", group="Theme",
+     tooltip="When enabled, the selected theme colours override the manual Bullish/Bearish colour inputs.")
+
+targetDays = input.int(5, "FVG visible (days)", minval=1, maxval=30, group="Display")
+labelAlign = input.string("Right", "Label alignment", options=["Left", "Center", "Right"], group="Display")
+bullColor  = input.color(color.new(color.green, 70), "Bullish FVG color", group="Display")
+bearColor  = input.color(color.new(color.red,   70), "Bearish FVG color", group="Display")
+bullBord   = input.color(color.new(color.green, 40), "Bullish border",    group="Display")
+bearBord   = input.color(color.new(color.red,   40), "Bearish border",    group="Display")
+
+minSizePct = input.float(0.05, "Minimum FVG size (%)", minval=0.0, maxval=5.0, step=0.01, group="Filter",
+     tooltip="FVGs smaller than this percentage of price will be ignored")
+useVolume  = input.bool(true, "Volume filter", group="Filter",
+     tooltip="Only show FVGs where volume on the middle candle (B) exceeds the average by the set multiplier")
+volLength  = input.int(20,  "Volume MA length",   minval=5,   maxval=100,  group="Filter")
+volMult    = input.float(1.0, "Volume multiplier", minval=1.0, maxval=10.0, step=0.1, group="Filter",
+     tooltip="Middle candle volume must exceed average × multiplier")
+
+fillMode   = input.string("Wick", "FVG invalidation",
+     options=["Wick", "Midline"],
+     group="Fill Condition")
+
+show15m = input.bool(true, "15m", group="Timeframes")
+show1h  = input.bool(true, "1h",  group="Timeframes")
+show4h  = input.bool(true, "4h",  group="Timeframes")
+
+// ─────────────────────────────────────────────
+// THEME COLOUR PALETTE
+// ─────────────────────────────────────────────
+isFut  = themeChoice == "Synthwave"
+isCol  = themeChoice == "Colorful"
+isSun  = themeChoice == "Sunny"
+isNeon = themeChoice == "Neon"
+isMono = themeChoice == "Monochrome"
+isArc  = themeChoice == "Arctic"
+isDusk = themeChoice == "Dusk"
+
+// Raw accent colours — same palette as ORB Sessions scripts
+T_UP_RAW = isFut ? color.rgb(0,   229, 255) : isSun ? color.rgb(255, 179, 0)   : isNeon ? color.rgb(0,   255, 136) : isMono ? color.rgb(255, 255, 255) : isArc ? color.rgb(178, 235, 242) : isDusk ? color.rgb(244, 143, 177) : color.rgb(38,  166, 154)
+T_DN_RAW = isFut ? color.rgb(255, 0,   229) : isSun ? color.rgb(191, 54,  12)  : isNeon ? color.rgb(255, 0,   85)  : isMono ? color.rgb(66,  66,  66)  : isArc ? color.rgb(1,   87,  155)  : isDusk ? color.rgb(69,  39,  160)  : color.rgb(239, 83,  80)
+
+// FVG fill — semi-transparent
+T_BULL_FILL = color.new(T_UP_RAW, 75)
+T_BEAR_FILL = color.new(T_DN_RAW, 75)
+
+// FVG border — less transparent
+T_BULL_BORD = color.new(T_UP_RAW, 40)
+T_BEAR_BORD = color.new(T_DN_RAW, 40)
+
+// Midline
+T_BULL_MID = color.new(T_UP_RAW, 20)
+T_BEAR_MID = color.new(T_DN_RAW, 20)
+
+// Resolved colours (theme vs manual)
+rBullFill = applyTheme ? T_BULL_FILL : bullColor
+rBearFill = applyTheme ? T_BEAR_FILL : bearColor
+rBullBord = applyTheme ? T_BULL_BORD : bullBord
+rBearBord = applyTheme ? T_BEAR_BORD : bearBord
+rBullMid  = applyTheme ? T_BULL_MID  : color.new(color.green, 20)
+rBearMid  = applyTheme ? T_BEAR_MID  : color.new(color.red,   20)
+
+// ─────────────────────────────────────────────
+// BEREKENINGEN
+// ─────────────────────────────────────────────
+chartMinutes = timeframe.in_seconds() / 60
+maxBars      = int(targetDays * 1440 / chartMinutes)
+
+// ─────────────────────────────────────────────
+// TYPE
+// ─────────────────────────────────────────────
+type FVG
+    box   b
+    line  mid
+    label lbl
+    float top
+    float bot
+    bool  bull
+    int   startBar
+    int   createdAt
+
+var FVG[] fvgs = array.new<FVG>()
+
+// ─────────────────────────────────────────────
+// LABEL X POSITIE BEREKENEN
+// ─────────────────────────────────────────────
+getLabelX(int startBar, string align) =>
+    switch align
+        "Left"  => startBar
+        "Right" => bar_index
+        =>         math.round((startBar + bar_index) / 2)
+
+// ─────────────────────────────────────────────
+// FVG TOEVOEGEN
+// ─────────────────────────────────────────────
+addFVG(float topVal, float botVal, bool bull, int startBar, string tfLabel) =>
+    topFixed = math.max(topVal, botVal)
+    botFixed = math.min(topVal, botVal)
+    mid      = math.avg(topFixed, botFixed)
+    sizePct  = (topFixed - botFixed) / botFixed * 100
+
+    if sizePct >= minSizePct
+        bgCol  = bull ? rBullFill : rBearFill
+        brdCol = bull ? rBullBord : rBearBord
+        midCol = bull ? rBullMid  : rBearMid
+
+        newBox = box.new(
+             left         = startBar,
+             top          = topFixed,
+             right        = bar_index,
+             bottom       = botFixed,
+             border_color = brdCol,
+             border_width = 1,
+             bgcolor      = bgCol)
+
+        lblStyle = switch labelAlign
+            "Left"  => label.style_label_right
+            "Right" => label.style_label_left
+            =>         label.style_label_center
+        lblX = getLabelX(startBar, labelAlign)
+
+        newLbl = label.new(
+             x         = lblX,
+             y         = mid,
+             text      = tfLabel,
+             color     = color.new(color.black, 100),
+             textcolor = color.white,
+             style     = lblStyle,
+             size      = size.small)
+
+        newMid = line.new(
+             x1    = startBar,
+             y1    = mid,
+             x2    = bar_index,
+             y2    = mid,
+             color = midCol,
+             width = 1,
+             style = line.style_dashed)
+
+        array.push(fvgs, FVG.new(newBox, newMid, newLbl, topFixed, botFixed, bull, startBar, bar_index))
+
+// ─────────────────────────────────────────────
+// FILL CHECK
+// ─────────────────────────────────────────────
+isFilled(FVG fvg) =>
+    mid = math.avg(fvg.top, fvg.bot)
+    switch fillMode
+        "Wick" => high >= fvg.bot and low <= fvg.top
+        =>        high >= mid     and low <= mid
+
+// ─────────────────────────────────────────────
+// BAR INDEX TERUGVINDEN OP BASIS VAN TIJD
+// ─────────────────────────────────────────────
+getBarAtTime(int t) =>
+    result = -1
+    limit  = math.min(bar_index, maxBars)
+    for j = 0 to limit
+        if time[j] <= t
+            result := bar_index - j
+            break
+    result
+
+// ─────────────────────────────────────────────
+// HTF DATA OPHALEN + FVG DETECTIE
+// ─────────────────────────────────────────────
+detectFVG(string tf, string tfLabel, bool enabled) =>
+    if enabled
+        htf_time  = request.security(syminfo.tickerid, tf, time[1],   lookahead=barmerge.lookahead_off)
+        htf_timeA = request.security(syminfo.tickerid, tf, time[3],   lookahead=barmerge.lookahead_off)
+        htf_highC = request.security(syminfo.tickerid, tf, high[1],   lookahead=barmerge.lookahead_off)
+        htf_lowC  = request.security(syminfo.tickerid, tf, low[1],    lookahead=barmerge.lookahead_off)
+        htf_highA = request.security(syminfo.tickerid, tf, high[3],   lookahead=barmerge.lookahead_off)
+        htf_lowA  = request.security(syminfo.tickerid, tf, low[3],    lookahead=barmerge.lookahead_off)
+        htf_volB  = request.security(syminfo.tickerid, tf, volume[2], lookahead=barmerge.lookahead_off)
+        htf_volMA = request.security(syminfo.tickerid, tf, ta.sma(volume, volLength), lookahead=barmerge.lookahead_off)
+
+        isNewBar = ta.change(htf_time) != 0 and not na(htf_time)
+        volOk    = not useVolume or (not na(htf_volB) and not na(htf_volMA) and htf_volB >= htf_volMA * volMult)
+
+        if isNewBar and volOk
+            startBar = getBarAtTime(int(htf_timeA))
+            // Only draw if the FVG start time is within the targetDays window
+            maxAgeMs = targetDays * 1440 * 60 * 1000
+            fvgInRange = not na(htf_timeA) and (time - int(htf_timeA)) <= maxAgeMs
+            if startBar != -1 and fvgInRange
+                if htf_lowC > htf_highA
+                    addFVG(htf_lowC, htf_highA, true, startBar, tfLabel)
+                if htf_lowA > htf_highC
+                    addFVG(htf_lowA, htf_highC, false, startBar, tfLabel)
+
+detectFVG("15",  "15m", show15m)
+detectFVG("60",  "1h",  show1h)
+detectFVG("240", "4h",  show4h)
+
+// ─────────────────────────────────────────────
+// FVGs UPDATEN / VERWIJDEREN
+// ─────────────────────────────────────────────
+n = array.size(fvgs)
+if n > 0
+    i = n - 1
+    while i >= 0
+        fvg = array.get(fvgs, i)
+        if isFilled(fvg) or bar_index - fvg.createdAt > maxBars
+            box.delete(fvg.b)
+            line.delete(fvg.mid)
+            label.delete(fvg.lbl)
+            array.remove(fvgs, i)
+        else
+            box.set_right(fvg.b,  bar_index)
+            line.set_x2(fvg.mid,  bar_index)
+            lblX = getLabelX(fvg.startBar, labelAlign)
+            label.set_x(fvg.lbl, lblX)
+        i -= 1

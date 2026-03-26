@@ -1,0 +1,495 @@
+// This Pine Script(TM) v6 indicator is subject to the terms of the Mozilla Public License 2.0
+// https://mozilla.org/MPL/2.0/
+// (c) Viprasol
+
+//@version=6
+indicator("[Viprasol] KNN SuperTrend Engine", max_labels_count=200, overlay=true, max_bars_back=2000)
+
+// ──────────────────────────────────────────────────────────────────────────────
+// CONSTANTS
+// ──────────────────────────────────────────────────────────────────────────────
+const color  COLOR_BULL       = #289EFF
+const color  COLOR_BEAR       = #CE3F6C
+const color  COLOR_BULL_DIM   = color.new(#00FFBB, 50)
+const color  COLOR_BEAR_DIM   = color.new(#FF3355, 50)
+const color  COLOR_NEUTRAL    = color.new(#64748B, 20)
+const color  COLOR_CONFIDENCE = #FFD700
+const color  COLOR_PANEL_BG   = #1A1A2E
+const color  COLOR_PANEL_HDR  = #0F3460
+const string VP_LABEL         = "VIPRASOL"
+
+// ──────────────────────────────────────────────────────────────────────────────
+// INPUTS
+// ──────────────────────────────────────────────────────────────────────────────
+// --- SuperTrend ---
+string GRP_ST = "SuperTrend"
+int atrLookbackInput = input.int(10, "ATR Length", minval=1, group=GRP_ST,
+     tooltip="ATR period used by the SuperTrend calculation. Lower = more responsive, higher = smoother.")
+float stFactorInput = input.float(2.0, "SuperTrend Factor", minval=0.01, step=0.01, group=GRP_ST,
+     tooltip="Multiplier for ATR bands. Higher values create wider bands with fewer direction changes.")
+
+// --- KNN Engine ---
+string GRP_KNN = "KNN Engine"
+int kNeighborsInput = input.int(10, "K-Neighbors", minval=1, maxval=50, group=GRP_KNN,
+     tooltip="Number of nearest neighbors to vote on prediction. More neighbors = smoother but slower to react.")
+int trainingWindowInput = input.int(1000, "Training Window Size", minval=10, group=GRP_KNN,
+     tooltip="How many historical bars the KNN engine looks back to find similar patterns.")
+int strideInput = input.int(10, "Sampling Stride", minval=1, group=GRP_KNN,
+     tooltip="Step size between sampled data points. Controls the temporal resolution of feature comparison.")
+float predictionThresholdInput = input.float(0.9, "Prediction Threshold", minval=0.1, maxval=1.0, step=0.01, group=GRP_KNN,
+     tooltip="Minimum probability required for the KNN to generate a signal. Higher = fewer but more confident signals.")
+
+// --- Feature Engineering ---
+string GRP_FEAT = "Feature Engineering"
+string featureMaTypeInput = input.string("SMA", "Feature MA Type",
+     options=["SMA", "EMA", "DEMA", "TEMA", "LSMA", "WMA", "HMA", "ZLSMA", "SMMA", "THMA"], group=GRP_FEAT,
+     tooltip="Moving average type used for feature calculation. Different types capture different aspects of price behavior.")
+int rsiPeriodInput = input.int(20, "RSI Period", minval=2, group=GRP_FEAT,
+     tooltip="RSI lookback period for feature generation across all three stride windows.")
+int maPeriodInput = input.int(20, "MA Period", minval=2, group=GRP_FEAT,
+     tooltip="Moving average period for price deviation features across all three stride windows.")
+int signalSmoothInput = input.int(10, "Signal Line Period", minval=2, group=GRP_FEAT,
+     tooltip="Smoothing period for RSI-signal distance features. Captures momentum shifts.")
+int chopPeriodInput = input.int(14, "Choppiness Period", minval=2, group=GRP_FEAT,
+     tooltip="Choppiness Index period. Measures whether the market is trending or ranging.")
+int normWindowInput = input.int(1000, "Normalization Window", minval=10, group=GRP_FEAT,
+     tooltip="Z-score normalization lookback. All features are standardized over this window.")
+float distExponentInput = input.float(2.0, "Distance Exponent (p)", minval=1.0, step=0.1, group=GRP_FEAT,
+     tooltip="Minkowski distance parameter. p=2 is Euclidean, p=1 is Manhattan. Controls how distance is measured between feature vectors.")
+float kernelShapeInput = input.float(2.0, "Kernel Shape", minval=0.1, step=0.1, group=GRP_FEAT,
+     tooltip="Gaussian kernel exponent for neighbor weighting. Higher = sharper falloff, closer neighbors matter more.")
+
+// --- Dimensionality Reduction ---
+string GRP_PCA = "Dimensionality Reduction"
+bool usePcaInput = input.bool(true, "Enable PCA Compression", group=GRP_PCA,
+     tooltip="Compresses 12 raw features into 4 principal components to reduce noise and improve prediction quality.")
+
+// --- Risk Management ---
+string GRP_RISK = "Risk Management"
+bool showTpSlInput = input.bool(true, "Show TP/SL Levels", group=GRP_RISK,
+     tooltip="Display entry, stop-loss, and take-profit lines when a confirmed signal fires.")
+float slAtrMultInput = input.float(1.5, "SL ATR Multiplier", minval=0.1, step=0.1, group=GRP_RISK,
+     tooltip="ATR multiplier for stop-loss distance from entry.")
+float tp1RrInput = input.float(1.5, "TP1 Risk:Reward", minval=0.1, step=0.1, group=GRP_RISK,
+     tooltip="Risk-to-reward ratio for first take-profit level.")
+float tp2RrInput = input.float(3.0, "TP2 Risk:Reward", minval=0.1, step=0.1, group=GRP_RISK,
+     tooltip="Risk-to-reward ratio for second take-profit level.")
+
+// --- Visuals ---
+string GRP_VIS = "Visuals"
+bool barColoringInput = input.bool(true, "Dynamic Bar Coloring", group=GRP_VIS,
+     tooltip="Colors bars based on KNN prediction confidence. Blue gradient = bullish confidence, pink gradient = bearish confidence.")
+bool showPredLabelsInput = input.bool(true, "Show Prediction Labels", group=GRP_VIS,
+     tooltip="Display probability percentage labels at SuperTrend direction changes.")
+bool showStFillInput = input.bool(true, "Show SuperTrend Fill", group=GRP_VIS,
+     tooltip="Display the gradient fill between price and the SuperTrend line.")
+bool showSignalMarkersInput = input.bool(true, "Show Signal Markers", group=GRP_VIS,
+     tooltip="Display triangle markers when KNN-confirmed signals fire.")
+
+// --- Dashboard ---
+string GRP_DASH = "Dashboard"
+bool showDashboardInput = input.bool(true, "Show Dashboard", group=GRP_DASH,
+     tooltip="Toggle the KNN analytics dashboard on/off.")
+string dashPositionInput = input.string("Top Right", "Dashboard Position",
+     options=["Top Left", "Top Right", "Bottom Left", "Bottom Right"], group=GRP_DASH,
+     tooltip="Screen position for the dashboard table.")
+string dashFontSizeInput = input.string("small", "Dashboard Font Size",
+     options=["tiny", "small", "normal", "large", "huge"], group=GRP_DASH,
+     tooltip="Font size for all dashboard text.")
+
+// ──────────────────────────────────────────────────────────────────────────────
+// FUNCTIONS
+// ──────────────────────────────────────────────────────────────────────────────
+getDashPosition(string pos) =>
+    switch pos
+        "Top Left"     => position.top_left
+        "Top Right"    => position.top_right
+        "Bottom Left"  => position.bottom_left
+        "Bottom Right" => position.bottom_right
+
+getFontSize(string sz) =>
+    switch sz
+        "tiny"   => size.tiny
+        "small"  => size.small
+        "normal" => size.normal
+        "large"  => size.large
+        "huge"   => size.huge
+
+addPanelRow(table tbl, int rowIdx, string title, string val, color valColor, string fontSize) =>
+    table.cell(tbl, 0, rowIdx, title, text_color=color.new(color.white, 20), text_halign=text.align_left,
+         text_size=getFontSize(fontSize), bgcolor=COLOR_PANEL_BG)
+    table.cell(tbl, 1, rowIdx, val, text_color=valColor, text_size=getFontSize(fontSize),
+         text_halign=text.align_right, bgcolor=COLOR_PANEL_BG)
+
+computeZlsma(float src, int period) =>
+    float linRegVal = ta.linreg(src, period, 0)
+    linRegVal + (linRegVal - ta.sma(src, period))
+
+computeDema(float src, int period) =>
+    float e1 = ta.ema(src, period)
+    2.0 * e1 - ta.ema(e1, period)
+
+computeTema(float src, int period) =>
+    float e1 = ta.ema(src, period)
+    float e2 = ta.ema(e1, period)
+    3.0 * (e1 - e2) + ta.ema(e2, period)
+
+computeThma(float src, int period) =>
+    int p3 = math.max(1, math.round(period / 3))
+    int p2 = math.max(1, math.round(period / 2))
+    ta.wma(ta.wma(src, p3) * 3 - ta.wma(src, p2) - ta.wma(src, period), period)
+
+resolveMovingAverage(string maType, float src, int period) =>
+    int safePeriod = math.max(1, period)
+    switch maType
+        "SMA"   => ta.sma(src, safePeriod)
+        "EMA"   => ta.ema(src, safePeriod)
+        "DEMA"  => computeDema(src, safePeriod)
+        "TEMA"  => computeTema(src, safePeriod)
+        "LSMA"  => ta.linreg(src, safePeriod, 0)
+        "WMA"   => ta.wma(src, safePeriod)
+        "HMA"   => ta.hma(src, safePeriod)
+        "ZLSMA" => computeZlsma(src, safePeriod)
+        "SMMA"  => ta.rma(src, safePeriod)
+        "THMA"  => computeThma(src, safePeriod)
+        => ta.sma(src, safePeriod)
+
+computeChoppiness(int period) =>
+    float trSum = math.sum(ta.tr, period)
+    float hiVal = math.max(ta.highest(high, period), close[1])
+    float loVal = math.min(ta.lowest(low, period), close[1])
+    100.0 * math.log10(trSum / (hiVal - loVal)) / math.log10(period)
+
+zScoreNormalize(float src, int period) =>
+    float srcMean = ta.sma(src[1], period)
+    float srcStd  = ta.stdev(src[1], period)
+    (src - srcMean) / math.max(srcStd, 0.00001)
+
+// ──────────────────────────────────────────────────────────────────────────────
+// CALCULATIONS — SuperTrend Labeling (Supervised Learning)
+// ──────────────────────────────────────────────────────────────────────────────
+[stLine, stDirection] = ta.supertrend(stFactorInput, atrLookbackInput)
+stLine := barstate.isfirst ? na : stLine
+float labelTarget = stDirection * -1.0
+
+for i = 1 to 5
+    if stDirection[i] != stDirection
+        labelTarget := 0.0
+
+// ──────────────────────────────────────────────────────────────────────────────
+// CALCULATIONS — Feature Engineering & Normalization
+// ──────────────────────────────────────────────────────────────────────────────
+// RSI features at 3 stride windows
+float rsiShort  = ta.rsi(close, rsiPeriodInput)
+float rsiMid    = ta.rsi(close[strideInput], rsiPeriodInput)
+float rsiLong   = ta.rsi(close[strideInput * 2], rsiPeriodInput)
+
+// MA deviation features at 3 stride windows
+float maDevShort = (close - resolveMovingAverage(featureMaTypeInput, close[1], maPeriodInput)) /
+     resolveMovingAverage(featureMaTypeInput, close[1], maPeriodInput)
+float maDevMid   = (close[strideInput] - resolveMovingAverage(featureMaTypeInput, close[strideInput + 1], maPeriodInput)) /
+     resolveMovingAverage(featureMaTypeInput, close[strideInput + 1], maPeriodInput)
+float maDevLong  = (close[strideInput * 2] - resolveMovingAverage(featureMaTypeInput, close[strideInput * 2 + 1], maPeriodInput)) /
+     resolveMovingAverage(featureMaTypeInput, close[strideInput * 2 + 1], maPeriodInput)
+
+// RSI-signal distance features at 3 stride windows
+float rsiSigDistShort = (rsiShort - ta.sma(rsiShort[1], signalSmoothInput)) / ta.sma(rsiShort[1], signalSmoothInput)
+float rsiSigDistMid   = (rsiMid - ta.sma(rsiMid[1], signalSmoothInput)) / ta.sma(rsiMid[1], signalSmoothInput)
+float rsiSigDistLong  = (rsiLong - ta.sma(rsiLong[1], signalSmoothInput)) / ta.sma(rsiLong[1], signalSmoothInput)
+
+// Choppiness features at 3 stride windows
+float chopShort = computeChoppiness(chopPeriodInput)
+float chopMid   = computeChoppiness(chopPeriodInput)[strideInput]
+float chopLong  = computeChoppiness(chopPeriodInput)[strideInput * 2]
+
+// Z-score normalization of all 12 features
+float rsiShortZ     = zScoreNormalize(rsiShort, normWindowInput)
+float rsiMidZ       = zScoreNormalize(rsiMid, normWindowInput)
+float rsiLongZ      = zScoreNormalize(rsiLong, normWindowInput)
+float maDevShortZ   = zScoreNormalize(maDevShort, normWindowInput)
+float maDevMidZ     = zScoreNormalize(maDevMid, normWindowInput)
+float maDevLongZ    = zScoreNormalize(maDevLong, normWindowInput)
+float rsiSigShortZ  = zScoreNormalize(rsiSigDistShort, normWindowInput)
+float rsiSigMidZ    = zScoreNormalize(rsiSigDistMid, normWindowInput)
+float rsiSigLongZ   = zScoreNormalize(rsiSigDistLong, normWindowInput)
+float chopShortZ    = zScoreNormalize(chopShort, normWindowInput)
+float chopMidZ      = zScoreNormalize(chopMid, normWindowInput)
+float chopLongZ     = zScoreNormalize(chopLong, normWindowInput)
+
+// ──────────────────────────────────────────────────────────────────────────────
+// CALCULATIONS — Dimensionality Reduction (PCA Compression)
+// ──────────────────────────────────────────────────────────────────────────────
+float component1 = 0.0
+float component2 = 0.0
+float component3 = 0.0
+float component4 = 0.0
+
+if usePcaInput
+    component1 := zScoreNormalize(rsiShortZ + maDevShortZ + rsiSigShortZ * 0.5, normWindowInput)
+    component2 := zScoreNormalize(rsiMidZ + maDevMidZ + rsiSigMidZ * 0.5, normWindowInput) * 0.9
+    component3 := zScoreNormalize(rsiLongZ + maDevLongZ + rsiSigLongZ * 0.5, normWindowInput) * 0.8
+    component4 := zScoreNormalize(chopShortZ + chopMidZ * 0.9 + chopLongZ * 0.8, normWindowInput) * 0.8
+else
+    component1 := rsiMidZ
+    component2 := maDevMidZ
+    component3 := rsiSigMidZ
+    component4 := chopMidZ
+
+// ──────────────────────────────────────────────────────────────────────────────
+// CALCULATIONS — KNN Core Engine
+// ──────────────────────────────────────────────────────────────────────────────
+float probBull = 0.0
+float probBear = 0.0
+var float[] knnDistances = array.new_float(0)
+var float[] knnLabels    = array.new_float(0)
+
+if bar_index > normWindowInput + strideInput
+    array.clear(knnDistances)
+    array.clear(knnLabels)
+
+    for i = strideInput to trainingWindowInput + strideInput by strideInput
+        if labelTarget[i] != 0
+            float d1 = math.abs(component1 - component1[i])
+            float d2 = math.abs(component2 - component2[i])
+            float d3 = math.abs(component3 - component3[i])
+            float d4 = math.abs(component4 - component4[i])
+            float dist = math.pow(
+                 math.pow(d1, distExponentInput) + math.pow(d2, distExponentInput) +
+                 math.pow(d3, distExponentInput) + math.pow(d4, distExponentInput),
+                 1.0 / distExponentInput)
+            array.push(knnDistances, dist)
+            array.push(knnLabels, labelTarget[i])
+
+    if array.size(knnDistances) >= kNeighborsInput
+        int[] sortedIndices = array.sort_indices(knnDistances, order.ascending)
+        float bullWeight = 0.0
+        float bearWeight = 0.0
+        float totalWeight = 0.0
+        float[] sortedDists = array.copy(knnDistances)
+        array.sort(sortedDists)
+        float sigma = array.get(sortedDists, math.min(int(kNeighborsInput / 2), array.size(sortedDists) - 1))
+        sigma := math.max(sigma, 0.0001)
+
+        for j = 0 to kNeighborsInput - 1
+            int neighborIdx = array.get(sortedIndices, j)
+            float neighborDist  = array.get(knnDistances, neighborIdx)
+            float neighborLabel = array.get(knnLabels, neighborIdx)
+            float w = math.exp(-math.pow(neighborDist, kernelShapeInput) / (2.0 * math.pow(sigma, 2)))
+            if neighborLabel == 1
+                bullWeight += w
+            else if neighborLabel == -1
+                bearWeight += w
+            totalWeight += w
+        probBull := totalWeight > 0 ? bullWeight / totalWeight : 0.0
+        probBear := totalWeight > 0 ? bearWeight / totalWeight : 0.0
+
+// ──────────────────────────────────────────────────────────────────────────────
+// CALCULATIONS — Signal Generation
+// ──────────────────────────────────────────────────────────────────────────────
+bool rawLongTrigger  = ta.crossover(probBull, predictionThresholdInput)
+bool rawShortTrigger = ta.crossover(probBear, predictionThresholdInput)
+
+var int lastPredictionDir = 0
+bool knnLongFired  = false
+bool knnShortFired = false
+
+if rawLongTrigger and lastPredictionDir <= 0
+    knnLongFired      := true
+    lastPredictionDir := 1
+
+if rawShortTrigger and lastPredictionDir >= 0
+    knnShortFired     := true
+    lastPredictionDir := -1
+
+// Combined KNN + SuperTrend confirmation
+var float confirmedTrendDir = 0.0
+if stDirection != nz(stDirection[1]) or rawLongTrigger or rawShortTrigger
+    if stDirection < 0 and lastPredictionDir == 1 and probBull > predictionThresholdInput
+        confirmedTrendDir := stDirection * -1.0
+    if stDirection > 0 and lastPredictionDir == -1 and probBear > predictionThresholdInput
+        confirmedTrendDir := stDirection * -1.0
+
+bool confirmedLong  = ta.crossover(confirmedTrendDir, 0.0)
+bool confirmedShort = ta.crossunder(confirmedTrendDir, 0.0)
+
+// ──────────────────────────────────────────────────────────────────────────────
+// CALCULATIONS — TP/SL Management
+// ──────────────────────────────────────────────────────────────────────────────
+var line  tpSlEntryLine  = na
+var line  tpSlStopLine   = na
+var line  tpSlTp1Line    = na
+var line  tpSlTp2Line    = na
+var label tpSlEntryLabel = na
+var label tpSlStopLabel  = na
+var label tpSlTp1Label   = na
+var label tpSlTp2Label   = na
+
+float currentAtr = ta.atr(atrLookbackInput)
+
+if showTpSlInput and (confirmedLong or confirmedShort)
+    line.delete(tpSlEntryLine),  label.delete(tpSlEntryLabel)
+    line.delete(tpSlStopLine),   label.delete(tpSlStopLabel)
+    line.delete(tpSlTp1Line),    label.delete(tpSlTp1Label)
+    line.delete(tpSlTp2Line),    label.delete(tpSlTp2Label)
+
+    int dir = confirmedLong ? 1 : -1
+    float entryPx  = close
+    float riskDist = currentAtr * slAtrMultInput
+    float slPx     = dir == 1 ? entryPx - riskDist : entryPx + riskDist
+    float tp1Px    = dir == 1 ? entryPx + riskDist * tp1RrInput : entryPx - riskDist * tp1RrInput
+    float tp2Px    = dir == 1 ? entryPx + riskDist * tp2RrInput : entryPx - riskDist * tp2RrInput
+
+    color dirColor = dir == 1 ? COLOR_BULL : COLOR_BEAR
+    tpSlEntryLine  := line.new(bar_index, entryPx, bar_index + 1, entryPx, color=dirColor, width=2, extend=extend.right)
+    tpSlEntryLabel := label.new(bar_index, entryPx, (dir == 1 ? "LONG " : "SHORT ") + str.tostring(entryPx, format.mintick),
+         style=label.style_label_left, color=dirColor, textcolor=color.white, size=size.small)
+    tpSlStopLine   := line.new(bar_index, slPx, bar_index + 1, slPx, color=COLOR_BEAR, width=1, style=line.style_dashed, extend=extend.right)
+    tpSlStopLabel  := label.new(bar_index, slPx, "SL " + str.tostring(slPx, format.mintick),
+         style=label.style_label_left, color=color.new(COLOR_BEAR, 40), textcolor=color.white, size=size.small)
+    tpSlTp1Line    := line.new(bar_index, tp1Px, bar_index + 1, tp1Px, color=color.new(COLOR_BULL, 30), width=1, extend=extend.right)
+    tpSlTp1Label   := label.new(bar_index, tp1Px, "TP1 " + str.tostring(tp1Px, format.mintick),
+         style=label.style_label_left, color=color.new(COLOR_BULL, 40), textcolor=color.white, size=size.small)
+    tpSlTp2Line    := line.new(bar_index, tp2Px, bar_index + 1, tp2Px, color=color.new(COLOR_BULL, 30), width=1, style=line.style_dotted, extend=extend.right)
+    tpSlTp2Label   := label.new(bar_index, tp2Px, "TP2 " + str.tostring(tp2Px, format.mintick),
+         style=label.style_label_left, color=color.new(COLOR_BULL, 40), textcolor=color.white, size=size.small)
+
+// Move labels forward
+if not na(tpSlEntryLabel)
+    label.set_x(tpSlEntryLabel, bar_index)
+if not na(tpSlStopLabel)
+    label.set_x(tpSlStopLabel, bar_index)
+if not na(tpSlTp1Label)
+    label.set_x(tpSlTp1Label, bar_index)
+if not na(tpSlTp2Label)
+    label.set_x(tpSlTp2Label, bar_index)
+
+// ──────────────────────────────────────────────────────────────────────────────
+// VISUALS — Bar Coloring & Gradient
+// ──────────────────────────────────────────────────────────────────────────────
+color gradientColor = probBull > probBear ?
+     color.from_gradient(probBull, 0.5, 0.95, COLOR_NEUTRAL, COLOR_BULL) :
+     color.from_gradient(probBear, 0.5, 0.95, COLOR_NEUTRAL, COLOR_BEAR)
+barcolor(barColoringInput ? gradientColor : na)
+
+// ──────────────────────────────────────────────────────────────────────────────
+// VISUALS — Signal Markers
+// ──────────────────────────────────────────────────────────────────────────────
+plotshape(showSignalMarkersInput and confirmedLong, "Confirmed Long", shape.labelup,
+     location.belowbar, color.new(COLOR_BULL, 30), size=size.tiny, text="UP", textcolor=color.white)
+plotshape(showSignalMarkersInput and confirmedShort, "Confirmed Short", shape.labeldown,
+     location.abovebar, color.new(COLOR_BEAR, 30), size=size.tiny, text="DN", textcolor=color.white)
+
+// SuperTrend direction change circles
+plotshape(ta.crossunder(stDirection, 0) ? stLine : na, "ST Bullish Flip", shape.circle,
+     location.absolute, confirmedTrendDir > 0 ? color.new(COLOR_BULL, 40) : color.new(COLOR_BEAR, 40), size=size.tiny)
+plotshape(ta.crossover(stDirection, 0) ? stLine : na, "ST Bearish Flip", shape.circle,
+     location.absolute, confirmedTrendDir > 0 ? color.new(COLOR_BULL, 40) : color.new(COLOR_BEAR, 40), size=size.tiny)
+
+// Prediction probability labels at SuperTrend flips
+if showPredLabelsInput and ta.crossunder(stDirection, 0)
+    label.new(bar_index, low,
+         text="Pred\n" + str.tostring(probBull * 100, "#.#") + "%",
+         color=color.new(COLOR_BULL, 90), textcolor=COLOR_BULL,
+         style=label.style_label_up, yloc=yloc.belowbar, size=size.small)
+
+if showPredLabelsInput and ta.crossover(stDirection, 0)
+    label.new(bar_index, high,
+         text="Pred\n" + str.tostring(probBear * 100, "#.#") + "%",
+         color=color.new(COLOR_BEAR, 90), textcolor=COLOR_BEAR,
+         style=label.style_label_down, yloc=yloc.abovebar, size=size.small)
+
+// ──────────────────────────────────────────────────────────────────────────────
+// VISUALS — SuperTrend Line & Fill
+// ──────────────────────────────────────────────────────────────────────────────
+upTrendPlot   = plot(confirmedTrendDir == 1  ? stLine : na, "Up Trend",   color=COLOR_BULL, style=plot.style_linebr)
+downTrendPlot = plot(confirmedTrendDir == -1 ? stLine : na, "Down Trend", color=COLOR_BEAR, style=plot.style_linebr)
+bodyMidPlot   = plot(barstate.isfirst ? na : (open + close) / 2.0, "Body Middle", display=display.none)
+lowPlot       = plot(low, display=display.none)
+highPlot      = plot(high, display=display.none)
+
+fill(lowPlot, upTrendPlot, (open + close) / 2.0, stLine,
+     showStFillInput and stDirection < 0 ? COLOR_BULL : na, na, title="Bull Fill")
+fill(highPlot, downTrendPlot, stLine, (open + close) / 2.0,
+     na, showStFillInput and stDirection > 0 ? COLOR_BEAR : na, title="Bear Fill")
+
+// ──────────────────────────────────────────────────────────────────────────────
+// VISUALS — Dashboard
+// ──────────────────────────────────────────────────────────────────────────────
+var table dashPanel = table.new(getDashPosition(dashPositionInput), 2, 12,
+     bgcolor=COLOR_PANEL_BG, border_width=1, border_color=color.new(color.gray, 60))
+
+if barstate.islast and showDashboardInput
+    // Header
+    table.cell(dashPanel, 0, 0, VP_LABEL, text_color=color.white, bgcolor=COLOR_PANEL_HDR,
+         text_size=getFontSize(dashFontSizeInput), text_halign=text.align_center)
+    table.cell(dashPanel, 1, 0, "KNN-ST", text_color=color.white, bgcolor=COLOR_PANEL_HDR,
+         text_size=getFontSize(dashFontSizeInput), text_halign=text.align_center)
+
+    // KNN Probabilities
+    addPanelRow(dashPanel, 1, "Bull Prob",
+         str.tostring(probBull * 100, "#.#") + "%",
+         probBull > predictionThresholdInput ? COLOR_BULL : COLOR_NEUTRAL, dashFontSizeInput)
+    addPanelRow(dashPanel, 2, "Bear Prob",
+         str.tostring(probBear * 100, "#.#") + "%",
+         probBear > predictionThresholdInput ? COLOR_BEAR : COLOR_NEUTRAL, dashFontSizeInput)
+
+    // Prediction
+    string predText = probBull > predictionThresholdInput ? "BULLISH" :
+         probBear > predictionThresholdInput ? "BEARISH" : "NEUTRAL"
+    color predColor = probBull > predictionThresholdInput ? COLOR_BULL :
+         probBear > predictionThresholdInput ? COLOR_BEAR : COLOR_NEUTRAL
+    addPanelRow(dashPanel, 3, "KNN Prediction", predText, predColor, dashFontSizeInput)
+
+    // Confidence
+    float maxProb = math.max(probBull, probBear)
+    string confText = maxProb >= 0.9 ? "VERY HIGH" : maxProb >= 0.7 ? "HIGH" : maxProb >= 0.5 ? "MODERATE" : "LOW"
+    color confColor = maxProb >= 0.9 ? COLOR_CONFIDENCE : maxProb >= 0.7 ? COLOR_BULL : COLOR_NEUTRAL
+    addPanelRow(dashPanel, 4, "Confidence", confText, confColor, dashFontSizeInput)
+
+    // SuperTrend
+    addPanelRow(dashPanel, 5, "SuperTrend",
+         stDirection < 0 ? "BULLISH" : "BEARISH",
+         stDirection < 0 ? COLOR_BULL : COLOR_BEAR, dashFontSizeInput)
+
+    // Confirmed direction
+    addPanelRow(dashPanel, 6, "Confirmed Dir",
+         confirmedTrendDir > 0 ? "LONG" : confirmedTrendDir < 0 ? "SHORT" : "FLAT",
+         confirmedTrendDir > 0 ? COLOR_BULL : confirmedTrendDir < 0 ? COLOR_BEAR : COLOR_NEUTRAL,
+         dashFontSizeInput)
+
+    // Features
+    addPanelRow(dashPanel, 7, "RSI (" + str.tostring(rsiPeriodInput) + ")",
+         str.tostring(rsiShort, "#.#"),
+         rsiShort > 50 ? COLOR_BULL : COLOR_BEAR, dashFontSizeInput)
+    addPanelRow(dashPanel, 8, "Choppiness",
+         str.tostring(chopShort, "#.#"),
+         chopShort > 61.8 ? COLOR_BEAR : COLOR_BULL, dashFontSizeInput)
+
+    // Settings summary
+    addPanelRow(dashPanel, 9, "K-Neighbors", str.tostring(kNeighborsInput), color.white, dashFontSizeInput)
+    addPanelRow(dashPanel, 10, "PCA", usePcaInput ? "ON" : "OFF",
+         usePcaInput ? COLOR_BULL : COLOR_NEUTRAL, dashFontSizeInput)
+    addPanelRow(dashPanel, 11, "MA Type", featureMaTypeInput, color.white, dashFontSizeInput)
+
+// ──────────────────────────────────────────────────────────────────────────────
+// ALERTS
+// ──────────────────────────────────────────────────────────────────────────────
+alertcondition(confirmedLong,
+     title="KNN Confirmed Long",
+     message="[Viprasol KNN-ST] LONG signal on {{ticker}} at {{close}} | TF: {{interval}}")
+
+alertcondition(confirmedShort,
+     title="KNN Confirmed Short",
+     message="[Viprasol KNN-ST] SHORT signal on {{ticker}} at {{close}} | TF: {{interval}}")
+
+alertcondition(confirmedLong or confirmedShort,
+     title="Any KNN Confirmed Signal",
+     message="[Viprasol KNN-ST] Signal on {{ticker}} at {{close}} | TF: {{interval}}")
+
+alertcondition(knnLongFired,
+     title="KNN Bullish Prediction",
+     message="[Viprasol KNN-ST] KNN predicts BULLISH on {{ticker}} | TF: {{interval}}")
+
+alertcondition(knnShortFired,
+     title="KNN Bearish Prediction",
+     message="[Viprasol KNN-ST] KNN predicts BEARISH on {{ticker}} | TF: {{interval}}")

@@ -1,0 +1,332 @@
+//@ ZakAlgoTrade
+//@version=5
+indicator("SMC Core Lite - Signals", overlay=true, max_boxes_count=100, max_lines_count=100, max_labels_count=100)
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ░░░░░░░░░░░░░░░░░░░░░░░░░░░ INPUTS ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░
+// ══════════════════════════════════════════════════════════════════════════════
+
+// Signals
+grp_sig = "══ SIGNALS ══"
+show_signals = input.bool(true, "Show LONG/SHORT Signals", group=grp_sig)
+show_sl_tp = input.bool(true, "Show SL/TP Lines", group=grp_sig)
+rr_ratio = input.float(2.0, "Risk:Reward", minval=1.0, maxval=5.0, step=0.5, group=grp_sig)
+signal_cooldown = input.int(10, "Signal Cooldown (bars)", minval=5, maxval=50, group=grp_sig)
+
+// Structure
+grp_str = "══ STRUCTURE ══"
+show_bos = input.bool(true, "Show BOS/CHoCH", group=grp_str)
+swing_len = input.int(5, "Swing Length", minval=2, maxval=15, group=grp_str)
+
+// Zones
+grp_zone = "══ ZONES ══"
+show_fvg = input.bool(true, "Show FVG", group=grp_zone)
+show_ob = input.bool(true, "Show Order Blocks", group=grp_zone)
+zone_lookback = input.int(50, "Zone Lookback", minval=20, maxval=100, group=grp_zone)
+ob_strength = input.float(1.5, "OB Strength (ATR)", minval=0.5, maxval=3.0, step=0.5, group=grp_zone)
+
+// Colors
+col_bull = input.color(#00E676, "Bullish Color")
+col_bear = input.color(#FF5252, "Bearish Color")
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ░░░░░░░░░░░░░░░░░░░░░░░░░░░ VARIABLES ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░
+// ══════════════════════════════════════════════════════════════════════════════
+
+var int bias = 0
+var float swing_h = na
+var float swing_l = na
+var int swing_h_bar = na
+var int swing_l_bar = na
+var int last_long = 0
+var int last_short = 0
+var bool recent_bos_bull = false
+var bool recent_bos_bear = false
+var int bos_bar = 0
+
+// FVG Storage (simple arrays - max 10 zones)
+var float[] fvg_top = array.new_float(10, na)
+var float[] fvg_bot = array.new_float(10, na)
+var bool[] fvg_bull = array.new_bool(10, false)
+var bool[] fvg_active = array.new_bool(10, false)
+var int fvg_idx = 0
+
+// OB Storage (simple arrays - max 10 zones)
+var float[] ob_top = array.new_float(10, na)
+var float[] ob_bot = array.new_float(10, na)
+var bool[] ob_bull = array.new_bool(10, false)
+var bool[] ob_active = array.new_bool(10, false)
+var int ob_idx = 0
+
+atr = ta.atr(14)
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ░░░░░░░░░░░░░░░░░░░░░░░░░░░ SWING DETECTION ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░
+// ══════════════════════════════════════════════════════════════════════════════
+
+ph = ta.pivothigh(high, swing_len, swing_len)
+pl = ta.pivotlow(low, swing_len, swing_len)
+
+if not na(ph)
+    swing_h := ph
+    swing_h_bar := bar_index - swing_len
+
+if not na(pl)
+    swing_l := pl
+    swing_l_bar := bar_index - swing_len
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ░░░░░░░░░░░░░░░░░░░░░░░░░░░ BOS DETECTION ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░
+// ══════════════════════════════════════════════════════════════════════════════
+
+bull_bos = not na(swing_h) and close > swing_h and close[1] <= swing_h
+bear_bos = not na(swing_l) and close < swing_l and close[1] >= swing_l
+
+if bull_bos
+    is_choch = bias == -1
+    if show_bos
+        lbl = is_choch ? "CHoCH↑" : "BOS↑"
+        label.new(bar_index, swing_h, lbl, color=col_bull, textcolor=color.rgb(0, 0, 0), 
+             style=label.style_label_down, size=size.tiny)
+    bias := 1
+    recent_bos_bull := true
+    recent_bos_bear := false
+    bos_bar := bar_index
+    swing_h := na
+
+if bear_bos
+    is_choch = bias == 1
+    if show_bos
+        lbl = is_choch ? "CHoCH↓" : "BOS↓"
+        label.new(bar_index, swing_l, lbl, color=col_bear, textcolor=color.rgb(0, 0, 0),
+             style=label.style_label_up, size=size.tiny)
+    bias := -1
+    recent_bos_bear := true
+    recent_bos_bull := false
+    bos_bar := bar_index
+    swing_l := na
+
+// Reset BOS flags
+if bar_index - bos_bar > 15
+    recent_bos_bull := false
+    recent_bos_bear := false
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ░░░░░░░░░░░░░░░░░░░░░░░░░░░ FVG DETECTION ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░
+// ══════════════════════════════════════════════════════════════════════════════
+
+if show_fvg and bar_index > 3
+    // Bullish FVG
+    if low > high[2] and close[1] > open[1]
+        array.set(fvg_top, fvg_idx % 10, low)
+        array.set(fvg_bot, fvg_idx % 10, high[2])
+        array.set(fvg_bull, fvg_idx % 10, true)
+        array.set(fvg_active, fvg_idx % 10, true)
+        fvg_idx += 1
+        
+        box.new(bar_index - 2, low, bar_index + 20, high[2], 
+             border_color=color.new(col_bull, 60), bgcolor=color.new(col_bull, 85))
+    
+    // Bearish FVG
+    if high < low[2] and close[1] < open[1]
+        array.set(fvg_top, fvg_idx % 10, low[2])
+        array.set(fvg_bot, fvg_idx % 10, high)
+        array.set(fvg_bull, fvg_idx % 10, false)
+        array.set(fvg_active, fvg_idx % 10, true)
+        fvg_idx += 1
+        
+        box.new(bar_index - 2, low[2], bar_index + 20, high,
+             border_color=color.new(col_bear, 60), bgcolor=color.new(col_bear, 85))
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ░░░░░░░░░░░░░░░░░░░░░░░░░░░ ORDER BLOCK DETECTION ░░░░░░░░░░░░░░░░░░░░░░░░░░░░
+// ══════════════════════════════════════════════════════════════════════════════
+
+if show_ob and bar_index > 10 and not na(atr)
+    impulse = atr * ob_strength
+    
+    // Bullish OB - strong bull move, find last bear candle
+    if (close - open) > impulse and close > open
+        for i = 1 to 10
+            if close[i] < open[i]
+                array.set(ob_top, ob_idx % 10, high[i])
+                array.set(ob_bot, ob_idx % 10, low[i])
+                array.set(ob_bull, ob_idx % 10, true)
+                array.set(ob_active, ob_idx % 10, true)
+                ob_idx += 1
+                
+                box.new(bar_index - i, high[i], bar_index + 20, low[i],
+                     border_color=color.blue, bgcolor=color.new(color.blue, 85), border_width=2)
+                break
+    
+    // Bearish OB - strong bear move, find last bull candle
+    if (open - close) > impulse and close < open
+        for i = 1 to 10
+            if close[i] > open[i]
+                array.set(ob_top, ob_idx % 10, high[i])
+                array.set(ob_bot, ob_idx % 10, low[i])
+                array.set(ob_bull, ob_idx % 10, false)
+                array.set(ob_active, ob_idx % 10, true)
+                ob_idx += 1
+                
+                box.new(bar_index - i, high[i], bar_index + 20, low[i],
+                     border_color=color.orange, bgcolor=color.new(color.orange, 85), border_width=2)
+                break
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ░░░░░░░░░░░░░░░░░░░░░░░░░░░ ZONE CHECK FUNCTION ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░
+// ══════════════════════════════════════════════════════════════════════════════
+
+// Check if price is in bullish zone
+f_inBullZone() =>
+    result = false
+    zone_bot = float(na)
+    
+    // Check FVGs
+    for i = 0 to 9
+        if array.get(fvg_active, i) and array.get(fvg_bull, i)
+            t = array.get(fvg_top, i)
+            b = array.get(fvg_bot, i)
+            if not na(t) and not na(b) and low <= t and low >= b
+                result := true
+                zone_bot := b
+                break
+    
+    // Check OBs
+    if not result
+        for i = 0 to 9
+            if array.get(ob_active, i) and array.get(ob_bull, i)
+                t = array.get(ob_top, i)
+                b = array.get(ob_bot, i)
+                if not na(t) and not na(b) and low <= t and low >= b
+                    result := true
+                    zone_bot := b
+                    break
+    
+    [result, zone_bot]
+
+// Check if price is in bearish zone
+f_inBearZone() =>
+    result = false
+    zone_top = float(na)
+    
+    // Check FVGs
+    for i = 0 to 9
+        if array.get(fvg_active, i) and not array.get(fvg_bull, i)
+            t = array.get(fvg_top, i)
+            b = array.get(fvg_bot, i)
+            if not na(t) and not na(b) and high >= b and high <= t
+                result := true
+                zone_top := t
+                break
+    
+    // Check OBs
+    if not result
+        for i = 0 to 9
+            if array.get(ob_active, i) and not array.get(ob_bull, i)
+                t = array.get(ob_top, i)
+                b = array.get(ob_bot, i)
+                if not na(t) and not na(b) and high >= b and high <= t
+                    result := true
+                    zone_top := t
+                    break
+    
+    [result, zone_top]
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ░░░░░░░░░░░░░░░░░░░░░░░░░░░ SIGNAL GENERATION ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░
+// ══════════════════════════════════════════════════════════════════════════════
+
+long_signal = false
+short_signal = false
+var float entry_price = na
+var float sl_price = na
+var float tp_price = na
+
+if show_signals and bar_index > 50 and not na(atr)
+    [in_bull_zone, bull_zone_bot] = f_inBullZone()
+    [in_bear_zone, bear_zone_top] = f_inBearZone()
+    
+    bull_candle = close > open
+    bear_candle = close < open
+    
+    // LONG Signal
+    long_cond = in_bull_zone and bull_candle and (recent_bos_bull or bias == 1)
+    if long_cond and (bar_index - last_long > signal_cooldown)
+        long_signal := true
+        entry_price := close
+        sl_price := na(bull_zone_bot) ? low - atr * 0.5 : bull_zone_bot - atr * 0.3
+        tp_price := close + (close - sl_price) * rr_ratio
+        last_long := bar_index
+    
+    // SHORT Signal
+    short_cond = in_bear_zone and bear_candle and (recent_bos_bear or bias == -1)
+    if short_cond and (bar_index - last_short > signal_cooldown)
+        short_signal := true
+        entry_price := close
+        sl_price := na(bear_zone_top) ? high + atr * 0.5 : bear_zone_top + atr * 0.3
+        tp_price := close - (sl_price - close) * rr_ratio
+        last_short := bar_index
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ░░░░░░░░░░░░░░░░░░░░░░░░░░░ PLOTTINGS ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░
+// ══════════════════════════════════════════════════════════════════════════════
+
+// Swing Points
+plotshape(not na(ph), style=shape.triangledown, location=location.abovebar, 
+     color=color.new(col_bear, 40), size=size.tiny, offset=-swing_len)
+plotshape(not na(pl), style=shape.triangleup, location=location.belowbar,
+     color=color.new(col_bull, 40), size=size.tiny, offset=-swing_len)
+
+// LONG Signal
+plotshape(long_signal, title="LONG", style=shape.labelup, location=location.belowbar,
+     color=col_bull, textcolor=color.rgb(0, 0, 0), text="LONG", size=size.small)
+
+// SHORT Signal
+plotshape(short_signal, title="SHORT", style=shape.labeldown, location=location.abovebar,
+     color=col_bear, textcolor=color.rgb(0, 0, 0), text="SHORT", size=size.small)
+
+// SL/TP Lines
+if show_sl_tp and long_signal
+    line.new(bar_index, entry_price, bar_index + 10, entry_price, color=color.white, width=1)
+    line.new(bar_index, sl_price, bar_index + 10, sl_price, color=color.red, style=line.style_dashed, width=1)
+    line.new(bar_index, tp_price, bar_index + 10, tp_price, color=color.green, style=line.style_dashed, width=1)
+    label.new(bar_index + 10, tp_price, "TP:" + str.tostring(tp_price, "#.##"), 
+         color=color.new(color.green, 80), textcolor=color.green, size=size.tiny, style=label.style_label_left)
+    label.new(bar_index + 10, sl_price, "SL:" + str.tostring(sl_price, "#.##"),
+         color=color.new(color.red, 80), textcolor=color.red, size=size.tiny, style=label.style_label_left)
+
+if show_sl_tp and short_signal
+    line.new(bar_index, entry_price, bar_index + 10, entry_price, color=color.white, width=1)
+    line.new(bar_index, sl_price, bar_index + 10, sl_price, color=color.red, style=line.style_dashed, width=1)
+    line.new(bar_index, tp_price, bar_index + 10, tp_price, color=color.green, style=line.style_dashed, width=1)
+    label.new(bar_index + 10, tp_price, "TP:" + str.tostring(tp_price, "#.##"),
+         color=color.new(color.green, 80), textcolor=color.green, size=size.tiny, style=label.style_label_left)
+    label.new(bar_index + 10, sl_price, "SL:" + str.tostring(sl_price, "#.##"),
+         color=color.new(color.red, 80), textcolor=color.red, size=size.tiny, style=label.style_label_left)
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ░░░░░░░░░░░░░░░░░░░░░░░░░░░ DASHBOARD ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░
+// ══════════════════════════════════════════════════════════════════════════════
+
+var table dash = table.new(position.top_right, 2, 3, bgcolor=color.new(#1a1a1a, 10), border_width=1)
+
+if barstate.islast
+    bias_txt = bias == 1 ? "BULL 🐂" : bias == -1 ? "BEAR 🐻" : "—"
+    bias_col = bias == 1 ? col_bull : bias == -1 ? col_bear : color.gray
+    
+    table.cell(dash, 0, 0, "SMC LITE", text_color=color.white, text_size=size.small, bgcolor=color.new(#2962FF, 30))
+    table.cell(dash, 1, 0, "v1.0", text_color=color.gray, text_size=size.tiny, bgcolor=color.new(#2962FF, 30))
+    table.cell(dash, 0, 1, "Bias", text_color=color.gray, text_size=size.tiny)
+    table.cell(dash, 1, 1, bias_txt, text_color=bias_col, text_size=size.small)
+    table.cell(dash, 0, 2, "R:R", text_color=color.gray, text_size=size.tiny)
+    table.cell(dash, 1, 2, "1:" + str.tostring(rr_ratio), text_color=color.aqua, text_size=size.small)
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ░░░░░░░░░░░░░░░░░░░░░░░░░░░ ALERTS ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░
+// ══════════════════════════════════════════════════════════════════════════════
+
+alertcondition(long_signal, "LONG Signal", "🟢 LONG {{ticker}} @ {{close}}")
+alertcondition(short_signal, "SHORT Signal", "🔴 SHORT {{ticker}} @ {{close}}")
+alertcondition(bull_bos, "Bullish BOS", "🟢 BOS {{ticker}}")
+alertcondition(bear_bos, "Bearish BOS", "🔴 BOS {{ticker}}")

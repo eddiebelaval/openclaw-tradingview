@@ -1,0 +1,437 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © ChainAssetsCapital
+// ============================================================
+// ORDER FLOW TRADING SYSTEM — Pine Script v6
+// Based on: Delta, CVD, OBI, Regime, Signal, MM Mode
+// ============================================================
+//@version=6
+indicator("Order Flow Trading System [v6]", shorttitle="OFTS", overlay=true, max_bars_back=500)
+
+// ─────────────────────────────────────────────────────────────
+// ██████  INPUTS
+// ─────────────────────────────────────────────────────────────
+
+// --- Feature Engine ---
+i_obi_depth     = input.int(10,   "OBI Book Depth (bars)",          group="📊 Feature Engine", minval=2,  maxval=50)
+i_cvd_len       = input.int(50,   "CVD Lookback",                    group="📊 Feature Engine", minval=5,  maxval=200)
+i_ti_len        = input.int(10,   "Trade Intensity Window",          group="📊 Feature Engine", minval=3,  maxval=50)
+i_vol_short     = input.int(14,   "Short Volatility Period",         group="📊 Feature Engine", minval=3,  maxval=50)
+i_vol_long      = input.int(50,   "Long Volatility Period",          group="📊 Feature Engine", minval=10, maxval=200)
+i_liq_depth     = input.int(20,   "Liquidity Depth Window",          group="📊 Feature Engine", minval=5,  maxval=100)
+
+// --- Regime ---
+i_ema_fast      = input.int(9,    "EMA Fast",                        group="🌪️ Regime Classifier", minval=3,  maxval=50)
+i_ema_slow      = input.int(21,   "EMA Slow",                        group="🌪️ Regime Classifier", minval=5,  maxval=200)
+i_atr_len       = input.int(14,   "ATR Length",                      group="🌪️ Regime Classifier", minval=3,  maxval=50)
+i_trend_thresh  = input.float(0.5,"Trend Threshold",                 group="🌪️ Regime Classifier", minval=0.1, maxval=3.0, step=0.1)
+i_of_thresh     = input.float(0.3,"Order Flow Dominance Thresh",     group="🌪️ Regime Classifier", minval=0.05, maxval=1.0, step=0.05)
+i_vol_low       = input.float(0.7,"Vol State LOW (Range)",           group="🌪️ Regime Classifier", minval=0.1, maxval=1.0, step=0.05)
+i_vol_high      = input.float(1.5,"Vol State HIGH (Volatile)",       group="🌪️ Regime Classifier", minval=1.0, maxval=5.0, step=0.1)
+i_liq_min       = input.float(0.2,"Min Liquidity Score",             group="🌪️ Regime Classifier", minval=0.01, maxval=1.0, step=0.01)
+
+// --- Signal Engine ---
+i_w1            = input.float(0.30,"w1: CVD Slope",                  group="🚀 Signal Engine", minval=0.0, maxval=1.0, step=0.05)
+i_w2            = input.float(0.25,"w2: OBI",                        group="🚀 Signal Engine", minval=0.0, maxval=1.0, step=0.05)
+i_w3            = input.float(0.20,"w3: Microprice vs Mid",          group="🚀 Signal Engine", minval=0.0, maxval=1.0, step=0.05)
+i_w4            = input.float(0.15,"w4: Trade Intensity",            group="🚀 Signal Engine", minval=0.0, maxval=1.0, step=0.05)
+i_w5            = input.float(0.10,"w5: HTF Bias",                   group="🚀 Signal Engine", minval=0.0, maxval=1.0, step=0.05)
+i_sig_thresh    = input.float(0.40,"Signal Entry Threshold",         group="🚀 Signal Engine", minval=0.1, maxval=1.0, step=0.05)
+i_abs_delta     = input.float(1.5, "Absorption Delta Multiplier",    group="🚀 Signal Engine", minval=0.5, maxval=5.0, step=0.1)
+i_abs_eps       = input.float(0.1, "Absorption Price ε (%)",         group="🚀 Signal Engine", minval=0.01, maxval=1.0, step=0.01)
+
+// --- Market Making ---
+i_mm_spread_min = input.float(0.05,"MM Min Spread (%)",              group="🏦 Market Making",  minval=0.01, maxval=1.0, step=0.01)
+i_mm_gamma      = input.float(0.1, "MM Risk Aversion (γ)",           group="🏦 Market Making",  minval=0.01, maxval=1.0, step=0.01)
+i_mm_k          = input.float(1.5, "MM Order Arrival Rate (k)",      group="🏦 Market Making",  minval=0.1,  maxval=10.0, step=0.1)
+
+// --- Risk ---
+i_kelly_frac    = input.float(0.25,"Kelly Fraction",                  group="⚖️ Risk Engine",   minval=0.05, maxval=1.0, step=0.05)
+i_max_inv       = input.float(0.10,"Max Inventory (%)",               group="⚖️ Risk Engine",   minval=0.01, maxval=0.5, step=0.01)
+
+// --- Adaptive Learning ---
+i_eta           = input.float(0.01,"Learning Rate (η)",               group="🤖 Adaptive",      minval=0.001, maxval=0.1, step=0.001)
+i_adapt_on      = input.bool(true, "Enable Adaptive Weights",         group="🤖 Adaptive")
+
+// --- Display ---
+i_show_cvd      = input.bool(true,  "Show CVD",                       group="🖥️ Display")
+i_show_obi      = input.bool(true,  "Show OBI",                       group="🖥️ Display")
+i_show_regime   = input.bool(true,  "Show Regime Background",         group="🖥️ Display")
+i_show_signals  = input.bool(true,  "Show Entry Signals",             group="🖥️ Display")
+i_show_mm       = input.bool(true,  "Show MM Quotes",                 group="🖥️ Display")
+i_show_score    = input.bool(true,  "Show Composite Score",           group="🖥️ Display")
+i_panel         = input.string("All", "Active Panel",                 group="🖥️ Display",
+                     options=["All","CVD","OBI","Score","Regime"])
+
+// ─────────────────────────────────────────────────────────────
+// ██████  DATA LAYER — APPROXIMATIONS
+// ─────────────────────────────────────────────────────────────
+
+// In Pine Script we cannot access real L2 book or tick trades.
+// We use the best available proxies:
+//   • Volume Delta  →  up_vol / down_vol via candle direction
+//   • OBI           →  bid/ask volume proxy from close position
+//   • Microprice    →  VWAP-weighted best bid/ask proxy
+//   • Trade Intensity → bar-to-bar volume rate of change
+
+// ─── Volume Delta (per bar) ───────────────────────────────────
+// Aggressor buy → close >= open  (price moved UP)
+// Aggressor sell → close < open
+bar_range    = high - low
+close_pos    = bar_range > 0 ? (close - low) / bar_range : 0.5   // 0–1 position
+
+// Buy/Sell volume split (Tick Rule proxy)
+buy_vol      = volume * close_pos
+sell_vol     = volume * (1 - close_pos)
+delta        = buy_vol - sell_vol
+
+// ─── Cumulative Volume Delta (CVD) ────────────────────────────
+cvd = ta.cum(delta)
+
+// CVD smoothed for slope
+cvd_ma       = ta.ema(cvd, i_cvd_len)
+cvd_slope_raw = (cvd_ma - cvd_ma[i_cvd_len]) / i_cvd_len
+
+// Normalise CVD slope to −1…+1
+cvd_slope_max  = ta.highest(math.abs(cvd_slope_raw), 200)
+cvd_slope_norm = cvd_slope_max != 0 ? cvd_slope_raw / cvd_slope_max : 0.0
+
+// ─── Order Book Imbalance (OBI) proxy ─────────────────────────
+// Bid-side proxy: volume when price is below rolling mid
+// Ask-side proxy: volume when price is above rolling mid
+rolling_mid  = ta.ema(hlc3, i_obi_depth)
+bid_proxy    = close < rolling_mid ? volume : 0.0
+ask_proxy    = close > rolling_mid ? volume : 0.0
+sum_bid      = math.sum(bid_proxy, i_obi_depth)
+sum_ask      = math.sum(ask_proxy, i_obi_depth)
+obi          = (sum_bid + sum_ask) > 0 ? (sum_bid - sum_ask) / (sum_bid + sum_ask) : 0.0
+
+// ─── Microprice ───────────────────────────────────────────────
+// Proxy: volume-weighted price around mid
+// Microprice = (best_ask × bid_size + best_bid × ask_size) / (bid_size + ask_size)
+// Approximation using VWAP and close
+vwap_val    = ta.vwap(hlc3)
+mid_price   = (high + low) / 2.0
+micro_price = (vwap_val * buy_vol + mid_price * sell_vol) / (buy_vol + sell_vol + 1e-10)
+micro_vs_mid = (micro_price - mid_price) / (mid_price + 1e-10)   // normalised
+
+// Normalise to −1…+1
+micro_max    = ta.highest(math.abs(micro_vs_mid), 200)
+micro_norm   = micro_max != 0 ? micro_vs_mid / micro_max : 0.0
+
+// ─── Trade Intensity ──────────────────────────────────────────
+// Proxy: relative volume spike
+vol_ma       = ta.ema(volume, i_ti_len)
+trade_intensity = vol_ma > 0 ? volume / vol_ma - 1.0 : 0.0
+// Clamp to 0…2 then normalise
+ti_clamped   = math.min(math.max(trade_intensity, 0.0), 3.0) / 3.0
+
+// ─── Short / Long Volatility ──────────────────────────────────
+log_ret      = math.log(close / close[1])
+var_short    = ta.ema(log_ret * log_ret, i_vol_short)
+var_long     = ta.ema(log_ret * log_ret, i_vol_long)
+sigma_short  = math.sqrt(var_short)
+sigma_long   = math.sqrt(var_long)
+vol_state    = sigma_long > 0 ? sigma_short / sigma_long : 1.0
+
+// ─── Liquidity Score ──────────────────────────────────────────
+// Proxy: book depth (volume) / spread (high - low relative)
+spread_pct   = mid_price > 0 ? (high - low) / mid_price : 0.0001
+spread_norm  = ta.ema(spread_pct, i_liq_depth)
+vol_depth    = ta.ema(volume, i_liq_depth)
+vol_depth_ma = ta.ema(vol_depth, i_liq_depth * 2)
+liq_score_raw = vol_depth_ma > 0 ? vol_depth / vol_depth_ma : 1.0
+liq_score    = spread_norm > 0 ? liq_score_raw / (spread_norm * 1000) : liq_score_raw
+liq_norm     = ta.ema(liq_score, 20)
+liq_thresh   = ta.percentile_nearest_rank(liq_norm, 200, 20)   // 20th pct = illiquid
+
+// ─────────────────────────────────────────────────────────────
+// ██████  REGIME CLASSIFIER
+// ─────────────────────────────────────────────────────────────
+
+ema_fast     = ta.ema(close, i_ema_fast)
+ema_slow     = ta.ema(close, i_ema_slow)
+atr_val      = ta.atr(i_atr_len)
+
+// Trend Score = |EMA_fast − EMA_slow| / ATR
+trend_score  = atr_val > 0 ? math.abs(ema_fast - ema_slow) / atr_val : 0.0
+
+// Order-Flow Dominance = |CVD slope|
+of_dominance = math.abs(cvd_slope_norm)
+
+// Regime integer codes
+int REGIME_TREND    = 1
+int REGIME_RANGE    = 2
+int REGIME_VOLATILE = 3
+int REGIME_ILLIQUID = 4
+
+var int regime = REGIME_RANGE
+
+if trend_score > i_trend_thresh and of_dominance > i_of_thresh
+    regime := REGIME_TREND
+else if vol_state > i_vol_high
+    regime := REGIME_VOLATILE
+else if liq_score < i_liq_min
+    regime := REGIME_ILLIQUID
+else if vol_state < i_vol_low
+    regime := REGIME_RANGE
+else
+    regime := REGIME_RANGE
+
+// ─────────────────────────────────────────────────────────────
+// ██████  HTF BIAS (Higher-Timeframe context)
+// ─────────────────────────────────────────────────────────────
+// Use a longer EMA as HTF proxy (e.g. 200-bar EMA on current TF)
+ema_htf      = ta.ema(close, 200)
+htf_bias     = close > ema_htf ? 1.0 : -1.0
+
+// ─────────────────────────────────────────────────────────────
+// ██████  SIGNAL ENGINE
+// ─────────────────────────────────────────────────────────────
+
+// --- Adaptive weights (online learning) ---
+var float w1 = i_w1
+var float w2 = i_w2
+var float w3 = i_w3
+var float w4 = i_w4
+var float w5 = i_w5
+
+// Normalize weights so they sum to 1.0
+w_sum_raw    = w1 + w2 + w3 + w4 + w5
+w1n          = w_sum_raw > 0 ? w1 / w_sum_raw : 0.2
+w2n          = w_sum_raw > 0 ? w2 / w_sum_raw : 0.2
+w3n          = w_sum_raw > 0 ? w3 / w_sum_raw : 0.2
+w4n          = w_sum_raw > 0 ? w4 / w_sum_raw : 0.2
+w5n          = w_sum_raw > 0 ? w5 / w_sum_raw : 0.2
+
+// Composite Long Score
+score_long   = w1n * cvd_slope_norm
+             + w2n * obi
+             + w3n * micro_norm
+             + w4n * ti_clamped
+             + w5n * (htf_bias * 0.5)   // htf_bias scaled to ±0.5
+
+score_short  = -score_long
+score_long   := math.max(math.min(score_long, 1.0), -1.0)
+
+// --- Absorption Detection ---
+delta_threshold = ta.ema(math.abs(delta), 20) * i_abs_delta
+price_chg_pct   = math.abs(close - close[1]) / (close[1] + 1e-10) * 100
+buy_absorption  = delta < -delta_threshold and price_chg_pct < i_abs_eps
+sell_absorption = delta > delta_threshold  and price_chg_pct < i_abs_eps
+
+// --- Exhaustion (bearish divergence) ---
+price_up_5   = close > close[5]
+delta_down_5 = delta < delta[5]
+bearish_div  = price_up_5 and delta_down_5
+
+price_dn_5   = close < close[5]
+delta_up_5   = delta > delta[5]
+bullish_div  = price_dn_5 and delta_up_5
+
+// --- Breakout Confirmation ---
+recent_high  = ta.highest(high, 20)[1]
+recent_low   = ta.lowest(low, 20)[1]
+vol_rising   = sigma_short > sigma_short[3]
+breakout_up  = close > recent_high and obi > 0 and cvd_slope_norm > 0 and vol_rising
+breakout_dn  = close < recent_low  and obi < 0 and cvd_slope_norm < 0 and vol_rising
+
+// --- Entry conditions ---
+long_entry   = score_long  >  i_sig_thresh and regime != REGIME_ILLIQUID
+short_entry  = score_short >  i_sig_thresh and regime != REGIME_ILLIQUID
+abs_long     = buy_absorption  and regime == REGIME_TREND
+abs_short    = sell_absorption and regime == REGIME_TREND
+
+// --- Flow-based exit conditions ---
+exit_long    = score_long < 0 or (regime == REGIME_VOLATILE and bearish_div)
+exit_short   = score_long > 0 or (regime == REGIME_VOLATILE and bullish_div)
+
+// ─────────────────────────────────────────────────────────────
+// ██████  MARKET MAKING MODE (Avellaneda–Stoikov)
+// ─────────────────────────────────────────────────────────────
+
+// Switch to MM when directional edge is low
+mm_active    = math.abs(score_long) < i_sig_thresh * 0.5
+             and regime != REGIME_ILLIQUID
+             and vol_state < i_vol_high * 0.8
+
+// Inventory proxy (net delta running sum, normalised)
+var float inventory = 0.0
+inventory := inventory + (long_entry ? 1.0 : short_entry ? -1.0 : 0.0)
+inventory  := math.max(math.min(inventory, 10.0), -10.0)
+
+// Avellaneda–Stoikov: T-t proxy = 1 (stationary version)
+T_minus_t    = 1.0
+sigma_sq     = var_short * 252 * 6.5 * 60   // annualised rough proxy (crypto: use as-is)
+
+// Reservation price  r = mid − inventory * γ * σ² * (T−t)
+reservation_price = mid_price - inventory * i_mm_gamma * sigma_sq * T_minus_t
+
+// Optimal spread  s = γ * σ² * (T−t) + (2/γ) * ln(1 + γ/k)
+optimal_spread_raw = i_mm_gamma * sigma_sq * T_minus_t
+                   + (2.0 / i_mm_gamma) * math.log(1.0 + i_mm_gamma / i_mm_k)
+optimal_spread = math.max(optimal_spread_raw, mid_price * i_mm_spread_min / 100)
+
+mm_bid       = reservation_price - optimal_spread / 2.0
+mm_ask       = reservation_price + optimal_spread / 2.0
+
+// Inventory skew signal
+inv_skew     = math.abs(inventory) > i_max_inv * 10
+             ? (inventory > 0 ? "SKEW ASK (reduce longs)" : "SKEW BID (reduce shorts)")
+             : "BALANCED"
+
+// ─────────────────────────────────────────────────────────────
+// ██████  RISK ENGINE
+// ─────────────────────────────────────────────────────────────
+
+// Edge = normalised score
+edge         = math.abs(score_long)
+// Kelly position size (fraction of capital)
+variance     = var_short > 0 ? var_short : 0.0001
+kelly_size   = i_kelly_frac * edge / (variance * 10000)   // scaled
+kelly_size  := math.min(kelly_size, i_max_inv)
+
+// ─────────────────────────────────────────────────────────────
+// ██████  ADAPTIVE WEIGHT UPDATE (Policy Gradient style)
+// ─────────────────────────────────────────────────────────────
+
+// Reward = 1-bar forward return × signal direction
+fwd_return   = close[0] - close[1]   // this bar's return
+reward_pnl   = long_entry[1] ? fwd_return : short_entry[1] ? -fwd_return : 0.0
+risk_penalty = sigma_short * 0.5
+reward       = reward_pnl - risk_penalty
+
+if i_adapt_on and math.abs(reward) > 0
+    w1 := math.max(0.01, w1 + i_eta * reward * cvd_slope_norm[1])
+    w2 := math.max(0.01, w2 + i_eta * reward * obi[1])
+    w3 := math.max(0.01, w3 + i_eta * reward * micro_norm[1])
+    w4 := math.max(0.01, w4 + i_eta * reward * ti_clamped[1])
+    w5 := math.max(0.01, w5 + i_eta * reward * (htf_bias[1] * 0.5))
+
+// ─────────────────────────────────────────────────────────────
+// ██████  PLOTTING
+// ─────────────────────────────────────────────────────────────
+
+// ─── Regime Background ────────────────────────────────────────
+regime_color = regime == REGIME_TREND    ? color.new(color.green,  90) :
+               regime == REGIME_VOLATILE ? color.new(color.red,    90) :
+               regime == REGIME_ILLIQUID ? color.new(color.yellow, 90) :
+               color.new(color.blue, 95)   // RANGE
+
+bgcolor(i_show_regime ? regime_color : na, title="Regime Background")
+
+// ─── Determine which panels to show ──────────────────────────
+show_cvd    = i_show_cvd   and (i_panel == "All" or i_panel == "CVD")
+show_obi    = i_show_obi   and (i_panel == "All" or i_panel == "OBI")
+show_score  = i_show_score and (i_panel == "All" or i_panel == "Score")
+
+// ─── CVD Panel ────────────────────────────────────────────────
+cvd_norm_val   = ta.ema(cvd_slope_norm, 3)
+plot(show_cvd ? cvd_norm_val : na, "CVD Slope (norm)", color=color.new(color.aqua, 0),    linewidth=2)
+plot(show_cvd ? obi            : na, "OBI",             color=color.new(color.orange, 0), linewidth=1)
+
+// ─── Composite Score ──────────────────────────────────────────
+plot(show_score ? score_long : na, "Long Score",  color=color.new(color.lime,  0), linewidth=2)
+plot(show_score ? -i_sig_thresh : na, "Threshold+", color=color.new(color.gray, 60), linewidth=1, style=plot.style_line)
+plot(show_score ?  i_sig_thresh : na, "Threshold-", color=color.new(color.gray, 60), linewidth=1, style=plot.style_line)
+
+// ─── Zero line ────────────────────────────────────────────────
+hline(0, "Zero", color=color.new(color.white, 70), linewidth=1, linestyle=hline.style_dotted)
+
+// ─── Delta ────────────────────────────────────────────────────
+delta_norm_max = ta.highest(math.abs(delta), 100)
+delta_norm_val = delta_norm_max > 0 ? delta / delta_norm_max : 0.0
+delta_color    = delta >= 0 ? color.new(color.teal, 40) : color.new(color.red, 40)
+plot(delta_norm_val, "Delta (norm)", color=delta_color, linewidth=1, style=plot.style_histogram)
+
+// ─── MM Spread Visualization ──────────────────────────────────
+mm_spread_norm = mid_price > 0 ? (optimal_spread / mid_price) * 100 : 0.0
+plot(i_show_mm and mm_active ? mm_spread_norm * 5 : na, "MM Spread (×5)", color=color.new(color.yellow, 30), linewidth=1, style=plot.style_circles)
+
+// ─── Signals ──────────────────────────────────────────────────
+plotshape(i_show_signals and long_entry  ? score_long  : na, "LONG",         shape.triangleup,   location.bottom, color.new(color.lime,   0), size=size.small)
+plotshape(i_show_signals and short_entry ? score_short : na, "SHORT",        shape.triangledown, location.top,    color.new(color.red,    0), size=size.small)
+plotshape(i_show_signals and abs_long    ? score_long  : na, "ABS LONG",     shape.circle,       location.bottom, color.new(color.aqua,   0), size=size.tiny)
+plotshape(i_show_signals and abs_short   ? score_short : na, "ABS SHORT",    shape.circle,       location.top,    color.new(color.orange, 0), size=size.tiny)
+plotshape(i_show_signals and breakout_up ? 0.9         : na, "BREAKOUT UP",  shape.labelup,      location.absolute, color.new(color.green, 10), size=size.tiny, text="BRK▲", textcolor=color.white)
+plotshape(i_show_signals and breakout_dn ? -0.9        : na, "BREAKOUT DN",  shape.labeldown,    location.absolute, color.new(color.red,   10), size=size.tiny, text="BRK▼", textcolor=color.white)
+plotshape(i_show_signals and bearish_div ? 0.7         : na, "BEARISH DIV",  shape.xcross,       location.absolute, color.new(color.fuchsia, 0), size=size.tiny)
+plotshape(i_show_signals and bullish_div ? -0.7        : na, "BULLISH DIV",  shape.xcross,       location.absolute, color.new(color.teal, 0),    size=size.tiny)
+
+// ─── Exit signals ─────────────────────────────────────────────
+plotshape(i_show_signals and exit_long  ? 0.5 : na, "EXIT LONG",  shape.square, location.absolute, color.new(color.orange, 20), size=size.tiny, text="X")
+plotshape(i_show_signals and exit_short ? -0.5 : na,"EXIT SHORT", shape.square, location.absolute, color.new(color.purple, 20), size=size.tiny, text="X")
+
+// ─────────────────────────────────────────────────────────────
+// ██████  INFO TABLE
+// ─────────────────────────────────────────────────────────────
+
+if barstate.islast
+    var table info = table.new(position.top_right, 2, 14,
+         bgcolor=color.new(color.black, 20), border_color=color.new(color.gray, 50), border_width=1)
+
+    // Header
+    table.cell(info, 0, 0, "ORDER FLOW SYSTEM",     text_color=color.white,        text_size=size.small, bgcolor=color.new(color.navy, 10))
+    table.cell(info, 1, 0, "VALUE",                  text_color=color.white,        text_size=size.small, bgcolor=color.new(color.navy, 10))
+
+    // Regime
+    reg_str      = regime == REGIME_TREND    ? "🟢 TREND"     :
+                   regime == REGIME_VOLATILE ? "🔴 VOLATILE"  :
+                   regime == REGIME_ILLIQUID ? "🟡 ILLIQUID"  : "⚪ RANGE"
+    table.cell(info, 0, 1, "Regime",   text_color=color.silver, text_size=size.small)
+    table.cell(info, 1, 1, reg_str,    text_color=color.white,  text_size=size.small)
+
+    // Mode
+    mode_str     = mm_active ? "🟡 LIQUIDITY (MM)" : "🟢 ALPHA (DIR)"
+    table.cell(info, 0, 2, "Mode",     text_color=color.silver, text_size=size.small)
+    table.cell(info, 1, 2, mode_str,   text_color=color.white,  text_size=size.small)
+
+    // Score
+    score_str    = str.tostring(math.round(score_long * 100) / 100)
+    score_clr    = score_long > i_sig_thresh ? color.lime : score_long < -i_sig_thresh ? color.red : color.gray
+    table.cell(info, 0, 3, "Long Score",  text_color=color.silver, text_size=size.small)
+    table.cell(info, 1, 3, score_str,     text_color=score_clr,    text_size=size.small)
+
+    // CVD slope
+    table.cell(info, 0, 4, "CVD Slope",    text_color=color.silver, text_size=size.small)
+    table.cell(info, 1, 4, str.tostring(math.round(cvd_slope_norm * 100)/100), text_color=cvd_slope_norm >= 0 ? color.teal : color.red, text_size=size.small)
+
+    // OBI
+    table.cell(info, 0, 5, "OBI",          text_color=color.silver, text_size=size.small)
+    table.cell(info, 1, 5, str.tostring(math.round(obi * 100)/100), text_color=obi >= 0 ? color.teal : color.red, text_size=size.small)
+
+    // Vol State
+    table.cell(info, 0, 6, "Vol State",    text_color=color.silver, text_size=size.small)
+    table.cell(info, 1, 6, str.tostring(math.round(vol_state * 100)/100), text_color=color.white, text_size=size.small)
+
+    // Trend Score
+    table.cell(info, 0, 7, "Trend Score",  text_color=color.silver, text_size=size.small)
+    table.cell(info, 1, 7, str.tostring(math.round(trend_score * 100)/100), text_color=color.white, text_size=size.small)
+
+    // MM Active
+    table.cell(info, 0, 8, "MM Bid",       text_color=color.silver, text_size=size.small)
+    table.cell(info, 1, 8, mm_active ? str.tostring(math.round(mm_bid * 100)/100) : "—", text_color=color.yellow, text_size=size.small)
+
+    table.cell(info, 0, 9, "MM Ask",       text_color=color.silver, text_size=size.small)
+    table.cell(info, 1, 9, mm_active ? str.tostring(math.round(mm_ask * 100)/100) : "—", text_color=color.yellow, text_size=size.small)
+
+    // Kelly Size
+    table.cell(info, 0, 10, "Kelly Size",   text_color=color.silver, text_size=size.small)
+    table.cell(info, 1, 10, str.tostring(math.round(kelly_size * 10000)/100) + "%", text_color=color.white, text_size=size.small)
+
+    // Adaptive Weights
+    table.cell(info, 0, 11, "Weights [w1–w5]", text_color=color.silver, text_size=size.small)
+    w_str = str.tostring(math.round(w1n*100)) + "/" +
+             str.tostring(math.round(w2n*100)) + "/" +
+             str.tostring(math.round(w3n*100)) + "/" +
+             str.tostring(math.round(w4n*100)) + "/" +
+             str.tostring(math.round(w5n*100))
+    table.cell(info, 1, 11, w_str, text_color=color.aqua, text_size=size.small)
+
+    // Inv Skew
+    table.cell(info, 0, 12, "Inv Skew",    text_color=color.silver, text_size=size.small)
+    table.cell(info, 1, 12, inv_skew,      text_color=color.orange, text_size=size.small)
+
+    // Absorption
+    abs_str = buy_absorption ? "BUY ABS 🟢" : sell_absorption ? "SELL ABS 🔴" : "—"
+    table.cell(info, 0, 13, "Absorption",  text_color=color.silver, text_size=size.small)
+    table.cell(info, 1, 13, abs_str,       text_color=color.white,  text_size=size.small)

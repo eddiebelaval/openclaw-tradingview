@@ -1,0 +1,371 @@
+//@version=5
+indicator('BSP Divergence Stats', shorttitle = 'BSPs', overlay = true, max_bars_back = 500)
+
+// ── Inputs ───────────────────────────────────────────────────────────────────
+typeCM   = input.string('Delta Volume', 'Pressure Mode', ['Delta Volume', 'Pressure'])
+bg       = input.bool(true, 'Color Bars')
+lb       = input.int(100, 'Lookback (bars)', 20, 500)
+tpos     = input.string('Bottom Right', 'Table Position', ['Bottom Right', 'Bottom Left', 'Top Right', 'Top Left'])
+tf_high  = input.timeframe('', 'Main TF (empty = chart)', tooltip = 'Leave empty to use chart TF')
+tf_sub1  = input.timeframe('1', 'Sub TF 1')
+tf_sub2  = input.timeframe('2', 'Sub TF 2')
+showLbl  = input.bool(true,  'Show Labels on Candles')
+lblSize  = input.string('small', 'Label Size', ['tiny', 'small', 'normal'])
+
+// ── TF validation ─────────────────────────────────────────────────────────────
+tf_high_secs  = timeframe.in_seconds(tf_high == '' ? timeframe.period : tf_high)
+tf_sub1_secs  = timeframe.in_seconds(tf_sub1)
+tf_sub2_secs  = timeframe.in_seconds(tf_sub2)
+valid_sub1    = tf_sub1_secs < tf_high_secs
+valid_sub2    = tf_sub2_secs < tf_high_secs
+use_custom_tf = tf_high != ''
+
+// ── Main TF reference ────────────────────────────────────────────────────────
+ref_close = use_custom_tf ? request.security(syminfo.tickerid, tf_high, close, lookahead = barmerge.lookahead_on) : close
+
+// ── Sub-candle data ───────────────────────────────────────────────────────────
+[o1, h1, l1, c1, c1p] = request.security_lower_tf(syminfo.tickerid, tf_sub1, [open, high, low, close, close[1]])
+[o2, h2, l2, c2, c2p] = request.security_lower_tf(syminfo.tickerid, tf_sub2, [open, high, low, close, close[1]])
+float[] v1_arr = request.security_lower_tf(syminfo.tickerid, tf_sub1, volume)
+float[] v2_arr = request.security_lower_tf(syminfo.tickerid, tf_sub2, volume)
+
+// ── Calculators ───────────────────────────────────────────────────────────────
+calc_bp_pressure(o, h, l, c, cp) => c - math.min(l, cp)
+calc_sp_pressure(o, h, l, c, cp) => math.max(h, cp) - c
+
+calc_bp_dv(h, l, c, v) =>
+    float rng   = h - l
+    float buy_v = rng > 0 ? v * (c - l) / rng : v * 0.5
+    float sel_v = rng > 0 ? v * (h - c) / rng : v * 0.5
+    buy_v - sel_v
+
+calc_sp_dv(h, l, c, v) =>
+    float rng   = h - l
+    float buy_v = rng > 0 ? v * (c - l) / rng : v * 0.5
+    float sel_v = rng > 0 ? v * (h - c) / rng : v * 0.5
+    sel_v - buy_v
+
+// ── Accumulate per TF ────────────────────────────────────────────────────────
+bp_from_tf(o_arr, h_arr, l_arr, c_arr, cp_arr, v_arr, mode) =>
+    int   sz = array.size(c_arr)
+    float bp = 0.0
+    if sz > 0
+        for i = 0 to sz - 1
+            float _o  = array.get(o_arr,  i)
+            float _h  = array.get(h_arr,  i)
+            float _l  = array.get(l_arr,  i)
+            float _c  = array.get(c_arr,  i)
+            float _cp = array.get(cp_arr, i)
+            float _v  = array.get(v_arr,  i)
+            bp += mode == 'Pressure' ? calc_bp_pressure(_o, _h, _l, _c, _cp) : calc_bp_dv(_h, _l, _c, _v)
+    bp
+
+sp_from_tf(o_arr, h_arr, l_arr, c_arr, cp_arr, v_arr, mode) =>
+    int   sz = array.size(c_arr)
+    float sp = 0.0
+    if sz > 0
+        for i = 0 to sz - 1
+            float _o  = array.get(o_arr,  i)
+            float _h  = array.get(h_arr,  i)
+            float _l  = array.get(l_arr,  i)
+            float _c  = array.get(c_arr,  i)
+            float _cp = array.get(cp_arr, i)
+            float _v  = array.get(v_arr,  i)
+            sp += mode == 'Pressure' ? calc_sp_pressure(_o, _h, _l, _c, _cp) : calc_sp_dv(_h, _l, _c, _v)
+    sp
+
+// ── Raw values ────────────────────────────────────────────────────────────────
+float bp1 = valid_sub1 ? bp_from_tf(o1, h1, l1, c1, c1p, v1_arr, typeCM) : 0.0
+float sp1 = valid_sub1 ? sp_from_tf(o1, h1, l1, c1, c1p, v1_arr, typeCM) : 0.0
+float bp2 = valid_sub2 ? bp_from_tf(o2, h2, l2, c2, c2p, v2_arr, typeCM) : 0.0
+float sp2 = valid_sub2 ? sp_from_tf(o2, h2, l2, c2, c2p, v2_arr, typeCM) : 0.0
+
+float bp_raw = valid_sub1 and valid_sub2 ? math.avg(bp1, bp2) : valid_sub1 ? bp1 : valid_sub2 ? bp2 : 0.0
+float sp_raw = valid_sub1 and valid_sub2 ? math.avg(sp1, sp2) : valid_sub1 ? sp1 : valid_sub2 ? sp2 : 0.0
+
+bpma = ta.hma(bp_raw, 2)
+spma = ta.hma(sp_raw, 2)
+
+// ── Hidden signal ─────────────────────────────────────────────────────────────
+_tf_ref     = tf_high == '' ? timeframe.period : tf_high
+float _h5   = request.security(syminfo.tickerid, _tf_ref, high,   lookahead = barmerge.lookahead_on)
+float _l5   = request.security(syminfo.tickerid, _tf_ref, low,    lookahead = barmerge.lookahead_on)
+float _c5   = request.security(syminfo.tickerid, _tf_ref, close,  lookahead = barmerge.lookahead_on)
+float _o5   = request.security(syminfo.tickerid, _tf_ref, open,   lookahead = barmerge.lookahead_on)
+float _v5   = request.security(syminfo.tickerid, _tf_ref, volume, lookahead = barmerge.lookahead_on)
+
+float _spread   = _h5 - _l5
+float dvBuyVol  = _spread > 0 ? _v5 * (_c5 - _l5) / _spread : _v5 * 0.5
+float dvSellVol = _spread > 0 ? _v5 * (_h5 - _c5) / _spread : _v5 * 0.5
+float dvTotal   = dvBuyVol + dvSellVol
+float dvRatio   = dvTotal > 0 ? dvBuyVol / dvTotal : 0.5
+bool  curIsGreen = _c5 > _o5
+bool  hiddenBuy  = dvRatio > 0.55 and not curIsGreen
+bool  hiddenSell = dvRatio < 0.45 and curIsGreen
+
+// ── Divergence flags ──────────────────────────────────────────────────────────
+bool bull_div = bpma < bpma[1] and ref_close > ref_close[1]
+bool bear_div = spma < spma[1] and ref_close < ref_close[1]
+bool no_div   = not bull_div and not bear_div
+
+bool bull_conf = barstate.isconfirmed and bull_div
+bool bear_conf = barstate.isconfirmed and bear_div
+bool none_conf = barstate.isconfirmed and no_div
+bool hbuy_conf = barstate.isconfirmed and hiddenBuy
+bool hsel_conf = barstate.isconfirmed and hiddenSell
+
+float next_ret = ref_close - ref_close[1]
+
+// ── Stats ─────────────────────────────────────────────────────────────────────
+float bull_up_f = bull_conf[1] and next_ret > 0 ? 1.0 : 0.0
+float bull_dn_f = bull_conf[1] and next_ret < 0 ? 1.0 : 0.0
+float bear_up_f = bear_conf[1] and next_ret > 0 ? 1.0 : 0.0
+float bear_dn_f = bear_conf[1] and next_ret < 0 ? 1.0 : 0.0
+float hbuy_up_f = hbuy_conf[1] and next_ret > 0 ? 1.0 : 0.0
+float hbuy_dn_f = hbuy_conf[1] and next_ret < 0 ? 1.0 : 0.0
+float hsel_up_f = hsel_conf[1] and next_ret > 0 ? 1.0 : 0.0
+float hsel_dn_f = hsel_conf[1] and next_ret < 0 ? 1.0 : 0.0
+float bull_f    = bull_conf ? 1.0 : 0.0
+float bear_f    = bear_conf ? 1.0 : 0.0
+float hbuy_f    = hbuy_conf ? 1.0 : 0.0
+float hsel_f    = hsel_conf ? 1.0 : 0.0
+
+cnt_bull     = math.sum(bull_f,    lb)
+cnt_bear     = math.sum(bear_f,    lb)
+cnt_hbuy     = math.sum(hbuy_f,    lb)
+cnt_hsel     = math.sum(hsel_f,    lb)
+bull_next_up = math.sum(bull_up_f, lb)
+bull_next_dn = math.sum(bull_dn_f, lb)
+bear_next_up = math.sum(bear_up_f, lb)
+bear_next_dn = math.sum(bear_dn_f, lb)
+hbuy_next_up = math.sum(hbuy_up_f, lb)
+hbuy_next_dn = math.sum(hbuy_dn_f, lb)
+hsel_next_up = math.sum(hsel_up_f, lb)
+hsel_next_dn = math.sum(hsel_dn_f, lb)
+
+// ── Live snapshot ─────────────────────────────────────────────────────────────
+float live_net   = nz(bp_raw) - nz(sp_raw)
+float live_total = nz(bp_raw) + nz(sp_raw)
+float live_ratio = live_total > 0 ? nz(bp_raw) / live_total * 100 : 50.0
+int   live_pct   = math.round(live_ratio)
+
+// ── Next candle bias ──────────────────────────────────────────────────────────
+float f1_up   = hiddenBuy  ? 25.0 : 0.0
+float f1_down = hiddenSell ? 25.0 : 0.0
+float f2_up   = dvRatio > 0.5 ? math.min((dvRatio - 0.5) * 40.0, 20.0) : 0.0
+float f2_down = dvRatio < 0.5 ? math.min((0.5 - dvRatio) * 40.0, 20.0) : 0.0
+float f3_up   = bpma > bpma[1] ? (curIsGreen ? 15.0 : 8.0) : 0.0
+float f3_down = bpma < bpma[1] ? 15.0 : 0.0
+float f4_up   = spma < spma[1] ? 15.0 : 0.0
+float f4_down = spma > spma[1] ? (not curIsGreen ? 15.0 : 8.0) : 0.0
+float f5_up   = bear_div ? 15.0 : 0.0
+float f5_down = bull_div ? 15.0 : 0.0
+float f6_up   = live_pct > 65 ? 10.0 : live_pct > 55 ? 5.0 : 0.0
+float f6_down = live_pct < 35 ? 10.0 : live_pct < 45 ? 5.0 : 0.0
+
+float score_up   = f1_up   + f2_up   + f3_up   + f4_up   + f5_up   + f6_up
+float score_down = f1_down + f2_down + f3_down + f4_down + f5_down + f6_down
+float bias_pct   = math.max(5.0, math.min(95.0, 50.0 + ((score_up - score_down) / 100.0 * 50.0)))
+int   bias_int   = math.round(bias_pct)
+int   bias_dn    = 100 - bias_int
+bool  nxt_up     = bias_int > 55
+bool  nxt_down   = bias_int < 45
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+pct(a, b)   => b > 0 ? math.round(a / b * 100) : 0
+fmt(v)      => str.tostring(math.round(v))
+fmtpct(v)   => str.tostring(v) + '%'
+
+lbl_size_val = lblSize == 'tiny' ? size.tiny : lblSize == 'normal' ? size.normal : size.small
+
+// ══════════════════════════════════════════════════════════════════════════════
+// LABELS ABOVE / BELOW CANDLES
+// Only on confirmed bars (barstate.isconfirmed) to avoid label spam
+// Each signal type gets its own label with explanation
+// ══════════════════════════════════════════════════════════════════════════════
+
+// Label only fires on the first bar of each new signal
+// Use change detection so we don't repeat on every bar
+bool bull_div_new  = bull_conf  and not bull_div[1]
+bool bear_div_new  = bear_conf  and not bear_div[1]
+bool hbuy_new      = hbuy_conf  and not hiddenBuy[1]
+bool hsel_new      = hsel_conf  and not hiddenSell[1]
+
+// historical edge for label
+int lbl_bull_up = pct(bull_next_up, cnt_bull)
+int lbl_bull_dn = pct(bull_next_dn, cnt_bull)
+int lbl_bear_up = pct(bear_next_up, cnt_bear)
+int lbl_bear_dn = pct(bear_next_dn, cnt_bear)
+int lbl_hbuy_up = pct(hbuy_next_up, cnt_hbuy)
+int lbl_hbuy_dn = pct(hbuy_next_dn, cnt_hbuy)
+int lbl_hsel_up = pct(hsel_next_up, cnt_hsel)
+int lbl_hsel_dn = pct(hsel_next_dn, cnt_hsel)
+
+// ── Bull Div label (purple candle) ────────────────────────────────────────────
+// Meaning: price went UP but buying pressure FELL — weak move, possible reversal down
+if showLbl and bull_div_new
+    label.new(
+         bar_index, high,
+         '⚠ Bull Div\nBP↓ price↑\nnext ↑' + str.tostring(lbl_bull_up) + '% ↓' + str.tostring(lbl_bull_dn) + '%',
+         style      = label.style_label_down,
+         color      = color.new(color.rgb(155, 0, 255), 10),
+         textcolor  = color.white,
+         size       = lbl_size_val)
+
+// ── Bear Div label (orange candle) ────────────────────────────────────────────
+// Meaning: price went DOWN but selling pressure FELL — weak move, possible reversal up
+if showLbl and bear_div_new
+    label.new(
+         bar_index, high,
+         '⚠ Bear Div\nSP↓ price↓\nnext ↑' + str.tostring(lbl_bear_up) + '% ↓' + str.tostring(lbl_bear_dn) + '%',
+         style      = label.style_label_down,
+         color      = color.new(color.rgb(245, 127, 23), 10),
+         textcolor  = color.white,
+         size       = lbl_size_val)
+
+// ── Hidden Buy label (green candle) ───────────────────────────────────────────
+// Meaning: red candle but buyers dominated volume — smart money accumulating
+if showLbl and hbuy_new and not bull_div and not bear_div
+    label.new(
+         bar_index, low,
+         '👁 H.Buy\nbuyers on red\nnext ↑' + str.tostring(lbl_hbuy_up) + '% ↓' + str.tostring(lbl_hbuy_dn) + '%',
+         style      = label.style_label_up,
+         color      = color.new(color.green, 15),
+         textcolor  = color.white,
+         size       = lbl_size_val)
+
+// ── Hidden Sell label (red candle) ────────────────────────────────────────────
+// Meaning: green candle but sellers dominated volume — smart money distributing
+if showLbl and hsel_new and not bull_div and not bear_div
+    label.new(
+         bar_index, low,
+         '👁 H.Sell\nsellers on green\nnext ↑' + str.tostring(lbl_hsel_up) + '% ↓' + str.tostring(lbl_hsel_dn) + '%',
+         style      = label.style_label_up,
+         color      = color.new(color.red, 15),
+         textcolor  = color.white,
+         size       = lbl_size_val)
+
+// ── Table display values ──────────────────────────────────────────────────────
+string cur_div_txt  = bull_div ? 'Bull Div' : bear_div ? 'Bear Div' : 'No Div'
+color  cur_div_bg   = bull_div ? color.new(#6a0dad, 10) : bear_div ? color.new(#e65c00, 10) : color.new(#1a3a5c, 10)
+string cur_dir_txt  = live_net > 0 ? '▲  BUYING' : live_net < 0 ? '▼  SELLING' : '◆  NEUTRAL'
+color  cur_dir_col  = live_net > 0 ? color.lime   : live_net < 0 ? color.red    : color.gray
+color  cur_dir_bg   = live_net > 0 ? color.new(color.green, 15) : live_net < 0 ? color.new(color.red, 15) : color.new(color.gray, 60)
+string cur_rat_txt  = str.tostring(live_pct) + '% buy  /  ' + str.tostring(100 - live_pct) + '% sell'
+color  cur_rat_col  = live_pct > 60 ? color.lime : live_pct < 40 ? color.red : color.gray
+string cur_bp_txt   = bpma > bpma[1] ? '▲ BP rising' : bpma < bpma[1] ? '▼ BP falling' : '— BP flat'
+string cur_sp_txt   = spma > spma[1] ? '▲ SP rising' : spma < spma[1] ? '▼ SP falling' : '— SP flat'
+color  cur_bp_col   = bpma > bpma[1] ? color.lime : bpma < bpma[1] ? color.rgb(155,0,255)  : color.gray
+color  cur_sp_col   = spma > spma[1] ? color.red  : spma < spma[1] ? color.rgb(245,127,23) : color.gray
+string cur_hid_txt  = hiddenBuy ? 'HIDDEN BUY' : hiddenSell ? 'HIDDEN SELL' : '—'
+color  cur_hid_col  = hiddenBuy ? color.lime   : hiddenSell ? color.red     : color.new(color.gray, 40)
+color  cur_hid_bg   = hiddenBuy ? color.new(color.green, 15) : hiddenSell ? color.new(color.red, 15) : color.new(color.gray, 70)
+
+string nxt_dir_txt  = nxt_up ? '▲  UP' : nxt_down ? '▼  DOWN' : '◆  NEUTRAL'
+string nxt_prob_txt = nxt_up ? str.tostring(bias_int) + '% UP' : nxt_down ? str.tostring(bias_dn) + '% DOWN' : '50%'
+string nxt_conf_txt = (bias_int >= 75 or bias_dn >= 75) ? 'HIGH' : (bias_int >= 62 or bias_dn >= 62) ? 'MED' : 'LOW'
+color  nxt_conf_col = (bias_int >= 75 or bias_dn >= 75) ? color.yellow : (bias_int >= 62 or bias_dn >= 62) ? color.lime : color.gray
+color  nxt_txt_col  = nxt_up and bias_int >= 75 ? color.white : nxt_up and bias_int >= 62 ? color.lime : nxt_up ? color.green : nxt_down and bias_dn >= 75 ? color.white : nxt_down and bias_dn >= 62 ? color.red : nxt_down ? color.orange : color.gray
+color  nxt_bg       = nxt_up and bias_int >= 75 ? color.new(color.green, 5) : nxt_up and bias_int >= 62 ? color.new(color.green, 20) : nxt_up ? color.new(color.green, 40) : nxt_down and bias_dn >= 75 ? color.new(color.red, 5) : nxt_down and bias_dn >= 62 ? color.new(color.red, 20) : nxt_down ? color.new(color.red, 40) : color.new(color.gray, 60)
+
+int    hist_up      = bull_div ? pct(bull_next_up, cnt_bull) : bear_div ? pct(bear_next_up, cnt_bear) : 50
+int    hist_dn      = bull_div ? pct(bull_next_dn, cnt_bull) : bear_div ? pct(bear_next_dn, cnt_bear) : 50
+int    hist_hup     = hiddenBuy ? pct(hbuy_next_up, cnt_hbuy) : hiddenSell ? pct(hsel_next_up, cnt_hsel) : 50
+int    hist_hdn     = hiddenBuy ? pct(hbuy_next_dn, cnt_hbuy) : hiddenSell ? pct(hsel_next_dn, cnt_hsel) : 50
+string hist_div_txt = bull_div ? 'Bull Div hist: ↑' + fmtpct(hist_up) + ' ↓' + fmtpct(hist_dn) : bear_div ? 'Bear Div hist: ↑' + fmtpct(hist_up) + ' ↓' + fmtpct(hist_dn) : 'no div — baseline ↑50% ↓50%'
+string hist_hid_txt = hiddenBuy ? 'H.Buy hist: ↑' + fmtpct(hist_hup) + ' ↓' + fmtpct(hist_hdn) : hiddenSell ? 'H.Sell hist: ↑' + fmtpct(hist_hup) + ' ↓' + fmtpct(hist_hdn) : '—'
+color  hist_div_col = hist_up > hist_dn ? color.lime : hist_up < hist_dn ? color.red : color.gray
+color  hist_hid_col = hist_hup > hist_hdn ? color.lime : hist_hup < hist_hdn ? color.red : color.gray
+
+string score_bar = ''
+int    bar_fill  = math.round(bias_pct / 100.0 * 8)
+for _i = 0 to 7
+    score_bar := score_bar + (_i < bar_fill ? '█' : '░')
+
+string driver_txt = hiddenBuy or hiddenSell ? 'driver: HIDDEN SIGNAL' : bear_div or bull_div ? 'driver: DIVERGENCE' : math.abs(dvRatio - 0.5) > 0.1 ? 'driver: DV RATIO' : live_pct > 60 or live_pct < 40 ? 'driver: LIVE RATIO' : 'driver: MOMENTUM'
+
+tf_label    = (tf_high == '' ? timeframe.period : tf_high) + '  |  ' + tf_sub1 + '+' + tf_sub2
+has_warning = not valid_sub1 or not valid_sub2
+valid_label = (not valid_sub1 ? '⚠ Sub1 >= Main' : '') + (not valid_sub2 ? '  ⚠ Sub2 >= Main' : '')
+
+tpos_val = switch tpos
+    'Bottom Right' => position.bottom_right
+    'Bottom Left'  => position.bottom_left
+    'Top Right'    => position.top_right
+    'Top Left'     => position.top_left
+
+col_hdr  = color.new(#1a1a2e, 0)
+col_live = color.new(#0d1f0d, 0)
+col_nxt  = color.new(#0d0d2e, 0)
+col_txt  = color.white
+col_sub  = color.new(color.white, 20)
+col_warn = color.new(#7a1a1a, 0)
+col_blk  = color.new(color.black, 50)
+
+var table t = table.new(tpos_val, 4, 12,
+     border_width = 1,
+     border_color = color.new(color.gray, 50),
+     frame_width  = 2,
+     frame_color  = color.new(color.gray, 30))
+
+cell(row, col, txt, bg_c, tc, ts) =>
+    table.cell(t, col, row, txt, bgcolor = bg_c, text_color = tc, text_size = ts, text_halign = text.align_center)
+
+if barstate.islast or barstate.isrealtime
+
+    // row 0 — header
+    table.merge_cells(t, 0, 0, 3, 0)
+    cell(0, 0, has_warning ? valid_label : tf_label + '  |  ' + typeCM,
+         has_warning ? col_warn : col_hdr,
+         has_warning ? color.yellow : col_sub, size.small)
+
+    // ── CURRENT CANDLE ────────────────────────────────────────────────────────
+    table.merge_cells(t, 0, 1, 3, 1)
+    cell(1, 0, '— CURRENT CANDLE —', col_live, color.new(color.white, 10), size.small)
+
+    table.merge_cells(t, 0, 2, 1, 2)
+    table.merge_cells(t, 2, 2, 3, 2)
+    cell(2, 0, cur_dir_txt, cur_dir_bg, cur_dir_col, size.large)
+    cell(2, 2, cur_rat_txt, col_blk,    cur_rat_col, size.normal)
+
+    table.merge_cells(t, 0, 3, 1, 3)
+    table.merge_cells(t, 2, 3, 3, 3)
+    cell(3, 0, cur_bp_txt, col_blk, cur_bp_col, size.normal)
+    cell(3, 2, cur_sp_txt, col_blk, cur_sp_col, size.normal)
+
+    table.merge_cells(t, 0, 4, 1, 4)
+    table.merge_cells(t, 2, 4, 3, 4)
+    cell(4, 0, cur_hid_txt, cur_hid_bg, cur_hid_col, size.normal)
+    cell(4, 2, cur_div_txt, cur_div_bg, col_txt,     size.normal)
+
+    // ── NEXT CANDLE BIAS ──────────────────────────────────────────────────────
+    table.merge_cells(t, 0, 5, 3, 5)
+    cell(5, 0, '— NEXT CANDLE BIAS —', col_nxt, color.new(color.white, 5), size.small)
+
+    cell(6, 0, nxt_dir_txt,  nxt_bg, nxt_txt_col, size.large)
+    table.merge_cells(t, 1, 6, 2, 6)
+    cell(6, 1, nxt_prob_txt, nxt_bg, nxt_txt_col, size.large)
+    cell(6, 3, nxt_conf_txt, nxt_bg, nxt_conf_col, size.normal)
+
+    cell(7, 0, 'Strength', col_hdr, col_sub, size.tiny)
+    table.merge_cells(t, 1, 7, 2, 7)
+    cell(7, 1, score_bar, col_blk, nxt_up ? color.lime : nxt_down ? color.red : color.gray, size.normal)
+    cell(7, 3, str.tostring(math.round(score_up)) + ' / ' + str.tostring(math.round(score_down)), col_blk, col_sub, size.tiny)
+
+    table.merge_cells(t, 0, 8, 3, 8)
+    cell(8, 0, driver_txt, col_nxt, color.new(color.white, 25), size.tiny)
+
+    table.merge_cells(t, 0, 9, 3, 9)
+    cell(9, 0, hist_div_txt, col_blk, hist_div_col, size.small)
+
+    table.merge_cells(t, 0, 10, 3, 10)
+    cell(10, 0, hist_hid_txt, col_blk, hist_hid_col, size.small)
+
+    table.merge_cells(t, 0, 11, 3, 11)
+    cell(11, 0, 'stats based on last ' + fmt(lb) + ' bars', col_hdr, col_sub, size.tiny)
+
+// ── Bar coloring ──────────────────────────────────────────────────────────────
+barcolor(bg and bull_div                                     ? color.new(color.rgb(155, 0, 255), 0)  : na)
+barcolor(bg and bear_div                                     ? color.new(color.rgb(245, 127, 23), 0) : na)
+barcolor(bg and hiddenBuy  and not bull_div and not bear_div ? color.new(color.lime, 40)             : na)
+barcolor(bg and hiddenSell and not bull_div and not bear_div ? color.new(color.red,  40)             : na)

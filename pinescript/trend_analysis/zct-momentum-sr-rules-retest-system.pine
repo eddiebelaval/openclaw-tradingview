@@ -1,0 +1,283 @@
+//@version=6
+indicator("ZCT Momentum + S/R Rules (Retest System)", shorttitle="ZCT-MOMO", overlay=true, max_lines_count=200, max_labels_count=200)
+
+//====================================================
+// INPUTS
+//====================================================
+grpLevels = "ZCT Levels"
+showPD     = input.bool(true,  "Show PDH/PDL", group=grpLevels)
+show4H     = input.bool(true,  "Show Prev 4H H/L", group=grpLevels)
+show1H     = input.bool(true,  "Show Prev 1H H/L", group=grpLevels)
+show15m    = input.bool(true,  "Show Prev 15m H/L", group=grpLevels)
+
+labelOffset = input.int(20, "Label Offset (bars)", minval=1, maxval=300, group=grpLevels)
+lineW       = input.int(2, "Line Width", minval=1, maxval=5, group=grpLevels)
+
+colPD   = input.color(color.new(color.aqua, 0),   "PD Color", group=grpLevels)
+col4H   = input.color(color.new(color.orange, 0), "4H Color", group=grpLevels)
+col1H   = input.color(color.new(color.blue, 0),   "1H Color", group=grpLevels)
+col15   = input.color(color.new(color.purple, 0), "15m Color", group=grpLevels)
+
+grpSMMA = "Trend Filter (SMMA)"
+useSMMA = input.bool(true, "Use SMMA trend filter", group=grpSMMA)
+smmaLen = input.int(30, "SMMA Length", minval=1, group=grpSMMA)
+smmaSrc = input.source(close, "SMMA Source", group=grpSMMA)
+smmaCol = input.color(color.white, "SMMA Color", group=grpSMMA)
+smmaW   = input.int(2, "SMMA Width", minval=1, maxval=5, group=grpSMMA)
+
+grpRules = "Rule Engine"
+lookbackHours     = input.int(8,  "Fresh/Recycled lookback (hours)", minval=1, maxval=48, group=grpRules)
+recycledTouches   = input.int(2,  "Recycled if touches ≥", minval=1, maxval=10, group=grpRules)
+touchTolATR       = input.float(0.15, "Touch tolerance (ATR x)", minval=0.01, step=0.01, group=grpRules)
+
+grindBars         = input.int(8,  "Slow grind bars", minval=3, maxval=30, group=grpRules)
+bodyMaxATR        = input.float(0.9, "Slow grind max avg body (ATR x)", minval=0.1, step=0.1, group=grpRules)
+
+volLen            = input.int(20, "Volume MA length", minval=5, maxval=100, group=grpRules)
+volSlopeBars      = input.int(8,  "Volume rising check bars", minval=3, maxval=30, group=grpRules)
+
+maxSMMAcrosses    = input.int(2,  "Max SMMA crossovers in window", minval=0, maxval=20, group=grpRules)
+crossLookback     = input.int(30, "Crossover lookback (bars)", minval=5, maxval=300, group=grpRules)
+
+retestWindowBars  = input.int(50, "Retest must happen within (bars)", minval=5, maxval=500, group=grpRules)
+
+grpSignals = "Signals"
+showPreBreakNotice = input.bool(true, "Show WAIT after break confirmed", group=grpSignals)
+showEntrySignals   = input.bool(true, "Show BUY/SELL on retest", group=grpSignals)
+onlyAgrade         = input.bool(true, "Strict A-grade only (all filters)", group=grpSignals)
+
+atrLen = input.int(14, "ATR Length", minval=2, group=grpRules)
+
+//====================================================
+// CORE SERIES
+//====================================================
+atr  = ta.atr(atrLen)
+tol  = atr * touchTolATR
+
+smma = ta.rma(smmaSrc, smmaLen)
+plot(useSMMA ? smma : na, "SMMA", color=smmaCol, linewidth=smmaW)
+
+// Convert hours → bars (approx)
+tfSec = timeframe.in_seconds(timeframe.period)
+barsInHour = tfSec > 0 ? math.round(3600 / tfSec) : 60
+freshLookbackBars = math.max(10, lookbackHours * barsInHour)
+
+//====================================================
+// ZCT LEVELS (Prev H/L)
+//====================================================
+[pdh, pdl]   = request.security(syminfo.tickerid, "D",   [high[1], low[1]], lookahead=barmerge.lookahead_off)
+[p4h, p4l]   = request.security(syminfo.tickerid, "240", [high[1], low[1]], lookahead=barmerge.lookahead_off)
+[p1h, p1l]   = request.security(syminfo.tickerid, "60",  [high[1], low[1]], lookahead=barmerge.lookahead_off)
+[p15h, p15l] = request.security(syminfo.tickerid, "15",  [high[1], low[1]], lookahead=barmerge.lookahead_off)
+
+//====================================================
+// DRAW HELPERS
+//====================================================
+f_line(line ln, float y, color c, bool enabled) =>
+    line out = ln
+    if enabled and not na(y)
+        if na(out)
+            out := line.new(bar_index, y, bar_index + 1, y, extend=extend.right, color=c, width=lineW)
+        else
+            line.set_xy1(out, bar_index, y)
+            line.set_xy2(out, bar_index + 1, y)
+            line.set_color(out, c)
+            line.set_width(out, lineW)
+    else
+        if not na(out)
+            line.delete(out)
+            out := na
+    out
+
+f_label(label lb, float y, color c, bool enabled, string txt) =>
+    label out = lb
+    if enabled and not na(y)
+        if na(out)
+            out := label.new(bar_index + labelOffset, y, txt, style=label.style_label_left, textcolor=color.white, color=color.new(c, 0))
+        else
+            label.set_x(out, bar_index + labelOffset)
+            label.set_y(out, y)
+            label.set_text(out, txt)
+            label.set_color(out, color.new(c, 0))
+            label.set_textcolor(out, color.white)
+    else
+        if not na(out)
+            label.delete(out)
+            out := na
+    out
+
+// Typed declarations (no comma chaining)
+var line ln_pdh  = na
+var line ln_pdl  = na
+var line ln_p4h  = na
+var line ln_p4l  = na
+var line ln_p1h  = na
+var line ln_p1l  = na
+var line ln_p15h = na
+var line ln_p15l = na
+
+var label lb_pdh  = na
+var label lb_pdl  = na
+var label lb_p4h  = na
+var label lb_p4l  = na
+var label lb_p1h  = na
+var label lb_p1l  = na
+var label lb_p15h = na
+var label lb_p15l = na
+
+ln_pdh  := f_line(ln_pdh,  pdh,  colPD, showPD)
+ln_pdl  := f_line(ln_pdl,  pdl,  colPD, showPD)
+
+ln_p4h  := f_line(ln_p4h,  p4h,  col4H, show4H)
+ln_p4l  := f_line(ln_p4l,  p4l,  col4H, show4H)
+
+ln_p1h  := f_line(ln_p1h,  p1h,  col1H, show1H)
+ln_p1l  := f_line(ln_p1l,  p1l,  col1H, show1H)
+
+ln_p15h := f_line(ln_p15h, p15h, col15, show15m)
+ln_p15l := f_line(ln_p15l, p15l, col15, show15m)
+
+lb_pdh  := f_label(lb_pdh,  pdh,  colPD, showPD,  "PDH")
+lb_pdl  := f_label(lb_pdl,  pdl,  colPD, showPD,  "PDL")
+lb_p4h  := f_label(lb_p4h,  p4h,  col4H, show4H,  "P4H")
+lb_p4l  := f_label(lb_p4l,  p4l,  col4H, show4H,  "P4L")
+lb_p1h  := f_label(lb_p1h,  p1h,  col1H, show1H,  "P1H")
+lb_p1l  := f_label(lb_p1l,  p1l,  col1H, show1H,  "P1L")
+lb_p15h := f_label(lb_p15h, p15h, col15, show15m, "P15H")
+lb_p15l := f_label(lb_p15l, p15l, col15, show15m, "P15L")
+
+//====================================================
+// RULE FUNCTIONS
+//====================================================
+f_touches(float lvl) =>
+    int cnt = 0
+    if not na(lvl)
+        int lim = math.min(freshLookbackBars, bar_index)
+        for i = 0 to lim
+            bool touched = (high[i] >= (lvl - tol)) and (low[i] <= (lvl + tol))
+            cnt += touched ? 1 : 0
+    cnt
+
+f_isFresh(float lvl) =>
+    f_touches(lvl) < recycledTouches
+
+// Slow grind (quantified) - FIXED (no ta.sma in conditional)
+avgBody = ta.sma(math.abs(close - open), grindBars)
+slowGrindRes = ta.rising(low, grindBars) and (avgBody <= atr * bodyMaxATR)
+slowGrindSup = ta.falling(high, grindBars) and (avgBody <= atr * bodyMaxATR)
+
+// Volume rising (quantified)
+vma     = ta.sma(volume, volLen)
+volOk   = ta.rising(vma, volSlopeBars) and volume >= vma
+
+// SMMA crossovers count - FIXED (math.sum instead of ta.sum)
+crossSeries = ta.cross(close, smma) ? 1 : 0
+crossCount  = math.sum(crossSeries, crossLookback)
+crossOk     = crossCount <= maxSMMAcrosses
+
+trendLongOk  = not useSMMA or close > smma
+trendShortOk = not useSMMA or close < smma
+
+AgradeLongOk  = slowGrindRes and volOk and crossOk and trendLongOk
+AgradeShortOk = slowGrindSup and volOk and crossOk and trendShortOk
+
+BgradeLongOk  = slowGrindRes and trendLongOk
+BgradeShortOk = slowGrindSup and trendShortOk
+
+longFiltersOk  = onlyAgrade ? AgradeLongOk : BgradeLongOk
+shortFiltersOk = onlyAgrade ? AgradeShortOk : BgradeShortOk
+
+// Break + Retest helpers
+breakConfirmedUp(lvl)    => not na(lvl) and close > lvl and close[1] > lvl
+breakJustConfirmedUp(lvl)=> breakConfirmedUp(lvl) and close[2] <= lvl
+retestLong(lvl)          => not na(lvl) and low <= (lvl + tol) and close > lvl
+
+breakConfirmedDn(lvl)    => not na(lvl) and close < lvl and close[1] < lvl
+breakJustConfirmedDn(lvl)=> breakConfirmedDn(lvl) and close[2] >= lvl
+retestShort(lvl)         => not na(lvl) and high >= (lvl - tol) and close < lvl
+
+//====================================================
+// SIGNAL ENGINE
+//====================================================
+resLevels = array.from(pdh, p4h, p1h, p15h)
+supLevels = array.from(pdl, p4l, p1l, p15l)
+
+resEnabled = array.from(showPD, show4H, show1H, show15m)
+supEnabled = array.from(showPD, show4H, show1H, show15m)
+
+resNames = array.from("PDH","P4H","P1H","P15H")
+supNames = array.from("PDL","P4L","P1L","P15L")
+
+var int[] brkRes = array.new_int(4, na)
+var int[] brkSup = array.new_int(4, na)
+
+bool preLong = false
+bool preShort = false
+bool entryLong = false
+bool entryShort = false
+string trigTxt = ""
+
+// LONG
+for i = 0 to 3
+    bool en = array.get(resEnabled, i)
+    float lvl = array.get(resLevels, i)
+    string nm = array.get(resNames, i)
+
+    if en and not na(lvl)
+        bool fresh = f_isFresh(lvl)
+        bool breakoutAllowed = fresh
+
+        bool justConf = breakoutAllowed and longFiltersOk and breakJustConfirmedUp(lvl)
+        if justConf
+            array.set(brkRes, i, bar_index)
+            if showPreBreakNotice
+                preLong := true
+                trigTxt := "BREAK OK (" + nm + ") → WAIT RETEST"
+
+        int bidx = array.get(brkRes, i)
+        bool inWindow = not na(bidx) and (bar_index - bidx <= retestWindowBars)
+        bool ret = inWindow and retestLong(lvl)
+        if ret and showEntrySignals
+            entryLong := true
+            trigTxt := "BUY RETEST (" + nm + ")"
+
+// SHORT
+for i = 0 to 3
+    bool en = array.get(supEnabled, i)
+    float lvl = array.get(supLevels, i)
+    string nm = array.get(supNames, i)
+
+    if en and not na(lvl)
+        bool fresh = f_isFresh(lvl)
+        bool breakoutAllowed = fresh
+
+        bool justConf = breakoutAllowed and shortFiltersOk and breakJustConfirmedDn(lvl)
+        if justConf
+            array.set(brkSup, i, bar_index)
+            if showPreBreakNotice
+                preShort := true
+                trigTxt := "BREAK OK (" + nm + ") → WAIT RETEST"
+
+        int bidx = array.get(brkSup, i)
+        bool inWindow = not na(bidx) and (bar_index - bidx <= retestWindowBars)
+        bool ret = inWindow and retestShort(lvl)
+        if ret and showEntrySignals
+            entryShort := true
+            trigTxt := "SELL RETEST (" + nm + ")"
+
+//====================================================
+// PLOTS + ALERTS
+//====================================================
+plotshape(preLong,  title="Pre Break Long",  style=shape.triangleup,   location=location.belowbar, size=size.tiny, text="WAIT", color=color.new(color.green, 0), textcolor=color.white)
+plotshape(preShort, title="Pre Break Short", style=shape.triangledown, location=location.abovebar, size=size.tiny, text="WAIT", color=color.new(color.red, 0),   textcolor=color.white)
+
+plotshape(entryLong,  title="BUY Retest",  style=shape.labelup,   location=location.belowbar, text="BUY",  color=color.new(color.lime, 0), textcolor=color.black, size=size.small)
+plotshape(entryShort, title="SELL Retest", style=shape.labeldown, location=location.abovebar, text="SELL", color=color.new(color.red, 0),  textcolor=color.white, size=size.small)
+
+if (preLong or preShort or entryLong or entryShort)
+    label.new(bar_index, close, trigTxt, style=label.style_label_left, textcolor=color.white, color=color.new(color.black, 0))
+
+alertcondition(preLong,   "Break Confirmed Up (Wait Retest)",   "Break confirmed → WAIT retest (Long).")
+alertcondition(preShort,  "Break Confirmed Down (Wait Retest)", "Break confirmed → WAIT retest (Short).")
+alertcondition(entryLong, "BUY on Retest",                      "BUY signal on retest at ZCT level.")
+alertcondition(entryShort,"SELL on Retest",                     "SELL signal on retest at ZCT level.")

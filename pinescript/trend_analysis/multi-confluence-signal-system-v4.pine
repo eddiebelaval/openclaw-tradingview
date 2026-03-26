@@ -1,0 +1,570 @@
+// This Pine Script™ v6 indicator is subject to the terms of the Mozilla Public License 2.0
+// https://mozilla.org/MPL/2.0/
+
+//@version=6
+indicator("Multi-Confluence Signal System v4", overlay=true, max_lines_count=500, max_labels_count=500)
+
+// ═══════════════════════════════════════════════════════════════
+// INPUTS
+// ═══════════════════════════════════════════════════════════════
+
+// EMA Settings
+emaFastLen  = input.int(9,   "Fast EMA Length",  minval=1, group="EMAs")
+emaSlowLen  = input.int(50,  "Slow EMA Length",  minval=1, group="EMAs")
+emaTrendLen = input.int(200, "Trend EMA Length", minval=50, group="EMAs")
+
+// RSI Settings
+rsiLen         = input.int(14, "RSI Length",              minval=1,  group="RSI")
+rsiOB          = input.int(70, "RSI Overbought",          minval=50, group="RSI")
+rsiOS          = input.int(30, "RSI Oversold",             minval=10, group="RSI")
+rsiDivLookback = input.int(5,  "RSI Divergence Lookback", minval=2, maxval=20, group="RSI")
+rsiSlopeLen    = input.int(3,  "RSI Slope Bars",          minval=2, maxval=10, group="RSI")
+
+// MACD Settings
+macdFast   = input.int(12, "MACD Fast",   minval=1, group="MACD")
+macdSlow   = input.int(26, "MACD Slow",   minval=1, group="MACD")
+macdSignal = input.int(9,  "MACD Signal", minval=1, group="MACD")
+
+// ADX Settings
+adxLen      = input.int(14,  "ADX Length",          minval=1,  group="ADX")
+adxThreshold = input.int(20, "ADX Min Threshold",   minval=10, maxval=50, group="ADX", tooltip="Only trade when ADX > this value. Filters out choppy/ranging markets.")
+
+// Bollinger Band Settings
+bbLen  = input.int(20,   "BB Length",     minval=1,  group="Bollinger Bands")
+bbMult = input.float(2.0, "BB Multiplier", minval=0.5, step=0.1, group="Bollinger Bands")
+
+// Volume Settings
+volMaLen      = input.int(20,   "Volume MA Length",        minval=1, group="Volume")
+volMultiplier = input.float(1.3, "Volume Threshold (x avg)", minval=0.5, step=0.1, group="Volume")
+
+// ATR / Risk Settings
+atrLen    = input.int(14,   "ATR Length",                minval=1,  group="ATR / Risk")
+atrSlMult = input.float(1.5, "Stop Loss ATR Multiplier",  minval=0.5, step=0.1, group="ATR / Risk")
+atrTpMult = input.float(2.0, "Take Profit ATR Multiplier", minval=1.0, step=0.1, group="ATR / Risk", tooltip="Lowered from 3.0 to 2.0 for higher win rate")
+useTrail  = input.bool(true, "Use Trailing Stop",          group="ATR / Risk", tooltip="Trails stop to lock in profits once trade moves 1 ATR in your favor")
+trailATR  = input.float(1.0, "Trailing Stop ATR Distance", minval=0.3, step=0.1, group="ATR / Risk")
+
+// Structure Settings
+swingLookback = input.int(10, "Swing High/Low Lookback", minval=3, maxval=50, group="Structure")
+
+// Signal Filters
+useEMACross     = input.bool(true, "Use EMA Cross Filter",      group="Signal Filters")
+useRSIFilter    = input.bool(true, "Use RSI Filter",             group="Signal Filters")
+useVolFilter    = input.bool(true, "Use Volume Filter",           group="Signal Filters")
+useDivergence   = input.bool(true, "Use RSI Divergence",         group="Signal Filters")
+useMACDFilter   = input.bool(true, "Use MACD Filter",             group="Signal Filters")
+useADXFilter    = input.bool(true, "Use ADX Trend Strength",     group="Signal Filters")
+useBBFilter     = input.bool(true, "Use Bollinger Band Filter",  group="Signal Filters")
+useStructure    = input.bool(true, "Use Structure Filter",        group="Signal Filters")
+minScore        = input.float(3.5, "Minimum Signal Score",        minval=1.5, maxval=7.0, step=0.5, group="Signal Filters")
+cooldownBars    = input.int(12,    "Signal Cooldown (bars)",      minval=1, maxval=50, group="Signal Filters")
+reqConsecCandles = input.int(2,    "Confirm Candles Required",    minval=1, maxval=5, group="Signal Filters")
+
+// Pullback Filter
+usePullback = input.bool(true, "Require Pullback Entry", group="Signal Filters", tooltip="In a downtrend, only sell after a bounce toward EMA. In uptrend, only buy after dip toward EMA. Avoids chasing.")
+pullbackATR = input.float(0.5, "Pullback Proximity (ATR)", minval=0.1, step=0.1, group="Signal Filters", tooltip="Price must be within this many ATRs of the fast EMA")
+
+// Display Settings
+showEMAs      = input.bool(true,  "Show EMAs",            group="Display")
+showTrendEMA  = input.bool(true,  "Show 200 EMA",          group="Display")
+showBB        = input.bool(false, "Show Bollinger Bands",  group="Display")
+showSignals   = input.bool(true,  "Show Buy/Sell Labels",  group="Display")
+showSLTP      = input.bool(true,  "Show SL/TP Levels",     group="Display")
+showDashboard = input.bool(true,  "Show Dashboard",         group="Display")
+
+// ═══════════════════════════════════════════════════════════════
+// CALCULATIONS
+// ═══════════════════════════════════════════════════════════════
+
+// --- EMAs ---
+emaFast  = ta.ema(close, emaFastLen)
+emaSlow  = ta.ema(close, emaSlowLen)
+emaTrend = ta.ema(close, emaTrendLen)
+
+emaBullCross = ta.crossover(emaFast, emaSlow)
+emaBearCross = ta.crossunder(emaFast, emaSlow)
+
+emaBullish = emaFast > emaSlow
+emaBearish = emaFast < emaSlow
+
+// EMA slopes
+emaFastSlope = emaFast - emaFast[3]
+emaSlowSlope = emaSlow - emaSlow[3]
+emaTrendSlope = emaTrend - emaTrend[3]
+
+// All EMAs must slope in same direction
+allEmasBullSlope = emaFastSlope > 0 and emaSlowSlope > 0
+allEmasBearSlope = emaFastSlope < 0 and emaSlowSlope < 0
+
+// Master trend
+masterBull = close > emaTrend
+masterBear = close < emaTrend
+
+// --- RSI ---
+rsi = ta.rsi(close, rsiLen)
+rsiRising  = rsi > rsi[1]
+rsiFalling = rsi < rsi[1]
+rsiSlope     = rsi - rsi[rsiSlopeLen]
+rsiBullSlope = rsiSlope > 0
+rsiBearSlope = rsiSlope < 0
+
+// RSI Divergence
+priceLow  = ta.lowest(low, rsiDivLookback)
+priceHigh = ta.highest(high, rsiDivLookback)
+rsiLow    = ta.lowest(rsi, rsiDivLookback)
+rsiHigh   = ta.highest(rsi, rsiDivLookback)
+
+bullDivergence = low <= priceLow[rsiDivLookback] and rsi > rsiLow[rsiDivLookback] and rsi < 45
+bearDivergence = high >= priceHigh[rsiDivLookback] and rsi < rsiHigh[rsiDivLookback] and rsi > 55
+
+// --- MACD ---
+[macdLine, signalLine, histLine] = ta.macd(close, macdFast, macdSlow, macdSignal)
+macdBullish    = macdLine > signalLine
+macdBearish    = macdLine < signalLine
+macdBullCross  = ta.crossover(macdLine, signalLine)
+macdBearCross  = ta.crossunder(macdLine, signalLine)
+macdAboveZero  = macdLine > 0
+macdBelowZero  = macdLine < 0
+
+// MACD Histogram expanding (momentum acceleration)
+histExpBull = histLine > histLine[1] and histLine > histLine[2]
+histExpBear = histLine < histLine[1] and histLine < histLine[2]
+
+// --- ADX (Trend Strength) ---
+[diPlus, diMinus, adxVal] = ta.dmi(adxLen, adxLen)
+strongTrend = adxVal > adxThreshold
+adxRising   = adxVal > adxVal[1]
+
+// --- Bollinger Bands ---
+bbBasis = ta.sma(close, bbLen)
+bbDev   = bbMult * ta.stdev(close, bbLen)
+bbUpper = bbBasis + bbDev
+bbLower = bbBasis - bbDev
+
+// Price position within BB
+nearBBUpper = high > bbUpper or high > (bbBasis + bbDev * 0.8)
+nearBBLower = low < bbLower or low < (bbBasis - bbDev * 0.8)
+bbWidth     = (bbUpper - bbLower) / bbBasis
+bbSqueeze   = bbWidth < ta.sma(bbWidth, 50) * 0.75  // Low volatility squeeze
+
+// --- Volume ---
+volMA      = ta.sma(volume, volMaLen)
+highVolume = volume > volMA * volMultiplier
+
+// --- ATR ---
+atr = ta.atr(atrLen)
+
+// --- Structure ---
+swingHigh = ta.highest(high, swingLookback)
+swingLow  = ta.lowest(low, swingLookback)
+higherLow = swingLow > swingLow[swingLookback]
+lowerHigh = swingHigh < swingHigh[swingLookback]
+
+// --- Candlestick Patterns ---
+bullishEngulfing = close > open and close > open[1] and open < close[1] and close > open[1]
+bearishEngulfing = close < open and close < open[1] and open > close[1] and close < open[1]
+hammer           = (high - low) > 2.5 * math.abs(close - open) and (close - low) / (high - low) > 0.6 and (open - low) / (high - low) > 0.6
+shootingStar     = (high - low) > 2.5 * math.abs(close - open) and (high - close) / (high - low) > 0.6 and (high - open) / (high - low) > 0.6
+
+bullCandle = bullishEngulfing or hammer
+bearCandle = bearishEngulfing or shootingStar
+
+// --- Consecutive Candle Confirmation ---
+bullConsec = true
+bearConsec = true
+for i = 0 to reqConsecCandles - 1
+    if close[i] <= open[i]
+        bullConsec := false
+    if close[i] >= open[i]
+        bearConsec := false
+
+// --- Pullback Filter ---
+nearFastEMA_buy  = math.abs(low - emaFast) < atr * pullbackATR
+nearFastEMA_sell = math.abs(high - emaFast) < atr * pullbackATR
+pullbackBuy  = not usePullback or nearFastEMA_buy
+pullbackSell = not usePullback or nearFastEMA_sell
+
+// ═══════════════════════════════════════════════════════════════
+// SIGNAL LOGIC — v4 Enhanced Scoring
+// ═══════════════════════════════════════════════════════════════
+
+buyScore  = 0.0
+sellScore = 0.0
+
+// 1: EMA Trend alignment
+if useEMACross
+    buyScore  += emaBullish ? 1 : emaBullCross ? 1.5 : 0
+    sellScore += emaBearish ? 1 : emaBearCross ? 1.5 : 0
+
+// 1b: EMA slope agreement (NEW)
+buyScore  += allEmasBullSlope ? 0.5 : 0
+sellScore += allEmasBearSlope ? 0.5 : 0
+
+// 2: RSI + slope
+if useRSIFilter
+    buyScore  += rsi < 45 and rsiBullSlope ? 1.0 : rsi < 55 and rsiRising ? 0.5 : 0
+    sellScore += rsi > 55 and rsiBearSlope ? 1.0 : rsi > 45 and rsiFalling ? 0.5 : 0
+
+// 3: Volume
+if useVolFilter
+    buyScore  += highVolume and close > open ? 1 : 0
+    sellScore += highVolume and close < open ? 1 : 0
+
+// 4: RSI Divergence
+if useDivergence
+    buyScore  += bullDivergence ? 1.5 : 0
+    sellScore += bearDivergence ? 1.5 : 0
+
+// 5: MACD + histogram expansion
+if useMACDFilter
+    buyScore  += macdBullish ? 0.5 : 0
+    buyScore  += macdBullCross ? 0.5 : 0
+    buyScore  += macdAboveZero ? 0.25 : 0
+    buyScore  += histExpBull ? 0.5 : 0
+    sellScore += macdBearish ? 0.5 : 0
+    sellScore += macdBearCross ? 0.5 : 0
+    sellScore += macdBelowZero ? 0.25 : 0
+    sellScore += histExpBear ? 0.5 : 0
+
+// 6: ADX trend strength (NEW)
+if useADXFilter
+    buyScore  += strongTrend and diPlus > diMinus ? 1.0 : 0
+    sellScore += strongTrend and diMinus > diPlus ? 1.0 : 0
+    buyScore  += adxRising and diPlus > diMinus ? 0.25 : 0
+    sellScore += adxRising and diMinus > diPlus ? 0.25 : 0
+
+// 7: Bollinger Band (NEW — sell near upper, buy near lower)
+if useBBFilter
+    buyScore  += nearBBLower ? 0.75 : 0
+    sellScore += nearBBUpper ? 0.75 : 0
+
+// 8: Candlestick patterns
+buyScore  += bullCandle ? 0.5 : 0
+sellScore += bearCandle ? 0.5 : 0
+
+// 9: Price vs EMAs
+buyScore  += close > emaFast and close > emaSlow ? 0.5 : close > emaFast ? 0.25 : 0
+sellScore += close < emaFast and close < emaSlow ? 0.5 : close < emaFast ? 0.25 : 0
+
+// 10: Structure
+if useStructure
+    buyScore  += higherLow ? 0.5 : 0
+    sellScore += lowerHigh ? 0.5 : 0
+
+// 11: Consecutive candles
+buyScore  += bullConsec ? 0.5 : 0
+sellScore += bearConsec ? 0.5 : 0
+
+// ═══════════════════════════════════════════════════════════════
+// HARD GATES — ALL must pass
+// ═══════════════════════════════════════════════════════════════
+
+// Gate 1: Master trend (200 EMA)
+buyGate  = masterBull and emaBullish
+sellGate = masterBear and emaBearish
+
+// Gate 2: ADX must confirm trend exists (no trading in chop)
+adxGate = not useADXFilter or strongTrend
+
+// Gate 3: Not in BB squeeze (avoid low-vol breakout fakeouts)
+squeezeGate = not bbSqueeze
+
+// Gate 4: Pullback entry
+pullbackGateBuy  = pullbackBuy
+pullbackGateSell = pullbackSell
+
+// Combined gates
+buyAllowed  = buyGate and adxGate and squeezeGate and pullbackGateBuy
+sellAllowed = sellGate and adxGate and squeezeGate and pullbackGateSell
+
+// ═══════════════════════════════════════════════════════════════
+// SIGNAL CLASSIFICATION
+// ═══════════════════════════════════════════════════════════════
+
+strongBuy  = buyScore >= 4.5
+strongSell = sellScore >= 4.5
+mediumBuy  = buyScore >= minScore and buyScore < 4.5
+mediumSell = sellScore >= minScore and sellScore < 4.5
+
+buySignal  = (strongBuy or mediumBuy) and buyScore > sellScore and buyAllowed
+sellSignal = (strongSell or mediumSell) and sellScore > buyScore and sellAllowed
+
+// Cooldown
+var int lastBuyBar  = 0
+var int lastSellBar = 0
+
+buySignalFiltered  = buySignal  and (bar_index - lastBuyBar)  > cooldownBars
+sellSignalFiltered = sellSignal and (bar_index - lastSellBar) > cooldownBars
+
+if buySignalFiltered
+    lastBuyBar := bar_index
+if sellSignalFiltered
+    lastSellBar := bar_index
+
+// ═══════════════════════════════════════════════════════════════
+// TRAILING STOP + SL/TP MANAGEMENT
+// ═══════════════════════════════════════════════════════════════
+
+var float activeSL    = na
+var float activeTP    = na
+var float activeEntry = na
+var bool  activeIsBuy = false
+var float activeHigh  = na  // Highest price since entry (for trailing)
+var float activeLow   = na  // Lowest price since entry (for trailing)
+
+if buySignalFiltered
+    activeSL    := close - atr * atrSlMult
+    activeTP    := close + atr * atrTpMult
+    activeEntry := close
+    activeIsBuy := true
+    activeHigh  := close
+    activeLow   := close
+
+if sellSignalFiltered
+    activeSL    := close + atr * atrSlMult
+    activeTP    := close - atr * atrTpMult
+    activeEntry := close
+    activeIsBuy := false
+    activeHigh  := close
+    activeLow   := close
+
+// Update trailing stop
+if not na(activeEntry) and useTrail
+    if activeIsBuy
+        activeHigh := math.max(activeHigh, high)
+        // Once price moves 1 ATR in our favor, start trailing
+        if activeHigh - activeEntry > atr * 1.0
+            newTrailSL = activeHigh - atr * trailATR
+            activeSL := math.max(activeSL, newTrailSL)
+    else
+        activeLow := math.min(activeLow, low)
+        if activeEntry - activeLow > atr * 1.0
+            newTrailSL = activeLow + atr * trailATR
+            activeSL := math.min(activeSL, newTrailSL)
+
+slHit = not na(activeSL) and ((activeIsBuy and low <= activeSL) or (not activeIsBuy and high >= activeSL))
+tpHit = not na(activeTP) and ((activeIsBuy and high >= activeTP) or (not activeIsBuy and low <= activeTP))
+
+if slHit or tpHit
+    activeSL    := na
+    activeTP    := na
+    activeEntry := na
+    activeHigh  := na
+    activeLow   := na
+
+// ═══════════════════════════════════════════════════════════════
+// PLOTTING
+// ═══════════════════════════════════════════════════════════════
+
+plot(showEMAs ? emaFast : na, "Fast EMA (9)", color=color.new(#00BFFF, 0), linewidth=2)
+plot(showEMAs ? emaSlow : na, "Slow EMA (50)", color=color.new(#FF6347, 0), linewidth=2)
+plot(showTrendEMA ? emaTrend : na, "Trend EMA (200)", color=color.new(#FFD700, 0), linewidth=3)
+
+emaFastPlot = plot(showEMAs ? emaFast : na, display=display.none)
+emaSlowPlot = plot(showEMAs ? emaSlow : na, display=display.none)
+fill(emaFastPlot, emaSlowPlot, color=emaBullish ? color.new(#00BFFF, 90) : color.new(#FF6347, 90))
+
+// Bollinger Bands
+plot(showBB ? bbUpper : na, "BB Upper", color=color.new(color.purple, 60))
+plot(showBB ? bbLower : na, "BB Lower", color=color.new(color.purple, 60))
+plot(showBB ? bbBasis : na, "BB Basis", color=color.new(color.purple, 80))
+
+// SL/TP
+plot(showSLTP and not na(activeSL) ? activeSL : na, "Stop Loss", color=color.new(color.red, 20), linewidth=2, style=plot.style_linebr)
+plot(showSLTP and not na(activeTP) ? activeTP : na, "Take Profit", color=color.new(color.green, 20), linewidth=2, style=plot.style_linebr)
+plot(showSLTP and not na(activeEntry) ? activeEntry : na, "Entry", color=color.new(color.white, 50), linewidth=1, style=plot.style_linebr)
+
+// Buy/Sell Labels
+if showSignals and buySignalFiltered
+    lblColor = strongBuy ? color.green : color.new(color.green, 30)
+    lblText  = (strongBuy ? "★ STRONG BUY" : "BUY") + " (" + str.tostring(buyScore, "#.#") + ")"
+    if showSLTP
+        lblText += "\nSL: " + str.tostring(close - atr * atrSlMult, "#.##")
+        lblText += "  TP: " + str.tostring(close + atr * atrTpMult, "#.##")
+    label.new(bar_index, low, lblText,
+              style=label.style_label_up, color=lblColor, textcolor=color.white,
+              size=strongBuy ? size.normal : size.small)
+
+if showSignals and sellSignalFiltered
+    lblColor = strongSell ? color.red : color.new(color.red, 30)
+    lblText  = (strongSell ? "★ STRONG SELL" : "SELL") + " (" + str.tostring(sellScore, "#.#") + ")"
+    if showSLTP
+        lblText += "\nSL: " + str.tostring(close + atr * atrSlMult, "#.##")
+        lblText += "  TP: " + str.tostring(close - atr * atrTpMult, "#.##")
+    label.new(bar_index, high, lblText,
+              style=label.style_label_down, color=lblColor, textcolor=color.white,
+              size=strongSell ? size.normal : size.small)
+
+bgcolor(buySignalFiltered and strongBuy ? color.new(color.green, 92) : na)
+bgcolor(sellSignalFiltered and strongSell ? color.new(color.red, 92) : na)
+
+// BB Squeeze warning
+bgcolor(bbSqueeze ? color.new(color.yellow, 95) : na)
+
+// ═══════════════════════════════════════════════════════════════
+// WIN/LOSS TRACKER WITH TRAILING STOP
+// ═══════════════════════════════════════════════════════════════
+
+var int   totalTrades  = 0
+var int   wins         = 0
+var int   losses       = 0
+var float lastEntry    = na
+var bool  lastIsBuy    = false
+var bool  inTrade      = false
+var float trackHigh    = na
+var float trackLow     = na
+var float trackSL      = na
+var float trackTP      = na
+var float entryATR     = na
+
+if buySignalFiltered and not inTrade
+    lastEntry   := close
+    lastIsBuy   := true
+    inTrade     := true
+    totalTrades += 1
+    trackHigh   := close
+    trackLow    := close
+    trackSL     := close - atr * atrSlMult
+    trackTP     := close + atr * atrTpMult
+    entryATR    := atr
+
+if sellSignalFiltered and not inTrade
+    lastEntry   := close
+    lastIsBuy   := false
+    inTrade     := true
+    totalTrades += 1
+    trackHigh   := close
+    trackLow    := close
+    trackSL     := close + atr * atrSlMult
+    trackTP     := close - atr * atrTpMult
+    entryATR    := atr
+
+if inTrade and not na(lastEntry) and not na(entryATR)
+    // Update tracking
+    if lastIsBuy
+        trackHigh := math.max(trackHigh, high)
+        // Trailing stop
+        if useTrail and trackHigh - lastEntry > entryATR * 1.0
+            newSL   = trackHigh - entryATR * trailATR
+            trackSL := math.max(trackSL, newSL)
+        // Check exits
+        if low <= trackSL
+            // Determine if trailing made this a win
+            if trackSL > lastEntry
+                wins += 1
+            else
+                losses += 1
+            inTrade := false
+        else if high >= trackTP
+            wins    += 1
+            inTrade := false
+    else
+        trackLow := math.min(trackLow, low)
+        if useTrail and lastEntry - trackLow > entryATR * 1.0
+            newSL   = trackLow + entryATR * trailATR
+            trackSL := math.min(trackSL, newSL)
+        if high >= trackSL
+            if trackSL < lastEntry
+                wins += 1
+            else
+                losses += 1
+            inTrade := false
+        else if low <= trackTP
+            wins    += 1
+            inTrade := false
+
+winRate    = totalTrades > 0 ? (wins / totalTrades) * 100 : 0.0
+lossRate   = totalTrades > 0 ? (losses / totalTrades) * 100 : 0.0
+openTrades = totalTrades - wins - losses
+expectancy = totalTrades > 0 ? ((wins * atrTpMult) - (losses * atrSlMult)) / totalTrades : 0.0
+profitFactor = losses > 0 ? (wins * atrTpMult) / (losses * atrSlMult) : 0.0
+
+// ═══════════════════════════════════════════════════════════════
+// DASHBOARD
+// ═══════════════════════════════════════════════════════════════
+
+if showDashboard and barstate.islast
+    var table dash = table.new(position.top_right, 2, 16,
+                               bgcolor=color.new(#1a1a2e, 10),
+                               border_width=1,
+                               border_color=color.new(color.gray, 60))
+
+    table.cell(dash, 0, 0, "SIGNAL SYSTEM v4", text_color=color.white, text_size=size.small, bgcolor=color.new(#16213e, 0))
+    table.cell(dash, 1, 0, syminfo.ticker, text_color=#00BFFF, text_size=size.small, bgcolor=color.new(#16213e, 0))
+
+    mTrendText  = masterBull ? "BULLISH ▲" : "BEARISH ▼"
+    mTrendColor = masterBull ? color.green : color.red
+    table.cell(dash, 0, 1, "Master Trend", text_color=color.gray, text_size=size.small)
+    table.cell(dash, 1, 1, mTrendText, text_color=mTrendColor, text_size=size.small)
+
+    trendText  = emaBullish ? "BULL (9>50)" : "BEAR (9<50)"
+    trendColor = emaBullish ? color.green : color.red
+    table.cell(dash, 0, 2, "EMA Trend", text_color=color.gray, text_size=size.small)
+    table.cell(dash, 1, 2, trendText, text_color=trendColor, text_size=size.small)
+
+    adxText  = strongTrend ? str.tostring(adxVal, "#.#") + " STRONG" : str.tostring(adxVal, "#.#") + " WEAK"
+    adxColor = strongTrend ? color.green : color.orange
+    table.cell(dash, 0, 3, "ADX", text_color=color.gray, text_size=size.small)
+    table.cell(dash, 1, 3, adxText, text_color=adxColor, text_size=size.small)
+
+    macdText  = macdBullish ? "BULLISH" : "BEARISH"
+    macdColor = macdBullish ? color.green : color.red
+    table.cell(dash, 0, 4, "MACD", text_color=color.gray, text_size=size.small)
+    table.cell(dash, 1, 4, macdText + (histExpBull ? " ⬆" : histExpBear ? " ⬇" : ""), text_color=macdColor, text_size=size.small)
+
+    rsiColor = rsi > rsiOB ? color.red : rsi < rsiOS ? color.green : color.yellow
+    table.cell(dash, 0, 5, "RSI", text_color=color.gray, text_size=size.small)
+    table.cell(dash, 1, 5, str.tostring(rsi, "#.#"), text_color=rsiColor, text_size=size.small)
+
+    volText  = highVolume ? "HIGH ✓" : "LOW ✗"
+    volColor = highVolume ? color.green : color.gray
+    table.cell(dash, 0, 6, "Volume", text_color=color.gray, text_size=size.small)
+    table.cell(dash, 1, 6, volText, text_color=volColor, text_size=size.small)
+
+    sqText  = bbSqueeze ? "SQUEEZE ⚠" : "NORMAL"
+    sqColor = bbSqueeze ? color.yellow : color.gray
+    table.cell(dash, 0, 7, "Bollinger", text_color=color.gray, text_size=size.small)
+    table.cell(dash, 1, 7, sqText, text_color=sqColor, text_size=size.small)
+
+    table.cell(dash, 0, 8, "Buy Score", text_color=color.gray, text_size=size.small)
+    table.cell(dash, 1, 8, str.tostring(buyScore, "#.#") + (buyAllowed ? " ✓" : " BLOCKED"), text_color=buyAllowed and buyScore >= minScore ? color.green : color.gray, text_size=size.small)
+
+    table.cell(dash, 0, 9, "Sell Score", text_color=color.gray, text_size=size.small)
+    table.cell(dash, 1, 9, str.tostring(sellScore, "#.#") + (sellAllowed ? " ✓" : " BLOCKED"), text_color=sellAllowed and sellScore >= minScore ? color.red : color.gray, text_size=size.small)
+
+    divText  = bullDivergence ? "BULL DIV" : bearDivergence ? "BEAR DIV" : "NONE"
+    divColor = bullDivergence ? color.green : bearDivergence ? color.red : color.gray
+    table.cell(dash, 0, 10, "Divergence", text_color=color.gray, text_size=size.small)
+    table.cell(dash, 1, 10, divText, text_color=divColor, text_size=size.small)
+
+    slText = not na(activeSL) ? str.tostring(activeSL, "#.##") : "—"
+    tpText = not na(activeTP) ? str.tostring(activeTP, "#.##") : "—"
+    table.cell(dash, 0, 11, "Active SL", text_color=color.gray, text_size=size.small)
+    table.cell(dash, 1, 11, slText, text_color=color.red, text_size=size.small)
+    table.cell(dash, 0, 12, "Active TP", text_color=color.gray, text_size=size.small)
+    table.cell(dash, 1, 12, tpText, text_color=color.green, text_size=size.small)
+
+    // Stats
+    table.cell(dash, 0, 13, "Win Rate", text_color=color.gray, text_size=size.small, bgcolor=color.new(#16213e, 0))
+    wrColor = winRate >= 60 ? color.green : winRate >= 45 ? color.orange : color.red
+    table.cell(dash, 1, 13, str.tostring(winRate, "#.#") + "% (" + str.tostring(wins) + "W " + str.tostring(losses) + "L / " + str.tostring(totalTrades) + ")", text_color=wrColor, text_size=size.small, bgcolor=color.new(#16213e, 0))
+
+    table.cell(dash, 0, 14, "Profit Factor", text_color=color.gray, text_size=size.small, bgcolor=color.new(#16213e, 0))
+    pfColor = profitFactor >= 1.5 ? color.green : profitFactor >= 1.0 ? color.orange : color.red
+    table.cell(dash, 1, 14, str.tostring(profitFactor, "#.##"), text_color=pfColor, text_size=size.small, bgcolor=color.new(#16213e, 0))
+
+    table.cell(dash, 0, 15, "Expectancy", text_color=color.gray, text_size=size.small, bgcolor=color.new(#16213e, 0))
+    expColor = expectancy > 0 ? color.green : color.red
+    table.cell(dash, 1, 15, str.tostring(expectancy, "#.##") + "R", text_color=expColor, text_size=size.small, bgcolor=color.new(#16213e, 0))
+
+// ═══════════════════════════════════════════════════════════════
+// ALERTS
+// ═══════════════════════════════════════════════════════════════
+
+alertcondition(buySignalFiltered and strongBuy,   "Strong Buy",    "STRONG BUY Signal Triggered")
+alertcondition(buySignalFiltered,                 "Buy",           "BUY Signal Triggered")
+alertcondition(sellSignalFiltered and strongSell,  "Strong Sell",   "STRONG SELL Signal Triggered")
+alertcondition(sellSignalFiltered,                "Sell",          "SELL Signal Triggered")
+alertcondition(emaBullCross,                      "EMA Bull Cross", "9 EMA crossed above 50 EMA")
+alertcondition(emaBearCross,                      "EMA Bear Cross", "9 EMA crossed below 50 EMA")
+alertcondition(bbSqueeze and not bbSqueeze[1],    "BB Squeeze",    "Bollinger Band Squeeze Detected")

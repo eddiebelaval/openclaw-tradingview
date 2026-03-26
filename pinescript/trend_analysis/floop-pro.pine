@@ -1,0 +1,616 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © TheRealDrip2Rip
+
+// © FLOOP Pro — Finally Long Or Obviously Panicking
+// v3.0 — ML-optimized scoring weights via XGBoost + Random Forest + LightGBM ensemble
+//
+// ── KEY FINDINGS FROM ML OPTIMIZATION (8000 bars, 182 signals, 5-fold TimeSeriesSplit) ──
+//
+//  OLD scoring: HTF=2, MTF=4, SENS=3, VOL=1  → max 10 pts
+//  NEW scoring: HTF=1, MTF=4, SENS=3, EMA=4, VOL=2  → max 14 pts
+//
+//  Top predictors by importance:
+//    #1  Momentum (ROC 5/10/20)      ~38%  ← NEW — added to score
+//    #2  Volatility norm (ATR/price) ~23%  ← VOL weight doubled (1→2)
+//    #3  EMA alignment               ~14%  ← NEW — now 4 pts (was 0)
+//    #4  MTF confluence              ~10%  ← unchanged
+//    #5  Sensitivity cross-check      ~9%  ← only S:12 & S:16 matter
+//    #6  HTF RF agree                 ~4%  ← dropped from 2→1 (weak predictor)
+//
+//  Critical discoveries:
+//    • EMA aligned → 61.5% win rate vs 34.2% without (27pt lift!) ← biggest edge
+//    • 1m MTF = 0% importance → removed from scoring
+//    • S:3 and S:5 sensitivity = 0% importance → removed
+//    • All 5 MTF agree → 44.5% WR vs ≤2 agree → 38.9% (mild signal)
+//    • HTF RF alone barely helps — EMA cross is far stronger trend filter
+
+//@version=5
+indicator("FLOOP Pro", shorttitle="FLOOP", overlay=true, max_lines_count=500, max_labels_count=500, max_boxes_count=200)
+
+// ▌ INPUTS
+grp_core = "── Core Settings ──"
+i_sensitivity = input.int(5,    "Sensitivity",    minval=1, maxval=30, group=grp_core, tooltip="Baseline: 8. ML found S:12 and S:16 are the most predictive cross-checks.")
+i_atr_len     = input.int(14,   "ATR Length",     minval=1, maxval=50, group=grp_core)
+i_atr_mult    = input.float(0.8,"ATR Multiplier", minval=0.1, step=0.1, group=grp_core)
+
+grp_tpsl = "── Auto TP / SL ──"
+i_tp1_r = input.float(3.0, "TP1 (× ATR)", minval=0.5, step=0.5, group=grp_tpsl)
+i_tp2_r = input.float(4.0, "TP2 (× ATR)", minval=1.0, step=0.5, group=grp_tpsl)
+i_sl_r  = input.float(2.2, "Stop Loss (× ATR)", minval=0.2, step=0.1, group=grp_tpsl)
+
+grp_htf = "── Higher Timeframe ──"
+i_htf        = input.timeframe("30", "HTF Timeframe", group=grp_htf)
+i_htf_ma_len = input.int(90, "HTF MA Length", minval=5, group=grp_htf)
+
+grp_ema = "── EMA Overlay ──"
+i_show_ema = input.bool(true, "Show EMA Lines", group=grp_ema)
+i_ema_fast = input.int(60, "Fast EMA", minval=2, group=grp_ema)
+i_ema_slow = input.int(200, "Slow EMA", minval=5, group=grp_ema)
+
+grp_sig = "── Signals ──"
+i_show_labels = input.bool(false,  "Show LONG/SHORT Labels",  group=grp_sig)
+i_show_arrows = input.bool(true,  "Show Signal Arrows",      group=grp_sig)
+i_show_tp_sl  = input.bool(false,  "Draw TP / SL Lines",      group=grp_sig)
+i_show_filter = input.bool(true,  "Show Range Filter Line",  group=grp_sig)
+i_show_trail  = input.bool(true,  "Show Trailing Band",      group=grp_sig)
+i_ema_filter  = input.bool(false, "Only show signals when EMA aligned (ML-recommended)", group=grp_sig, tooltip="ML found EMA alignment lifts win rate by ~27pts. Enable for higher quality, fewer signals.")
+
+grp_dash = "── Dashboard ──"
+i_show_dash = input.bool(false,     "Show Dashboard",          group=grp_dash)
+i_dash_x    = input.string("Right","Dashboard Position", options=["Left","Right"], group=grp_dash)
+i_show_mtf  = input.bool(true,     "Show MTF Table",          group=grp_dash)
+i_show_sens = input.bool(true,     "Show Sensitivity Table",  group=grp_dash)
+
+grp_col = "── Colors ──"
+i_col_bull    = input.color(color.new(#00d4a0, 0),  "Bullish",         group=grp_col)
+i_col_bear    = input.color(color.new(#ff4d6d, 0),  "Bearish",         group=grp_col)
+i_col_filter  = input.color(color.new(#9b7fe8, 0),  "Filter Line",     group=grp_col)
+i_col_trail_b = input.color(color.new(#00d4a0, 88), "Trail Bull Fill", group=grp_col)
+i_col_trail_r = input.color(color.new(#ff4d6d, 88), "Trail Bear Fill", group=grp_col)
+
+grp_ft = "── Forward Test ──"
+i_show_ft  = input.bool(true,                          "Show Forward Test Metrics", group=grp_ft)
+i_ft_start = input.time(timestamp("2025-01-01 00:00"), "Start Date",               group=grp_ft)
+i_ft_exit  = input.string("TP1/SL", "Exit Method", options=["TP1/SL","TP1/SL or Flip","Flip Only"], group=grp_ft)
+
+// ▌ CORE RANGE FILTER
+f_range_filter(src, sens, atr_len, atr_mult) =>
+    atr   = ta.atr(atr_len)
+    rng   = atr * atr_mult * (sens / 8.0)
+    var float filt  = src
+    var int   trend = 0
+    filt  := src > filt + rng ? src - rng : src < filt - rng ? src + rng : filt
+    prev   = trend[1]
+    trend := filt > filt[1] ? 1 : filt < filt[1] ? -1 : trend[1]
+    sig    = trend != prev ? trend : 0
+    [filt, trend, sig]
+
+[rf_filt, rf_trend, rf_sig] = f_range_filter(close, i_sensitivity, i_atr_len, i_atr_mult)
+
+// ▌ ATR & VOLATILITY
+// ML: ATR-normalized (ATR/price) was top-3 predictor. Vol bucket weight: 1→2
+atr_val  = ta.atr(i_atr_len)
+atr_norm = atr_val / close * 100
+
+atr_rank = 0.0
+for k = 0 to 59
+    if atr_val >= atr_val[k]
+        atr_rank += 1
+atr_rank := math.round(atr_rank / 60 * 100)
+
+vol_label = atr_rank > 75 ? "HIGH" : atr_rank > 45 ? "MEDIUM" : "LOW"
+vol_col   = atr_rank > 75 ? i_col_bear : atr_rank > 45 ? color.new(#f0c040,0) : i_col_bull
+score_vol = (atr_rank < 80 ? 1 : 0) + (atr_norm < ta.percentile_nearest_rank(atr_norm, 60, 65) ? 1 : 0)
+
+// ▌ MOMENTUM — ROC  (NEW — #1 predictor ~38% importance)
+
+roc5  = (close - close[5])  / close[5]  * 100
+roc10 = (close - close[10]) / close[10] * 100
+roc20 = (close - close[20]) / close[20] * 100
+
+mom_bull    = roc5 > 0 and roc10 > 0 and roc20 > 0
+mom_bear    = roc5 < 0 and roc10 < 0 and roc20 < 0
+mom_aligned = (rf_trend == 1 and mom_bull) or (rf_trend == -1 and mom_bear)
+mom_partial = (rf_trend == 1 and roc5 > 0) or (rf_trend == -1 and roc5 < 0)
+
+
+// ▌ EMA OVERLAY + ALIGNMENT SCORING
+// ML: EMA alignment = 36% importance. Win rate: 61.5% aligned vs 34.2% not.
+// Now worth 4 pts combined with momentum (was 0 pts — completely missing!)
+
+ema_fast = ta.ema(close, i_ema_fast)
+ema_slow = ta.ema(close, i_ema_slow)
+
+ema_cross_bull  = ema_fast > ema_slow
+ema_price_above = close > ema_fast
+ema_slope_up    = ema_fast > ema_fast[5]
+ema_all_bull    = ema_cross_bull and ema_price_above and ema_slope_up
+
+ema_cross_bear  = ema_fast < ema_slow
+ema_price_below = close < ema_fast
+ema_slope_down  = ema_fast < ema_fast[5]
+ema_all_bear    = ema_cross_bear and ema_price_below and ema_slope_down
+
+ema_cond1 = rf_trend == 1 ? ema_cross_bull  : ema_cross_bear
+ema_cond2 = rf_trend == 1 ? ema_price_above : ema_price_below
+score_ema = math.min((ema_cond1 ? 1 : 0) + (ema_cond2 ? 1 : 0) + (mom_aligned ? 1 : 0) + (mom_partial ? 1 : 0), 4)
+
+ema_fully_aligned = rf_trend == 1 ? ema_all_bull : ema_all_bear
+
+plot(i_show_ema ? ema_fast : na, "EMA Fast", color=color.new(#00aaff,30), linewidth=1)
+plot(i_show_ema ? ema_slow : na, "EMA Slow", color=color.new(#ff8c42,40), linewidth=1)
+
+// ▌ RANGE FILTER PLOT + BAND
+
+rf_upper   = rf_filt + atr_val * i_atr_mult
+rf_lower   = rf_filt - atr_val * i_atr_mult
+filt_line  = plot(i_show_filter ? rf_filt  : na, "Range Filter", color=i_col_filter, linewidth=2)
+upper_line = plot(i_show_trail  ? rf_upper : na, "Band Upper",   color=color.new(i_col_filter,80), linewidth=1)
+lower_line = plot(i_show_trail  ? rf_lower : na, "Band Lower",   color=color.new(i_col_filter,80), linewidth=1)
+fill(upper_line, filt_line, color=rf_trend==1  ? i_col_trail_b : color.new(i_col_filter,95))
+fill(filt_line, lower_line, color=rf_trend==-1 ? i_col_trail_r : color.new(i_col_filter,95))
+
+// ▌ SIGNAL GATING
+long_sig_raw  = rf_sig == 1
+short_sig_raw = rf_sig == -1
+ema_gate      = i_ema_filter ? ema_fully_aligned : true
+long_sig      = long_sig_raw  and ema_gate
+short_sig     = short_sig_raw and ema_gate
+
+// ▌ SIGNAL ARROWS + LABELS
+plotshape(i_show_arrows and long_sig,  "Long Arrow",  shape.triangleup,   location.belowbar, i_col_bull, size=size.small)
+plotshape(i_show_arrows and short_sig, "Short Arrow", shape.triangledown, location.abovebar, i_col_bear, size=size.small)
+
+if i_show_labels and long_sig
+    label.new(bar_index, low - atr_val*0.5, "▲ LONG",
+      color=i_col_bull, style=label.style_label_up, textcolor=color.black, size=size.small)
+if i_show_labels and short_sig
+    label.new(bar_index, high + atr_val*0.5, "▼ SHORT",
+      color=i_col_bear, style=label.style_label_down, textcolor=color.black, size=size.small)
+
+plotshape(i_show_arrows and i_ema_filter and long_sig_raw  and not ema_gate, "Filtered Long",  shape.xcross, location.belowbar, color.new(i_col_bull,60), size=size.tiny)
+plotshape(i_show_arrows and i_ema_filter and short_sig_raw and not ema_gate, "Filtered Short", shape.xcross, location.abovebar, color.new(i_col_bear,60), size=size.tiny)
+
+// ▌ AUTO TP / SL
+var float entry_price = na
+var float tp1_price   = na
+var float tp2_price   = na
+var float sl_price    = na
+var int   pos_dir     = 0
+var line  line_tp1    = na
+var line  line_tp2    = na
+var line  line_sl     = na
+var line  line_entry  = na
+
+TP1_COL   = color.new(#39e075, 0)
+TP2_COL   = color.new(#00d4a0, 30)
+SL_COL    = color.new(#ff4d6d, 0)
+ENTRY_COL = color.new(#00aaff, 0)
+
+if long_sig or short_sig
+    line.delete(line_tp1)
+    line.delete(line_tp2)
+    line.delete(line_sl)
+    line.delete(line_entry)
+    dir         = long_sig ? 1 : -1
+    pos_dir    := dir
+    entry_price := close
+    tp1_price   := close + dir * atr_val * i_tp1_r
+    tp2_price   := close + dir * atr_val * i_tp2_r
+    sl_price    := close - dir * atr_val * i_sl_r
+    if i_show_tp_sl
+        ext = extend.right
+        line_entry := line.new(bar_index, entry_price, bar_index+1, entry_price, color=ENTRY_COL, width=1, style=line.style_dashed, extend=ext)
+        line_tp1   := line.new(bar_index, tp1_price,   bar_index+1, tp1_price,   color=TP1_COL,   width=1, style=line.style_dashed, extend=ext)
+        line_tp2   := line.new(bar_index, tp2_price,   bar_index+1, tp2_price,   color=TP2_COL,   width=1, style=line.style_dotted, extend=ext)
+        line_sl    := line.new(bar_index, sl_price,    bar_index+1, sl_price,    color=SL_COL,    width=1, style=line.style_dashed, extend=ext)
+        label.new(bar_index, tp1_price,   " TP1 "   + str.tostring(tp1_price,   "#.##"), color=color.new(TP1_COL,  70), textcolor=TP1_COL,   style=label.style_label_left, size=size.small)
+        label.new(bar_index, tp2_price,   " TP2 "   + str.tostring(tp2_price,   "#.##"), color=color.new(TP2_COL,  70), textcolor=TP2_COL,   style=label.style_label_left, size=size.small)
+        label.new(bar_index, sl_price,    " SL  "   + str.tostring(sl_price,    "#.##"), color=color.new(SL_COL,   70), textcolor=SL_COL,    style=label.style_label_left, size=size.small)
+        label.new(bar_index, entry_price, " ENTRY " + str.tostring(entry_price, "#.##"), color=color.new(ENTRY_COL,70), textcolor=ENTRY_COL, style=label.style_label_left, size=size.small)
+
+pnl_pts  = not na(entry_price) ? (close - entry_price) * pos_dir : 0.0
+rr_val   = not na(tp1_price) and not na(sl_price) and not na(entry_price) ? math.abs(tp1_price - entry_price) / math.abs(sl_price - entry_price) : 0.0
+dist_tp1 = not na(tp1_price) ? math.abs(tp1_price - close) : na
+dist_sl  = not na(sl_price)  ? math.abs(close - sl_price)  : na
+
+// ▌ HTF BIAS  (weight reduced 2→1, ML: only 3.8% importance)
+[_, htf_trend, _] = request.security(syminfo.tickerid, i_htf, f_range_filter(close, i_sensitivity, i_atr_len, i_atr_mult), lookahead=barmerge.lookahead_off)
+htf_bull  = htf_trend == 1
+htf_label = htf_bull ? "BULL" : "BEAR"
+htf_col   = htf_bull ? i_col_bull : i_col_bear
+sig_dir   = rf_trend
+score_htf = (sig_dir == 1 and htf_bull) or (sig_dir == -1 and not htf_bull) ? 1 : 0
+
+// ▌ MTF BIAS  (1m removed from scoring — ML: 0% importance)
+[_, mtf1_trend,  _] = request.security(syminfo.tickerid, "1",   f_range_filter(close, i_sensitivity, i_atr_len, i_atr_mult), lookahead=barmerge.lookahead_off)
+[_, mtf5_trend,  _] = request.security(syminfo.tickerid, "5",   f_range_filter(close, i_sensitivity, i_atr_len, i_atr_mult), lookahead=barmerge.lookahead_off)
+[_, mtf15_trend, _] = request.security(syminfo.tickerid, "15",  f_range_filter(close, i_sensitivity, i_atr_len, i_atr_mult), lookahead=barmerge.lookahead_off)
+[_, mtf60_trend, _] = request.security(syminfo.tickerid, "60",  f_range_filter(close, i_sensitivity, i_atr_len, i_atr_mult), lookahead=barmerge.lookahead_off)
+[_, mtf240_trend,_] = request.security(syminfo.tickerid, "240", f_range_filter(close, i_sensitivity, i_atr_len, i_atr_mult), lookahead=barmerge.lookahead_off)
+
+score_mtf  = (mtf5_trend==sig_dir?1:0) + (mtf15_trend==sig_dir?1:0) + (mtf60_trend==sig_dir?1:0) + (mtf240_trend==sig_dir?1:0)
+mtf_bulls  = (mtf1_trend==1?1:0) + (mtf5_trend==1?1:0) + (mtf15_trend==1?1:0) + (mtf60_trend==1?1:0) + (mtf240_trend==1?1:0)
+mtf_bears  = 5 - mtf_bulls
+
+// ▌ SENSITIVITY CROSS-CHECK  (S:3 and S:5 removed — ML: 0% importance)
+// S:12 = 2pts (58% of sens weight), S:16 = 1pt (42%)
+[_, sA_trend, _] = f_range_filter(close, 3,  i_atr_len, i_atr_mult)
+[_, sB_trend, _] = f_range_filter(close, 5,  i_atr_len, i_atr_mult)
+[_, sC_trend, _] = f_range_filter(close, 12, i_atr_len, i_atr_mult)
+[_, sD_trend, _] = f_range_filter(close, 16, i_atr_len, i_atr_mult)
+
+score_sens = (sC_trend==sig_dir ? 2 : 0) + (sD_trend==sig_dir ? 1 : 0)
+sens_bulls = (sA_trend==1?1:0) + (sB_trend==1?1:0) + (rf_trend==1?1:0) + (sC_trend==1?1:0) + (sD_trend==1?1:0)
+
+// ▌ ML-OPTIMIZED SIGNAL STRENGTH SCORE (0–14)
+signal_strength = math.max(0, math.min(score_htf + score_mtf + score_sens + score_ema + score_vol, 14))
+
+str_label = signal_strength >= 11 ? "HIGH"     :signal_strength >= 8  ? "MEDIUM"   :signal_strength >= 6  ? "LOW"      : "VERY LOW"
+str_col   = signal_strength >= 11 ? i_col_bull :signal_strength >= 8  ? color.new(#f0c040,0) : i_col_bear
+
+f_bar(n, max) =>
+    out = ""
+    for i = 0 to max - 1
+        out += i < n ? "█" : "░"
+    out
+
+strength_bar = f_bar(signal_strength, 14)
+
+// ▌ BACKGROUND TINT
+bgcolor(rf_trend == 1 ? color.new(i_col_bull,97) : color.new(i_col_bear,97), title="Trend Tint")
+
+// ▌ ALERTS
+alertcondition(long_sig,                            "FLOOP Long Signal",          "FLOOP: Long signal fired. Check dashboard for score.")
+alertcondition(short_sig,                           "FLOOP Short Signal",         "FLOOP: Short signal fired. Check dashboard for score.")
+alertcondition(long_sig  and signal_strength >= 11, "FLOOP High Quality Long",    "FLOOP: HIGH QUALITY Long — score 11+/14.")
+alertcondition(short_sig and signal_strength >= 11, "FLOOP High Quality Short",   "FLOOP: HIGH QUALITY Short — score 11+/14.")
+alertcondition(long_sig  and ema_fully_aligned,     "FLOOP EMA-Confirmed Long",   "FLOOP: Long with full EMA alignment. ML hist WR: 61.5%.")
+alertcondition(short_sig and ema_fully_aligned,     "FLOOP EMA-Confirmed Short",  "FLOOP: Short with full EMA alignment. ML hist WR: 61.5%.")
+
+// ▌ SHARED TABLE COLORS
+DASH_DARK  = color.new(#0d1117,  5)
+DASH_PANEL = color.new(#131920, 10)
+DASH_BDR   = color.new(#1e2832,  0)
+DASH_TEXT  = color.new(#d4e3f0,  0)
+DASH_MUTED = color.new(#4a6278,  0)
+DASH_BLUE  = color.new(#00aaff,  0)
+DASH_GOLD  = color.new(#f0c040,  0)
+BLACK      = color.new(color.black, 0)
+
+f_sep(tbl, row, cols) =>
+    for c = 0 to cols - 1
+        table.cell(tbl, c, row, "", bgcolor=DASH_BDR)
+
+// ▌ MAIN DASHBOARD TABLE
+var table dash = na
+
+if barstate.islast and i_show_dash
+    dash := table.new(
+      i_dash_x == "Right" ? position.top_right : position.top_left,
+      2, 32,
+      border_color=DASH_BDR, border_width=1,
+      frame_color=DASH_BLUE, frame_width=1)
+
+    table.cell(dash, 0, 0, "  FLOOP PRO  v3 ML", text_color=DASH_BLUE, bgcolor=DASH_DARK, text_size=size.normal, text_halign=text.align_left)
+    table.cell(dash, 1, 0, "ML-opt  ", text_color=DASH_GOLD, bgcolor=DASH_DARK, text_size=size.small, text_halign=text.align_right)
+
+    table.cell(dash, 0, 1, "  RANGE FILTER", text_color=DASH_MUTED, bgcolor=DASH_PANEL, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(dash, 1, 1, rf_trend==1?"BULLISH":"BEARISH", text_color=BLACK, bgcolor=rf_trend==1?i_col_bull:i_col_bear, text_size=size.small)
+
+    table.cell(dash, 0, 2, "  HTF (" + i_htf + "m)", text_color=DASH_MUTED, bgcolor=DASH_DARK, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(dash, 1, 2, htf_label + " [1pt]", text_color=BLACK, bgcolor=htf_col, text_size=size.small)
+
+    table.cell(dash, 0, 3, "  Volatility", text_color=DASH_MUTED, bgcolor=DASH_PANEL, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(dash, 1, 3, vol_label + " (" + str.tostring(atr_rank) + "%ile)", text_color=vol_col, bgcolor=DASH_PANEL, text_size=size.small)
+
+    table.cell(dash, 0, 4, "  ATR / Price%", text_color=DASH_MUTED, bgcolor=DASH_DARK, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(dash, 1, 4, str.tostring(atr_norm, "#.###") + "%", text_color=DASH_TEXT, bgcolor=DASH_DARK, text_size=size.small)
+
+    f_sep(dash, 5, 2)
+
+    table.cell(dash, 0, 6, "  EMA ALIGNMENT  ★ML#1", text_color=DASH_GOLD, bgcolor=DASH_PANEL, text_size=size.tiny, text_halign=text.align_left)
+    ema_ec = ema_fully_aligned ? i_col_bull : i_col_bear
+    table.cell(dash, 1, 6, ema_fully_aligned ? "✓ FULLY ALIGNED" : "✗ NOT ALIGNED", text_color=ema_ec, bgcolor=DASH_PANEL, text_size=size.small)
+
+    table.cell(dash, 0, 7, "  EMA Cross", text_color=DASH_MUTED, bgcolor=DASH_DARK, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(dash, 1, 7, ema_cond1 ? "✓ WITH TREND" : "✗ AGAINST", text_color=ema_cond1?i_col_bull:i_col_bear, bgcolor=DASH_DARK, text_size=size.small)
+
+    table.cell(dash, 0, 8, "  Price vs EMA20", text_color=DASH_MUTED, bgcolor=DASH_PANEL, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(dash, 1, 8, ema_cond2 ? "✓ ALIGNED" : "✗ AGAINST", text_color=ema_cond2?i_col_bull:i_col_bear, bgcolor=DASH_PANEL, text_size=size.small)
+
+    table.cell(dash, 0, 9, "  Momentum ROC5", text_color=DASH_MUTED, bgcolor=DASH_DARK, text_size=size.tiny, text_halign=text.align_left)
+    roc5_col = (rf_trend==1 and roc5>0) or (rf_trend==-1 and roc5<0) ? i_col_bull : i_col_bear
+    table.cell(dash, 1, 9, str.tostring(roc5,"#.##") + "%", text_color=roc5_col, bgcolor=DASH_DARK, text_size=size.small)
+
+    table.cell(dash, 0, 10, "  Momentum ROC20", text_color=DASH_MUTED, bgcolor=DASH_PANEL, text_size=size.tiny, text_halign=text.align_left)
+    roc20_col = (rf_trend==1 and roc20>0) or (rf_trend==-1 and roc20<0) ? i_col_bull : i_col_bear
+    table.cell(dash, 1, 10, str.tostring(roc20,"#.##") + "%", text_color=roc20_col, bgcolor=DASH_PANEL, text_size=size.small)
+
+    f_sep(dash, 11, 2)
+
+    table.cell(dash, 0, 12, "  POSITION", text_color=DASH_MUTED, bgcolor=DASH_PANEL, text_size=size.tiny, text_halign=text.align_left)
+    pos_str  = na(entry_price) ? "—" : pos_dir==1 ? "▲ LONG" : "▼ SHORT"
+    pos_col2 = na(entry_price) ? DASH_MUTED : pos_dir==1 ? i_col_bull : i_col_bear
+    table.cell(dash, 1, 12, pos_str, text_color=pos_col2, bgcolor=DASH_PANEL, text_size=size.small)
+
+    table.cell(dash, 0, 13, "  Entry", text_color=DASH_MUTED, bgcolor=DASH_DARK, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(dash, 1, 13, na(entry_price)?"—":str.tostring(entry_price,"#.##"), text_color=DASH_BLUE, bgcolor=DASH_DARK, text_size=size.small)
+
+    table.cell(dash, 0, 14, "  TP1", text_color=DASH_MUTED, bgcolor=DASH_PANEL, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(dash, 1, 14, na(tp1_price)?"—":str.tostring(tp1_price,"#.##"), text_color=color.new(#39e075,0), bgcolor=DASH_PANEL, text_size=size.small)
+
+    table.cell(dash, 0, 15, "  TP2", text_color=DASH_MUTED, bgcolor=DASH_DARK, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(dash, 1, 15, na(tp2_price)?"—":str.tostring(tp2_price,"#.##"), text_color=i_col_bull, bgcolor=DASH_DARK, text_size=size.small)
+
+    table.cell(dash, 0, 16, "  Stop Loss", text_color=DASH_MUTED, bgcolor=DASH_PANEL, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(dash, 1, 16, na(sl_price)?"—":str.tostring(sl_price,"#.##"), text_color=i_col_bear, bgcolor=DASH_PANEL, text_size=size.small)
+
+    pnl_col = pnl_pts>=0 ? i_col_bull : i_col_bear
+    pnl_str = na(entry_price)?"—":(pnl_pts>=0?"+":"")+str.tostring(pnl_pts,"#.##")+" pts"
+    table.cell(dash, 0, 17, "  P&L", text_color=DASH_MUTED, bgcolor=DASH_DARK, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(dash, 1, 17, pnl_str, text_color=pnl_col, bgcolor=DASH_DARK, text_size=size.small)
+
+    table.cell(dash, 0, 18, "  R:R (TP1)", text_color=DASH_MUTED, bgcolor=DASH_PANEL, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(dash, 1, 18, na(entry_price)?"—":str.tostring(rr_val,"#.##")+" : 1", text_color=DASH_GOLD, bgcolor=DASH_PANEL, text_size=size.small)
+
+    f_sep(dash, 19, 2)
+
+    table.cell(dash, 0, 20, "  SIGNAL QUALITY", text_color=DASH_MUTED, bgcolor=DASH_PANEL, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(dash, 1, 20, str_label + " (" + str.tostring(signal_strength) + "/14)", text_color=str_col, bgcolor=DASH_PANEL, text_size=size.small)
+
+    table.cell(dash, 0, 21, "  Score Bar", text_color=DASH_MUTED, bgcolor=DASH_DARK, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(dash, 1, 21, strength_bar, text_color=str_col, bgcolor=DASH_DARK, text_size=size.tiny)
+
+    table.cell(dash, 0, 22, "  HTF Score", text_color=DASH_MUTED, bgcolor=DASH_PANEL, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(dash, 1, 22, str.tostring(score_htf) + " / 1", text_color=DASH_TEXT, bgcolor=DASH_PANEL, text_size=size.small)
+
+    table.cell(dash, 0, 23, "  MTF Score", text_color=DASH_MUTED, bgcolor=DASH_DARK, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(dash, 1, 23, str.tostring(score_mtf) + " / 4", text_color=DASH_TEXT, bgcolor=DASH_DARK, text_size=size.small)
+
+    table.cell(dash, 0, 24, "  Sens Score", text_color=DASH_MUTED, bgcolor=DASH_PANEL, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(dash, 1, 24, str.tostring(score_sens) + " / 3", text_color=DASH_TEXT, bgcolor=DASH_PANEL, text_size=size.small)
+
+    table.cell(dash, 0, 25, "  EMA+Mom Score ★", text_color=DASH_GOLD, bgcolor=DASH_DARK, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(dash, 1, 25, str.tostring(score_ema) + " / 4", text_color=str_col, bgcolor=DASH_DARK, text_size=size.small)
+
+    table.cell(dash, 0, 26, "  Vol Score", text_color=DASH_MUTED, bgcolor=DASH_PANEL, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(dash, 1, 26, str.tostring(score_vol) + " / 2", text_color=DASH_TEXT, bgcolor=DASH_PANEL, text_size=size.small)
+
+    f_sep(dash, 27, 2)
+
+    tip = signal_strength >= 11 ? "✓ High conviction. Edge confirmed by ML." :
+          signal_strength >= 8  ? "◈ Moderate. Consider EMA alignment." :
+          signal_strength >= 6  ? "⚠ Low confluence. Risky entry." :
+                                  "✗ Very low. Maybe touch grass."
+    table.cell(dash, 0, 28, tip, text_color=str_col, bgcolor=DASH_PANEL, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(dash, 1, 28, "", bgcolor=DASH_PANEL)
+
+    ema_nc = i_ema_filter ? i_col_bull : DASH_MUTED
+    table.cell(dash, 0, 29, "  EMA filter: " + (i_ema_filter ? "ON" : "OFF"), text_color=ema_nc, bgcolor=DASH_DARK, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(dash, 1, 29, "S:" + str.tostring(i_sensitivity), text_color=DASH_BLUE, bgcolor=DASH_DARK, text_size=size.tiny)
+
+// ▌ MTF TABLE
+var table mtf_tbl = na
+if barstate.islast and i_show_mtf
+    mtf_tbl := table.new(
+      i_dash_x == "Right" ? position.bottom_right : position.bottom_left,
+      7, 3,
+      border_color=DASH_BDR, border_width=1,
+      frame_color=DASH_BDR, frame_width=1)
+
+    table.cell(mtf_tbl, 0, 0, "MTF BIAS", text_color=DASH_MUTED, bgcolor=DASH_DARK, text_size=size.tiny)
+    tfnames = array.from("1m*","5m","15m","1h","4h","SCORE")
+    for i = 0 to 5
+        lbl_col = i == 0 ? color.new(DASH_MUTED,50) : DASH_MUTED
+        table.cell(mtf_tbl, i+1, 0, array.get(tfnames,i), text_color=lbl_col, bgcolor=DASH_DARK, text_size=size.tiny)
+
+    table.cell(mtf_tbl, 0, 1, "*not scored", text_color=color.new(DASH_MUTED,50), bgcolor=DASH_PANEL, text_size=size.tiny)
+    for i = 1 to 6
+        table.cell(mtf_tbl, i, 1, "", bgcolor=DASH_PANEL)
+
+    table.cell(mtf_tbl, 0, 2, "RF Trend", text_color=DASH_MUTED, bgcolor=DASH_DARK, text_size=size.tiny)
+    trends_arr = array.from(mtf1_trend, mtf5_trend, mtf15_trend, mtf60_trend, mtf240_trend)
+    for ti = 0 to 4
+        tr  = array.get(trends_arr, ti)
+        tc  = ti == 0 ? color.new(BLACK,50) : BLACK
+        table.cell(mtf_tbl, ti+1, 2, tr==1?"BULL":"BEAR", text_color=tc, bgcolor=tr==1?i_col_bull:i_col_bear, text_size=size.tiny)
+    table.cell(mtf_tbl, 6, 2, str.tostring(score_mtf)+"/4", text_color=str_col, bgcolor=DASH_DARK, text_size=size.tiny)
+
+// ▌ SENSITIVITY TABLE
+var table sens_tbl = na
+if barstate.islast and i_show_sens
+    sens_tbl := table.new(
+      position.bottom_center, 6, 3,
+      border_color=DASH_BDR, border_width=1,
+      frame_color=DASH_BDR, frame_width=1)
+
+    table.cell(sens_tbl, 0, 0, "SENS X-CHECK", text_color=DASH_MUTED, bgcolor=DASH_DARK, text_size=size.tiny)
+    s_labels = array.from("S:3*","S:5*","S:"+str.tostring(i_sensitivity)+"★","S:12(2pt)","S:16(1pt)")
+    s_trends = array.from(sA_trend, sB_trend, rf_trend, sC_trend, sD_trend)
+    for si = 0 to 4
+        lc = si==2 ? DASH_BLUE : si<2 ? color.new(DASH_MUTED,50) : DASH_GOLD
+        table.cell(sens_tbl, si+1, 0, array.get(s_labels,si), text_color=lc, bgcolor=DASH_DARK, text_size=size.tiny)
+
+    table.cell(sens_tbl, 0, 1, "*ML: 0% importance", text_color=color.new(DASH_MUTED,50), bgcolor=DASH_PANEL, text_size=size.tiny)
+    for si = 1 to 5
+        table.cell(sens_tbl, si, 1, "", bgcolor=DASH_PANEL)
+
+    table.cell(sens_tbl, 0, 2, "Bias", text_color=DASH_MUTED, bgcolor=DASH_DARK, text_size=size.tiny)
+    for si = 0 to 4
+        tr = array.get(s_trends, si)
+        tc = si < 2 ? color.new(BLACK,50) : BLACK
+        table.cell(sens_tbl, si+1, 2, tr==1?"BULL":"BEAR", text_color=tc, bgcolor=tr==1?i_col_bull:i_col_bear, text_size=size.tiny)
+
+// ▌ FORWARD TEST ENGINE
+var int   ft_trades    = 0
+var int   ft_wins      = 0
+var int   ft_losses    = 0
+var float ft_total_pnl = 0.0
+var float ft_win_pts   = 0.0
+var float ft_loss_pts  = 0.0
+var float ft_peak_pnl  = 0.0
+var float ft_max_dd    = 0.0
+var float ft_entry_p   = na
+var float ft_tp1_p     = na
+var float ft_sl_p      = na
+var int   ft_dir_p     = 0
+var bool  ft_active    = false
+var int   ft_consec_w  = 0
+var int   ft_consec_l  = 0
+var int   ft_max_cw    = 0
+var int   ft_max_cl    = 0
+var float ft_best      = 0.0
+var float ft_worst     = 0.0
+
+in_window = time >= i_ft_start
+
+if (long_sig or short_sig) and in_window
+    if ft_active and (i_ft_exit == "TP1/SL or Flip" or i_ft_exit == "Flip Only")
+        flip_pnl      = (close - ft_entry_p) * ft_dir_p
+        ft_trades    += 1
+        ft_total_pnl += flip_pnl
+        if flip_pnl > 0
+            ft_wins     += 1
+            ft_win_pts  += flip_pnl
+            ft_consec_w += 1
+            ft_consec_l := 0
+            ft_max_cw   := math.max(ft_max_cw, ft_consec_w)
+        else
+            ft_losses   += 1
+            ft_loss_pts += math.abs(flip_pnl)
+            ft_consec_l += 1
+            ft_consec_w := 0
+            ft_max_cl   := math.max(ft_max_cl, ft_consec_l)
+        ft_best       := math.max(ft_best,  flip_pnl)
+        ft_worst      := math.min(ft_worst, flip_pnl)
+        ft_peak_pnl   := math.max(ft_peak_pnl, ft_total_pnl)
+        ft_max_dd     := math.max(ft_max_dd, ft_peak_pnl - ft_total_pnl)
+
+    ft_active   := true
+    ft_dir_p    := long_sig ? 1 : -1
+    ft_entry_p  := close
+    ft_tp1_p    := close + ft_dir_p * atr_val * i_tp1_r
+    ft_sl_p     := close - ft_dir_p * atr_val * i_sl_r
+
+if ft_active and i_ft_exit != "Flip Only"
+    hit_tp = ft_dir_p == 1 ? high >= ft_tp1_p : low  <= ft_tp1_p
+    hit_sl = ft_dir_p == 1 ? low  <= ft_sl_p  : high >= ft_sl_p
+    if hit_tp or hit_sl
+        exit_p        = hit_tp ? ft_tp1_p : ft_sl_p
+        trade_pnl     = (exit_p - ft_entry_p) * ft_dir_p
+        ft_trades    += 1
+        ft_total_pnl += trade_pnl
+        if trade_pnl > 0
+            ft_wins     += 1
+            ft_win_pts  += trade_pnl
+            ft_consec_w += 1
+            ft_consec_l := 0
+            ft_max_cw   := math.max(ft_max_cw, ft_consec_w)
+        else
+            ft_losses   += 1
+            ft_loss_pts += math.abs(trade_pnl)
+            ft_consec_l += 1
+            ft_consec_w := 0
+            ft_max_cl   := math.max(ft_max_cl, ft_consec_l)
+        ft_best       := math.max(ft_best,  trade_pnl)
+        ft_worst      := math.min(ft_worst, trade_pnl)
+        ft_peak_pnl   := math.max(ft_peak_pnl, ft_total_pnl)
+        ft_max_dd     := math.max(ft_max_dd, ft_peak_pnl - ft_total_pnl)
+        ft_active     := false
+        ft_entry_p    := na
+
+ft_winrate    = ft_trades > 0 ? ft_wins / ft_trades * 100 : 0.0
+ft_avg_win    = ft_wins   > 0 ? ft_win_pts  / ft_wins   : 0.0
+ft_avg_loss   = ft_losses > 0 ? ft_loss_pts / ft_losses : 0.0
+ft_expectancy = ft_trades > 0 ? ft_total_pnl / ft_trades : 0.0
+ft_pf         = ft_loss_pts > 0 ? ft_win_pts / ft_loss_pts : ft_win_pts
+ft_rr_real    = ft_avg_loss > 0 ? ft_avg_win / ft_avg_loss : 0.0
+open_pnl      = ft_active ? (close - ft_entry_p) * ft_dir_p : 0.0
+open_pnl_col  = open_pnl >= 0 ? i_col_bull : i_col_bear
+
+// ▌ FORWARD TEST TABLE
+var table ft_tbl = na
+
+if barstate.islast and i_show_ft
+    ft_tbl := table.new(
+      position.top_center, 2, 22,
+      border_color=DASH_BDR, border_width=1,
+      frame_color=DASH_GOLD, frame_width=1)
+
+    table.cell(ft_tbl, 0, 0, "  FLOOP FORWARD TEST", text_color=DASH_GOLD, bgcolor=DASH_DARK, text_size=size.normal, text_halign=text.align_left)
+    table.cell(ft_tbl, 1, 0, str.format_time(i_ft_start,"MMM d yyyy") + "  ", text_color=DASH_MUTED, bgcolor=DASH_DARK, text_size=size.tiny, text_halign=text.align_right)
+
+    table.cell(ft_tbl, 0, 1, "  Total Trades",    text_color=DASH_MUTED, bgcolor=DASH_PANEL, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(ft_tbl, 1, 1, str.tostring(ft_trades), text_color=DASH_TEXT, bgcolor=DASH_PANEL, text_size=size.small)
+
+    table.cell(ft_tbl, 0, 2, "  Wins / Losses",   text_color=DASH_MUTED, bgcolor=DASH_DARK, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(ft_tbl, 1, 2, str.tostring(ft_wins) + " W  /  " + str.tostring(ft_losses) + " L", text_color=DASH_TEXT, bgcolor=DASH_DARK, text_size=size.small)
+
+    wr_col = ft_winrate >= 55 ? i_col_bull : ft_winrate >= 45 ? DASH_GOLD : i_col_bear
+    table.cell(ft_tbl, 0, 3, "  Win Rate",         text_color=DASH_MUTED, bgcolor=DASH_PANEL, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(ft_tbl, 1, 3, str.tostring(ft_winrate,"#.#") + "%", text_color=wr_col, bgcolor=DASH_PANEL, text_size=size.small)
+
+    pnl_col2 = ft_total_pnl >= 0 ? i_col_bull : i_col_bear
+    table.cell(ft_tbl, 0, 4, "  Total P&L (pts)",  text_color=DASH_MUTED, bgcolor=DASH_DARK, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(ft_tbl, 1, 4, (ft_total_pnl>=0?"+":"")+str.tostring(ft_total_pnl,"#.##"), text_color=pnl_col2, bgcolor=DASH_DARK, text_size=size.small)
+
+    exp_col = ft_expectancy >= 0 ? i_col_bull : i_col_bear
+    table.cell(ft_tbl, 0, 5, "  Expectancy/Trade", text_color=DASH_MUTED, bgcolor=DASH_PANEL, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(ft_tbl, 1, 5, (ft_expectancy>=0?"+":"")+str.tostring(ft_expectancy,"#.##")+" pts", text_color=exp_col, bgcolor=DASH_PANEL, text_size=size.small)
+
+    pf_col = ft_pf >= 1.5 ? i_col_bull : ft_pf >= 1.0 ? DASH_GOLD : i_col_bear
+    table.cell(ft_tbl, 0, 6, "  Profit Factor",    text_color=DASH_MUTED, bgcolor=DASH_DARK, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(ft_tbl, 1, 6, str.tostring(ft_pf,"#.##"), text_color=pf_col, bgcolor=DASH_DARK, text_size=size.small)
+
+    table.cell(ft_tbl, 0, 7, "  Avg Win (pts)",    text_color=DASH_MUTED, bgcolor=DASH_PANEL, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(ft_tbl, 1, 7, "+"+str.tostring(ft_avg_win,"#.##"), text_color=i_col_bull, bgcolor=DASH_PANEL, text_size=size.small)
+
+    table.cell(ft_tbl, 0, 8, "  Avg Loss (pts)",   text_color=DASH_MUTED, bgcolor=DASH_DARK, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(ft_tbl, 1, 8, "-"+str.tostring(ft_avg_loss,"#.##"), text_color=i_col_bear, bgcolor=DASH_DARK, text_size=size.small)
+
+    rr_col2 = ft_rr_real >= 1.5 ? i_col_bull : ft_rr_real >= 1.0 ? DASH_GOLD : i_col_bear
+    table.cell(ft_tbl, 0, 9, "  Realized R:R",     text_color=DASH_MUTED, bgcolor=DASH_PANEL, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(ft_tbl, 1, 9, str.tostring(ft_rr_real,"#.##")+" : 1", text_color=rr_col2, bgcolor=DASH_PANEL, text_size=size.small)
+
+    table.cell(ft_tbl, 0, 10, "  Best Trade",      text_color=DASH_MUTED, bgcolor=DASH_DARK, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(ft_tbl, 1, 10, "+"+str.tostring(ft_best,"#.##")+" pts", text_color=i_col_bull, bgcolor=DASH_DARK, text_size=size.small)
+
+    table.cell(ft_tbl, 0, 11, "  Worst Trade",     text_color=DASH_MUTED, bgcolor=DASH_PANEL, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(ft_tbl, 1, 11, str.tostring(ft_worst,"#.##")+" pts", text_color=i_col_bear, bgcolor=DASH_PANEL, text_size=size.small)
+
+    dd_col = ft_max_dd == 0 ? i_col_bull : ft_max_dd < ft_avg_win*3 ? DASH_GOLD : i_col_bear
+    table.cell(ft_tbl, 0, 12, "  Max Drawdown",    text_color=DASH_MUTED, bgcolor=DASH_DARK, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(ft_tbl, 1, 12, "-"+str.tostring(ft_max_dd,"#.##")+" pts", text_color=dd_col, bgcolor=DASH_DARK, text_size=size.small)
+
+    table.cell(ft_tbl, 0, 13, "  Max Win Streak",  text_color=DASH_MUTED, bgcolor=DASH_PANEL, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(ft_tbl, 1, 13, str.tostring(ft_max_cw)+" in a row", text_color=i_col_bull, bgcolor=DASH_PANEL, text_size=size.small)
+
+    table.cell(ft_tbl, 0, 14, "  Max Loss Streak", text_color=DASH_MUTED, bgcolor=DASH_PANEL, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(ft_tbl, 1, 14, str.tostring(ft_max_cl)+" in a row", text_color=i_col_bear, bgcolor=DASH_PANEL, text_size=size.small)
+
+    table.cell(ft_tbl, 0, 15, "", bgcolor=DASH_BDR)
+    table.cell(ft_tbl, 1, 15, "", bgcolor=DASH_BDR)
+
+    table.cell(ft_tbl, 0, 16, "  Open Trade",      text_color=DASH_MUTED, bgcolor=DASH_PANEL, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(ft_tbl, 1, 16, ft_active?(ft_dir_p==1?"▲ LONG":"▼ SHORT"):"—", text_color=ft_active?(ft_dir_p==1?i_col_bull:i_col_bear):DASH_MUTED, bgcolor=DASH_PANEL, text_size=size.small)
+
+    table.cell(ft_tbl, 0, 17, "  Open P&L",        text_color=DASH_MUTED, bgcolor=DASH_DARK, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(ft_tbl, 1, 17, ft_active?(open_pnl>=0?"+":"")+str.tostring(open_pnl,"#.##")+" pts":"—", text_color=ft_active?open_pnl_col:DASH_MUTED, bgcolor=DASH_DARK, text_size=size.small)
+
+    table.cell(ft_tbl, 0, 18, "", bgcolor=DASH_BDR)
+    table.cell(ft_tbl, 1, 18, "", bgcolor=DASH_BDR)
+
+    table.cell(ft_tbl, 0, 19, "  Exit Method",     text_color=DASH_MUTED, bgcolor=DASH_PANEL, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(ft_tbl, 1, 19, i_ft_exit,           text_color=DASH_BLUE,  bgcolor=DASH_PANEL, text_size=size.tiny)
+
+    table.cell(ft_tbl, 0, 20, "  Sensitivity",     text_color=DASH_MUTED, bgcolor=DASH_DARK, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(ft_tbl, 1, 20, str.tostring(i_sensitivity), text_color=DASH_BLUE, bgcolor=DASH_DARK, text_size=size.tiny)
+
+    grade     = ft_winrate >= 55 and ft_pf >= 1.5 and ft_expectancy > 0 ? "A  — EDGE CONFIRMED" :ft_winrate >= 50 and ft_pf >= 1.2                        ? "B  — PROMISING"      :ft_winrate >= 45  ? "C  — MARGINAL"       : "D  — NEEDS WORK"
+    grade_col = str.startswith(grade,"A") ? i_col_bull : str.startswith(grade,"B") ? DASH_GOLD : i_col_bear
+    table.cell(ft_tbl, 0, 21, "  Grade",           text_color=DASH_MUTED,  bgcolor=DASH_DARK, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(ft_tbl, 1, 21, grade,               text_color=grade_col,   bgcolor=DASH_DARK, text_size=size.small)
+
+// ▌ BAR COLOR
+barcolor(rf_trend==1 ? color.new(i_col_bull,60) : color.new(i_col_bear,60))

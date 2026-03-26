@@ -1,0 +1,295 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// TLADe Session AVWAP — Anchored VWAP by Market Session
+// ═══════════════════════════════════════════════════════════════════════════════
+// Auto-resets daily. No manual date input needed.
+//
+// Sessions (UTC default):
+//   ASIA      00:00  — Asian open / Globex rollover
+//   EUROPE    08:00  — European cash open
+//   USA       15:30  — US cash open (9:30 ET)
+//   USA PREV  15:30 previous day — persists until next US open
+//
+// The USA Previous Day AVWAP shows where yesterday's US session
+// volume-weighted average is pulling price. Cross of current vs prev
+// signals intraday regime change.
+//
+// by TLADe (tradelikeadealer.com)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+//@version=6
+indicator("TLADe Session AVWAP", overlay=true, max_labels_count=20, max_lines_count=20)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// INPUTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+grpTime = "⏰ Session Start Times (local timezone)"
+asiaH = input.int(0,  "Asia Hour",     minval=0, maxval=23, group=grpTime, inline="asia")
+asiaM = input.int(0,  "Min",           minval=0, maxval=59, group=grpTime, inline="asia")
+euH   = input.int(8,  "Europe Hour",   minval=0, maxval=23, group=grpTime, inline="eu")
+euM   = input.int(0,  "Min",           minval=0, maxval=59, group=grpTime, inline="eu")
+usaH  = input.int(9,  "USA Hour",      minval=0, maxval=23, group=grpTime, inline="usa")
+usaM  = input.int(30, "Min",           minval=0, maxval=59, group=grpTime, inline="usa")
+
+grpTZ = "🌐 Timezones"
+asiaTZ = input.string("UTC",              "Asia TZ",   options=["UTC", "Asia/Tokyo", "Asia/Shanghai", "Asia/Singapore"], group=grpTZ)
+euTZ   = input.string("Europe/Berlin",    "Europe TZ", options=["Europe/Berlin", "Europe/London", "UTC"], group=grpTZ)
+usaTZ  = input.string("America/New_York", "USA TZ",    options=["America/New_York", "America/Chicago", "UTC"], group=grpTZ)
+
+grpStyle = "🎨 Style"
+asiaCol   = input.color(#FF9800,              "Asia",          group=grpStyle, inline="c1")
+euCol     = input.color(#26A69A,              "Europe",        group=grpStyle, inline="c1")
+usaCol    = input.color(#2962FF,              "USA",           group=grpStyle, inline="c2")
+prevCol   = input.color(color.new(#2962FF,50),"USA Prev Day",  group=grpStyle, inline="c2")
+lineW     = input.int(2, "Line Width",  minval=1, maxval=4, group=grpStyle)
+
+grpShow = "👁 Visibility"
+showAsia = input.bool(true,  "Asia",             group=grpShow, inline="v1")
+showEU   = input.bool(true,  "Europe",           group=grpShow, inline="v1")
+showUSA  = input.bool(true,  "USA",              group=grpShow, inline="v2")
+showPrev = input.bool(true,  "USA Previous Day", group=grpShow, inline="v2")
+showLbl  = input.bool(true,  "Labels",           group=grpShow)
+showExt  = input.bool(true,  "Extend Lines Right", group=grpShow)
+
+grpCalc = "⚙️ Calculation"
+srcInput = input.string("HLC3", "Price Source", options=["HLC3", "OHLC4", "CLOSE", "HL2"], group=grpCalc)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// PRICE SOURCE
+// ═══════════════════════════════════════════════════════════════════════════════
+
+float src = switch srcInput
+    "HLC3"  => hlc3
+    "OHLC4" => ohlc4
+    "CLOSE" => close
+    "HL2"   => hl2
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SESSION START DETECTION (timezone-aware — auto-adjusts for DST)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// Asia: detect in its own timezone
+asiaBarMins  = hour(time, asiaTZ) * 60 + minute(time, asiaTZ)
+asiaPrevMins = hour(nz(time[1], time), asiaTZ) * 60 + minute(nz(time[1], time), asiaTZ)
+asiaTgt      = asiaH * 60 + asiaM
+
+// Europe: detect in its own timezone
+euBarMins  = hour(time, euTZ) * 60 + minute(time, euTZ)
+euPrevMins = hour(nz(time[1], time), euTZ) * 60 + minute(nz(time[1], time), euTZ)
+euTgt      = euH * 60 + euM
+
+// USA: detect in its own timezone
+usaBarMins  = hour(time, usaTZ) * 60 + minute(time, usaTZ)
+usaPrevMins = hour(nz(time[1], time), usaTZ) * 60 + minute(nz(time[1], time), usaTZ)
+usaTgt      = usaH * 60 + usaM
+
+// Day change detection (UTC for universal boundary)
+newDay = dayofmonth(time, "UTC") != dayofmonth(nz(time[1], time), "UTC")
+
+// Session triggers: current bar is at/past target, previous bar was before
+// Asia at midnight: detect via day change in Asia TZ
+newDayAsia  = dayofmonth(time, asiaTZ) != dayofmonth(nz(time[1], time), asiaTZ)
+isAsiaReset = asiaTgt == 0 ? newDayAsia : (asiaBarMins >= asiaTgt and asiaPrevMins < asiaTgt)
+
+// EU & USA: detect crossing in their local timezone
+newDayEU  = dayofmonth(time, euTZ)  != dayofmonth(nz(time[1], time), euTZ)
+newDayUSA = dayofmonth(time, usaTZ) != dayofmonth(nz(time[1], time), usaTZ)
+
+isEuReset  = euBarMins  >= euTgt  and euPrevMins  < euTgt  and not newDayEU
+isUsaReset = usaBarMins >= usaTgt and usaPrevMins < usaTgt and not newDayUSA
+
+// Edge case: day changed and we jumped past the target
+if newDayEU and euTgt > 0 and euBarMins >= euTgt
+    isEuReset := true
+if newDayUSA and usaTgt > 0 and usaBarMins >= usaTgt
+    isUsaReset := true
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// AVWAP ACCUMULATORS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// --- State variables ---
+var bool  asiaOn  = false
+var float asiaPV  = 0.0
+var float asiaVol = 0.0
+
+var bool  euOn  = false
+var float euPV  = 0.0
+var float euVol = 0.0
+
+var bool  usaOn  = false
+var float usaPV  = 0.0
+var float usaVol = 0.0
+
+var bool  prevOn  = false
+var float prevPV  = 0.0
+var float prevVol = 0.0
+
+// ─── NEW DAY BOUNDARY ───
+// At midnight: promote USA→prev, hide EU & USA until their session starts today.
+// Asia resets immediately (via isAsiaReset which fires on newDay).
+// This prevents showing yesterday's EU/USA data as if it were today's.
+if newDay
+    // Europe: hide until 08:00 today
+    euOn  := false
+    euPV  := 0.0
+    euVol := 0.0
+
+    // USA: promote yesterday's accumulator → previous day
+    if usaOn
+        prevOn  := true
+        prevPV  := usaPV
+        prevVol := usaVol
+
+    // USA current: hide until 15:30 today
+    usaOn  := false
+    usaPV  := 0.0
+    usaVol := 0.0
+
+// ─── SESSION RESETS ───
+
+// Asia: resets at midnight (already handled by newDay + isAsiaReset)
+if isAsiaReset
+    asiaOn  := true
+    asiaPV  := 0.0
+    asiaVol := 0.0
+
+// Europe: activates at 08:00
+if isEuReset
+    euOn  := true
+    euPV  := 0.0
+    euVol := 0.0
+
+// USA: activates at 15:30 (promotion already happened at midnight)
+if isUsaReset
+    usaOn  := true
+    usaPV  := 0.0
+    usaVol := 0.0
+
+// ─── ACCUMULATE ───
+if asiaOn
+    asiaPV  += src * volume
+    asiaVol += volume
+
+if euOn
+    euPV  += src * volume
+    euVol += volume
+
+if usaOn
+    usaPV  += src * volume
+    usaVol += volume
+
+// USA Prev Day: keeps accumulating (live AVWAP anchored from yesterday 15:30)
+if prevOn
+    prevPV  += src * volume
+    prevVol += volume
+
+// ─── VALUES ───
+float asiaVal = asiaOn and asiaVol > 0 ? asiaPV / asiaVol : na
+float euVal   = euOn   and euVol   > 0 ? euPV   / euVol   : na
+float usaVal  = usaOn  and usaVol  > 0 ? usaPV  / usaVol  : na
+float prevVal = prevOn and prevVol > 0 ? prevPV / prevVol : na
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// PLOTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+plot(showAsia ? asiaVal : na, "AVWAP Asia",     asiaCol, lineW)
+plot(showEU   ? euVal   : na, "AVWAP Europe",   euCol,   lineW)
+plot(showUSA  ? usaVal  : na, "AVWAP USA",      usaCol,  lineW)
+plot(showPrev ? prevVal : na, "AVWAP USA Prev", prevCol, lineW, style=plot.style_line)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// EXTENSION LINES (horizontal projection to the right)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+var line asiaLine = na
+var line euLine   = na
+var line usaLine  = na
+var line prevLine = na
+
+if showExt
+    // Asia
+    if showAsia and not na(asiaVal)
+        if na(asiaLine)
+            asiaLine := line.new(bar_index, asiaVal, bar_index + 1, asiaVal, color=asiaCol, width=lineW, style=line.style_dotted, extend=extend.right)
+        else
+            line.set_xy1(asiaLine, bar_index, asiaVal)
+            line.set_xy2(asiaLine, bar_index + 1, asiaVal)
+
+    // Europe
+    if showEU and not na(euVal)
+        if na(euLine)
+            euLine := line.new(bar_index, euVal, bar_index + 1, euVal, color=euCol, width=lineW, style=line.style_dotted, extend=extend.right)
+        else
+            line.set_xy1(euLine, bar_index, euVal)
+            line.set_xy2(euLine, bar_index + 1, euVal)
+
+    // USA
+    if showUSA and not na(usaVal)
+        if na(usaLine)
+            usaLine := line.new(bar_index, usaVal, bar_index + 1, usaVal, color=usaCol, width=lineW, style=line.style_dotted, extend=extend.right)
+        else
+            line.set_xy1(usaLine, bar_index, usaVal)
+            line.set_xy2(usaLine, bar_index + 1, usaVal)
+
+    // USA Previous Day
+    if showPrev and not na(prevVal)
+        if na(prevLine)
+            prevLine := line.new(bar_index, prevVal, bar_index + 1, prevVal, color=prevCol, width=lineW, style=line.style_dashed, extend=extend.right)
+        else
+            line.set_xy1(prevLine, bar_index, prevVal)
+            line.set_xy2(prevLine, bar_index + 1, prevVal)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// LABELS (at right edge, updating every bar)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+var label asiaLbl = na
+var label euLbl   = na
+var label usaLbl  = na
+var label prevLbl = na
+
+if showLbl and barstate.islast
+    // Asia
+    if showAsia and not na(asiaVal)
+        if na(asiaLbl)
+            asiaLbl := label.new(bar_index + 3, asiaVal, "ASIA " + str.tostring(asiaVal, format.mintick), style=label.style_label_left, size=size.small, textcolor=color.white, color=asiaCol)
+        else
+            label.set_xy(asiaLbl, bar_index + 3, asiaVal)
+            label.set_text(asiaLbl, "ASIA " + str.tostring(asiaVal, format.mintick))
+
+    // Europe
+    if showEU and not na(euVal)
+        if na(euLbl)
+            euLbl := label.new(bar_index + 3, euVal, "EU " + str.tostring(euVal, format.mintick), style=label.style_label_left, size=size.small, textcolor=color.white, color=euCol)
+        else
+            label.set_xy(euLbl, bar_index + 3, euVal)
+            label.set_text(euLbl, "EU " + str.tostring(euVal, format.mintick))
+
+    // USA
+    if showUSA and not na(usaVal)
+        if na(usaLbl)
+            usaLbl := label.new(bar_index + 3, usaVal, "USA " + str.tostring(usaVal, format.mintick), style=label.style_label_left, size=size.small, textcolor=color.white, color=usaCol)
+        else
+            label.set_xy(usaLbl, bar_index + 3, usaVal)
+            label.set_text(usaLbl, "USA " + str.tostring(usaVal, format.mintick))
+
+    // USA Previous Day
+    if showPrev and not na(prevVal)
+        if na(prevLbl)
+            prevLbl := label.new(bar_index + 3, prevVal, "USA PD " + str.tostring(prevVal, format.mintick), style=label.style_label_left, size=size.small, textcolor=color.white, color=prevCol)
+        else
+            label.set_xy(prevLbl, bar_index + 3, prevVal)
+            label.set_text(prevLbl, "USA PD " + str.tostring(prevVal, format.mintick))
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ALERTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// Price crosses USA AVWAP
+alertcondition(ta.cross(close, usaVal),  "Price × USA AVWAP",      "Price crossed USA Session AVWAP")
+alertcondition(ta.cross(close, prevVal), "Price × USA Prev AVWAP", "Price crossed USA Previous Day AVWAP")
+
+// Current USA crosses Previous USA (regime change signal)
+alertcondition(ta.cross(usaVal, prevVal), "USA × USA Prev (Regime)", "Current USA AVWAP crossed Previous Day — regime change signal")

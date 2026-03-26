@@ -1,0 +1,333 @@
+// This work is licensed under Creative Commons Attribution-NonCommercial-ShareAlike 4.0 International  
+// https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © UAlgo
+
+//@version=6
+indicator("Hidden Markov Reversal Finder [UAlgo]", overlay = false, max_labels_count = 500, max_lines_count = 500)
+
+const int STATE_COUNT = 3
+const int STATE_BULL = 0
+const int STATE_BALANCE = 1
+const int STATE_BEAR = 2
+const float EPS = 0.000001
+
+clampFloat(float value, float minValue, float maxValue) =>
+    math.min(math.max(value, minValue), maxValue)
+
+pctString(float value) =>
+    str.tostring(value * 100.0, "0.0") + "%"
+
+type HMMModel
+    array<string> names
+    array<string> tags
+    array<color> colors
+    array<float> muRet
+    array<float> muVol
+    array<float> varRet
+    array<float> varVol
+    array<float> posterior
+    array<float> predicted
+    array<float> transitions
+    table dashboard
+    label stateLabel
+
+method normalize(array<float> values, float fallbackValue) =>
+    int count = values.size()
+    float total = 0.0
+    for i = 0 to count - 1
+        total += math.max(values.get(i), 0.0)
+    if total <= EPS
+        for i = 0 to count - 1
+            values.set(i, fallbackValue)
+    else
+        float invTotal = 1.0 / total
+        for i = 0 to count - 1
+            values.set(i, values.get(i) * invTotal)
+    values
+
+method argMax(array<float> values) =>
+    int winner = 0
+    float bestValue = values.get(0)
+    int count = values.size()
+    for i = 1 to count - 1
+        float currentValue = values.get(i)
+        if currentValue > bestValue
+            bestValue := currentValue
+            winner := i
+    winner
+
+transitionIndex(int fromState, int toState) =>
+    fromState * STATE_COUNT + toState
+method setTransition(HMMModel this, int fromState, int toState, float probability) =>
+    this.transitions.set(transitionIndex(fromState, toState), probability)
+
+method getTransition(HMMModel this, int fromState, int toState) =>
+    this.transitions.get(transitionIndex(fromState, toState))
+
+method configureTransitions(HMMModel this, float bullStay, float balanceStay, float bearStay) =>
+    float bullDrift = 1.0 - bullStay
+    float balanceDrift = 1.0 - balanceStay
+    float bearDrift = 1.0 - bearStay
+    this.setTransition(STATE_BULL, STATE_BULL, bullStay)
+    this.setTransition(STATE_BULL, STATE_BALANCE, bullDrift * 0.78)
+    this.setTransition(STATE_BULL, STATE_BEAR, bullDrift * 0.22)
+    this.setTransition(STATE_BALANCE, STATE_BULL, balanceDrift * 0.50)
+    this.setTransition(STATE_BALANCE, STATE_BALANCE, balanceStay)
+    this.setTransition(STATE_BALANCE, STATE_BEAR, balanceDrift * 0.50)
+    this.setTransition(STATE_BEAR, STATE_BULL, bearDrift * 0.22)
+    this.setTransition(STATE_BEAR, STATE_BALANCE, bearDrift * 0.78)
+    this.setTransition(STATE_BEAR, STATE_BEAR, bearStay)
+    this
+
+method emission(HMMModel this, int stateIndex, float retObs, float volObs) =>
+    float retVariance = math.max(this.varRet.get(stateIndex), 0.12)
+    float volVariance = math.max(this.varVol.get(stateIndex), 0.12)
+    float retDeviation = retObs - this.muRet.get(stateIndex)
+    float volDeviation = volObs - this.muVol.get(stateIndex)
+    float exponent = -0.5 * ((retDeviation * retDeviation) / retVariance + (volDeviation * volDeviation) / volVariance)
+    float normalizer = 1.0 / (2.0 * math.pi * math.sqrt(retVariance * volVariance))
+    math.max(normalizer * math.exp(math.max(exponent, -24.0)), EPS)
+
+method predict(HMMModel this) =>
+    for toState = 0 to STATE_COUNT - 1
+        float predictedProbability = 0.0
+        for fromState = 0 to STATE_COUNT - 1
+            predictedProbability += this.posterior.get(fromState) * this.getTransition(fromState, toState)
+        this.predicted.set(toState, predictedProbability)
+    this.predicted.normalize(1.0 / STATE_COUNT)
+    this
+
+method filter(HMMModel this, float retObs, float volObs) =>
+    this.predict()
+    for stateIndex = 0 to STATE_COUNT - 1
+        float nextPosterior = this.predicted.get(stateIndex) * this.emission(stateIndex, retObs, volObs)
+        this.posterior.set(stateIndex, nextPosterior)
+    this.posterior.normalize(1.0 / STATE_COUNT)
+    this.posterior.argMax()
+
+method adapt(HMMModel this, float retObs, float volObs, float learningRate) =>
+    for stateIndex = 0 to STATE_COUNT - 1
+        float responsibility = this.posterior.get(stateIndex) * learningRate
+        float oldMuRet = this.muRet.get(stateIndex)
+        float oldMuVol = this.muVol.get(stateIndex)
+        float oldVarRet = math.max(this.varRet.get(stateIndex), 0.12)
+        float oldVarVol = math.max(this.varVol.get(stateIndex), 0.12)
+        float retError = retObs - oldMuRet
+        float volError = volObs - oldMuVol
+        float nextMuRet = clampFloat(oldMuRet + responsibility * retError, -3.0, 3.0)
+        float nextMuVol = clampFloat(oldMuVol + responsibility * volError, -3.0, 3.0)
+        float nextVarRet = clampFloat(oldVarRet + responsibility * (retError * retError - oldVarRet), 0.12, 4.0)
+        float nextVarVol = clampFloat(oldVarVol + responsibility * (volError * volError - oldVarVol), 0.12, 4.0)
+        this.muRet.set(stateIndex, nextMuRet)
+        this.muVol.set(stateIndex, nextMuVol)
+        this.varRet.set(stateIndex, nextVarRet)
+        this.varVol.set(stateIndex, nextVarVol)
+    this
+
+method regimeScore(HMMModel this) =>
+    this.posterior.get(STATE_BULL) - this.posterior.get(STATE_BEAR)
+
+method confidence(HMMModel this) =>
+    this.posterior.get(this.posterior.argMax())
+
+method activeName(HMMModel this, int stateIndex) =>
+    this.names.get(stateIndex)
+
+method activeTag(HMMModel this, int stateIndex) =>
+    this.tags.get(stateIndex)
+
+method activeColor(HMMModel this, int stateIndex) =>
+    this.colors.get(stateIndex)
+
+stateArrow(int stateIndex) =>
+    stateIndex == STATE_BULL ? "▲" : stateIndex == STATE_BEAR ? "▼" : "•"
+
+method probabilityText(HMMModel this) =>
+    "BULL " + pctString(this.posterior.get(STATE_BULL)) + "  |  BASE " + pctString(this.posterior.get(STATE_BALANCE)) + "  |  BEAR " + pctString(this.posterior.get(STATE_BEAR))
+
+method drawStateLabel(HMMModel this, int stateIndex, float confidenceValue, float atrValue, bool enabled) =>
+    if enabled
+        float yValue = stateIndex == STATE_BEAR ? high + atrValue * 0.45 : stateIndex == STATE_BULL ? low - atrValue * 0.45 : close
+        string labelText = this.activeTag(stateIndex) + "\n" + stateArrow(stateIndex)
+        this.stateLabel := label.new(bar_index, yValue, labelText, xloc = xloc.bar_index, yloc = yloc.price, style = label.style_none, textcolor = color.new(this.activeColor(stateIndex), 15), size = size.tiny, text_formatting = text.format_bold, force_overlay = true, tooltip = this.activeName(stateIndex) + "\n" + "Confidence: " + pctString(confidenceValue) + "\n" + this.probabilityText())
+    this
+
+method drawReversalLabel(HMMModel this, bool isBullish, float confidenceValue, float stretchValue, float probabilityValue, float atrValue, bool enabled) =>
+    if enabled
+        float yAnchor = isBullish ? low : high
+        float yValue = isBullish ? low - atrValue * 0.34 : high + atrValue * 0.34
+        color signalColor = isBullish ? this.activeColor(STATE_BULL) : this.activeColor(STATE_BEAR)
+        string signalTag = isBullish ? "B" : "S"
+        string tipText = signalTag + " reversal" + "\n" + "Confidence: " + pctString(confidenceValue) + "\n" + "State peak: " + pctString(probabilityValue) + "\n" + "Stretch: " + str.tostring(stretchValue, "0.00") + " ATR"
+        line.new(x1 = bar_index, y1 = yAnchor, x2 = bar_index, y2 = yValue, xloc = xloc.bar_index, extend = extend.none, color = color.new(signalColor, 25), style = line.style_solid, width = 1, force_overlay = true)
+        label.new(bar_index, yValue, signalTag, xloc = xloc.bar_index, yloc = yloc.price, style = label.style_none, textcolor = signalColor, size = size.small, text_formatting = text.format_bold, force_overlay = true, tooltip = tipText)
+    this
+
+method renderPanel(HMMModel this, bool showPanel, int activeState, float confidenceValue, float retObs, float volObs, float scoreValue, float stretchValue, string signalText) =>
+    if barstate.islast
+        color accentColor = this.activeColor(activeState)
+        if showPanel
+            table.cell(this.dashboard, 0, 0, "HMM STATE", text_color = color.new(#20323C, 0), text_size = size.small, bgcolor = color.new(#E8DDC8, 10))
+            table.cell(this.dashboard, 1, 0, this.activeName(activeState), text_color = accentColor, text_size = size.small, bgcolor = color.new(#FFF9F0, 10))
+            table.cell(this.dashboard, 0, 1, "CONF", text_color = color.new(#20323C, 0), text_size = size.small, bgcolor = color.new(#E8DDC8, 10))
+            table.cell(this.dashboard, 1, 1, pctString(confidenceValue), text_color = color.new(#20323C, 0), text_size = size.small, bgcolor = color.new(#FFF9F0, 10))
+            table.cell(this.dashboard, 0, 2, "RET Z", text_color = color.new(#20323C, 0), text_size = size.small, bgcolor = color.new(#E8DDC8, 10))
+            table.cell(this.dashboard, 1, 2, str.tostring(retObs, "0.00"), text_color = color.new(#20323C, 0), text_size = size.small, bgcolor = color.new(#FFF9F0, 10))
+            table.cell(this.dashboard, 0, 3, "VOL Z", text_color = color.new(#20323C, 0), text_size = size.small, bgcolor = color.new(#E8DDC8, 10))
+            table.cell(this.dashboard, 1, 3, str.tostring(volObs, "0.00"), text_color = color.new(#20323C, 0), text_size = size.small, bgcolor = color.new(#FFF9F0, 10))
+            table.cell(this.dashboard, 0, 4, "SCORE", text_color = color.new(#20323C, 0), text_size = size.small, bgcolor = color.new(#E8DDC8, 10))
+            table.cell(this.dashboard, 1, 4, str.tostring(scoreValue, "0.00"), text_color = color.new(#20323C, 0), text_size = size.small, bgcolor = color.new(#FFF9F0, 10))
+            table.cell(this.dashboard, 0, 5, "POSTERIOR", text_color = color.new(#20323C, 0), text_size = size.small, bgcolor = color.new(#E8DDC8, 10))
+            table.cell(this.dashboard, 1, 5, this.probabilityText(), text_color = color.new(#20323C, 0), text_size = size.tiny, bgcolor = color.new(#FFF9F0, 10))
+            table.cell(this.dashboard, 0, 6, "STRETCH", text_color = color.new(#20323C, 0), text_size = size.small, bgcolor = color.new(#E8DDC8, 10))
+            table.cell(this.dashboard, 1, 6, str.tostring(stretchValue, "0.00") + " ATR", text_color = color.new(#20323C, 0), text_size = size.small, bgcolor = color.new(#FFF9F0, 10))
+            table.cell(this.dashboard, 0, 7, "SETUP", text_color = color.new(#20323C, 0), text_size = size.small, bgcolor = color.new(#E8DDC8, 10))
+            table.cell(this.dashboard, 1, 7, signalText, text_color = accentColor, text_size = size.small, bgcolor = color.new(#FFF9F0, 10))
+        else
+            for row = 0 to 7
+                table.cell(this.dashboard, 0, row, "", bgcolor = na)
+                table.cell(this.dashboard, 1, row, "", bgcolor = na)
+    this
+
+createModel() =>
+    array<string> names = array.from("Bull Expansion", "Balance", "Bear Stress")
+    array<string> tags = array.from("BULL", "BASE", "BEAR")
+    array<color> colors = array.from(color.new(#0B8F77, 0), color.new(#C7822F, 0), color.new(#C44536, 0))
+    array<float> muRet = array.from(0.95, 0.05, -0.95)
+    array<float> muVol = array.from(-0.75, 0.10, 1.00)
+    array<float> varRet = array.from(0.70, 0.95, 0.80)
+    array<float> varVol = array.from(0.55, 0.75, 0.65)
+    array<float> posterior = array.from(0.30, 0.40, 0.30)
+    array<float> predicted = array.new<float>(STATE_COUNT, 1.0 / STATE_COUNT)
+    array<float> transitions = array.new<float>(STATE_COUNT * STATE_COUNT, 0.0)
+    table dashboard = table.new(position.top_right, 2, 8, frame_color = color.new(#2D3A3A, 65), frame_width = 1, border_width = 0, bgcolor = color.new(#FFF9F0, 80))
+    label stateLabel = na
+    HMMModel.new(names, tags, colors, muRet, muVol, varRet, varVol, posterior, predicted, transitions, dashboard, stateLabel)
+
+groupModel = "Model"
+groupFeatures = "Observations"
+groupReversal = "Reversal Logic"
+groupVisual = "Visual"
+
+bullStay = input.float(0.92, "Bull persistence", minval = 0.55, maxval = 0.995, step = 0.005, group = groupModel)
+balanceStay = input.float(0.86, "Balance persistence", minval = 0.40, maxval = 0.995, step = 0.005, group = groupModel)
+bearStay = input.float(0.90, "Bear persistence", minval = 0.55, maxval = 0.995, step = 0.005, group = groupModel)
+learningRate = input.float(0.055, "Online learning rate", minval = 0.0, maxval = 0.25, step = 0.005, group = groupModel)
+confidenceThreshold = input.float(0.58, "Signal confidence", minval = 0.34, maxval = 0.95, step = 0.01, group = groupModel)
+
+returnSmoothLength = input.int(3, "Return smoothing", minval = 1, maxval = 20, group = groupFeatures)
+returnZLength = input.int(34, "Return normalization", minval = 10, maxval = 200, group = groupFeatures)
+volLength = input.int(14, "Volatility length", minval = 5, maxval = 100, group = groupFeatures)
+volBaselineLength = input.int(55, "Volatility baseline", minval = 20, maxval = 300, group = groupFeatures)
+obsClamp = input.float(3.5, "Observation clamp", minval = 1.5, maxval = 6.0, step = 0.1, group = groupFeatures)
+
+stretchLength = input.int(34, "Stretch baseline", minval = 10, maxval = 200, group = groupReversal)
+peakLookback = input.int(6, "Peak lookback", minval = 2, maxval = 30, group = groupReversal)
+stretchThreshold = input.float(1.4, "Stretch threshold", minval = 0.4, maxval = 4.0, step = 0.1, group = groupReversal)
+probabilityPeak = input.float(0.68, "State peak threshold", minval = 0.45, maxval = 0.95, step = 0.01, group = groupReversal)
+probabilityFade = input.float(0.04, "Peak fade minimum", minval = 0.01, maxval = 0.25, step = 0.01, group = groupReversal)
+flipThreshold = input.float(0.12, "Momentum flip threshold", minval = 0.0, maxval = 1.5, step = 0.01, group = groupReversal)
+cooldownBars = input.int(10, "Signal cooldown", minval = 1, maxval = 100, group = groupReversal)
+
+showProbabilities = input.bool(true, "Plot state probabilities", group = groupVisual)
+showDashboard = input.bool(true, "Show dashboard", group = groupVisual)
+showStateLabels = input.bool(true, "Show state tags", group = groupVisual)
+showSignalMarkers = input.bool(true, "Show signal markers", group = groupVisual)
+showSignalDots = input.bool(true, "Show signal dots", group = groupVisual)
+paintBars = input.bool(true, "Color bars by regime", group = groupVisual)
+
+var HMMModel model = createModel()
+
+if barstate.isfirst
+    model.configureTransitions(bullStay, balanceStay, bearStay)
+
+float logReturn = math.log(close / nz(close[1], close))
+float smoothedReturn = ta.ema(logReturn, returnSmoothLength)
+float returnStdev = math.max(nz(ta.stdev(logReturn, returnZLength), EPS), EPS)
+float returnObs = clampFloat(smoothedReturn / returnStdev, -obsClamp, obsClamp)
+
+float realizedVol = nz(ta.stdev(logReturn, volLength), EPS)
+float volMean = nz(ta.ema(realizedVol, volBaselineLength), realizedVol)
+float volStdev = math.max(nz(ta.stdev(realizedVol, volBaselineLength), EPS), EPS)
+float volObs = clampFloat((realizedVol - volMean) / volStdev, -obsClamp, obsClamp)
+float basis = ta.ema(close, stretchLength)
+float atrValue = math.max(ta.atr(14), syminfo.mintick)
+float stretch = (close - basis) / atrValue
+
+int warmupBars = math.max(returnZLength, volBaselineLength) + volLength
+bool ready = bar_index > warmupBars and not na(returnObs) and not na(volObs)
+
+int activeState = STATE_BALANCE
+if ready
+    activeState := model.filter(returnObs, volObs)
+    model.adapt(returnObs, volObs, learningRate)
+else
+    activeState := model.posterior.argMax()
+
+float bullProb = model.posterior.get(STATE_BULL)
+float balanceProb = model.posterior.get(STATE_BALANCE)
+float bearProb = model.posterior.get(STATE_BEAR)
+float confidenceValue = model.confidence()
+float regimeScore = model.regimeScore()
+color regimeColor = model.activeColor(activeState)
+int barTint = int(math.round(clampFloat(84.0 - confidenceValue * 42.0, 35.0, 88.0)))
+
+bool stateChanged = ready and activeState != nz(activeState[1], activeState)
+float bullPeak = nz(ta.highest(bullProb[1], peakLookback), bullProb)
+float bearPeak = nz(ta.highest(bearProb[1], peakLookback), bearProb)
+float bullFade = bullPeak - bullProb
+float bearFade = bearPeak - bearProb
+bool topRotation = bullPeak >= probabilityPeak and bullFade >= probabilityFade and bullProb < bullPeak and bearProb > nz(bearProb[1], bearProb)
+bool bottomRotation = bearPeak >= probabilityPeak and bearFade >= probabilityFade and bearProb < bearPeak and bullProb > nz(bullProb[1], bullProb)
+bool momentumDown = regimeScore < nz(regimeScore[1], regimeScore) and returnObs < -flipThreshold
+bool momentumUp = regimeScore > nz(regimeScore[1], regimeScore) and returnObs > flipThreshold
+bool topStretch = stretch >= stretchThreshold
+bool bottomStretch = stretch <= -stretchThreshold
+
+var int lastBuySignalBar = na
+var int lastSellSignalBar = na
+bool buyCooldownOk = na(lastBuySignalBar) or bar_index - lastBuySignalBar > cooldownBars
+bool sellCooldownOk = na(lastSellSignalBar) or bar_index - lastSellSignalBar > cooldownBars
+
+bool bullSignal = ready and bottomRotation and momentumUp and bottomStretch and confidenceValue >= confidenceThreshold and buyCooldownOk
+bool bearSignal = ready and topRotation and momentumDown and topStretch and confidenceValue >= confidenceThreshold and sellCooldownOk
+bool balanceSignal = stateChanged and activeState == STATE_BALANCE and confidenceValue >= confidenceThreshold
+
+if bullSignal
+    lastBuySignalBar := bar_index
+
+if bearSignal
+    lastSellSignalBar := bar_index
+
+bool drawBullReversal = bullSignal and showSignalMarkers
+bool drawBearReversal = bearSignal and showSignalMarkers
+bool drawStateShift = stateChanged and confidenceValue >= confidenceThreshold and showStateLabels
+
+model.drawReversalLabel(true, confidenceValue, stretch, bearPeak, atrValue, drawBullReversal)
+model.drawReversalLabel(false, confidenceValue, stretch, bullPeak, atrValue, drawBearReversal)
+model.drawStateLabel(activeState, confidenceValue, atrValue, drawStateShift)
+
+string setupText = bearSignal ? "SELL REVERSAL" : bullSignal ? "BUY REVERSAL" : topRotation ? "TOP WATCH" : bottomRotation ? "BOTTOM WATCH" : "WAIT"
+model.renderPanel(showDashboard, activeState, confidenceValue, returnObs, volObs, regimeScore, stretch, setupText)
+
+hline(1.0, "Bull Edge", color = color.new(#0B8F77, 82), linestyle = hline.style_dotted)
+hline(0.0, "Balance Line", color = color.new(#20323C, 80), linestyle = hline.style_dotted)
+hline(-1.0, "Bear Edge", color = color.new(#C44536, 82), linestyle = hline.style_dotted)
+
+plotZero = plot(0.0, "Zero", color = color.new(#20323C, 100))
+plotScore = plot(regimeScore, "Regime score", color = regimeColor, linewidth = 3)
+plotConfidence = plot(confidenceValue * 2.0 - 1.0, "Confidence ribbon", color = color.new(regimeColor, 55), linewidth = 1, style = plot.style_area)
+fill(plotScore, plotZero, color = color.new(regimeColor, 85))
+
+plot(showProbabilities ? bullProb : na, "Bull posterior", color = color.new(#0B8F77, 0), linewidth = 2)
+plot(showProbabilities ? balanceProb : na, "Balance posterior", color = color.new(#C7822F, 0), linewidth = 2)
+plot(showProbabilities ? bearProb : na, "Bear posterior", color = color.new(#C44536, 0), linewidth = 2)
+plot(ready ? stretch / math.max(stretchThreshold, 0.1) : na, "Normalized stretch", color = color.new(#6B7A8F, 30), linewidth = 1, style = plot.style_line)
+plotshape(showSignalDots and bullSignal, title = "Buy reversal", style = shape.circle, location = location.belowbar, color = color.new(#0B8F77, 0), size = size.tiny, force_overlay = true)
+plotshape(showSignalDots and bearSignal, title = "Sell reversal", style = shape.circle, location = location.abovebar, color = color.new(#C44536, 0), size = size.tiny, force_overlay = true)
+
+barcolor(paintBars and ready ? color.new(regimeColor, barTint) : na)
+
+alertcondition(bullSignal, title = "HMM Buy Reversal", message = "HMM reversal logic detected a bottoming buy setup.")
+alertcondition(bearSignal, title = "HMM Sell Reversal", message = "HMM reversal logic detected a topping sell setup.")
+alertcondition(balanceSignal, title = "HMM Balance", message = "HMM regime switched to Balance.")

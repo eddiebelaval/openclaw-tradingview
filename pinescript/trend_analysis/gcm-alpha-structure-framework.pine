@@ -1,0 +1,250 @@
+//@version=6
+indicator(title="GCM Alpha Structure Framework", shorttitle="GCM ASF", overlay=true, max_labels_count=500, max_boxes_count=500, max_lines_count=500)
+
+// ==========================================
+// 1. INPUTS & SETTINGS
+// ==========================================
+grp_ms        = "Market Structure (Macro)"
+lookback      = input.int(10, "Structure Period", minval=2, group=grp_ms)
+displacement  = input.float(1.2, "Displacement Factor", minval=1.0, group=grp_ms)
+show_fvg      = input.bool(true, "Show Unmitigated FVGs", group=grp_ms)
+show_ob       = input.bool(true, "Show Unmitigated OBs", group=grp_ms)
+// Default Max Active Zones set to 4
+max_zones     = input.int(4, "Max Active Zones", minval=1, maxval=5, group=grp_ms)
+fvg_min_size  = input.float(0.2, "Min FVG Size (ATR %)", minval=0.0, group=grp_ms)
+
+grp_bb        = "Stealth Volatility (Bollinger)"
+show_bb_color = input.bool(true, "Color Candles at BB Extremes", group=grp_bb)
+bb_len        = input.int(20, "BB Length", group=grp_bb)
+bb_mult       = input.float(2.0, "BB StdDev", group=grp_bb)
+
+grp_sr        = "Support & Resistance (Aether)"
+show_sr       = input.bool(true, "Show Dynamic S/R Lines", group=grp_sr)
+pivotLen      = input.int(10, "S/R Pivot Lookback", group=grp_sr)
+extLen        = 5 
+
+grp_scalp     = "Seamless Trend Lines (Aether)"
+show_struc    = input.bool(true, "Show Seamless Projector", group=grp_scalp)
+len_scalp     = input.int(7, "Scalper Length (HMA)", group=grp_scalp)
+
+grp_alerts    = "Alerts Engine"
+use_alerts    = input.bool(true, "Enable Sniper Alerts", group=grp_alerts)
+
+// ==========================================
+// 2. STEALTH BOLLINGER BANDS (Candle Coloring)
+// ==========================================
+bb_basis = ta.sma(close, bb_len)
+bb_dev   = bb_mult * ta.stdev(close, bb_len)
+bb_upper = bb_basis + bb_dev
+bb_lower = bb_basis - bb_dev
+
+is_bb_extreme  = high >= bb_upper or low <= bb_lower
+is_bull_candle = close > open
+is_bear_candle = close < open
+
+// Neon Green (#2dff00) for Bullish Extreme, Fuchsia for Bearish
+bb_color = is_bb_extreme ? (is_bull_candle ? color.new(#2dff00, 0) : is_bear_candle ? color.new(color.fuchsia, 0) : na) : na
+barcolor(show_bb_color ? bb_color : na)
+
+// ==========================================
+// 3. STATE VARIABLES & ARRAYS
+// ==========================================
+var bool  is_bull    = true
+var float v_high     = na
+var float v_low      = na
+var int   v_high_idx = na
+var int   v_low_idx  = na
+
+var box[] active_bull_fvgs = array.new_box()
+var box[] active_bear_fvgs = array.new_box()
+var box[] active_bull_obs  = array.new_box()
+var box[] active_bear_obs  = array.new_box()
+
+// ==========================================
+// 4. AETHER INTEGRATION: S/R LINES (Transparent Labels)
+// ==========================================
+ph_sr = ta.pivothigh(high, pivotLen, pivotLen)
+pl_sr = ta.pivotlow(low, pivotLen, pivotLen)
+
+var line resL = na, var line supL = na
+var label resLbl = na, var label supLbl = na
+var float resP = na, var float supP = na
+var bool resBroken = false, var bool supBroken = false
+c_res = #ff0000, c_sup = #12e49e
+
+if show_sr
+    if not na(ph_sr)
+        line.delete(resL), label.delete(resLbl)
+        resP := ph_sr, resBroken := false
+        resL := line.new(bar_index-pivotLen, ph_sr, bar_index + extLen, ph_sr, color=color.new(c_res, 30), width=3)
+        resLbl := label.new(bar_index + extLen, ph_sr, "RES (" + str.tostring(ph_sr, format.mintick) + ")", color=color.new(color.black, 100), textcolor=c_res, style=label.style_label_left, size=size.small)
+
+    if not na(pl_sr)
+        line.delete(supL), label.delete(supLbl)
+        supP := pl_sr, supBroken := false
+        supL := line.new(bar_index-pivotLen, pl_sr, bar_index + extLen, pl_sr, color=color.new(c_sup, 30), width=3)
+        supLbl := label.new(bar_index + extLen, pl_sr, "SUP (" + str.tostring(pl_sr, format.mintick) + ")", color=color.new(color.black, 100), textcolor=c_sup, style=label.style_label_left, size=size.small)
+
+    if not na(resL) and high > resP and not resBroken
+        resBroken := true
+        line.set_style(resL, line.style_dotted)
+
+    if not na(supL) and low < supP and not supBroken
+        supBroken := true
+        line.set_style(supL, line.style_dotted)
+
+    if not na(resL) 
+        line.set_x2(resL, bar_index + extLen), label.set_x(resLbl, bar_index + extLen)
+    if not na(supL) 
+        line.set_x2(supL, bar_index + extLen), label.set_x(supLbl, bar_index + extLen)
+
+// ==========================================
+// 5. AETHER INTEGRATION: SEAMLESS SCALPER
+// ==========================================
+var line struct_line = na 
+scalp_val = ta.hma(close, len_scalp)
+bool scalp_turn_up = ta.crossover(scalp_val, scalp_val[1])
+bool scalp_turn_dn = ta.crossunder(scalp_val, scalp_val[1])
+var int active_state = 0 
+
+if barstate.isconfirmed
+    if scalp_turn_up
+        active_state := 1
+    if scalp_turn_dn
+        active_state := -1
+
+if ta.change(active_state) != 0 and show_struc
+    line.delete(struct_line)
+    if active_state == 1
+        struct_line := line.new(bar_index-1, low[1], bar_index + 5, low, width=1, style=line.style_dashed, color=#12e49e)
+    if active_state == -1
+        struct_line := line.new(bar_index-1, high[1], bar_index + 5, high, width=1, style=line.style_dashed, color=#ff0000)
+
+if show_struc and not na(struct_line)
+    bool freeze_condition = (active_state == 1 and scalp_turn_dn) or (active_state == -1 and scalp_turn_up)
+    if freeze_condition
+        line.set_xy2(struct_line, bar_index + 4, (active_state == 1) ? low[1] : high[1])
+    else
+        line.set_xy2(struct_line, bar_index + 5, (active_state == 1) ? low : high)
+
+// ==========================================
+// 6. CORE MARKET STRUCTURE ENGINE (Macro)
+// ==========================================
+ph = ta.pivothigh(lookback, lookback)
+pl = ta.pivotlow(lookback, lookback)
+
+if not na(ph)
+    v_high := ph, v_high_idx := bar_index[lookback]
+if not na(pl)
+    v_low := pl, v_low_idx := bar_index[lookback]
+
+avg_body = ta.sma(math.abs(close - open), 20)
+atr_val  = ta.atr(14)
+is_disp  = math.abs(close - open) > (avg_body * displacement)
+
+bool bos_bull   = close > v_high and is_bull and is_disp
+bool choch_bull = close > v_high and not is_bull and is_disp
+bool bos_bear   = close < v_low and not is_bull and is_disp
+bool choch_bear = close < v_low and is_bull and is_disp
+
+clean_array(box_array, max_size) =>
+    if array.size(box_array) > max_size
+        box.delete(array.shift(box_array))
+
+// --- Macro BOS/CHoCH & OB Logic ---
+if (bos_bull or choch_bull)
+    if show_ob
+        for i = 1 to (bar_index - v_low_idx)
+            if close[i] < open[i]
+                ob_box = box.new(bar_index[i], high[i], bar_index, low[i], bgcolor=color.new(color.green, 65), border_color=color.new(color.green, 10), border_style=line.style_solid, text="OB", text_color=color.green, text_size=size.small, text_halign=text.align_right, text_valign=text.align_center)
+                array.push(active_bull_obs, ob_box)
+                clean_array(active_bull_obs, max_zones)
+                break
+
+    line.new(v_high_idx, v_high, bar_index - 1, v_high, color=color.green, width=1, style=line.style_dashed)
+    label.new(int(math.avg(v_high_idx, bar_index-1)), v_high, (bos_bull ? "BOS" : "CHoCH"), color=color.new(color.black, 100), textcolor=color.green, style=label.style_none, size=size.small, textalign=text.align_center)
+    is_bull := true, v_high := na 
+
+if (bos_bear or choch_bear)
+    if show_ob
+        for i = 1 to (bar_index - v_high_idx)
+            if close[i] > open[i]
+                ob_box = box.new(bar_index[i], high[i], bar_index, low[i], bgcolor=color.new(color.red, 65), border_color=color.new(color.red, 10), border_style=line.style_solid, text="OB", text_color=color.red, text_size=size.small, text_halign=text.align_right, text_valign=text.align_center)
+                array.push(active_bear_obs, ob_box)
+                clean_array(active_bear_obs, max_zones)
+                break
+
+    line.new(v_low_idx, v_low, bar_index - 1, v_low, color=color.red, width=1, style=line.style_dashed)
+    label.new(int(math.avg(v_low_idx, bar_index-1)), v_low, (bos_bear ? "BOS" : "CHoCH"), color=color.new(color.black, 100), textcolor=color.red, style=label.style_none, size=size.small, textalign=text.align_center)
+    is_bull := false, v_low := na 
+
+// --- Clean FVG Logic ---
+if show_fvg
+    middle_is_disp = math.abs(close[1] - open[1]) > (avg_body * displacement)
+    
+    // Bullish FVG
+    if low > high[2] and close[1] > high[2] and middle_is_disp
+        if (low - high[2]) > (atr_val * fvg_min_size) 
+            fvg_box = box.new(bar_index[2], low, bar_index, high[2], bgcolor=color.new(color.green, 75), border_color=color.new(color.green, 20), border_style=line.style_dotted, text="FVG", text_color=color.green, text_size=size.small, text_halign=text.align_right, text_valign=text.align_center)
+            array.push(active_bull_fvgs, fvg_box)
+            clean_array(active_bull_fvgs, max_zones)
+            
+    // Bearish FVG
+    if high < low[2] and close[1] < low[2] and middle_is_disp
+        if (low[2] - high) > (atr_val * fvg_min_size) 
+            fvg_box = box.new(bar_index[2], low[2], bar_index, high, bgcolor=color.new(color.red, 75), border_color=color.new(color.red, 20), border_style=line.style_dotted, text="FVG", text_color=color.red, text_size=size.small, text_halign=text.align_right, text_valign=text.align_center)
+            array.push(active_bear_fvgs, fvg_box)
+            clean_array(active_bear_fvgs, max_zones)
+
+// --- Mitigation Engine & Alert State Tracking ---
+bool in_bull_ob = false
+bool in_bear_ob = false
+
+if array.size(active_bull_fvgs) > 0
+    for i = array.size(active_bull_fvgs) - 1 to 0
+        b = array.get(active_bull_fvgs, i)
+        if box.get_right(b) < bar_index and low <= box.get_top(b)
+            box.delete(array.remove(active_bull_fvgs, i))
+        else
+            box.set_right(b, bar_index)
+
+if array.size(active_bear_fvgs) > 0
+    for i = array.size(active_bear_fvgs) - 1 to 0
+        b = array.get(active_bear_fvgs, i)
+        if box.get_right(b) < bar_index and high >= box.get_bottom(b)
+            box.delete(array.remove(active_bear_fvgs, i))
+        else
+            box.set_right(b, bar_index)
+
+if array.size(active_bull_obs) > 0
+    for i = array.size(active_bull_obs) - 1 to 0
+        b = array.get(active_bull_obs, i)
+        if box.get_right(b) < bar_index and low <= box.get_top(b)
+            in_bull_ob := true 
+            box.delete(array.remove(active_bull_obs, i))
+        else
+            box.set_right(b, bar_index)
+
+if array.size(active_bear_obs) > 0
+    for i = array.size(active_bear_obs) - 1 to 0
+        b = array.get(active_bear_obs, i)
+        if box.get_right(b) < bar_index and high >= box.get_bottom(b)
+            in_bear_ob := true 
+            box.delete(array.remove(active_bear_obs, i))
+        else
+            box.set_right(b, bar_index)
+
+// ==========================================
+// 7. BACKGROUND COLOR & ALERTS
+// ==========================================
+bgcolor(is_bull ? color.new(color.teal, 90) : color.new(color.maroon, 90), title="Trend Background")
+
+if use_alerts
+    if in_bull_ob and is_bb_extreme and is_bull_candle
+        alert("🟢 Sniper BUY: Price tapped Bullish OB at Volatility Extreme! (Neon Green)", alert.freq_once_per_bar_close)
+    if in_bear_ob and is_bb_extreme and is_bear_candle
+        alert("🔴 Sniper SELL: Price tapped Bearish OB at Volatility Extreme! (Fuchsia)", alert.freq_once_per_bar_close)
+    if bos_bull
+        alert("📈 Market Structure: Bullish Break of Structure Confirmed", alert.freq_once_per_bar_close)
+    if bos_bear
+        alert("📉 Market Structure: Bearish Break of Structure Confirmed", alert.freq_once_per_bar_close)

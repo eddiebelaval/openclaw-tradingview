@@ -1,0 +1,278 @@
+// © QuantFlowLabs
+//@version=6
+indicator('ORB Ultimate', shorttitle='ORB Ultimate', overlay = true, max_boxes_count = 500, max_labels_count = 500, max_lines_count = 500, max_bars_back = 5000)
+
+const bool DEBUG = false
+int maxBarsBack = last_bar_index
+int renderMaxBarsBack = 5000
+
+// --- BRANDED SETTINGS UI ---
+orbSession = input.session('0930-1030', 'ORB Session Hours', group = 'Core Strategy', display = display.none)
+orbTimezone = input.string('America/New_York', 'Timezone', options = ['America/New_York', 'Europe/London', 'Asia/Tokyo', 'UTC', 'Exchange'], group = 'Core Strategy', display = display.none)
+
+entryStrategy = input.string('Immediate Breakout', 'Entry Strategy', options = ['Immediate Breakout', 'Retest'], group = 'Core Strategy', display = display.none)
+breakoutCondition = input.string('Close', 'Breakout Condition', options = ['Close', 'EMA'], group = 'Core Strategy', display = display.none)
+
+tpMethod = input.string('RR', 'Take Profit Method', options = ['RR', 'ATR'], group = 'Risk Management', display = display.none)
+rrMultiplier = input.float(2.0, 'Risk:Reward Ratio (If RR selected)', step=0.5, group = 'Risk Management', display = display.none)
+tpAtrMult = input.float(1.5, 'TP ATR Multiplier (If ATR selected)', step=0.5, group = 'Risk Management', display = display.none)
+
+slMethod = input.string('Pivot Structure', 'Stop-Loss Placement', options = ['Other Side of ORB', 'Breakout Candle', 'ATR', 'Pivot Structure'], group = 'Risk Management', display = display.none)
+pivotLookback = input.int(10, 'Pivot Lookback Bars (If Pivot selected)', group = 'Risk Management', display = display.none)
+slAtrMult = input.float(2.0, 'SL ATR Multiplier (If ATR selected)', step=0.5, group = 'Risk Management', display = display.none)
+adaptiveSL = input.bool(true, 'Trail SL to Breakeven', group = 'Risk Management', display = display.none)
+
+useEmaFilter = input.bool(false, 'Require EMA Alignment', group = 'Filters', inline = 'emaFilter', display = display.none)
+emaLength = input.int(9, 'Length', options = [4, 9, 13, 20, 34, 50, 200], group = 'Filters', inline = 'emaFilter', display = display.none)
+
+orbDisplayEnabled = input.bool(true, 'Show Dashboard', group = 'UI & Visuals', display = display.none)
+orbLocation = input.string('Top Right', 'Dashboard Position', options = ['Top Right', 'Bottom Right', 'Top Center'], group = 'UI & Visuals', display = display.none)
+
+showORBZones = input.bool(true, 'Draw ORB Lines', group = 'UI & Visuals', display = display.none)
+plotEMA = input.bool(false, 'Show Trend EMA on Chart', group = 'UI & Visuals', inline = 'emaGroup', display = display.none)
+emaColor = input.color(color.new(color.white, 50), 'Color', group = 'UI & Visuals', inline = 'emaGroup', display = display.none)
+showSLTPLines = input.bool(true, 'Draw Active SL/TP Lines', group = 'UI & Visuals', display = display.none)
+showHistoricZones = input.bool(true, 'Show Historical Signals', group = 'UI & Visuals', display = display.none)
+
+highColor = input.color(#00bcd4, 'High Line (Cyan)', inline = 'colors', group = 'UI & Visuals', display = display.none)
+lowColor = input.color(#e91e63, 'Low Line (Magenta)', inline = 'colors', group = 'UI & Visuals', display = display.none)
+dashboardBg = input.color(#131722, 'Dashboard Background', group = 'UI & Visuals', display = display.none)
+
+retestsNeededForEntry = entryStrategy == 'Immediate Breakout' ? 0 : 1
+
+if timeframe.in_seconds() > timeframe.in_seconds('15')
+    runtime.error('ORB works best on timeframes under 15 min.')
+
+type Breakout
+    bool isBullish
+    int startIndex
+    int endIndex
+    bool failed = false
+    int retests = 0
+
+type ORB
+    float h
+    float l
+    int startTime
+    int startIndex
+    int endIndex
+    bool isLastSession
+    string state = 'Opening Range'
+    array<Breakout> breakouts
+    bool entryBullish
+    int entryIndex
+    float entryPrice
+    float entryATR
+    int tp1Index
+    float tp1Price
+    bool tp1FoundTick = false
+    int slIndex
+    float slPrice
+    bool slFoundTick = false
+    line hLine
+    line lLine
+    label entryLabel
+    line slLineObj = na
+    line tpLineObj = na
+    label tpLabel = na
+    label slLabel = na
+
+getPosition(positionText) =>
+    if positionText == 'Top Right'
+        position.top_right
+    else if positionText == 'Top Center'
+        position.top_center
+    else if positionText == 'Bottom Right'
+        position.bottom_right
+    else
+        position.middle_right
+
+createORB(float h, float l, int sT, int sI, int eI) =>
+    newORB = ORB.new(h, l, sT, sI, eI)
+    newORB.breakouts := array.new<Breakout>(0)
+    newORB
+
+safeDeleteORB(ORB orb) =>
+    line.delete(orb.hLine)
+    line.delete(orb.lLine)
+    label.delete(orb.entryLabel)
+    line.delete(orb.slLineObj)
+    line.delete(orb.tpLineObj)
+    label.delete(orb.tpLabel)
+    label.delete(orb.slLabel)
+    int(na) // Prevents return type mismatch errors
+
+var orbList = array.new<ORB>(0)
+ema = ta.ema((high + low) / 2.0, emaLength)
+atr = ta.atr(12)
+
+recentLow = ta.lowest(low, pivotLookback)
+recentHigh = ta.highest(high, pivotLookback)
+
+// Chart plotting: Only visible if plotEMA is ticked
+plot(plotEMA ? ema : na, color=emaColor, linewidth=2, title="Trend EMA", display=display.pane)
+
+t = time(timeframe.period, orbSession, orbTimezone)
+inSess = not na(t)
+sessionStart = inSess and not inSess[1]
+sessionEnd = not inSess and inSess[1]
+
+ORB lastORB = na
+ORB previousORB = na
+if orbList.size() > 0
+    lastORB := orbList.get(0)
+    lastORB.isLastSession := last_bar_time - time < 60 * 60 * 8 * 1000
+
+lastClose = close[1]
+if barstate.isconfirmed and last_bar_index - bar_index < maxBarsBack
+    if sessionStart
+        if not na(lastORB)
+            lastORB.endIndex := bar_index - 1
+            if not na(lastORB.entryIndex) and not lastORB.tp1FoundTick and not lastORB.slFoundTick
+                lastORB.slFoundTick := true
+                lastORB.slIndex := bar_index - 1
+            previousORB := lastORB
+
+        newORB = createORB(na, na, time, bar_index, na)
+        orbList.unshift(newORB)
+        lastORB := orbList.get(0)
+
+    if not na(lastORB)
+        if lastORB.state == 'Opening Range' and inSess
+            lastORB.h := math.max(nz(lastORB.h, 0), high)
+            lastORB.l := math.min(nz(lastORB.l, low), low)
+
+        if lastORB.state == 'Opening Range' and sessionEnd
+            lastORB.state := 'Waiting For Breakouts'
+
+    if not na(lastORB)
+        if lastORB.state == 'Waiting For Breakouts'
+            conditionPrice = breakoutCondition == 'EMA' ? ema : close
+            
+            bool isBullBreak = conditionPrice > lastORB.h
+            bool isBearBreak = conditionPrice < lastORB.l
+            
+            if useEmaFilter
+                isBullBreak := isBullBreak and close > ema
+                isBearBreak := isBearBreak and close < ema
+
+            if isBullBreak or isBearBreak
+                newBreakout = Breakout.new(isBullBreak, bar_index, na)
+                lastORB.breakouts.unshift(newBreakout)
+                lastORB.state := 'In Breakout'
+
+    if not na(lastORB)
+        if lastORB.state == 'In Breakout'
+            curBreakout = lastORB.breakouts.get(0)
+            if curBreakout.isBullish and close < lastORB.h or not curBreakout.isBullish and close > lastORB.l
+                curBreakout.failed := true
+                curBreakout.endIndex := bar_index
+                lastORB.state := 'Waiting For Breakouts'
+
+            if bar_index > curBreakout.startIndex and (curBreakout.isBullish and close > lastORB.h and low < lastORB.h or not curBreakout.isBullish and close < lastORB.l and high > lastORB.l)
+                curBreakout.retests := curBreakout.retests + 1
+
+            if curBreakout.retests >= retestsNeededForEntry
+                curBreakout.endIndex := bar_index
+                lastORB.state := 'Entry Taken'
+                lastORB.entryATR := atr
+                lastORB.entryIndex := bar_index
+                lastORB.entryPrice := close
+                lastORB.entryBullish := curBreakout.isBullish
+
+                if slMethod == 'Other Side of ORB'
+                    lastORB.slPrice := lastORB.entryBullish ? lastORB.l : lastORB.h
+                else if slMethod == 'Breakout Candle'
+                    lastORB.slPrice := lastORB.entryBullish ? low : high
+                else if slMethod == 'ATR'
+                    lastORB.slPrice := lastORB.entryBullish ? lastORB.entryPrice - (lastORB.entryATR * slAtrMult) : lastORB.entryPrice + (lastORB.entryATR * slAtrMult)
+                else if slMethod == 'Pivot Structure'
+                    lastORB.slPrice := lastORB.entryBullish ? recentLow : recentHigh
+
+                if tpMethod == 'ATR'
+                    lastORB.tp1Price := lastORB.entryPrice + (lastORB.entryATR * tpAtrMult * (lastORB.entryBullish ? 1 : -1))
+                else if tpMethod == 'RR'
+                    riskAmount = math.abs(lastORB.entryPrice - lastORB.slPrice)
+                    lastORB.tp1Price := lastORB.entryBullish ? lastORB.entryPrice + (riskAmount * rrMultiplier) : lastORB.entryPrice - (riskAmount * rrMultiplier)
+
+    if not na(lastORB)
+        if lastORB.state == 'Entry Taken'
+            if na(lastORB.slIndex) and not lastORB.tp1FoundTick and (lastORB.entryBullish and high >= lastORB.tp1Price or not lastORB.entryBullish and low <= lastORB.tp1Price)
+                lastORB.tp1Index := bar_index
+                lastORB.tp1FoundTick := true
+                if adaptiveSL
+                    lastORB.slPrice := lastORB.entryPrice
+
+            if not na(lastORB.slPrice) and na(lastORB.slIndex)
+                if (lastORB.entryBullish and low < lastORB.slPrice) or (not lastORB.entryBullish and high > lastORB.slPrice)
+                    if not lastORB.tp1FoundTick or bar_index != lastORB.tp1Index
+                        lastORB.slIndex := bar_index
+                        lastORB.slFoundTick := true
+
+// --- MASTER DRAWING ENGINE ---
+renderORB(ORB orb) =>
+    if orb.startIndex > last_bar_index - renderMaxBarsBack
+        if showORBZones
+            orb.hLine := line.new(orb.startIndex, orb.h, nz(orb.endIndex, last_bar_index), orb.h, color = highColor, width = 2)
+            orb.lLine := line.new(orb.startIndex, orb.l, nz(orb.endIndex, last_bar_index), orb.l, color = lowColor, width = 2)
+        
+        if not na(orb.entryIndex)
+            orb.entryLabel := label.new(orb.entryIndex, orb.entryPrice + orb.entryATR * 3 * (orb.entryBullish ? -1 : 1), orb.entryBullish ? 'BUY' : 'SELL', color = orb.entryBullish ? #00bcd4 : #e91e63, textcolor = color.white, style = orb.entryBullish ? label.style_label_up : label.style_label_down, size=size.small)
+
+            if showHistoricZones or orb.isLastSession
+                tradeActive = not orb.slFoundTick and not orb.tp1FoundTick
+                
+                if tradeActive and showSLTPLines
+                    if not na(orb.slPrice)
+                        orb.slLineObj := line.new(orb.entryIndex, orb.slPrice, last_bar_index, orb.slPrice, color=color.red, style=line.style_dashed, width=1)
+                        orb.slLabel := label.new(last_bar_index, orb.slPrice, 'SL', color=color.new(color.white, 100), textcolor=color.red, style=label.style_label_left, size=size.small)
+                    if not na(orb.tp1Price)
+                        orb.tpLineObj := line.new(orb.entryIndex, orb.tp1Price, last_bar_index, orb.tp1Price, color=color.green, style=line.style_dashed, width=1)
+                        orb.tpLabel := label.new(last_bar_index, orb.tp1Price, 'TP', color=color.new(color.white, 100), textcolor=color.green, style=label.style_label_left, size=size.small)
+    int(na) // Prevents return type mismatch errors
+
+if barstate.islast
+    if orbList.size() > 0
+        for i = 0 to (showHistoricZones ? orbList.size() - 1 : 0) by 1
+            curORB = orbList.get(i)
+            safeDeleteORB(curORB)
+            renderORB(curORB)
+
+// --- DASHBOARD RENDERING ---
+if barstate.islast and orbDisplayEnabled
+    var table ORBDisplay = table.new(getPosition(orbLocation), 2, 5, bgcolor = dashboardBg, frame_width = 1, frame_color = #363a45, border_width = 1, border_color = #363a45)
+    
+    ORB lastORBD = na
+    float foundEntryPrice = na
+    float curSL = na
+    float curTP = na
+    bool isTradeLive = false
+    
+    if orbList.size() > 0
+        lastORBD := orbList.get(0)
+        isTradeLive := not na(lastORBD.entryIndex) and not lastORBD.tp1FoundTick and not lastORBD.slFoundTick
+        if isTradeLive
+            foundEntryPrice := lastORBD.entryPrice
+            curSL := lastORBD.slPrice
+            curTP := lastORBD.tp1Price
+
+    liveEmaBullish = close > ema
+
+    table.merge_cells(ORBDisplay, 0, 0, 1, 0)
+    table.cell(ORBDisplay, 0, 0, 'ORB ULTIMATE', text_color = color.white, bgcolor = #2962ff, text_halign = text.align_center)
+    
+    table.cell(ORBDisplay, 0, 1, 'EMA Trend', text_color = color.gray, text_halign = text.align_left)
+    table.cell(ORBDisplay, 1, 1, liveEmaBullish ? 'BULLISH' : 'BEARISH', text_color = liveEmaBullish ? #00bcd4 : #e91e63, text_halign = text.align_right)
+    
+    table.cell(ORBDisplay, 0, 2, 'Entry', text_color = color.gray, text_halign = text.align_left)
+    table.cell(ORBDisplay, 1, 2, na(foundEntryPrice) ? 'WAITING' : str.tostring(foundEntryPrice, format.mintick), text_color = color.white, text_halign = text.align_right)
+            
+    float displayTP = na
+    if not na(foundEntryPrice)
+        displayTP := curTP
+            
+    table.cell(ORBDisplay, 0, 3, 'Take Profit', text_color = color.gray, text_halign = text.align_left)
+    table.cell(ORBDisplay, 1, 3, na(displayTP) ? '--' : str.tostring(displayTP, format.mintick), text_color = na(displayTP) ? color.white : #00bcd4, text_halign = text.align_right)
+
+    table.cell(ORBDisplay, 0, 4, 'Stop Loss', text_color = color.gray, text_halign = text.align_left)
+    table.cell(ORBDisplay, 1, 4, na(curSL) ? '--' : str.tostring(curSL, format.mintick), text_color = color.white, text_halign = text.align_right)

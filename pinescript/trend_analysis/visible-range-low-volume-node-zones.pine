@@ -1,0 +1,255 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0)
+// Visible Range LVN/HVN Zones
+// Volume Profile computed over the visible chart range
+
+//@version=6
+indicator('Visible Range LVN Zones', overlay = true, max_boxes_count = 500, max_labels_count = 500, max_lines_count = 500)
+
+max_bars_back(high, 5000)
+max_bars_back(low, 5000)
+max_bars_back(volume, 5000)
+
+// ══════════════════════════════════════════════════════════════════════════════
+// INPUTS
+// ══════════════════════════════════════════════════════════════════════════════
+
+group_vp = "Volume Profile"
+i_bins     = input.int(30, 'Number of Bins', minval = 10, maxval = 100, group = group_vp)
+i_hvn_pct  = input.float(75.0, 'HVN Threshold (%ile)', minval = 50.0, maxval = 95.0, group = group_vp)
+i_lvn_pct  = input.float(25.0, 'LVN Threshold (%ile)', minval = 5.0, maxval = 50.0, group = group_vp)
+
+group_vis = "Zone Display"
+i_showHVN  = input.bool(true, 'Show HVN Zones (S/R)', group = group_vis)
+i_showLVN  = input.bool(true, 'Show LVN Zones (Gaps)', group = group_vis)
+i_showPOC  = input.bool(true, 'Show POC Line', group = group_vis)
+i_hvnColor = input.color(color.new(#2196f3, 75), 'HVN Color', group = group_vis)
+i_lvnColor = input.color(color.new(#ff9800, 70), 'LVN Color', group = group_vis)
+i_pocColor = input.color(#f44336, 'POC Color', group = group_vis)
+i_extendZones = input.bool(true, 'Extend Zones Right', group = group_vis)
+
+group_daily    = "Daily LVN"
+i_showDailyLVN = input.bool(true, 'Show Today\'s Lowest Volume Zone', group = group_daily)
+i_dailyBins    = input.int(20, 'Daily Bins', minval = 10, maxval = 60, group = group_daily)
+i_dailyColor   = input.color(color.new(#e91e63, 50), 'Daily LVN Color', group = group_daily)
+
+// ══════════════════════════════════════════════════════════════════════════════
+// VISIBLE RANGE DETECTION
+// ══════════════════════════════════════════════════════════════════════════════
+
+// chart.left_visible_bar_time / chart.right_visible_bar_time give the
+// timestamps of the leftmost and rightmost visible bars. We convert these
+// into a bar-index lookback so the rest of the logic stays the same.
+
+visLeftTime  = chart.left_visible_bar_time
+visRightTime = chart.right_visible_bar_time
+
+// Track the bar_index of the first visible bar
+var int visLeftBar  = na
+var int visRightBar = na
+
+if not na(visLeftTime) and time >= visLeftTime and (na(visLeftBar) or time <= visLeftTime + timeframe.in_seconds() * 1000)
+    visLeftBar := bar_index
+
+visRightBar := bar_index   // always update to current bar
+
+// --- Daily start tracking (midnight, not session) ---
+var int dayStartBar = na
+if ta.change(dayofmonth) != 0
+    dayStartBar := bar_index
+
+// ══════════════════════════════════════════════════════════════════════════════
+// LVN/HVN DETECTION — Runs on last bar using visible range
+// ══════════════════════════════════════════════════════════════════════════════
+
+var box[] zoneBoxes = array.new_box()
+var line[] zoneLines = array.new_line()
+var label[] zoneLabels = array.new_label()
+
+if barstate.islast
+    // ── Resolve visible bar range ──────────────────────────────────────────
+    // Re-scan for the left-visible bar index precisely
+    int leftIdx  = na
+    int rightIdx = bar_index
+    int maxScan  = math.min(bar_index, 5000)
+
+    for i = 0 to maxScan - 1
+        if time[i] >= visLeftTime
+            leftIdx := bar_index - i
+        if time[i] < visLeftTime
+            break
+
+    if na(leftIdx)
+        leftIdx := 0
+
+    int lookback = rightIdx - leftIdx
+    if lookback < 2
+        lookback := 2
+
+    // ── Cleanup previous drawings ──────────────────────────────────────────
+    if zoneBoxes.size() > 0
+        for b in zoneBoxes
+            b.delete()
+        zoneBoxes.clear()
+    if zoneLines.size() > 0
+        for ln in zoneLines
+            ln.delete()
+        zoneLines.clear()
+    if zoneLabels.size() > 0
+        for lb in zoneLabels
+            lb.delete()
+        zoneLabels.clear()
+
+    // ── Build range high / low ─────────────────────────────────────────────
+    float rangeHigh = high
+    float rangeLow  = low
+    for i = 0 to lookback - 1
+        if high[i] > rangeHigh
+            rangeHigh := high[i]
+        if low[i] < rangeLow
+            rangeLow := low[i]
+
+    float binSize = (rangeHigh - rangeLow) / i_bins
+    if binSize <= 0
+        binSize := syminfo.mintick
+
+    // ── Accumulate volume into bins ────────────────────────────────────────
+    float[] binVols = array.new_float(i_bins, 0.0)
+
+    for i = 0 to lookback - 1
+        float barH = high[i]
+        float barL = low[i]
+        float barV = volume[i]
+        float wickRange = math.max(barH - barL, syminfo.mintick)
+        for b = 0 to i_bins - 1
+            float binBottom = rangeLow + b * binSize
+            float binTop    = binBottom + binSize
+            float intersectLow  = math.max(barL, binBottom)
+            float intersectHigh = math.min(barH, binTop)
+            if intersectHigh > intersectLow
+                float allocated = barV * (intersectHigh - intersectLow) / wickRange
+                binVols.set(b, binVols.get(b) + allocated)
+
+    // ── Thresholds ─────────────────────────────────────────────────────────
+    float[] sorted = array.copy(binVols)
+    array.sort(sorted, order.ascending)
+    int hvnIdx = int(math.floor(i_bins * i_hvn_pct / 100.0))
+    if hvnIdx >= i_bins
+        hvnIdx := i_bins - 1
+    int lvnIdx = int(math.floor(i_bins * i_lvn_pct / 100.0))
+    if lvnIdx < 0
+        lvnIdx := 0
+    float hvnThresh = sorted.get(hvnIdx)
+    float lvnThresh = sorted.get(lvnIdx)
+
+    float maxVol = binVols.max()
+    int pocIdx   = binVols.indexof(maxVol)
+    int zoneRight = i_extendZones ? bar_index + 50 : bar_index
+
+    // ── Draw zones ─────────────────────────────────────────────────────────
+    for b = 0 to i_bins - 1
+        float vol = binVols.get(b)
+        if vol == 0
+            continue
+        float binBottom = rangeLow + b * binSize
+        float binTop    = binBottom + binSize
+        bool isHVN = vol >= hvnThresh
+        bool isLVN = vol <= lvnThresh
+        bool isPOC = b == pocIdx
+
+        if isPOC and i_showPOC
+            float pocPrice = (binTop + binBottom) / 2.0
+            zoneLines.push(line.new(leftIdx, pocPrice, zoneRight, pocPrice, color = i_pocColor, width = 2, style = line.style_solid))
+            zoneLabels.push(label.new(leftIdx, pocPrice, "POC", color = color.new(color.white, 100), textcolor = i_pocColor, style = label.style_label_right, size = size.small))
+        if isHVN and i_showHVN and not isPOC
+            zoneBoxes.push(box.new(leftIdx, binTop, zoneRight, binBottom, bgcolor = i_hvnColor, border_color = color.new(color.white, 100)))
+        if isLVN and i_showLVN
+            zoneBoxes.push(box.new(leftIdx, binTop, zoneRight, binBottom, bgcolor = i_lvnColor, border_color = color.new(color.white, 100)))
+
+    // ── Anchor label ───────────────────────────────────────────────────────
+    zoneLabels.push(label.new(leftIdx, rangeHigh, "VP Visible Range (" + str.tostring(lookback) + " bars)", color = color.new(color.white, 100), textcolor = color.gray, style = label.style_label_down, size = size.tiny))
+
+    // ── Dashboard ──────────────────────────────────────────────────────────
+    var table dash = table.new(position.bottom_right, columns = 2, rows = 6, bgcolor = color.new(#1a1a2e, 10), border_width = 1, border_color = color.new(color.gray, 60))
+    table.cell(dash, 0, 0, "LVN ZONES", text_color = i_lvnColor, text_size = size.small)
+    table.cell(dash, 1, 0, "", text_size = size.small)
+
+    int hvnCount = 0
+    int lvnCount = 0
+    for b = 0 to i_bins - 1
+        float vol = binVols.get(b)
+        if vol >= hvnThresh and vol > 0
+            hvnCount += 1
+        if vol <= lvnThresh and vol > 0
+            lvnCount += 1
+
+    table.cell(dash, 0, 1, "Range", text_color = color.gray, text_size = size.tiny)
+    table.cell(dash, 1, 1, "Visible (" + str.tostring(lookback) + " bars)", text_color = color.white, text_size = size.tiny)
+    table.cell(dash, 0, 2, "HVN (S/R)", text_color = color.gray, text_size = size.tiny)
+    table.cell(dash, 1, 2, str.tostring(hvnCount) + " zones", text_color = i_hvnColor, text_size = size.tiny)
+    table.cell(dash, 0, 3, "LVN (Gaps)", text_color = color.gray, text_size = size.tiny)
+    table.cell(dash, 1, 3, str.tostring(lvnCount) + " zones", text_color = i_lvnColor, text_size = size.tiny)
+    float pocPrice2 = rangeLow + pocIdx * binSize + binSize / 2.0
+    table.cell(dash, 0, 4, "POC", text_color = color.gray, text_size = size.tiny)
+    table.cell(dash, 1, 4, str.tostring(pocPrice2, format.mintick), text_color = i_pocColor, text_size = size.tiny)
+    table.cell(dash, 0, 5, "Bins", text_color = color.gray, text_size = size.tiny)
+    table.cell(dash, 1, 5, str.tostring(i_bins), text_color = color.white, text_size = size.tiny)
+
+// ══════════════════════════════════════════════════════════════════════════════
+// DAILY LVN — Lowest volume zone since midnight
+// ══════════════════════════════════════════════════════════════════════════════
+
+var box dailyLVNBox = na
+var label dailyLVNLbl = na
+
+if barstate.islast and i_showDailyLVN and not na(dayStartBar)
+    box.delete(dailyLVNBox)
+    label.delete(dailyLVNLbl)
+
+    int dayLookback = bar_index - dayStartBar
+    if dayLookback < 2
+        dayLookback := 2
+
+    float dayHigh = high
+    float dayLow = low
+    for i = 0 to dayLookback - 1
+        if high[i] > dayHigh
+            dayHigh := high[i]
+        if low[i] < dayLow
+            dayLow := low[i]
+
+    float dayBinSize = (dayHigh - dayLow) / i_dailyBins
+    if dayBinSize <= 0
+        dayBinSize := syminfo.mintick
+
+    float[] dayBinVols = array.new_float(i_dailyBins, 0.0)
+
+    for i = 0 to dayLookback - 1
+        float barH = high[i]
+        float barL = low[i]
+        float barV = volume[i]
+        float wickRange = math.max(barH - barL, syminfo.mintick)
+        for b = 0 to i_dailyBins - 1
+            float binBottom = dayLow + b * dayBinSize
+            float binTop = binBottom + dayBinSize
+            float iLow = math.max(barL, binBottom)
+            float iHigh = math.min(barH, binTop)
+            if iHigh > iLow
+                float allocated = barV * (iHigh - iLow) / wickRange
+                dayBinVols.set(b, dayBinVols.get(b) + allocated)
+
+    // Find the bin with the absolute lowest volume (skip zero)
+    float minVol = float(na)
+    int minIdx = -1
+    for b = 0 to i_dailyBins - 1
+        float vol = dayBinVols.get(b)
+        if vol > 0 and (na(minVol) or vol < minVol)
+            minVol := vol
+            minIdx := b
+
+    if minIdx >= 0
+        float lvnBot = dayLow + minIdx * dayBinSize
+        float lvnTop = lvnBot + dayBinSize
+        float lvnMid = (lvnBot + lvnTop) / 2.0
+        int dRight = i_extendZones ? bar_index + 50 : bar_index
+        dailyLVNBox := box.new(dayStartBar, lvnTop, dRight, lvnBot, bgcolor = i_dailyColor, border_color = color.new(i_dailyColor, 30), border_width = 1, border_style = line.style_dashed)
+        dailyLVNLbl := label.new(dayStartBar, lvnMid, "Daily LVN", color = color.new(color.white, 100), textcolor = i_dailyColor, style = label.style_label_right, size = size.tiny)

@@ -1,0 +1,790 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © MPR86
+
+//@version=6
+indicator("Volume Profile / Chip Distribution S/R Zones (Peaks) [Modified]", "Volume Profile and Chip Distribution S/R zone (Peak)",
+     overlay = true, max_boxes_count = 500, max_labels_count = 500, max_bars_back = 5000)
+
+//==================================================================================================
+// HARD RULES (fixed styling)
+//==================================================================================================
+white20      = color.new(color.white, 80)          // white @ 20% opacity (not changeable)
+priceLabelBg = color.new(chart.fg_color, 89)       // keep label styling like TradingView defaults
+priceLabelFg = chart.fg_color
+
+//==================================================================================================
+// INPUTS (changeable only where allowed)
+//==================================================================================================
+groupVP = "Volume Profile - Core"
+
+vp_profileShow = input.bool(true, "Profile Histogram", group=groupVP)
+
+// Default lookback: 81 DAYS, changeable
+vp_profileDays = input.int(81, "Profile Lookback (Days)", minval=1, maxval=3650, group=groupVP)
+
+// Default rows: 33, changeable
+vp_profileNumberOfRows = input.int(33, "Profile Number of Rows", minval=10, maxval=130, group=groupVP)
+
+// Default VA: 100%, changeable (internal only; no VAH/VAL display)
+vp_valueAreaThreshold = input.float(100, "Value Area (%)", minval=0, maxval=100, group=groupVP) / 100
+
+vp_profileWidth = input.float(31, "Profile Width", minval=1, maxval=250, group=groupVP) / 100
+
+vp_pocShow  = input.string("None", "POC Mode", options=["Developing","Regular","None"], group=groupVP)
+vp_pocWidth = input.int(2, "POC Width", minval=1, maxval=5, group=groupVP)
+
+vp_profileLevels = input.string("Small", "Base Price Labels", options=["Tiny","Small","Normal","None"], group=groupVP)
+
+groupNodes = "S/R Zones - Peaks Engine"
+
+// show top N zones only (keeps it clean and within object limits)
+sr_topN = input.int(10, "Show Top N Zones", minval=1, maxval=25, group=groupNodes)
+
+// zone thickness controls
+sr_atrLen  = input.int(14, "ATR Length", minval=1, maxval=100, group=groupNodes)
+sr_atrFrac = input.float(0.25, "Zone Half-Width = max(priceStep, ATR * frac)", minval=0.01, maxval=2.0, group=groupNodes)
+
+// filters (prominence + relative-to-max)
+sr_promMin     = input.float(1.30, "Peak Prominence Min (vs local avg)", minval=1.0, maxval=10.0, group=groupNodes)
+sr_relToMaxMin = input.float(0.25, "Peak Min Relative to Max Node", minval=0.01, maxval=1.0, group=groupNodes)
+
+// merge nearby zones
+sr_mergeAtrFrac = input.float(0.50, "Merge Distance (ATR * frac)", minval=0.05, maxval=5.0, group=groupNodes)
+
+// scoring weights
+sr_touchPts  = input.float(1.0, "Score: Touch", minval=0.0, maxval=10.0, group=groupNodes)
+sr_rejectPts = input.float(2.0, "Score: Valid Rejection", minval=0.0, maxval=20.0, group=groupNodes)
+sr_breakPts  = input.float(3.0, "Score: Confirmed Break (penalty)", minval=0.0, maxval=50.0, group=groupNodes)
+sr_decay     = input.float(0.995, "Score Decay per Bar", minval=0.90, maxval=1.0, group=groupNodes)
+
+// break confirmation
+sr_breakAtrFrac = input.float(0.20, "Break Distance Confirm (ATR * frac)", minval=0.0, maxval=2.0, group=groupNodes)
+sr_breakConsec  = input.int(2, "Break Confirm: Consecutive Closes Outside", minval=1, maxval=5, group=groupNodes)
+
+// polarity bias threshold (tooltip classification only)
+sr_deltaStrong = input.float(0.15, "Polarity Bias Threshold (|deltaPct|)", minval=0.0, maxval=1.0, group=groupNodes)
+
+// Optional: include troughs (LVNs) as barrier zones
+sr_includeTroughs = input.bool(true, "Also Include Trough Zones (LVNs)", group=groupNodes)
+
+//==================================================================================================
+// CHIP DISTRIBUTION (Cost Basis Approx) — optional node source
+//==================================================================================================
+groupChip = "Chip Distribution (Cost Basis Approx)"
+chip_useAsSource      = input.bool(true, "Use Chip Distribution as Node Source", group=groupChip)
+chip_useSharesOut     = input.bool(true, "Use shares outstanding when available", group=groupChip)
+chip_turnoverLen      = input.int(20, "Turnover Avg Length (fallback)", minval=1, maxval=200, group=groupChip)
+chip_avgTurnoverGuess = input.float(0.01, "Fallback Avg Turnover per Bar", minval=0.0, maxval=1.0, group=groupChip)
+chip_turnoverScale    = input.float(1.0, "Turnover Scale", minval=0.0, maxval=10.0, group=groupChip)
+
+//==================================================================================================
+// TYPES (foundation)
+//==================================================================================================
+type BAR
+    float open   = open
+    float high   = high
+    float low    = low
+    float close  = close
+    float volume = volume
+    int   index  = bar_index
+
+type barData
+    float[] barHigh
+    float[] barLow
+    float[] barVolume
+    bool[]  barPolarity
+    int[]   barCount
+
+type volumeData
+    float[] totalVolume
+    float[] bullishVolume
+    int[]   endProfileIndex
+
+type volumeProfile
+    box[]         boxes
+    chart.point[] pocPoints
+    polyline      pocPolyline
+    int           pocLevel
+    int           vahLevel
+    int           valLevel
+    int           startIndex
+
+//==================================================================================================
+// HELPERS
+//==================================================================================================
+clamp01(x) =>
+    math.max(0.0, math.min(1.0, x))
+
+getTextSize(_text) =>
+    if _text != "None"
+        switch _text
+            "Tiny"   => size.tiny
+            "Small"  => size.small
+            "Normal" => size.normal
+            => size.auto
+    else
+        size.auto
+
+// lower-TF request
+requestBarData(_lowerTimeframe) => request.security_lower_tf(syminfo.tickerid, _lowerTimeframe, BAR.new(), ignore_invalid_timeframe = true)
+
+calculateTimeframe(_depth) =>
+    int tfInSec = timeframe.in_seconds(timeframe.period)
+    int m = 60
+    if _depth == 2
+        switch
+            tfInSec < 30            => "1S"
+            tfInSec < 1 * m         => "5S"
+            tfInSec <= 15 * m       => "1"
+            tfInSec <= 60 * m       => "5"
+            tfInSec <= 240 * m      => "15"
+            tfInSec <= 1440 * m     => "60"
+            => "D"
+    else
+        switch
+            tfInSec < 15            => "1S"
+            tfInSec < 30            => "5S"
+            tfInSec < 1 * m         => "15S"
+            tfInSec <= 5 * m        => "1"
+            tfInSec <= 15 * m       => "5"
+            tfInSec <= 60 * m       => "15"
+            tfInSec <= 240 * m      => "60"
+            tfInSec <= 1440 * m     => "240"
+            => "D"
+
+// --- FIX: Pine v6 doesn't allow mutating function arguments (like _lb := ...).
+// We return the updated label instead.
+
+updateLabel(_lb, _x, _y, _text, _style, _tip) =>
+    label out = _lb
+    if na(out)
+        out := label.new(_x, _y, _text, xloc.bar_index, yloc.price, priceLabelBg, _style, priceLabelFg, getTextSize(vp_profileLevels), text.align_left, _tip)
+    else
+        label.set_xy(out, _x, _y)
+        label.set_text(out, _text)
+        label.set_style(out, _style)
+        label.set_color(out, priceLabelBg)
+        label.set_textcolor(out, priceLabelFg)
+        label.set_size(out, getTextSize(vp_profileLevels))
+        label.set_tooltip(out, _tip)
+    out
+
+//==================================================================================================
+// STATE / STORAGE
+//==================================================================================================
+BAR bar = BAR.new()
+BAR[] ltfBarData = array.new<BAR>(1, BAR.new())
+
+var int prevRows = na
+
+var barData barDataArray = barData.new(array.new<float>(0), array.new<float>(0), array.new<float>(0), array.new<bool>(0), array.new<int>(0))
+
+var volumeData volumeDataArray = volumeData.new(array.new<float>(1, 0.0), array.new<float>(1, 0.0), array.new<int>(1, 0))
+
+var volumeProfile VP = volumeProfile.new(array.new<box>(0), array.new<chart.point>(0), na, na, na, na, na)
+
+var float highestPrice = na
+var float lowestPrice  = na
+
+// drawn S/R zones (only on last bar)
+var box[]   srBoxes  = array.new<box>(0)
+var label[] srLabels = array.new<label>(0)
+
+// persistent base labels (avoid label leak)
+var label lbHigh = na
+var label lbPOC  = na
+var label lbLow  = na
+
+// POC regular line (avoid line spam)
+var line pocLine = na
+
+//==================================================================================================
+// TIME -> BARS for "days lookback"
+//==================================================================================================
+barsPerDay = 86400.0 / timeframe.in_seconds(timeframe.period)
+vp_profileLengthRaw = int(math.round(vp_profileDays * barsPerDay))
+vp_profileLength = math.min(5000, math.max(1, vp_profileLengthRaw))
+vp_profileLength := last_bar_index < vp_profileLength ? last_bar_index : vp_profileLength - 1
+
+//==================================================================================================
+// INIT WHEN ROWS CHANGE
+//==================================================================================================
+if barstate.isfirst or vp_profileNumberOfRows != prevRows
+    prevRows := vp_profileNumberOfRows
+    volumeDataArray := volumeData.new(
+        array.new<float>(vp_profileNumberOfRows, 0.0),
+        array.new<float>(vp_profileNumberOfRows, 0.0),
+        array.new<int>(vp_profileNumberOfRows, 0)
+    )
+
+    // delete profile boxes if any
+    while array.size(VP.boxes) > 0
+        box.delete(array.pop(VP.boxes))
+
+    // clear old drawn S/R
+    while array.size(srBoxes) > 0
+        box.delete(array.pop(srBoxes))
+    while array.size(srLabels) > 0
+        label.delete(array.pop(srLabels))
+
+//==================================================================================================
+// PROFILE RANGE (highest/lowest over lookback)
+//==================================================================================================
+if bar.index == last_bar_index - vp_profileLength
+    VP.startIndex := bar.index
+    lowestPrice := bar.low
+    highestPrice := bar.high
+else if bar.index > last_bar_index - vp_profileLength
+    lowestPrice := math.min(bar.low, lowestPrice)
+    highestPrice := math.max(bar.high, highestPrice)
+
+// choose LTF feed
+if vp_profileLength <= 700
+    ltfBarData := requestBarData(calculateTimeframe(2))
+else
+    ltfBarData := array.new<BAR>(1, BAR.new(bar.open, bar.high, bar.low, bar.close, bar.volume))
+
+// collect historical LTF bars
+if barstate.ishistory and (bar.index >= last_bar_index - vp_profileLength) and bar.index < last_bar_index and ltfBarData.size() > 0
+    if not na(nz(ltfBarData.get(0).volume))
+        for j = 0 to ltfBarData.size() - 1
+            barDataArray.barHigh.push(ltfBarData.get(j).high)
+            barDataArray.barLow.push(ltfBarData.get(j).low)
+            barDataArray.barVolume.push(ltfBarData.get(j).volume)
+            barDataArray.barPolarity.push(ltfBarData.get(j).close > ltfBarData.get(j).open)
+        barDataArray.barCount.push(ltfBarData.size())
+
+priceStep = (highestPrice - lowestPrice) / vp_profileNumberOfRows
+atr = ta.atr(sr_atrLen)
+stepOk = priceStep > 0
+
+//==================================================================================================
+// MAIN BUILD (only on last bar)
+//==================================================================================================
+if barstate.islast and ltfBarData.size() > 0 and stepOk
+
+    // -------------------------
+    // Clean previous drawings
+    // -------------------------
+    // delete previous profile boxes
+    while array.size(VP.boxes) > 0
+        box.delete(array.pop(VP.boxes))
+
+    // delete previous zone drawings
+    while array.size(srBoxes) > 0
+        box.delete(array.pop(srBoxes))
+    while array.size(srLabels) > 0
+        label.delete(array.pop(srLabels))
+
+    // delete developing POC polyline if exists
+    if not na(VP.pocPolyline)
+        polyline.delete(VP.pocPolyline)
+        VP.pocPolyline := na
+
+    // hide/delete POC line if mode != Regular
+    // (we'll recreate/update it below if needed)
+    if not na(pocLine)
+        line.delete(pocLine)
+        pocLine := na
+
+    // -------------------------
+    // Rolling LTF arrays within window
+    // -------------------------
+    if barDataArray.barCount.size() > vp_profileLength
+        bc = barDataArray.barCount.shift()
+        for _ = 0 to bc - 1
+            barDataArray.barHigh.shift()
+            barDataArray.barLow.shift()
+            barDataArray.barVolume.shift()
+            barDataArray.barPolarity.shift()
+
+    // add current ltf bars
+    if not na(nz(ltfBarData.get(0).volume))
+        for j = 0 to ltfBarData.size() - 1
+            barDataArray.barHigh.push(ltfBarData.get(j).high)
+            barDataArray.barLow.push(ltfBarData.get(j).low)
+            barDataArray.barVolume.push(ltfBarData.get(j).volume)
+            barDataArray.barPolarity.push(ltfBarData.get(j).close > ltfBarData.get(j).open)
+        barDataArray.barCount.push(ltfBarData.size())
+
+    // -------------------------
+    // Reset bins
+    // -------------------------
+    for i = 0 to vp_profileNumberOfRows - 1
+        volumeDataArray.totalVolume.set(i, 0.0)
+        volumeDataArray.bullishVolume.set(i, 0.0)
+        volumeDataArray.endProfileIndex.set(i, 0)
+
+    // -------------------------
+    // Rebuild volume profile bins from LTF bar arrays
+    // -------------------------
+    barIndex = vp_profileLength
+    numberOfBars = 0
+    arraySize = barDataArray.barVolume.size()
+
+    VP.pocPoints.clear()
+
+    for arrayIndex = 0 to arraySize - 1
+        levelHigh = barDataArray.barHigh.get(arrayIndex)
+        levelLow  = barDataArray.barLow.get(arrayIndex)
+        levelVol  = barDataArray.barVolume.get(arrayIndex)
+
+        int startSlot = math.max(math.floor((levelLow - lowestPrice) / priceStep), 0)
+        int endSlot   = math.min(math.floor((levelHigh - lowestPrice) / priceStep), vp_profileNumberOfRows - 1)
+
+        for p = startSlot to endSlot
+            float priceLevel = lowestPrice + p * priceStep
+
+            volProp = switch
+                levelLow >= priceLevel and levelHigh > priceLevel + priceStep => (priceLevel + priceStep - levelLow) / (levelHigh - levelLow)
+                levelHigh <= priceLevel + priceStep and levelLow < priceLevel => (levelHigh - priceLevel) / (levelHigh - levelLow)
+                levelLow >= priceLevel and levelHigh <= priceLevel + priceStep => 1
+                => priceStep / (levelHigh - levelLow)
+
+            volumeDataArray.totalVolume.set(p, volumeDataArray.totalVolume.get(p) + levelVol * volProp)
+            if barDataArray.barPolarity.get(arrayIndex)
+                volumeDataArray.bullishVolume.set(p, volumeDataArray.bullishVolume.get(p) + levelVol * volProp)
+
+        // Developing POC (volume-based). If chip distribution is enabled, we auto-fallback to Regular POC for consistency.
+        if (vp_pocShow == "Developing") and (not chip_useAsSource)
+            // POC level so far
+            curMax = volumeDataArray.totalVolume.max()
+            curPocLevel = volumeDataArray.totalVolume.indexof(curMax)
+            if curPocLevel != -1
+                if arrayIndex == barDataArray.barCount.get(vp_profileLength - barIndex)
+                    BAR b = bar[barIndex]
+                    VP.pocPoints.push(chart.point.from_index(b.index, math.avg(b.high, b.low)))
+                    VP.pocPoints.push(chart.point.from_index(b.index + 1, lowestPrice + (curPocLevel + 0.5) * priceStep))
+                    numberOfBars += barDataArray.barCount.get(vp_profileLength - barIndex)
+                    barIndex -= 1
+                else if arrayIndex == (numberOfBars + barDataArray.barCount.get(vp_profileLength - barIndex)) and numberOfBars != 0
+                    BAR b = bar[barIndex]
+                    VP.pocPoints.push(chart.point.from_index(b.index + 1, lowestPrice + (curPocLevel + 0.5) * priceStep))
+                    numberOfBars += barDataArray.barCount.get(vp_profileLength - barIndex)
+                    barIndex -= 1
+                else if barIndex == 0
+                    BAR b = bar[barIndex]
+                    VP.pocPoints.push(chart.point.from_index(b.index + 1, lowestPrice + (curPocLevel + 0.5) * priceStep))
+                    numberOfBars += barDataArray.barCount.get(vp_profileLength - barIndex)
+
+    // developing POC polyline (volume-based only)
+    if (vp_pocShow == "Developing") and (not chip_useAsSource) and (VP.pocPoints.size() > 1)
+        VP.pocPolyline := polyline.new(VP.pocPoints, false, false, xloc.bar_index, white20, color(na), line.style_solid, vp_pocWidth)
+
+    //==================================================================================================
+    // CHIP DISTRIBUTION (Cost Basis Approximation via Turnover Migration)
+    // NOTE: This is an estimate. When shares outstanding is not available, turnover is approximated.
+    //==================================================================================================
+
+    // Per-bin "chips" (density of estimated cost basis) and bullish share of chips
+    float[] chipTotal = array.new<float>(vp_profileNumberOfRows, 0.0)
+    float[] chipBull  = array.new<float>(vp_profileNumberOfRows, 0.0)
+
+    // Shares outstanding via fundamentals (stocks only; often na on CFDs/crypto/forex)
+    float sharesOut = na
+    if chip_useSharesOut
+        sharesOut := request.financial(syminfo.tickerid, "TOTAL_SHARES_OUTSTANDING", "FQ")
+
+    bool hasSharesOut = chip_useSharesOut and not na(sharesOut) and sharesOut > 0
+
+    // Volume baseline for fallback turnover model
+    float avgVolSeries = ta.sma(volume, chip_turnoverLen)
+
+    // Walk bars from oldest -> newest (k large = older)
+    for k = vp_profileLength to 0
+        float vBar = volume[k]
+        if vBar > 0
+            float avgV = nz(avgVolSeries[k], vBar)
+
+            // turnover fraction (NO multiline ternary; safest form)
+            float tBase = na
+            if hasSharesOut
+                tBase := vBar / sharesOut
+            else
+                tBase := chip_avgTurnoverGuess * (avgV > 0 ? (vBar / avgV) : 1.0)
+
+            float turnover = clamp01(tBase * chip_turnoverScale)
+
+            if turnover > 0
+                // decay existing chips by turnover
+                for r = 0 to vp_profileNumberOfRows - 1
+                    chipTotal.set(r, chipTotal.get(r) * (1.0 - turnover))
+                    chipBull.set(r,  chipBull.get(r)  * (1.0 - turnover))
+
+                float hi = high[k]
+                float lo = low[k]
+                bool isBullBar = close[k] > open[k]
+
+                // Distribute the new "chips" across bins by overlap weights
+                if hi == lo
+                    int slot = int(math.floor((lo - lowestPrice) / priceStep))
+                    slot := math.max(0, math.min(vp_profileNumberOfRows - 1, slot))
+                    chipTotal.set(slot, chipTotal.get(slot) + turnover)
+                    if isBullBar
+                        chipBull.set(slot, chipBull.get(slot) + turnover)
+                else
+                    int startSlot = math.max(int(math.floor((lo - lowestPrice) / priceStep)), 0)
+                    int endSlot   = math.min(int(math.floor((hi - lowestPrice) / priceStep)), vp_profileNumberOfRows - 1)
+
+                    // sum overlap weights
+                    float sumW = 0.0
+                    for p = startSlot to endSlot
+                        float priceLevel = lowestPrice + p * priceStep
+                        float w = switch
+                            lo >= priceLevel and hi > priceLevel + priceStep => (priceLevel + priceStep - lo) / (hi - lo)
+                            hi <= priceLevel + priceStep and lo < priceLevel => (hi - priceLevel) / (hi - lo)
+                            lo >= priceLevel and hi <= priceLevel + priceStep => 1.0
+                            => priceStep / (hi - lo)
+                        sumW += w
+
+                    // add normalized distribution * turnover
+                    if sumW > 0
+                        for p = startSlot to endSlot
+                            float priceLevel = lowestPrice + p * priceStep
+                            float w = switch
+                                lo >= priceLevel and hi > priceLevel + priceStep => (priceLevel + priceStep - lo) / (hi - lo)
+                                hi <= priceLevel + priceStep and lo < priceLevel => (hi - priceLevel) / (hi - lo)
+                                lo >= priceLevel and hi <= priceLevel + priceStep => 1.0
+                                => priceStep / (hi - lo)
+
+                            float d = w / sumW
+                            chipTotal.set(p, chipTotal.get(p) + turnover * d)
+                            if isBullBar
+                                chipBull.set(p, chipBull.get(p) + turnover * d)
+
+    //==================================================================================================
+    // Choose node source: Chip Distribution OR Volume Profile
+    //==================================================================================================
+    useChips = chip_useAsSource
+
+    // if chip mode is ON and user chose Developing POC, we keep developing POC OFF and use Regular POC instead
+    pocModeEff = (useChips and vp_pocShow == "Developing") ? "Regular" : vp_pocShow
+
+    nodeMax = useChips ? chipTotal.max() : volumeDataArray.totalVolume.max()
+
+    //==================================================================================================
+    // Compute POC + Value Area INTERNALLY from node source (no VAH/VAL display)
+    //==================================================================================================
+    VP.pocLevel := useChips ? chipTotal.indexof(nodeMax) : volumeDataArray.totalVolume.indexof(nodeMax)
+
+    totalTraded = useChips ? (chipTotal.sum() * vp_valueAreaThreshold) : (volumeDataArray.totalVolume.sum() * vp_valueAreaThreshold)
+    vaVol = VP.pocLevel != -1 ? (useChips ? chipTotal.get(VP.pocLevel) : volumeDataArray.totalVolume.get(VP.pocLevel)) : 0.0
+
+    VP.vahLevel := VP.pocLevel
+    VP.valLevel := VP.pocLevel
+
+    while vaVol < totalTraded
+        if VP.valLevel == 0 and VP.vahLevel == vp_profileNumberOfRows - 1
+            break
+
+        volAbove = 0.0
+        if VP.vahLevel < vp_profileNumberOfRows - 1
+            volAbove := useChips ? chipTotal.get(VP.vahLevel + 1) : volumeDataArray.totalVolume.get(VP.vahLevel + 1)
+
+        volBelow = 0.0
+        if VP.valLevel > 0
+            volBelow := useChips ? chipTotal.get(VP.valLevel - 1) : volumeDataArray.totalVolume.get(VP.valLevel - 1)
+
+        if volAbove == 0 and volBelow == 0
+            break
+
+        if volAbove >= volBelow
+            vaVol += volAbove
+            VP.vahLevel += 1
+        else
+            vaVol += volBelow
+            VP.valLevel -= 1
+
+    pocPrice = (VP.pocLevel != -1) ? (lowestPrice + (VP.pocLevel + 0.5) * priceStep) : na
+
+    //==================================================================================================
+    // Draw POC (Regular)
+    //==================================================================================================
+    if pocModeEff == "Regular" and VP.pocLevel != -1
+        pocLine := line.new(VP.startIndex, pocPrice, last_bar_index, pocPrice, xloc=xloc.bar_index, extend=extend.none, color=white20, style=line.style_solid, width=vp_pocWidth)
+
+    //==================================================================================================
+    // Draw Profile Histogram (LEFT placement, white20)
+    //==================================================================================================
+    profilePlotLen = vp_profileLength > 360 ? 360 : vp_profileLength
+    profWidthBars  = profilePlotLen * vp_profileWidth
+
+    if vp_profileShow and nodeMax > 0
+        for lvl = 0 to vp_profileNumberOfRows - 1
+            tot  = useChips ? chipTotal.get(lvl) : volumeDataArray.totalVolume.get(lvl)
+            bull = useChips ? chipBull.get(lvl)  : volumeDataArray.bullishVolume.get(lvl)
+            bear = math.max(tot - bull, 0.0)
+
+            x1 = VP.startIndex
+            x2 = int(x1 + (bull / nodeMax) * profWidthBars)
+            VP.boxes.push(box.new(x1, lowestPrice + (lvl + 0.1) * priceStep, x2, lowestPrice + (lvl + 0.9) * priceStep,
+                                  border_color=color(na), bgcolor=white20))
+
+            x3 = x2
+            x4 = int(x3 + (bear / nodeMax) * profWidthBars)
+            VP.boxes.push(box.new(x3, lowestPrice + (lvl + 0.1) * priceStep, x4, lowestPrice + (lvl + 0.9) * priceStep,
+                                  border_color=color(na), bgcolor=white20))
+
+            volumeDataArray.endProfileIndex.set(lvl, x4)
+
+    //==================================================================================================
+    // Base price labels (persistent, no leaks)
+    //==================================================================================================
+    if vp_profileLevels != "None" and VP.pocLevel != -1
+        lbHigh := updateLabel(lbHigh, VP.startIndex, highestPrice, str.tostring(highestPrice, format.mintick), label.style_label_down, "Profile High")
+        lbPOC  := updateLabel(lbPOC,  last_bar_index, pocPrice,     str.tostring(pocPrice, format.mintick),     label.style_label_left, "Point of Control")
+        lbLow  := updateLabel(lbLow,  VP.startIndex, lowestPrice,   str.tostring(lowestPrice,  format.mintick), label.style_label_up,   "Profile Low")
+
+    //==================================================================================================
+    // PEAKS + (optional) TROUGHS -> CANDIDATE ZONES (using chosen node source)
+    //==================================================================================================
+    int[]   candLvl   = array.new<int>(0)
+    float[] candWt    = array.new<float>(0)
+    float[] candDelta = array.new<float>(0)
+
+    vmaxNode = nodeMax
+    N = math.max(1, int(vp_profileNumberOfRows * 0.09))  // neighborhood window (~3 bins for 33 rows)
+
+    // Peaks (HVNs)
+    for lvl = 0 to vp_profileNumberOfRows - 1
+        v = useChips ? chipTotal.get(lvl) : volumeDataArray.totalVolume.get(lvl)
+        if vmaxNode > 0 and (v / vmaxNode) >= sr_relToMaxMin
+            left  = math.max(0, lvl - N)
+            right = math.min(vp_profileNumberOfRows - 1, lvl + N)
+
+            bool isPeak = true
+            neighSum = 0.0
+            neighCnt = 0
+
+            for k = left to right
+                if k != lvl
+                    vk = useChips ? chipTotal.get(k) : volumeDataArray.totalVolume.get(k)
+                    neighSum += vk
+                    neighCnt += 1
+                    if vk >= v
+                        isPeak := false
+
+            neighAvg = neighCnt > 0 ? neighSum / neighCnt : v
+            prom = neighAvg > 0 ? v / neighAvg : 999.0
+
+            if isPeak and prom >= sr_promMin
+                tot  = v
+                bull = useChips ? chipBull.get(lvl) : volumeDataArray.bullishVolume.get(lvl)
+                bear = math.max(tot - bull, 0.0)
+                deltaPct = tot > 0 ? (bull - bear) / tot : 0.0
+
+                array.push(candLvl, lvl)
+                array.push(candWt, v)
+                array.push(candDelta, deltaPct)
+
+    // Troughs (LVNs)
+    if sr_includeTroughs and vmaxNode > 0
+        for lvl = 0 to vp_profileNumberOfRows - 1
+            v = useChips ? chipTotal.get(lvl) : volumeDataArray.totalVolume.get(lvl)
+            if (v / vmaxNode) <= 0.20
+                left  = math.max(0, lvl - N)
+                right = math.min(vp_profileNumberOfRows - 1, lvl + N)
+
+                bool isTrough = true
+                for k = left to right
+                    if k != lvl
+                        vk = useChips ? chipTotal.get(k) : volumeDataArray.totalVolume.get(k)
+                        if vk <= v
+                            isTrough := false
+
+                if isTrough
+                    tot  = v
+                    bull = useChips ? chipBull.get(lvl) : volumeDataArray.bullishVolume.get(lvl)
+                    bear = math.max(tot - bull, 0.0)
+                    deltaPct = tot > 0 ? (bull - bear) / tot : 0.0
+
+                    array.push(candLvl, lvl)
+                    array.push(candWt, v)
+                    array.push(candDelta, deltaPct)
+
+    //==================================================================================================
+    // BUILD ZONES: levels -> price zones, then MERGE nearby zones
+    //==================================================================================================
+    candN = array.size(candLvl)
+
+    float[] zCenter = array.new<float>(0)
+    float[] zBot    = array.new<float>(0)
+    float[] zTop    = array.new<float>(0)
+    float[] zWt     = array.new<float>(0)
+    float[] zDelta  = array.new<float>(0)
+
+    halfW = math.max(priceStep * 1.0, atr * sr_atrFrac)
+
+    if candN > 0
+        // sort candidates by center price (stable for small candN)
+        int[] idx = array.new<int>(candN, 0)
+        for i = 0 to candN - 1
+            array.set(idx, i, i)
+
+        if candN > 1
+            for i = 0 to candN - 2
+                best = i
+                bestP = lowestPrice + (array.get(candLvl, array.get(idx, i)) + 0.5) * priceStep
+                for j = i + 1 to candN - 1
+                    pj = lowestPrice + (array.get(candLvl, array.get(idx, j)) + 0.5) * priceStep
+                    if pj < bestP
+                        bestP := pj
+                        best := j
+                tmp = array.get(idx, i)
+                array.set(idx, i, array.get(idx, best))
+                array.set(idx, best, tmp)
+
+        mergeDist = atr * sr_mergeAtrFrac
+
+        for t = 0 to candN - 1
+            ii  = array.get(idx, t)
+            lvl = array.get(candLvl, ii)
+
+            c   = lowestPrice + (lvl + 0.5) * priceStep
+            bot = c - halfW
+            top = c + halfW
+            wt  = array.get(candWt, ii)
+            dp  = array.get(candDelta, ii)
+
+            if array.size(zCenter) == 0
+                array.push(zCenter, c), array.push(zBot, bot), array.push(zTop, top), array.push(zWt, wt), array.push(zDelta, dp)
+            else
+                last = array.size(zCenter) - 1
+                lastC = array.get(zCenter, last)
+
+                if math.abs(c - lastC) <= mergeDist
+                    lastBot = array.get(zBot, last)
+                    lastTop = array.get(zTop, last)
+                    lastWt  = array.get(zWt, last)
+                    lastDp  = array.get(zDelta, last)
+
+                    newWt = lastWt + wt
+                    newC  = newWt > 0 ? (lastC * lastWt + c * wt) / newWt : lastC
+                    newDp = newWt > 0 ? (lastDp * lastWt + dp * wt) / newWt : lastDp
+
+                    array.set(zCenter, last, newC)
+                    array.set(zBot, last, math.min(lastBot, bot))
+                    array.set(zTop, last, math.max(lastTop, top))
+                    array.set(zWt, last, newWt)
+                    array.set(zDelta, last, newDp)
+                else
+                    array.push(zCenter, c), array.push(zBot, bot), array.push(zTop, top), array.push(zWt, wt), array.push(zDelta, dp)
+
+    //==================================================================================================
+    // SCORE ZONES BY RETESTS / REJECTIONS / BREAKS over the lookback window
+    //==================================================================================================
+    zN = array.size(zCenter)
+    float[] zScore = array.new<float>(zN, 0.0)
+
+    if zN > 0
+        for zi = 0 to zN - 1
+            c   = array.get(zCenter, zi)
+            bot = array.get(zBot, zi)
+            top = array.get(zTop, zi)
+
+            score = 0.0
+            consecOutside = 0
+
+            for k = vp_profileLength to 0
+                hi = high[k]
+                lo = low[k]
+                cl = close[k]
+                ak = ta.atr(sr_atrLen)[k]
+
+                role = c < cl ? 1 : -1  // 1=support-side, -1=resistance-side
+                touch = (lo <= top) and (hi >= bot)
+
+                if role == 1
+                    outside = cl < bot
+                    consecOutside := outside ? (consecOutside + 1) : 0
+                    breakDist = cl < (bot - ak * sr_breakAtrFrac)
+                    breakConfirm = outside and (breakDist or consecOutside >= sr_breakConsec)
+
+                    if touch
+                        score += sr_touchPts
+                        if cl > top
+                            score += sr_rejectPts
+
+                    if breakConfirm
+                        score -= sr_breakPts
+                else
+                    outside = cl > top
+                    consecOutside := outside ? (consecOutside + 1) : 0
+                    breakDist = cl > (top + ak * sr_breakAtrFrac)
+                    breakConfirm = outside and (breakDist or consecOutside >= sr_breakConsec)
+
+                    if touch
+                        score += sr_touchPts
+                        if cl < bot
+                            score += sr_rejectPts
+
+                    if breakConfirm
+                        score -= sr_breakPts
+
+                score *= sr_decay
+
+            array.set(zScore, zi, score)
+
+    //==================================================================================================
+    // PICK TOP N ZONES BY SCORE + DRAW THEM + RIGHT-SIDE PRICE LABELS
+    //==================================================================================================
+    if zN > 0
+        showN = math.min(sr_topN, zN)
+
+        int[] zIdx = array.new<int>(zN, 0)
+        k = 0
+        while k < zN
+            array.set(zIdx, k, k)
+            k += 1
+
+        // partial selection sort for top N (SAFE)
+        i = 0
+        while i < showN
+            best = i
+            bestZi = array.get(zIdx, i)
+            bestScore = array.get(zScore, bestZi)
+
+            j = i + 1
+            while j < zN
+                ziJ = array.get(zIdx, j)
+                sc  = array.get(zScore, ziJ)
+                if sc > bestScore
+                    bestScore := sc
+                    best := j
+                j += 1
+
+            tmp = array.get(zIdx, i)
+            array.set(zIdx, i, array.get(zIdx, best))
+            array.set(zIdx, best, tmp)
+
+            i += 1
+
+        // draw selected zones
+        for r = 0 to showN - 1
+            zi = array.get(zIdx, r)
+
+            c  = array.get(zCenter, zi)
+            bot = array.get(zBot, zi)
+            top = array.get(zTop, zi)
+            dp = array.get(zDelta, zi)
+            sc = array.get(zScore, zi)
+
+            roleNow = c < close ? "Support-side" : "Resistance-side"
+            bias = math.abs(dp) >= sr_deltaStrong ? (dp > 0 ? "Bull-biased" : "Bear-biased") : "Neutral-bias"
+
+            // zone box (white20 fill + border)
+            b = box.new(VP.startIndex, top, last_bar_index, bot, border_color=white20, border_width=2, bgcolor=white20)
+            array.push(srBoxes, b)
+
+            // right-side label at end of zone (center price)
+            txt = str.tostring(c, format.mintick)
+            tip = "Zone center: " + str.tostring(c, format.mintick) +
+                  "\nScore: " + str.tostring(sc, format.mintick) +
+                  "\nRole: " + roleNow +
+                  "\nPolarity: " + bias +
+                  "\nDeltaPct: " + str.tostring(dp * 100, "#.##") + "%" +
+                  "\nNode source: " + (useChips ? "Chip Distribution (approx)" : "Volume Profile")
+
+            lb = label.new(last_bar_index + 1, c, txt, xloc.bar_index, yloc.price,
+                           priceLabelBg, label.style_label_right, priceLabelFg, getTextSize(vp_profileLevels), text.align_left, tip)
+            array.push(srLabels, lb)

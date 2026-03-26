@@ -1,0 +1,179 @@
+// Developed by Rider Algo
+// Movement Efficiency Indicator v2 (Recalibrated)
+// Measures how much of the total range converts into net directional progress,
+// adjusted by wick absorption to distinguish clean trends from "dirty" advances.
+// v2: Adaptive thresholds, crypto-friendly defaults, percentile-based zones.
+
+//@version=6
+indicator("Movement Efficiency v2 — [Rider Algo]", shorttitle="Movement Efficienty [Rider Algo]", overlay=false, precision=2)
+
+// ─── ASSET PROFILE ──────────────────────────────────────────────────────────
+string assetMode = input.string("Crypto / High Volatility", "Asset Profile", 
+     options=["Crypto / High Volatility", "Forex / Low Volatility", "Stocks / Medium Volatility", "Custom"], 
+     tooltip="Selects pre-tuned thresholds for different asset classes. Choose 'Custom' to set your own.")
+
+// ─── INPUTS ─────────────────────────────────────────────────────────────────
+int     lengthER      = input.int(10,    "Efficiency Period",       minval=2,  maxval=200, tooltip="Lookback window. Lower = more reactive. 10 works well for weekly, 14 for daily.")
+int     smoothLen     = input.int(3,     "Smoothing Length",        minval=1,  maxval=50,  tooltip="EMA smoothing. Lower = less lag.")
+float   wickWeight    = input.float(0.25,"Wick Penalty Weight",     minval=0.0, maxval=1.0, step=0.05, tooltip="How much wick noise penalizes efficiency. Reduced for crypto where wicks are natural.")
+
+// Custom thresholds (only used in Custom mode)
+float   customTrend   = input.float(0.45, "Custom: Trend Threshold",  minval=0.1, maxval=1.0, step=0.05, group="Custom Thresholds")
+float   customChop    = input.float(0.20, "Custom: Chop Threshold",   minval=0.05, maxval=0.9, step=0.05, group="Custom Thresholds")
+
+// Visual options
+string  colScheme     = input.string("Gradient", "Color Mode", options=["Gradient", "Zones"])
+bool    showFill      = input.bool(true,  "Show Background Zones")
+bool    showSignals   = input.bool(true,  "Show Transition Signals")
+bool    showRawER     = input.bool(false, "Show Raw ER (no wick penalty)", tooltip="Overlay the classic ER for comparison.")
+
+// ─── ADAPTIVE THRESHOLDS BASED ON ASSET PROFILE ─────────────────────────────
+// Crypto: wicks are normal, ER naturally lower → relaxed thresholds
+// Forex:  tighter ranges, cleaner moves → stricter thresholds
+// Stocks: middle ground
+float trendThresh = switch assetMode
+    "Crypto / High Volatility"    => 0.40
+    "Forex / Low Volatility"      => 0.55
+    "Stocks / Medium Volatility"  => 0.48
+    "Custom"                      => customTrend
+
+float chopThresh = switch assetMode
+    "Crypto / High Volatility"    => 0.18
+    "Forex / Low Volatility"      => 0.28
+    "Stocks / Medium Volatility"  => 0.22
+    "Custom"                      => customChop
+
+// ─── CLASSIC EFFICIENCY RATIO ───────────────────────────────────────────────
+// Net directional movement over 'n' bars
+float netMove = math.abs(close - close[lengthER])
+
+// Total path traveled (sum of individual bar movements)
+float pathSum = math.sum(math.abs(close - close[1]), lengthER)
+
+// Raw Efficiency Ratio: 1 = perfectly straight move, 0 = total noise
+float rawER = pathSum != 0 ? netMove / pathSum : 0.0
+
+// ─── WICK ABSORPTION METRIC ────────────────────────────────────────────────
+// Wicks represent rejection / absorption. High wick-to-body ratio = hidden friction.
+float bodySize   = math.abs(close - open)
+float totalRange = high - low
+
+// Wick ratio per bar: 0 = all body (clean), 1 = all wick (full rejection)
+float wickRatio = totalRange > 0 ? 1.0 - (bodySize / totalRange) : 0.0
+
+// Average wick ratio over the lookback period
+float avgWickRatio = ta.sma(wickRatio, lengthER)
+
+// ─── ADJUSTED EFFICIENCY ────────────────────────────────────────────────────
+// Softer penalty: use square root to reduce the harshness of the wick adjustment
+// This preserves the signal while preventing over-penalization in wick-heavy assets
+float wickPenalty     = 1.0 - (math.sqrt(avgWickRatio) * wickWeight)
+float adjustedER      = rawER * math.max(wickPenalty, 0.0)
+
+// Final smoothed output
+float efficiency = ta.ema(adjustedER, smoothLen)
+float rawSmoothed = ta.ema(rawER, smoothLen)
+
+// ─── PERCENTILE CONTEXT (dynamic reference) ─────────────────────────────────
+// Calculate where current efficiency sits relative to its own history
+// Helps the user understand if 0.35 is "high for this asset" or not
+int    percentileLen = 200
+var float pctRank = 0.0
+if bar_index >= percentileLen
+    int count = 0
+    for i = 1 to percentileLen
+        if efficiency[i] <= efficiency
+            count += 1
+    pctRank := count / percentileLen * 100
+else
+    pctRank := 50.0
+
+// ─── DIRECTIONAL BIAS ───────────────────────────────────────────────────────
+// When in trend regime, show if the trend is bullish or bearish
+float direction = close - close[lengthER]
+bool  isBullish = direction > 0
+bool  isBearish = direction < 0
+
+// ─── ZONE CLASSIFICATION ────────────────────────────────────────────────────
+bool isCleanTrend = efficiency >= trendThresh
+bool isChop       = efficiency <= chopThresh
+bool isTransition = not isCleanTrend and not isChop
+
+// Detect transitions (regime changes) — split by direction
+bool enterTrend     = isCleanTrend and not isCleanTrend[1]
+bool enterTrendBull = enterTrend and direction > 0
+bool enterTrendBear = enterTrend and direction < 0
+bool enterChop      = isChop       and not isChop[1]
+
+// ─── COLOR LOGIC ────────────────────────────────────────────────────────────
+// Enhanced gradient: red → orange → yellow → green
+color gradientCol = color.from_gradient(efficiency, chopThresh, trendThresh, color.new(#FF5252, 0), color.new(#4CAF50, 0))
+
+// Zone mode: discrete colors with directional bias in trend zone
+color trendCol = isBullish ? color.new(#4CAF50, 0) : color.new(#2196F3, 0)  // green = bull trend, blue = bear trend
+color zoneCol  = isCleanTrend ? trendCol : isChop ? color.new(#FF5252, 0) : color.new(#FFC107, 0)
+
+// Select active color based on user preference
+color activeCol = colScheme == "Gradient" ? gradientCol : zoneCol
+
+// ─── PLOTTING ───────────────────────────────────────────────────────────────
+// Main efficiency line — thicker for visibility
+effPlot = plot(efficiency, "Efficiency", color=activeCol, linewidth=3)
+
+// Optional: raw ER for comparison
+plot(showRawER ? rawSmoothed : na, "Raw ER", color=color.new(#9E9E9E, 50), linewidth=1, style=plot.style_line)
+
+// Reference thresholds
+hlineTop  = hline(trendThresh, "Trend Threshold", color=color.new(#4CAF50, 60), linestyle=hline.style_dashed)
+hlineMid  = hline(chopThresh,  "Chop Threshold",  color=color.new(#FF5252, 60), linestyle=hline.style_dashed)
+hlineZero = hline(0.0,         "Zero",            color=color.new(#9E9E9E, 85), linestyle=hline.style_dotted)
+hlineOne  = hline(1.0,         "Max",             color=color.new(#9E9E9E, 85), linestyle=hline.style_dotted)
+
+// Midline for visual reference
+hlineMidRef = hline((trendThresh + chopThresh) / 2, "Midline", color=color.new(#9E9E9E, 80), linestyle=hline.style_dotted)
+
+// Background fill for zones
+fill(hlineTop, hlineOne,  color=showFill ? color.new(#4CAF50, 88) : na, title="Trend Zone Fill")
+fill(hlineMid, hlineZero, color=showFill ? color.new(#FF5252, 88) : na, title="Chop Zone Fill")
+
+// Zero line fill under efficiency curve for better visual weight
+zeroPlot = plot(0, display=display.none)
+fill(effPlot, zeroPlot, color=color.new(activeCol, 80), title="Efficiency Area Fill")
+
+// ─── TRANSITION SIGNALS ─────────────────────────────────────────────────────
+// ▲ Green  = bullish trend detected
+// ▼ Red    = bearish trend detected
+// ▼ Orange = entering chop / noise zone
+plotshape(showSignals and enterTrendBull ? efficiency : na, "Bullish Trend",  style=shape.triangleup,   location=location.absolute, color=color.new(#4CAF50, 0), size=size.small)
+plotshape(showSignals and enterTrendBear ? efficiency : na, "Bearish Trend",  style=shape.triangledown, location=location.absolute, color=color.new(#FF5252, 0), size=size.small)
+plotshape(showSignals and enterChop      ? efficiency : na, "Enter Chop",     style=shape.triangledown, location=location.absolute, color=color.new(#FF9800, 0), size=size.small)
+
+// ─── INFO TABLE ─────────────────────────────────────────────────────────────
+var table infoPanel = table.new(position.top_right, 2, 6, bgcolor=color.new(#1E1E1E, 5), border_width=1, border_color=color.new(#333333, 0), frame_width=1, frame_color=color.new(#555555, 0))
+
+if barstate.islast
+    // Header
+    table.cell(infoPanel, 0, 0, "Metric",        text_color=color.new(#888888, 0), text_size=size.small, text_halign=text.align_left)
+    table.cell(infoPanel, 1, 0, "Value",          text_color=color.new(#888888, 0), text_size=size.small, text_halign=text.align_right)
+
+    // Efficiency value
+    table.cell(infoPanel, 0, 1, "Efficiency",     text_color=color.white, text_size=size.small, text_halign=text.align_left)
+    table.cell(infoPanel, 1, 1, str.tostring(efficiency, "#.###"), text_color=activeCol, text_size=size.normal, text_halign=text.align_right)
+
+    // Regime
+    string regime = isCleanTrend ? (isBullish ? "TREND ▲" : "TREND ▼") : isChop ? "CHOP ✗" : "TRANSITION ~"
+    color regimeCol = isCleanTrend ? trendCol : isChop ? color.new(#FF5252, 0) : color.new(#FFC107, 0)
+    table.cell(infoPanel, 0, 2, "Regime",         text_color=color.white, text_size=size.small, text_halign=text.align_left)
+    table.cell(infoPanel, 1, 2, regime,            text_color=regimeCol,  text_size=size.normal, text_halign=text.align_right)
+
+    // Percentile
+    table.cell(infoPanel, 0, 3, "Percentile",     text_color=color.white, text_size=size.small, text_halign=text.align_left)
+    table.cell(infoPanel, 1, 3, str.tostring(pctRank, "#") + "%", text_color=pctRank > 70 ? color.new(#4CAF50, 0) : pctRank < 30 ? color.new(#FF5252, 0) : color.new(#FFC107, 0), text_size=size.small, text_halign=text.align_right)
+
+    // Wick noise
+    table.cell(infoPanel, 0, 4, "Wick Noise",     text_color=color.white, text_size=size.small, text_halign=text.align_left)
+    table.cell(infoPanel, 1, 4, str.tostring(avgWickRatio * 100, "#.#") + "%", text_color=avgWickRatio > 0.5 ? color.new(#FF5252, 0) : color.new(#4CAF50, 0), text_size=size.small, text_halign=text.align_right)
+
+    // Asset profile
+    table.cell(infoPanel, 0, 5, "Profile",        text_color=color.new(#888888, 0), text_size=size.tiny, text_halign=text.align_left)
+    table.cell(infoPanel, 1, 5, assetMode,         text_color=color.new(#888888, 0), text_size=size.tiny, text_halign=text.align_right)

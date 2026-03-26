@@ -1,0 +1,289 @@
+//@version=6
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// LIQUIDITY STOP HUNT | Professional Edition [OPTIMIZED]
+// Detects: Equal H/L · Stop Hunts · Wick Rejections · Leverage Liq Levels
+// ═══════════════════════════════════════════════════════════════════════════════
+
+indicator('Liquidity Stop Hunt [Pro] - Optimized', overlay=true, max_lines_count=500, max_labels_count=500, max_bars_back=500)
+
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// INPUTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// ── Equal Highs / Lows ───────────────────────────────────────────────────────
+bool showEQ = input.bool(true, 'Show Equal Highs / Lows', group='① Equal H/L (Liquidity Pools)')
+int eqLookback = input.int(50, 'Lookback (bars)', minval=10, maxval=300, group='① Equal H/L (Liquidity Pools)')
+float eqThresh = input.float(0.02, 'Equality Threshold (%)', minval=0.01, maxval=1.0, step=0.01, group='① Equal H/L (Liquidity Pools)', tooltip='How close two highs/lows must be (% of price) to be considered equal. Lower = stricter match')
+color eqHighCol = input.color(color.new(#FF1744, 0), 'EQH Color', inline='eq', group='① Equal H/L (Liquidity Pools)')
+color eqLowCol = input.color(color.new(#00E676, 0), 'EQL Color', inline='eq', group='① Equal H/L (Liquidity Pools)')
+
+// ── Stop Hunt Detection ──────────────────────────────────────────────────────
+bool showHunt = input.bool(true, 'Show Stop Hunt Signals', group='② Stop Hunt Detection')
+int swingLen = input.int(10, 'Swing Pivot Length', minval=3, maxval=50, group='② Stop Hunt Detection')
+float huntVolMult = input.float(2.0, 'Min Volume ×', minval=1.0, maxval=5.0, step=0.1, group='② Stop Hunt Detection', tooltip='Hunt candle volume must exceed this multiple of the 20-bar average. Higher = fewer, stronger signals')
+color huntBearCol = input.color(color.new(#FF1744, 0), 'Bear Hunt', inline='hc', group='② Stop Hunt Detection')
+color huntBullCol = input.color(color.new(#00E676, 0), 'Bull Hunt', inline='hc', group='② Stop Hunt Detection')
+
+// ── Wick Rejection ───────────────────────────────────────────────────────────
+bool showWick = input.bool(true, 'Show Wick Rejections', group='③ Wick Rejection')
+float wickBodyMin = input.float(3.0, 'Wick : Body ratio', minval=1.5, maxval=10.0, step=0.5, group='③ Wick Rejection', tooltip='Upper or lower wick must be at least this many times the candle body. Higher = only strong pin bars')
+color wickUpCol = input.color(color.new(#18FFFF, 0), 'Bullish Wick', inline='wc', group='③ Wick Rejection')
+color wickDnCol = input.color(color.new(#FF6D00, 0), 'Bearish Wick', inline='wc', group='③ Wick Rejection')
+
+// ── Leverage Liquidation Levels ──────────────────────────────────────────────
+bool showLev = input.bool(true, 'Show Leverage Liq Levels', group='④ Leverage Liquidation')
+bool showL10 = input.bool(true, '10×', inline='lev1', group='④ Leverage Liquidation')
+color col10 = input.color(color.new(#64B5F6, 0), '', inline='lev1', group='④ Leverage Liquidation')
+bool showL25 = input.bool(true, '25×', inline='lev2', group='④ Leverage Liquidation')
+color col25 = input.color(color.new(#FFD54F, 0), '', inline='lev2', group='④ Leverage Liquidation')
+bool showL50 = input.bool(true, '50×', inline='lev3', group='④ Leverage Liquidation')
+color col50 = input.color(color.new(#FF8A65, 0), '', inline='lev3', group='④ Leverage Liquidation')
+bool showL100 = input.bool(true, '100×', inline='lev4', group='④ Leverage Liquidation')
+color col100 = input.color(color.new(#EF5350, 0), '', inline='lev4', group='④ Leverage Liquidation')
+bool showCustom = input.bool(false, 'Custom ×', inline='lev5', group='④ Leverage Liquidation')
+int customLev = input.int(20, '', minval=2, maxval=500, inline='lev5', group='④ Leverage Liquidation')
+color colCustom = input.color(color.new(#CE93D8, 0), '', inline='lev5', group='④ Leverage Liquidation')
+bool levFromHigh = input.bool(true, 'From Swing High (short liq above)', group='④ Leverage Liquidation', tooltip='Draws where leveraged shorts get liquidated if price pumps from the swing high')
+bool levFromLow = input.bool(true, 'From Swing Low (long liq below)', group='④ Leverage Liquidation', tooltip='Draws where leveraged longs get liquidated if price dumps from the swing low')
+bool levLabels = input.bool(true, 'Show Price Labels', group='④ Leverage Liquidation')
+
+// ── Display ──────────────────────────────────────────────────────────────────
+bool showDash = input.bool(true, 'Show Info Dashboard', group='⑤ Display')
+bool extendLines = input.bool(true, 'Extend EQ Lines Right', group='⑤ Display')
+
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// HELPERS & CALCULATIONS (Optimized)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+float atr14 = ta.atr(14)
+float volSMA20 = ta.sma(volume, 20)
+float bodySize = math.abs(close - open)
+float upperWick = high - math.max(open, close)
+float lowerWick = math.min(open, close) - low
+
+// Pivot calculations
+float ph = ta.pivothigh(swingLen, swingLen)
+float pl = ta.pivotlow(swingLen, swingLen)
+
+// State tracking
+var float lastPH = na
+var float lastPL = na
+var float prevPH = na
+var float prevPL = na
+var int lastPHBar = na
+var int lastPLBar = na
+
+// Flags for current signals
+bool isEQH = false
+bool isEQL = false
+float eqhPrice = na
+float eqlPrice = na
+
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ① EQUAL HIGHS & LOWS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+if not na(ph)
+    if not na(prevPH)
+        float diffPH = math.abs(ph - prevPH) / prevPH * 100
+        int barSepPH = bar_index - lastPHBar
+        if diffPH <= eqThresh and barSepPH >= swingLen * 2
+            isEQH := true
+            eqhPrice := math.max(ph, prevPH)
+    prevPH := lastPH
+    lastPH := ph
+    lastPHBar := bar_index
+
+if not na(pl)
+    if not na(prevPL)
+        float diffPL = math.abs(pl - prevPL) / prevPL * 100
+        int barSepPL = bar_index - lastPLBar
+        if diffPL <= eqThresh and barSepPL >= swingLen * 2
+            isEQL := true
+            eqlPrice := math.min(pl, prevPL)
+    prevPL := lastPL
+    lastPL := pl
+    lastPLBar := bar_index
+
+
+// ── Draw Equal Highs/Lows ────────────────────────────────────────────────────
+if showEQ and isEQH
+    int x1 = bar_index - swingLen
+    int x2 = extendLines ? bar_index + 30 : bar_index
+    line.new(x1, eqhPrice, x2, eqhPrice, xloc=xloc.bar_index, color=eqHighCol, style=line.style_dashed, width=1)
+    label.new(x1, eqhPrice, text='EQH ' + str.tostring(eqhPrice, format.mintick), style=label.style_label_right, color=color.new(eqHighCol, 80), textcolor=eqHighCol, size=size.tiny)
+
+if showEQ and isEQL
+    int x1 = bar_index - swingLen
+    int x2 = extendLines ? bar_index + 30 : bar_index
+    line.new(x1, eqlPrice, x2, eqlPrice, xloc=xloc.bar_index, color=eqLowCol, style=line.style_dashed, width=1)
+    label.new(x1, eqlPrice, text='EQL ' + str.tostring(eqlPrice, format.mintick), style=label.style_label_right, color=color.new(eqLowCol, 80), textcolor=eqLowCol, size=size.tiny)
+
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ② STOP HUNT DETECTION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+float swingHigh = ta.highest(high, eqLookback)[1]
+float swingLow = ta.lowest(low, eqLookback)[1]
+float atrHalf = atr14 * 0.5
+float volThresh = volSMA20 * huntVolMult
+
+bool bearHunt = showHunt and high > swingHigh and close < swingHigh and swingHigh - close > atrHalf and upperWick > bodySize * wickBodyMin and volume > volThresh
+
+bool bullHunt = showHunt and low < swingLow and close > swingLow and close - swingLow > atrHalf and lowerWick > bodySize * wickBodyMin and volume > volThresh
+
+if bearHunt
+    line.new(bar_index, high, bar_index - 3, high, color=huntBearCol, width=2, style=line.style_solid)
+    label.new(bar_index, high + atr14 * 0.4, text='BEAR HUNT\n' + str.tostring(high, format.mintick), style=label.style_label_down, color=color.new(huntBearCol, 70), textcolor=huntBearCol, size=size.small)
+
+if bullHunt
+    line.new(bar_index, low, bar_index - 3, low, color=huntBullCol, width=2, style=line.style_solid)
+    label.new(bar_index, low - atr14 * 0.4, text='BULL HUNT\n' + str.tostring(low, format.mintick), style=label.style_label_up, color=color.new(huntBullCol, 70), textcolor=huntBullCol, size=size.small)
+
+plotshape(bearHunt, title='Bear Hunt', location=location.abovebar, style=shape.triangledown, color=huntBearCol, size=size.small)
+plotshape(bullHunt, title='Bull Hunt', location=location.belowbar, style=shape.triangleup, color=huntBullCol, size=size.small)
+
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ③ WICK REJECTION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+float minBody = atr14 * 0.05
+float minWick = atr14 * 0.75
+
+bool bullWick = showWick and bodySize > minBody and lowerWick > bodySize * wickBodyMin and lowerWick > upperWick * 2.0 and lowerWick > minWick and not bullHunt
+
+bool bearWick = showWick and bodySize > minBody and upperWick > bodySize * wickBodyMin and upperWick > lowerWick * 2.0 and upperWick > minWick and not bearHunt
+
+if bullWick
+    label.new(bar_index, low - atr14 * 0.25, text='↑ REJ', style=label.style_label_up, color=color.new(wickUpCol, 75), textcolor=wickUpCol, size=size.tiny)
+
+if bearWick
+    label.new(bar_index, high + atr14 * 0.25, text='↓ REJ', style=label.style_label_down, color=color.new(wickDnCol, 75), textcolor=wickDnCol, size=size.tiny)
+
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ④ LEVERAGE LIQUIDATION LEVELS
+// 
+// Liq price formula (isolated margin, simplified):
+// Long liquidated at → entry × (1 − 1/leverage)
+// Short liquidated at → entry × (1 + 1/leverage)
+//
+// Entry proxy = confirmed swing pivot high or low
+// ═══════════════════════════════════════════════════════════════════════════════
+
+f_lev_line(float entry, int lev, bool isLong, color col) =>
+    float liqPrice = isLong ? entry * (1.0 - 1.0 / lev) : entry * (1.0 + 1.0 / lev)
+    int x2 = bar_index + 40
+    line.new(bar_index, liqPrice, x2, liqPrice, xloc=xloc.bar_index, color=color.new(col, 35), style=line.style_dotted, width=1)
+    if levLabels
+        string side = isLong ? 'L' : 'S'
+        label.new(x2, liqPrice, text=side + str.tostring(lev) + '× ' + str.tostring(liqPrice, format.mintick), style=label.style_label_left, color=color.new(col, 78), textcolor=col, size=size.tiny)
+
+bool pivotVolOk = volume[swingLen] > volSMA20
+
+// Draw leverage levels from swing highs
+if showLev and levFromHigh and not na(ph) and pivotVolOk
+    if showL10
+        f_lev_line(ph, 10, true, col10)
+    if showL25
+        f_lev_line(ph, 25, true, col25)
+    if showL50
+        f_lev_line(ph, 50, true, col50)
+    if showL100
+        f_lev_line(ph, 100, true, col100)
+    if showCustom
+        f_lev_line(ph, customLev, true, colCustom)
+
+// Draw leverage levels from swing lows
+if showLev and levFromLow and not na(pl) and pivotVolOk
+    if showL10
+        f_lev_line(pl, 10, false, col10)
+    if showL25
+        f_lev_line(pl, 25, false, col25)
+    if showL50
+        f_lev_line(pl, 50, false, col50)
+    if showL100
+        f_lev_line(pl, 100, false, col100)
+    if showCustom
+        f_lev_line(pl, customLev, false, colCustom)
+
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ⑤ INFO DASHBOARD
+// ═══════════════════════════════════════════════════════════════════════════════
+
+var int cntBearHunt = 0
+var int cntBullHunt = 0
+var int cntEQH = 0
+var int cntEQL = 0
+var int cntBearWick = 0
+var int cntBullWick = 0
+
+if bearHunt
+    cntBearHunt += 1
+if bullHunt
+    cntBullHunt += 1
+if isEQH
+    cntEQH += 1
+if isEQL
+    cntEQL += 1
+if bearWick
+    cntBearWick += 1
+if bullWick
+    cntBullWick += 1
+
+
+if barstate.islast and showDash
+    var table d = table.new(position.top_right, 3, 10, bgcolor=color.new(#0D0D0D, 15), border_color=color.new(chart.fg_color, 85), border_width=1, frame_color=color.new(chart.fg_color, 70), frame_width=1)
+
+    // Header
+    table.cell(d, 0, 0, text='STOP HUNT SUITE', text_color=chart.fg_color, text_size=size.small, text_halign=text.align_center, bgcolor=color.new(#111111, 10))
+    table.cell(d, 1, 0, text='', bgcolor=color.new(#111111, 10))
+    table.cell(d, 2, 0, text='', bgcolor=color.new(#111111, 10))
+
+    // Column headers
+    table.cell(d, 0, 1, text='Signal', text_color=color.new(chart.fg_color, 40), text_size=size.tiny, bgcolor=color(na))
+    table.cell(d, 1, 1, text='Status', text_color=color.new(chart.fg_color, 40), text_size=size.tiny, bgcolor=color(na))
+    table.cell(d, 2, 1, text='Count', text_color=color.new(chart.fg_color, 40), text_size=size.tiny, bgcolor=color(na))
+
+    // Signal rows
+    array<string> rowLabels = array.from('Bear Hunt', 'Bull Hunt', 'EQ High', 'EQ Low', 'Bear Wick', 'Bull Wick')
+    array<bool> rowActive = array.from(bearHunt, bullHunt, isEQH, isEQL, bearWick, bullWick)
+    array<int> rowCounts = array.from(cntBearHunt, cntBullHunt, cntEQH, cntEQL, cntBearWick, cntBullWick)
+    array<color> rowColors = array.from(huntBearCol, huntBullCol, eqHighCol, eqLowCol, wickDnCol, wickUpCol)
+
+    for r = 0 to 5 by 1
+        bool active = rowActive.get(r)
+        color rc = rowColors.get(r)
+        table.cell(d, 0, r + 2, text=rowLabels.get(r), text_color=color.new(chart.fg_color, 30), text_size=size.tiny, bgcolor=color(na), text_halign=text.align_left)
+        table.cell(d, 1, r + 2, text=active ? '● LIVE' : '○', text_color=active ? rc : color.new(chart.fg_color, 65), text_size=size.tiny, bgcolor=active ? color.new(rc, 92) : color(na))
+        table.cell(d, 2, r + 2, text=str.tostring(rowCounts.get(r)), text_color=color.new(rc, 20), text_size=size.tiny, bgcolor=color(na))
+
+    // Swing level reference row
+    string hText = not na(lastPH) ? str.tostring(lastPH, format.mintick) : '—'
+    string lText = not na(lastPL) ? str.tostring(lastPL, format.mintick) : '—'
+    table.cell(d, 0, 8, text='Lev Base', text_color=color.new(chart.fg_color, 40), text_size=size.tiny, bgcolor=color(na))
+    table.cell(d, 1, 8, text='H ' + hText + ' / L ' + lText, text_color=color.new(#CE93D8, 20), text_size=size.tiny, bgcolor=color(na))
+    table.cell(d, 2, 8, text='', bgcolor=color(na))
+
+    // ATR row
+    table.cell(d, 0, 9, text='ATR(14)', text_color=color.new(chart.fg_color, 50), text_size=size.tiny, bgcolor=color(na))
+    table.cell(d, 1, 9, text=str.tostring(atr14, format.mintick), text_color=color.new(chart.fg_color, 30), text_size=size.tiny, bgcolor=color(na))
+    table.cell(d, 2, 9, text='', bgcolor=color(na))
+
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ⑥ ALERTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+alertcondition(bearHunt, title='🔴 Bear Stop Hunt', message='BEAR HUNT — Spike above swing high, closed back inside on {{ticker}} {{interval}}. Price: {{close}}')
+alertcondition(bullHunt, title='🟢 Bull Stop Hunt', message='BULL HUNT — Spike below swing low, closed back inside on {{ticker}} {{interval}}. Price: {{close}}')
+alertcondition(isEQH, title='⚠️ Equal Highs Detected', message='EQH — Liquidity pool above price on {{ticker}} {{interval}}. Price: {{close}}')
+alertcondition(isEQL, title='⚠️ Equal Lows Detected', message='EQL — Liquidity pool below price on {{ticker}} {{interval}}. Price: {{close}}')
+alertcondition(bearHunt or bullHunt, title='⚡ Any Stop Hunt', message='STOP HUNT detected on {{ticker}} {{interval}}. Price: {{close}}')

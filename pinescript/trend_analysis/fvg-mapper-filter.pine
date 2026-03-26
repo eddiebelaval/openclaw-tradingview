@@ -1,0 +1,174 @@
+//@version=6
+indicator("FVG Mapper + Filter (HTF Close-to-Close Zones) [CONFIRMED FIX]", overlay=true, max_boxes_count=500, max_lines_count=500)
+
+// =====================
+// Inputs
+// =====================
+htf              = input.timeframe("240", "HTF for FVGs")
+
+showOnlyUnfilled = input.bool(true, "Close zone on HTF confirmation (do not delete)")
+removeMode       = input.string("HTF Wick Touch", "HTF close mode",
+     options=["HTF Wick Touch", "HTF Close Inside", "HTF Invalidate Close"])
+
+maxZones         = input.int(80, "Max zones to keep", minval=5, maxval=200)
+
+useMinSizeFilter = input.bool(true, "Filter tiny FVGs by HTF ATR")
+minAtrFrac       = input.float(0.25, "Min FVG size (ATR frac)", minval=0.05, step=0.05)
+
+nearPriceFilter  = input.bool(false, "Near price filter (HIDE far zones, don't delete)")
+nearAtr1mMult    = input.float(8.0, "Near distance (1m ATR x)", minval=1.0, step=0.5)
+hideAlpha        = input.int(100, "Hidden zone alpha (0-100)", minval=70, maxval=100)
+
+fadeClosed       = input.bool(true, "Fade closed zones")
+closedAlpha      = input.int(92, "Closed zone alpha (0-100)", minval=0, maxval=100)
+
+bullCol          = input.color(color.new(color.lime, 86), "Bull FVG fill")
+bearCol          = input.color(color.new(color.red,  86), "Bear FVG fill")
+bullBorder       = input.color(color.new(color.lime, 55), "Bull border")
+bearBorder       = input.color(color.new(color.red,  55), "Bear border")
+
+// =====================
+// HTF series (confirmed close; no repaint)
+// =====================
+[H0, L0, C0, atrHTF, TC0] = request.security(syminfo.tickerid, htf, [high, low, close, ta.atr(14), time_close], barmerge.gaps_off, barmerge.lookahead_off)
+[H2, L2]                 = request.security(syminfo.tickerid, htf, [high[2], low[2]], barmerge.gaps_off, barmerge.lookahead_off)
+
+// TRUE "HTF candle just closed" event
+htfConfirmed = request.security(syminfo.tickerid, htf, barstate.isconfirmed, barmerge.gaps_off, barmerge.lookahead_off)
+
+// 3-candle FVG model (candle3 vs candle1)
+bullFVG = L0 > H2
+bullTop = L0
+bullBot = H2
+bullSz  = bullTop - bullBot
+
+bearFVG = H0 < L2
+bearTop = L2
+bearBot = H0
+bearSz  = bearTop - bearBot
+
+minSizeOk(_sz) =>
+    not useMinSizeFilter or _sz >= (atrHTF * minAtrFrac)
+
+// =====================
+// Storage
+// =====================
+var box[]  zones     = array.new_box()
+var bool[] isBull    = array.new_bool()
+var bool[] isClosed  = array.new_bool()
+var int[]  zoneTime  = array.new_int()   // store HTF time_close (TC0) of creation candle
+
+f_exists(_tc, _bull) =>
+    sz = array.size(zoneTime)
+    if sz == 0
+        false
+    else
+        found = false
+        for i = 0 to sz - 1
+            if array.get(zoneTime, i) == _tc and array.get(isBull, i) == _bull
+                found := true
+        found
+
+f_trim_fifo() =>
+    while array.size(zones) > maxZones
+        bx = array.shift(zones)
+        box.delete(bx)
+        array.shift(isBull)
+        array.shift(isClosed)
+        array.shift(zoneTime)
+
+// =====================
+// HTF-confirmed close condition
+// =====================
+f_htf_close(_bull, _top, _bot) =>
+    wickTouch   = not (H0 < _bot or L0 > _top)      // HTF range intersects zone
+    closeInside = (C0 <= _top and C0 >= _bot)       // HTF close inside zone
+    invalClose  = _bull ? (C0 < _bot) : (C0 > _top) // close through far side
+
+    // "Close Inside" should also count close-through
+    closeInsideOrThrough = closeInside or invalClose
+
+    res = false
+    if removeMode == "HTF Wick Touch"
+        res := wickTouch
+    else if removeMode == "HTF Close Inside"
+        res := closeInsideOrThrough
+    else
+        res := invalClose
+
+    res
+
+// =====================
+// Close zones ONLY when HTF candle is confirmed closed
+// =====================
+if showOnlyUnfilled and htfConfirmed and array.size(zones) > 0
+    for i = array.size(zones) - 1 to 0
+        if array.get(isClosed, i)
+            continue
+
+        // Skip closing on the same HTF candle close that created the zone
+        if array.get(zoneTime, i) == TC0
+            continue
+
+        bx   = array.get(zones, i)
+        top  = box.get_top(bx)
+        bot  = box.get_bottom(bx)
+        bull = array.get(isBull, i)
+
+        if f_htf_close(bull, top, bot)
+            box.set_extend(bx, extend.none)
+            box.set_right(bx, bar_index)
+
+            if fadeClosed
+                box.set_bgcolor(bx, bull ? color.new(color.lime, closedAlpha) : color.new(color.red, closedAlpha))
+                box.set_border_color(bx, bull ? color.new(color.lime, closedAlpha) : color.new(color.red, closedAlpha))
+
+            array.set(isClosed, i, true)
+
+// =====================
+// Create zones ONLY when HTF candle is confirmed closed
+// =====================
+if htfConfirmed
+    if bullFVG and minSizeOk(bullSz) and not f_exists(TC0, true)
+        b = box.new(bar_index, bullTop, bar_index, bullBot,
+            xloc=xloc.bar_index, extend=extend.right,
+            bgcolor=bullCol, border_color=bullBorder)
+        array.push(zones, b)
+        array.push(isBull, true)
+        array.push(isClosed, false)
+        array.push(zoneTime, TC0)
+
+    if bearFVG and minSizeOk(bearSz) and not f_exists(TC0, false)
+        b = box.new(bar_index, bearTop, bar_index, bearBot,
+            xloc=xloc.bar_index, extend=extend.right,
+            bgcolor=bearCol, border_color=bearBorder)
+        array.push(zones, b)
+        array.push(isBull, false)
+        array.push(isClosed, false)
+        array.push(zoneTime, TC0)
+
+f_trim_fifo()
+
+// =====================
+// Near-price filter (HIDE far zones, do not delete)
+// =====================
+atr1m = ta.atr(14)
+
+if nearPriceFilter and array.size(zones) > 0
+    for i = 0 to array.size(zones) - 1
+        bx     = array.get(zones, i)
+        top    = box.get_top(bx)
+        bot    = box.get_bottom(bx)
+        bull   = array.get(isBull, i)
+        closed = array.get(isClosed, i)
+
+        dist = math.min(math.abs(close - top), math.abs(close - bot))
+        far  = dist > atr1m * nearAtr1mMult
+
+        baseBg = closed and fadeClosed ? (bull ? color.new(color.lime, closedAlpha) : color.new(color.red, closedAlpha))
+                                      : (bull ? bullCol : bearCol)
+        baseBr = closed and fadeClosed ? (bull ? color.new(color.lime, closedAlpha) : color.new(color.red, closedAlpha))
+                                      : (bull ? bullBorder : bearBorder)
+
+        box.set_bgcolor(bx, far ? color.new(color.rgb(0,0,0), hideAlpha) : baseBg)
+        box.set_border_color(bx, far ? color.new(color.rgb(0,0,0), hideAlpha) : baseBr)

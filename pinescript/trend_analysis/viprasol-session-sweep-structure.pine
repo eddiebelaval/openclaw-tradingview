@@ -1,0 +1,657 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © Viprasol Tech Private Limited
+// Based on TJR Trades Strategy concept. Significantly enhanced with order blocks, FVG mitigation,
+// OTE zones, smart TP/SL, displacement filtering, PDH/PDL liquidity, confluence scoring,
+// candle coloring, and full dashboard under Viprasol branding.
+
+//@version=6
+indicator("[Viprasol] Session Sweep Structure", shorttitle = "VP - SSS", overlay = true,
+     max_labels_count = 500, max_lines_count = 500, max_boxes_count = 500)
+
+// ══════════════════════════════════════════════════════════════════
+// ─── CONSTANTS ───
+// ══════════════════════════════════════════════════════════════════
+var string GRP_SESSION   = "Session Times"
+var string GRP_LIQ       = "Liquidity Levels"
+var string GRP_STRUCT    = "Market Structure"
+var string GRP_OB        = "Order Blocks"
+var string GRP_FVG       = "Fair Value Gaps"
+var string GRP_OTE       = "OTE Zone"
+var string GRP_TPSL      = "Take Profit / Stop Loss"
+var string GRP_DISPLACE  = "Displacement Filter"
+var string GRP_DASH      = "Dashboard"
+var string GRP_STYLE     = "Style"
+var string GRP_ALERTS    = "Alerts"
+
+var int    DIR_NONE      = 0
+var int    DIR_BULL      = 1
+var int    DIR_BEAR      = -1
+
+// ══════════════════════════════════════════════════════════════════
+// ─── INPUTS ───
+// ══════════════════════════════════════════════════════════════════
+
+// Session Times
+asiaStartInput      = input.session("2000-0000", "Asia Session Range",     group = GRP_SESSION, tooltip = "Defines the liquidity accumulation window. Default: 8 PM - 12 AM EST.")
+tradeWindowInput    = input.session("0300-1100", "Trading Session Range",   group = GRP_SESSION, tooltip = "Active trading window where sweeps and entries are detected. Default: 3 AM - 11 AM EST (London + NY AM).")
+timezoneRefInput    = input.string("America/New_York", "Timezone",          group = GRP_SESSION, tooltip = "Timezone for session calculations. Recommended: America/New_York.")
+showAsiaBoxInput    = input.bool(true, "Show Asia Range Lines",             group = GRP_SESSION, tooltip = "Draw dashed lines at Asia session high/low.")
+showSessionBgInput  = input.bool(true, "Show Session Backgrounds",          group = GRP_SESSION, tooltip = "Shade the Asia and Trading session periods on the chart.")
+
+// Liquidity Levels
+showPdhPdlInput     = input.bool(true, "Show Previous Day H/L",            group = GRP_LIQ, tooltip = "Draw previous day high and low as additional liquidity reference levels.")
+showPwhPwlInput     = input.bool(false, "Show Previous Week H/L",          group = GRP_LIQ, tooltip = "Draw previous week high and low.")
+pdhStyleInput       = input.string("Dashed", "PDH/PDL Line Style",         group = GRP_LIQ, options = ["Solid", "Dashed", "Dotted"], tooltip = "Line style for previous day levels.")
+
+// Market Structure
+swingSensInput      = input.int(2, "Swing Sensitivity (Pivot Bars)",        group = GRP_STRUCT, minval = 1, maxval = 10, tooltip = "Number of bars left/right for pivot detection. Higher = fewer but stronger swing points.")
+showMssInput        = input.bool(true, "Show MSS Labels",                   group = GRP_STRUCT, tooltip = "Display Market Structure Shift labels on the chart.")
+showSwingDotsInput  = input.bool(false, "Show Swing Point Dots",            group = GRP_STRUCT, tooltip = "Mark detected swing highs/lows with small dots.")
+maxMssPerSession    = input.int(2, "Max MSS Signals Per Session",           group = GRP_STRUCT, minval = 1, maxval = 5, tooltip = "Limit how many MSS signals can fire in one trading session to reduce noise.")
+
+// Order Blocks
+showObInput         = input.bool(true, "Show Order Blocks",                 group = GRP_OB, tooltip = "Draw order block zones at the origin candle of an MSS event.")
+obMaxAgeInput       = input.int(50, "OB Max Age (Bars)",                    group = GRP_OB, minval = 10, maxval = 200, tooltip = "Remove order blocks older than this many bars.")
+obMitigateInput     = input.bool(true, "Mitigate OBs on Touch",            group = GRP_OB, tooltip = "Delete order blocks when price returns and touches them.")
+
+// Fair Value Gaps
+showFvgInput        = input.bool(true, "Show Fair Value Gaps",              group = GRP_FVG, tooltip = "Display 3-candle imbalance gaps on the chart.")
+fvgMitigateInput    = input.bool(true, "Mitigate FVGs When Filled",        group = GRP_FVG, tooltip = "Remove FVG boxes when price fills the gap.")
+fvgFillThreshInput  = input.float(0.5, "Fill Threshold (0-1)",             group = GRP_FVG, minval = 0.0, maxval = 1.0, step = 0.1, tooltip = "Proportion of the gap that must be filled before mitigation. 1.0 = full fill required.")
+fvgMaxAgeInput      = input.int(80, "FVG Max Age (Bars)",                   group = GRP_FVG, minval = 10, maxval = 300, tooltip = "Remove FVGs older than this many bars.")
+
+// OTE Zone
+showOteInput        = input.bool(true, "Show OTE Zone",                     group = GRP_OTE, tooltip = "Draw the Optimal Trade Entry (62-79% Fib retracement) zone after a sweep + MSS event.")
+oteFibHiInput       = input.float(0.62, "OTE Fib High",                    group = GRP_OTE, minval = 0.5, maxval = 0.85, step = 0.01, tooltip = "Upper Fibonacci level for OTE zone.")
+oteFibLoInput       = input.float(0.79, "OTE Fib Low",                     group = GRP_OTE, minval = 0.5, maxval = 0.95, step = 0.01, tooltip = "Lower Fibonacci level for OTE zone.")
+oteMaxBarsInput     = input.int(20, "OTE Max Display Bars",                 group = GRP_OTE, minval = 5, maxval = 50, tooltip = "How many bars to extend the OTE zone box.")
+
+// TP / SL
+showTpSlInput       = input.bool(true, "Show TP/SL Levels",                group = GRP_TPSL, tooltip = "Draw take-profit and stop-loss lines after MSS signals.")
+rrTp1Input          = input.float(1.5, "TP1 R:R",                          group = GRP_TPSL, minval = 0.5, maxval = 5.0, step = 0.1, tooltip = "Risk-reward ratio for first target.")
+rrTp2Input          = input.float(2.5, "TP2 R:R",                          group = GRP_TPSL, minval = 1.0, maxval = 8.0, step = 0.1, tooltip = "Risk-reward ratio for second target.")
+rrTp3Input          = input.float(4.0, "TP3 R:R",                          group = GRP_TPSL, minval = 1.5, maxval = 12.0, step = 0.5, tooltip = "Risk-reward ratio for third target.")
+tpslMaxBarsInput    = input.int(30, "TP/SL Max Display Bars",              group = GRP_TPSL, minval = 5, maxval = 100, tooltip = "How many bars to extend TP/SL lines.")
+
+// Displacement Filter
+useDisplaceInput    = input.bool(true, "Require Displacement for MSS",     group = GRP_DISPLACE, tooltip = "Only trigger MSS if the break candle shows institutional displacement (large body + above-average range).")
+displaceMultInput   = input.float(1.5, "Displacement ATR Multiple",        group = GRP_DISPLACE, minval = 1.0, maxval = 3.0, step = 0.1, tooltip = "Candle range must exceed ATR * this multiple to qualify as displacement.")
+displaceBodyInput   = input.float(0.6, "Min Body Ratio",                   group = GRP_DISPLACE, minval = 0.3, maxval = 0.9, step = 0.05, tooltip = "Minimum candle body as percentage of total range.")
+
+// Dashboard
+showDashInput       = input.bool(true, "Show Dashboard",                    group = GRP_DASH, tooltip = "Display an info panel with session status, sweep flags, and signal summary.")
+dashPosInput        = input.string("Bottom Right", "Dashboard Position",    group = GRP_DASH, options = ["Top Left", "Top Right", "Bottom Left", "Bottom Right"], tooltip = "Where to place the dashboard on the chart.")
+dashSizeInput       = input.string("Small", "Dashboard Size",              group = GRP_DASH, options = ["Tiny", "Small", "Normal"], tooltip = "Text size for the dashboard.")
+
+// Style
+bullTintInput       = input.color(#089981, "Bullish Color",                 group = GRP_STYLE, tooltip = "Color for bullish elements.")
+bearTintInput       = input.color(#f23645, "Bearish Color",                 group = GRP_STYLE, tooltip = "Color for bearish elements.")
+asiaBgTintInput     = input.color(color.new(#5b9cf6, 90), "Asia BG",       group = GRP_STYLE, tooltip = "Background color for Asia session.")
+tradeBgTintInput    = input.color(color.new(#089981, 92), "Trading BG",    group = GRP_STYLE, tooltip = "Background color for Trading session.")
+candleColorInput    = input.bool(true, "Color Candles by Session",          group = GRP_STYLE, tooltip = "Tint candles based on the active session context.")
+neutralTintInput    = input.color(color.new(#787b86, 50), "Neutral Color",  group = GRP_STYLE, tooltip = "Color for neutral/inactive candles.")
+
+// ══════════════════════════════════════════════════════════════════
+// ─── HELPER FUNCTIONS ───
+// ══════════════════════════════════════════════════════════════════
+
+resolveLineStyle(string styleStr) =>
+    switch styleStr
+        "Solid"  => line.style_solid
+        "Dotted" => line.style_dotted
+        =>          line.style_dashed
+
+resolveTablePos(string posStr) =>
+    switch posStr
+        "Top Left"     => position.top_left
+        "Top Right"    => position.top_right
+        "Bottom Left"  => position.bottom_left
+        =>                position.bottom_right
+
+resolveTextSize(string sizeStr) =>
+    switch sizeStr
+        "Tiny"   => size.tiny
+        "Normal" => size.normal
+        =>          size.small
+
+isDisplacementCandle(float atrVal) =>
+    float candleRange = high - low
+    float bodySize    = math.abs(close - open)
+    float bodyRatio   = candleRange > 0 ? bodySize / candleRange : 0.0
+    bool  rangeOk     = candleRange > atrVal * displaceMultInput
+    bool  bodyOk      = bodyRatio >= displaceBodyInput
+    rangeOk and bodyOk
+
+renderConfluenceStars(int score) =>
+    switch
+        score >= 7 => "★★★"
+        score >= 5 => "★★☆"
+        score >= 3 => "★☆☆"
+        =>            "☆☆☆"
+
+// ══════════════════════════════════════════════════════════════════
+// ─── SESSION DETECTION ───
+// ══════════════════════════════════════════════════════════════════
+
+isInsideAsia    = not na(time(timeframe.period, asiaStartInput, timezoneRefInput))
+isInsideTrading = not na(time(timeframe.period, tradeWindowInput, timezoneRefInput))
+
+asiaJustStarted    = isInsideAsia and not isInsideAsia[1]
+tradingJustStarted = isInsideTrading and not isInsideTrading[1]
+
+// Session Backgrounds
+bgcolor(showSessionBgInput and isInsideAsia    ? asiaBgTintInput  : na, title = "Asia Session BG")
+bgcolor(showSessionBgInput and isInsideTrading ? tradeBgTintInput : na, title = "Trading Session BG")
+
+// ══════════════════════════════════════════════════════════════════
+// ─── CORE CALCULATIONS ───
+// ══════════════════════════════════════════════════════════════════
+
+float atrValue = ta.atr(14)
+
+// ══════════════════════════════════════════════════════════════════
+// ─── ASIA RANGE TRACKING ───
+// ══════════════════════════════════════════════════════════════════
+
+var float asiaRangeHigh = na
+var float asiaRangeLow  = na
+var line  asiaHighLine  = na
+var line  asiaLowLine   = na
+
+if asiaJustStarted
+    asiaRangeHigh := high
+    asiaRangeLow  := low
+    if showAsiaBoxInput
+        asiaHighLine := line.new(bar_index, asiaRangeHigh, bar_index + 1, asiaRangeHigh, color = chart.fg_color, style = line.style_dashed, width = 1)
+        asiaLowLine  := line.new(bar_index, asiaRangeLow,  bar_index + 1, asiaRangeLow,  color = chart.fg_color, style = line.style_dashed, width = 1)
+        label.new(bar_index, asiaRangeHigh, "Asia Range", textcolor = chart.fg_color, style = label.style_none, size = size.tiny, textalign = text.align_left)
+else if isInsideAsia
+    asiaRangeHigh := math.max(asiaRangeHigh, high)
+    asiaRangeLow  := math.min(asiaRangeLow, low)
+    if showAsiaBoxInput
+        line.set_xy1(asiaHighLine, line.get_x1(asiaHighLine), asiaRangeHigh)
+        line.set_xy2(asiaHighLine, bar_index, asiaRangeHigh)
+        line.set_xy1(asiaLowLine, line.get_x1(asiaLowLine), asiaRangeLow)
+        line.set_xy2(asiaLowLine, bar_index, asiaRangeLow)
+else if isInsideTrading and showAsiaBoxInput
+    line.set_x2(asiaHighLine, bar_index)
+    line.set_x2(asiaLowLine, bar_index)
+
+// ══════════════════════════════════════════════════════════════════
+// ─── PREVIOUS DAY / WEEK HIGH & LOW ───
+// ══════════════════════════════════════════════════════════════════
+
+[prevDayHigh, prevDayLow]   = request.security(syminfo.tickerid, "D", [high[1], low[1]], lookahead = barmerge.lookahead_on)
+[prevWeekHigh, prevWeekLow] = request.security(syminfo.tickerid, "W", [high[1], low[1]], lookahead = barmerge.lookahead_on)
+
+var line pdhLine = na
+var line pdlLine = na
+var line pwhLine = na
+var line pwlLine = na
+
+pdhLnStyle = resolveLineStyle(pdhStyleInput)
+
+if barstate.islast
+    if showPdhPdlInput
+        if not na(pdhLine)
+            line.delete(pdhLine)
+            line.delete(pdlLine)
+        pdhLine := line.new(bar_index - 20, prevDayHigh, bar_index + 5, prevDayHigh, color = color.new(#ff9800, 30), style = pdhLnStyle, width = 1)
+        pdlLine := line.new(bar_index - 20, prevDayLow,  bar_index + 5, prevDayLow,  color = color.new(#ff9800, 30), style = pdhLnStyle, width = 1)
+        label.new(bar_index + 5, prevDayHigh, "PDH", textcolor = color.new(#ff9800, 30), style = label.style_none, size = size.tiny)
+        label.new(bar_index + 5, prevDayLow,  "PDL", textcolor = color.new(#ff9800, 30), style = label.style_none, size = size.tiny)
+    if showPwhPwlInput
+        if not na(pwhLine)
+            line.delete(pwhLine)
+            line.delete(pwlLine)
+        pwhLine := line.new(bar_index - 20, prevWeekHigh, bar_index + 5, prevWeekHigh, color = color.new(#2196f3, 30), style = pdhLnStyle, width = 1)
+        pwlLine := line.new(bar_index - 20, prevWeekLow,  bar_index + 5, prevWeekLow,  color = color.new(#2196f3, 30), style = pdhLnStyle, width = 1)
+        label.new(bar_index + 5, prevWeekHigh, "PWH", textcolor = color.new(#2196f3, 30), style = label.style_none, size = size.tiny)
+        label.new(bar_index + 5, prevWeekLow,  "PWL", textcolor = color.new(#2196f3, 30), style = label.style_none, size = size.tiny)
+
+// ══════════════════════════════════════════════════════════════════
+// ─── SWEEP DETECTION ───
+// ══════════════════════════════════════════════════════════════════
+
+var bool asiaHighSwept = false
+var bool asiaLowSwept  = false
+
+if asiaJustStarted
+    asiaHighSwept := false
+    asiaLowSwept  := false
+
+bool sweepHighEvent = false
+bool sweepLowEvent  = false
+
+if isInsideTrading and not na(asiaRangeHigh)
+    if high > asiaRangeHigh and not asiaHighSwept
+        asiaHighSwept  := true
+        sweepHighEvent := true
+    if low < asiaRangeLow and not asiaLowSwept
+        asiaLowSwept  := true
+        sweepLowEvent := true
+
+// Check PDH/PDL sweeps for confluence
+bool pdhSwept = showPdhPdlInput and not na(prevDayHigh) and high > prevDayHigh
+bool pdlSwept = showPdhPdlInput and not na(prevDayLow) and low < prevDayLow
+
+// ══════════════════════════════════════════════════════════════════
+// ─── SWING POINT DETECTION ───
+// ══════════════════════════════════════════════════════════════════
+
+pivotHigh = ta.pivothigh(swingSensInput, swingSensInput)
+pivotLow  = ta.pivotlow(swingSensInput, swingSensInput)
+
+var float recentSwingHigh = na
+var float recentSwingLow  = na
+
+if not na(pivotHigh)
+    recentSwingHigh := pivotHigh
+    if showSwingDotsInput
+        label.new(bar_index - swingSensInput, pivotHigh, "•", textcolor = bearTintInput, style = label.style_none, size = size.tiny)
+
+if not na(pivotLow)
+    recentSwingLow := pivotLow
+    if showSwingDotsInput
+        label.new(bar_index - swingSensInput, pivotLow, "•", textcolor = bullTintInput, style = label.style_none, size = size.tiny)
+
+// ══════════════════════════════════════════════════════════════════
+// ─── MARKET STRUCTURE SHIFT (MSS) ───
+// ══════════════════════════════════════════════════════════════════
+
+bool rawBullMss = asiaLowSwept and not na(recentSwingHigh) and close > recentSwingHigh and close[1] <= recentSwingHigh
+bool rawBearMss = asiaHighSwept and not na(recentSwingLow) and close < recentSwingLow and close[1] >= recentSwingLow
+
+// Displacement filter
+bool bullDisplaceOk = useDisplaceInput ? isDisplacementCandle(atrValue) and close > open : true
+bool bearDisplaceOk = useDisplaceInput ? isDisplacementCandle(atrValue) and close < open : true
+
+bool filteredBullMss = rawBullMss and bullDisplaceOk
+bool filteredBearMss = rawBearMss and bearDisplaceOk
+
+// Session signal limiter
+var int bullMssCount = 0
+var int bearMssCount = 0
+
+if not isInsideTrading
+    bullMssCount := 0
+    bearMssCount := 0
+
+bool bullMssFired = false
+bool bearMssFired = false
+
+if isInsideTrading
+    if filteredBullMss and bullMssCount < maxMssPerSession
+        bullMssFired := true
+        bullMssCount += 1
+    if filteredBearMss and bearMssCount < maxMssPerSession
+        bearMssFired := true
+        bearMssCount += 1
+
+// ══════════════════════════════════════════════════════════════════
+// ─── CONFLUENCE SCORING ───
+// ══════════════════════════════════════════════════════════════════
+
+calcBullConfluence() =>
+    int score = 0
+    // Asia sweep occurred
+    score += asiaLowSwept ? 2 : 0
+    // PDL sweep bonus
+    score += pdlSwept ? 1 : 0
+    // Displacement candle quality
+    score += (useDisplaceInput and isDisplacementCandle(atrValue)) ? 2 : 0
+    // Inside trading session
+    score += isInsideTrading ? 1 : 0
+    // Volume above average
+    float avgVol = ta.sma(volume, 20)
+    score += (volume > avgVol * 1.2) ? 1 : 0
+    // Close in upper portion of candle
+    float candleRange = high - low
+    score += (candleRange > 0 and (close - low) / candleRange > 0.65) ? 1 : 0
+    // Near Asia low (swept from below)
+    float distToAsiaLow = not na(asiaRangeLow) ? math.abs(low - asiaRangeLow) / atrValue : 999.0
+    score += distToAsiaLow < 1.5 ? 1 : 0
+    // PDH/PDL proximity
+    float distToPdl = not na(prevDayLow) ? math.abs(low - prevDayLow) / atrValue : 999.0
+    score += distToPdl < 1.5 ? 1 : 0
+    math.min(score, 10)
+
+calcBearConfluence() =>
+    int score = 0
+    score += asiaHighSwept ? 2 : 0
+    score += pdhSwept ? 1 : 0
+    score += (useDisplaceInput and isDisplacementCandle(atrValue)) ? 2 : 0
+    score += isInsideTrading ? 1 : 0
+    float avgVol = ta.sma(volume, 20)
+    score += (volume > avgVol * 1.2) ? 1 : 0
+    float candleRange = high - low
+    score += (candleRange > 0 and (high - close) / candleRange > 0.65) ? 1 : 0
+    float distToAsiaHi = not na(asiaRangeHigh) ? math.abs(high - asiaRangeHigh) / atrValue : 999.0
+    score += distToAsiaHi < 1.5 ? 1 : 0
+    float distToPdh = not na(prevDayHigh) ? math.abs(high - prevDayHigh) / atrValue : 999.0
+    score += distToPdh < 1.5 ? 1 : 0
+    math.min(score, 10)
+
+var int lastBullScore = 0
+var int lastBearScore = 0
+
+if bullMssFired
+    lastBullScore := calcBullConfluence()
+if bearMssFired
+    lastBearScore := calcBearConfluence()
+
+// ══════════════════════════════════════════════════════════════════
+// ─── MSS LABELS ───
+// ══════════════════════════════════════════════════════════════════
+
+if showMssInput and bullMssFired
+    string stars = renderConfluenceStars(lastBullScore)
+    string tip   = "MSS Bullish\nConfluence: " + str.tostring(lastBullScore) + "/10\n" +
+                   "Asia Low Swept: " + (asiaLowSwept ? "Yes" : "No") + "\n" +
+                   "Displacement: " + (bullDisplaceOk ? "Yes" : "No") + "\n" +
+                   "PDL Swept: " + (pdlSwept ? "Yes" : "No")
+    label.new(bar_index, low, "MSS ▲ " + stars, color = color.new(bullTintInput, 85),
+         textcolor = bullTintInput, style = label.style_label_up, size = size.small, tooltip = tip)
+
+if showMssInput and bearMssFired
+    string stars = renderConfluenceStars(lastBearScore)
+    string tip   = "MSS Bearish\nConfluence: " + str.tostring(lastBearScore) + "/10\n" +
+                   "Asia High Swept: " + (asiaHighSwept ? "Yes" : "No") + "\n" +
+                   "Displacement: " + (bearDisplaceOk ? "Yes" : "No") + "\n" +
+                   "PDH Swept: " + (pdhSwept ? "Yes" : "No")
+    label.new(bar_index, high, "MSS ▼ " + stars, color = color.new(bearTintInput, 85),
+         textcolor = bearTintInput, style = label.style_label_down, size = size.small, tooltip = tip)
+
+// ══════════════════════════════════════════════════════════════════
+// ─── ORDER BLOCKS AT MSS ORIGIN ───
+// ══════════════════════════════════════════════════════════════════
+
+var array<box> bullObBoxes = array.new<box>()
+var array<int> bullObBars  = array.new<int>()
+var array<box> bearObBoxes = array.new<box>()
+var array<int> bearObBars  = array.new<int>()
+
+if showObInput and bullMssFired
+    // Bullish OB: last bearish candle before the break
+    int obBar   = bar_index - 1
+    float obTop = math.max(open[1], close[1])
+    float obBot = math.min(open[1], close[1])
+    if close[1] < open[1]  // was bearish
+        box obBox = box.new(obBar, obTop, bar_index + 10, obBot, border_color = bullTintInput, bgcolor = color.new(bullTintInput, 85), border_width = 1)
+        array.push(bullObBoxes, obBox)
+        array.push(bullObBars, bar_index)
+
+if showObInput and bearMssFired
+    int obBar   = bar_index - 1
+    float obTop = math.max(open[1], close[1])
+    float obBot = math.min(open[1], close[1])
+    if close[1] > open[1]  // was bullish
+        box obBox = box.new(obBar, obTop, bar_index + 10, obBot, border_color = bearTintInput, bgcolor = color.new(bearTintInput, 85), border_width = 1)
+        array.push(bearObBoxes, obBox)
+        array.push(bearObBars, bar_index)
+
+// OB Management: extend, mitigate, age-out
+if showObInput and array.size(bullObBoxes) > 0
+    for i = array.size(bullObBoxes) - 1 to 0
+        box bx    = array.get(bullObBoxes, i)
+        int birth = array.get(bullObBars, i)
+        float top = box.get_top(bx)
+        float bot = box.get_bottom(bx)
+        bool mitigated = obMitigateInput and low <= top and low >= bot
+        bool expired   = (bar_index - birth) > obMaxAgeInput
+        if mitigated or expired
+            box.delete(bx)
+            array.remove(bullObBoxes, i)
+            array.remove(bullObBars, i)
+        else
+            box.set_right(bx, bar_index + 3)
+
+if showObInput and array.size(bearObBoxes) > 0
+    for i = array.size(bearObBoxes) - 1 to 0
+        box bx    = array.get(bearObBoxes, i)
+        int birth = array.get(bearObBars, i)
+        float top = box.get_top(bx)
+        float bot = box.get_bottom(bx)
+        bool mitigated = obMitigateInput and high >= bot and high <= top
+        bool expired   = (bar_index - birth) > obMaxAgeInput
+        if mitigated or expired
+            box.delete(bx)
+            array.remove(bearObBoxes, i)
+            array.remove(bearObBars, i)
+        else
+            box.set_right(bx, bar_index + 3)
+
+// ══════════════════════════════════════════════════════════════════
+// ─── FAIR VALUE GAPS + MITIGATION ───
+// ══════════════════════════════════════════════════════════════════
+
+bool isBullFvg = low > high[2]
+bool isBearFvg = high < low[2]
+
+var array<box> fvgBoxes     = array.new<box>()
+var array<int> fvgBirthBars = array.new<int>()
+var array<int> fvgDirs      = array.new<int>()
+var array<float> fvgTops    = array.new<float>()
+var array<float> fvgBots    = array.new<float>()
+
+if showFvgInput
+    if isBullFvg
+        float gapTop = low
+        float gapBot = high[2]
+        box fvgBox = box.new(bar_index - 2, gapTop, bar_index, gapBot, border_color = na, bgcolor = color.new(bullTintInput, 85))
+        array.push(fvgBoxes, fvgBox)
+        array.push(fvgBirthBars, bar_index)
+        array.push(fvgDirs, DIR_BULL)
+        array.push(fvgTops, gapTop)
+        array.push(fvgBots, gapBot)
+    if isBearFvg
+        float gapTop = low[2]
+        float gapBot = high
+        box fvgBox = box.new(bar_index - 2, gapTop, bar_index, gapBot, border_color = na, bgcolor = color.new(bearTintInput, 85))
+        array.push(fvgBoxes, fvgBox)
+        array.push(fvgBirthBars, bar_index)
+        array.push(fvgDirs, DIR_BEAR)
+        array.push(fvgTops, gapTop)
+        array.push(fvgBots, gapBot)
+
+// FVG Management
+if showFvgInput and array.size(fvgBoxes) > 0
+    for i = array.size(fvgBoxes) - 1 to 0
+        box bx      = array.get(fvgBoxes, i)
+        int birth   = array.get(fvgBirthBars, i)
+        int dir     = array.get(fvgDirs, i)
+        float top   = array.get(fvgTops, i)
+        float bot   = array.get(fvgBots, i)
+        float gapSize = top - bot
+
+        bool filled = false
+        if fvgMitigateInput
+            if dir == DIR_BULL
+                float fillAmt = top - low
+                filled := gapSize > 0 and fillAmt / gapSize >= fvgFillThreshInput and low < top
+            else
+                float fillAmt = high - bot
+                filled := gapSize > 0 and fillAmt / gapSize >= fvgFillThreshInput and high > bot
+
+        bool expired = (bar_index - birth) > fvgMaxAgeInput
+
+        if filled or expired
+            box.delete(bx)
+            array.remove(fvgBoxes, i)
+            array.remove(fvgBirthBars, i)
+            array.remove(fvgDirs, i)
+            array.remove(fvgTops, i)
+            array.remove(fvgBots, i)
+        else
+            box.set_right(bx, bar_index + 2)
+
+// ══════════════════════════════════════════════════════════════════
+// ─── OTE ZONE ───
+// ══════════════════════════════════════════════════════════════════
+
+var box oteBox = na
+
+if showOteInput and bullMssFired and not na(asiaRangeLow)
+    if not na(oteBox)
+        box.delete(oteBox)
+    float swingLow  = asiaRangeLow
+    float swingHigh = close
+    float swingSpan = swingHigh - swingLow
+    float oteTop    = swingHigh - swingSpan * oteFibHiInput
+    float oteBot    = swingHigh - swingSpan * oteFibLoInput
+    oteBox := box.new(bar_index, oteTop, bar_index + oteMaxBarsInput, oteBot,
+         border_color = color.new(bullTintInput, 50), bgcolor = color.new(bullTintInput, 90), border_width = 1, border_style = line.style_dotted)
+    label.new(bar_index, oteTop, "OTE", textcolor = bullTintInput, style = label.style_none, size = size.tiny)
+
+if showOteInput and bearMssFired and not na(asiaRangeHigh)
+    if not na(oteBox)
+        box.delete(oteBox)
+    float swingHigh = asiaRangeHigh
+    float swingLow  = close
+    float swingSpan = swingHigh - swingLow
+    float oteTop    = swingLow + swingSpan * oteFibHiInput
+    float oteBot    = swingLow + swingSpan * oteFibLoInput
+    oteBox := box.new(bar_index, oteBot, bar_index + oteMaxBarsInput, oteTop,
+         border_color = color.new(bearTintInput, 50), bgcolor = color.new(bearTintInput, 90), border_width = 1, border_style = line.style_dotted)
+    label.new(bar_index, oteBot, "OTE", textcolor = bearTintInput, style = label.style_none, size = size.tiny)
+
+// ══════════════════════════════════════════════════════════════════
+// ─── TAKE PROFIT / STOP LOSS ───
+// ══════════════════════════════════════════════════════════════════
+
+var line slLine  = na
+var line tp1Line = na
+var line tp2Line = na
+var line tp3Line = na
+
+cleanTpSl() =>
+    if not na(slLine)
+        line.delete(slLine)
+    if not na(tp1Line)
+        line.delete(tp1Line)
+    if not na(tp2Line)
+        line.delete(tp2Line)
+    if not na(tp3Line)
+        line.delete(tp3Line)
+
+if showTpSlInput and bullMssFired
+    cleanTpSl()
+    float entry    = close
+    float stopLoss = not na(asiaRangeLow) ? asiaRangeLow - atrValue * 0.2 : low - atrValue
+    float risk     = entry - stopLoss
+    int endBar     = bar_index + tpslMaxBarsInput
+
+    slLine  := line.new(bar_index, stopLoss,               endBar, stopLoss,               color = bearTintInput,             style = line.style_dashed, width = 1)
+    tp1Line := line.new(bar_index, entry + risk * rrTp1Input, endBar, entry + risk * rrTp1Input, color = bullTintInput,             style = line.style_dotted, width = 1)
+    tp2Line := line.new(bar_index, entry + risk * rrTp2Input, endBar, entry + risk * rrTp2Input, color = bullTintInput,             style = line.style_dotted, width = 1)
+    tp3Line := line.new(bar_index, entry + risk * rrTp3Input, endBar, entry + risk * rrTp3Input, color = color.new(bullTintInput, 40), style = line.style_dotted, width = 1)
+
+    label.new(bar_index, stopLoss,               "SL",  textcolor = bearTintInput, style = label.style_none, size = size.tiny)
+    label.new(bar_index, entry + risk * rrTp1Input, "TP1", textcolor = bullTintInput, style = label.style_none, size = size.tiny)
+    label.new(bar_index, entry + risk * rrTp2Input, "TP2", textcolor = bullTintInput, style = label.style_none, size = size.tiny)
+    label.new(bar_index, entry + risk * rrTp3Input, "TP3", textcolor = bullTintInput, style = label.style_none, size = size.tiny)
+
+if showTpSlInput and bearMssFired
+    cleanTpSl()
+    float entry    = close
+    float stopLoss = not na(asiaRangeHigh) ? asiaRangeHigh + atrValue * 0.2 : high + atrValue
+    float risk     = stopLoss - entry
+    int endBar     = bar_index + tpslMaxBarsInput
+
+    slLine  := line.new(bar_index, stopLoss,               endBar, stopLoss,               color = bearTintInput,             style = line.style_dashed, width = 1)
+    tp1Line := line.new(bar_index, entry - risk * rrTp1Input, endBar, entry - risk * rrTp1Input, color = bearTintInput,             style = line.style_dotted, width = 1)
+    tp2Line := line.new(bar_index, entry - risk * rrTp2Input, endBar, entry - risk * rrTp2Input, color = bearTintInput,             style = line.style_dotted, width = 1)
+    tp3Line := line.new(bar_index, entry - risk * rrTp3Input, endBar, entry - risk * rrTp3Input, color = color.new(bearTintInput, 40), style = line.style_dotted, width = 1)
+
+    label.new(bar_index, stopLoss,               "SL",  textcolor = bearTintInput, style = label.style_none, size = size.tiny)
+    label.new(bar_index, entry - risk * rrTp1Input, "TP1", textcolor = bearTintInput, style = label.style_none, size = size.tiny)
+    label.new(bar_index, entry - risk * rrTp2Input, "TP2", textcolor = bearTintInput, style = label.style_none, size = size.tiny)
+    label.new(bar_index, entry - risk * rrTp3Input, "TP3", textcolor = bearTintInput, style = label.style_none, size = size.tiny)
+
+// ══════════════════════════════════════════════════════════════════
+// ─── CANDLE COLORING BY SESSION ───
+// ══════════════════════════════════════════════════════════════════
+
+color sessionCandleColor = candleColorInput ?
+     (isInsideTrading ? (close > open ? bullTintInput : bearTintInput) :
+     isInsideAsia ? color.new(#5b9cf6, 40) :
+     neutralTintInput) : na
+
+barcolor(sessionCandleColor, title = "Session Candle Color")
+
+// ══════════════════════════════════════════════════════════════════
+// ─── DASHBOARD ───
+// ══════════════════════════════════════════════════════════════════
+
+var table dashTable = na
+
+if showDashInput and barstate.islast
+    tblPos  = resolveTablePos(dashPosInput)
+    tblSize = resolveTextSize(dashSizeInput)
+
+    dashTable := table.new(tblPos, 2, 9, bgcolor = color.new(#1e222d, 10), border_color = color.new(chart.fg_color, 80), border_width = 1, frame_color = color.new(chart.fg_color, 80), frame_width = 1)
+
+    // Header
+    table.cell(dashTable, 0, 0, "VP - SSS", text_color = color.new(#2196f3, 0), text_size = tblSize, text_halign = text.align_center)
+    table.merge_cells(dashTable, 0, 0, 1, 0)
+
+    // Session status
+    string sessionStr = isInsideTrading ? "Trading" : isInsideAsia ? "Asia" : "Closed"
+    color  sessionClr = isInsideTrading ? bullTintInput : isInsideAsia ? color.new(#5b9cf6, 0) : neutralTintInput
+    table.cell(dashTable, 0, 1, "Session",        text_color = chart.fg_color, text_size = tblSize)
+    table.cell(dashTable, 1, 1, sessionStr,        text_color = sessionClr,     text_size = tblSize)
+
+    // Asia Range
+    string asiaStr = not na(asiaRangeHigh) ? str.tostring(asiaRangeHigh, format.mintick) + " / " + str.tostring(asiaRangeLow, format.mintick) : "—"
+    table.cell(dashTable, 0, 2, "Asia H/L",       text_color = chart.fg_color, text_size = tblSize)
+    table.cell(dashTable, 1, 2, asiaStr,           text_color = chart.fg_color, text_size = tblSize)
+
+    // Sweep status
+    string sweepStr = (asiaHighSwept and asiaLowSwept) ? "Both" : asiaHighSwept ? "High" : asiaLowSwept ? "Low" : "None"
+    color sweepClr  = (asiaHighSwept or asiaLowSwept) ? color.new(#ff9800, 0) : neutralTintInput
+    table.cell(dashTable, 0, 3, "Sweep",           text_color = chart.fg_color, text_size = tblSize)
+    table.cell(dashTable, 1, 3, sweepStr,           text_color = sweepClr,       text_size = tblSize)
+
+    // Bull MSS count
+    table.cell(dashTable, 0, 4, "Bull MSS",        text_color = chart.fg_color, text_size = tblSize)
+    table.cell(dashTable, 1, 4, str.tostring(bullMssCount) + " / " + str.tostring(maxMssPerSession), text_color = bullTintInput, text_size = tblSize)
+
+    // Bear MSS count
+    table.cell(dashTable, 0, 5, "Bear MSS",        text_color = chart.fg_color, text_size = tblSize)
+    table.cell(dashTable, 1, 5, str.tostring(bearMssCount) + " / " + str.tostring(maxMssPerSession), text_color = bearTintInput, text_size = tblSize)
+
+    // Last bull score
+    table.cell(dashTable, 0, 6, "Bull Score",      text_color = chart.fg_color, text_size = tblSize)
+    table.cell(dashTable, 1, 6, lastBullScore > 0 ? str.tostring(lastBullScore) + "/10 " + renderConfluenceStars(lastBullScore) : "—", text_color = bullTintInput, text_size = tblSize)
+
+    // Last bear score
+    table.cell(dashTable, 0, 7, "Bear Score",      text_color = chart.fg_color, text_size = tblSize)
+    table.cell(dashTable, 1, 7, lastBearScore > 0 ? str.tostring(lastBearScore) + "/10 " + renderConfluenceStars(lastBearScore) : "—", text_color = bearTintInput, text_size = tblSize)
+
+    // Branding
+    table.cell(dashTable, 0, 8, "VIPRASOL", text_color = color.new(#2196f3, 30), text_size = size.tiny, text_halign = text.align_center)
+    table.merge_cells(dashTable, 0, 8, 1, 8)
+
+// ══════════════════════════════════════════════════════════════════
+// ─── ALERTS — DYNAMIC v6 ───
+// ══════════════════════════════════════════════════════════════════
+
+if bullMssFired
+    alert("VP-SSS | BULLISH MSS | " + syminfo.ticker + " | " + timeframe.period + " | Price: " + str.tostring(close) + " | Confluence: " + str.tostring(lastBullScore) + "/10", alert.freq_once_per_bar_close)
+
+if bearMssFired
+    alert("VP-SSS | BEARISH MSS | " + syminfo.ticker + " | " + timeframe.period + " | Price: " + str.tostring(close) + " | Confluence: " + str.tostring(lastBearScore) + "/10", alert.freq_once_per_bar_close)
+
+if sweepHighEvent
+    alert("VP-SSS | ASIA HIGH SWEPT | " + syminfo.ticker + " | " + timeframe.period + " | Price: " + str.tostring(high) + " | Level: " + str.tostring(asiaRangeHigh), alert.freq_once_per_bar_close)
+
+if sweepLowEvent
+    alert("VP-SSS | ASIA LOW SWEPT | " + syminfo.ticker + " | " + timeframe.period + " | Price: " + str.tostring(low) + " | Level: " + str.tostring(asiaRangeLow), alert.freq_once_per_bar_close)
+
+// ─── Legacy alertcondition (static) ───
+alertcondition(bullMssFired, "Bullish MSS", "VP-SSS: Bullish Market Structure Shift detected after liquidity sweep.")
+alertcondition(bearMssFired, "Bearish MSS", "VP-SSS: Bearish Market Structure Shift detected after liquidity sweep.")
+alertcondition(sweepHighEvent, "Asia High Swept", "VP-SSS: Asia session high has been swept.")
+alertcondition(sweepLowEvent, "Asia Low Swept", "VP-SSS: Asia session low has been swept.")
+alertcondition(bullMssFired and lastBullScore >= 7, "High Confidence Bull MSS", "VP-SSS: High-confidence bullish MSS (7+/10).")
+alertcondition(bearMssFired and lastBearScore >= 7, "High Confidence Bear MSS", "VP-SSS: High-confidence bearish MSS (7+/10).")

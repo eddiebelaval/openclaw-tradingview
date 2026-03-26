@@ -1,0 +1,181 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © BackQuant
+ 
+//@version=6
+indicator("LOWESS Adaptive Envelope [BackQuant]", overlay = true)
+
+// Inputs
+srcInput       = input.source(close, "Source")
+lengthInput    = input.int(200, "Length", minval = 50, tooltip = "Bars used for the LOWESS fit.")
+bandwidthInput = input.float(0.25, "Bandwidth", minval = 0.05, step = 0.05, tooltip = "Locality control. Lower = hugs local structure, higher = smoother.")
+envMultInput   = input.float(2.0, "Envelope Width", minval = 0.5, step = 0.5, tooltip = "Multiplier on local residual spread.")
+extrapInput    = input.int(25, "Extrapolation Bars", minval = 0, maxval = 100)
+bullInput      = input.color(#00ff00, "Bull Color")
+bearInput      = input.color(#ff0000, "Bear Color")
+showInfoInput  = input.bool(true, "Show Info Label")
+
+// Cast to simple color for fill compatibility
+color bullCol = bullInput
+color bearCol = bearInput
+
+// Polyline and label storage
+var polyline fitLine     = na
+var polyline upperLine   = na
+var polyline lowerLine   = na
+var polyline fillPoly    = na
+var polyline extFitLine  = na
+var polyline extFillPoly = na
+var label    infoLabel   = na
+
+if barstate.islast and bar_index >= lengthInput
+    polyline.delete(fitLine)
+    polyline.delete(upperLine)
+    polyline.delete(lowerLine)
+    polyline.delete(fillPoly)
+    polyline.delete(extFitLine)
+    polyline.delete(extFillPoly)
+    label.delete(infoLabel)
+
+    // Collect prices — index 0 = oldest, lengthInput-1 = most recent
+    float[] prices = array.new_float(lengthInput)
+    for i = 0 to lengthInput - 1
+        prices.set(i, srcInput[lengthInput - 1 - i])
+
+    // LOWESS: local weighted linear regression with tricube kernel
+    float[] fitted = array.new_float(lengthInput, 0.0)
+    float h = math.max(bandwidthInput * lengthInput / 2.0, 2.0)
+
+    for i = 0 to lengthInput - 1
+        float sumW = 0.0
+        float sumWX = 0.0
+        float sumWY = 0.0
+        float sumWXX = 0.0
+        float sumWXY = 0.0
+
+        int jStart = math.max(0, int(i - h) - 1)
+        int jEnd   = math.min(lengthInput - 1, int(i + h) + 1)
+
+        for j = jStart to jEnd
+            float u = math.abs(float(i - j)) / h
+            if u < 1.0
+                float w = math.pow(1.0 - math.pow(u, 3), 3)
+                float x = float(j)
+                float y = prices.get(j)
+                sumW   += w
+                sumWX  += w * x
+                sumWY  += w * y
+                sumWXX += w * x * x
+                sumWXY += w * x * y
+
+        float denom = sumW * sumWXX - sumWX * sumWX
+        if math.abs(denom) > 1e-10
+            float a = (sumWXX * sumWY - sumWX * sumWXY) / denom
+            float b = (sumW * sumWXY - sumWX * sumWY) / denom
+            fitted.set(i, a + b * float(i))
+        else
+            fitted.set(i, prices.get(i))
+
+    // Residuals, R², and adaptive envelope width
+    float[] absRes = array.new_float(lengthInput, 0.0)
+    float ssRes = 0.0
+    float ssTot = 0.0
+    float pMean = prices.avg()
+
+    for i = 0 to lengthInput - 1
+        float res = prices.get(i) - fitted.get(i)
+        absRes.set(i, math.abs(res))
+        ssRes += res * res
+        ssTot += math.pow(prices.get(i) - pMean, 2)
+
+    float rSquared = ssTot > 0 ? 1.0 - ssRes / ssTot : 0.0
+
+    // Smooth absolute residuals for locally adaptive envelope
+    float[] envW = array.new_float(lengthInput, 0.0)
+    int rWin = math.max(3, int(h * 0.8))
+
+    for i = 0 to lengthInput - 1
+        float rSum = 0.0
+        int rCnt = 0
+        int rS = math.max(0, i - rWin)
+        int rE = math.min(lengthInput - 1, i + rWin)
+        for j = rS to rE
+            rSum += absRes.get(j)
+            rCnt += 1
+        envW.set(i, rCnt > 0 ? (rSum / rCnt) * envMultInput : 0.0)
+
+    // Build drawing points
+    int startIdx = bar_index - lengthInput + 1
+
+    array<chart.point> fitPts   = array.new<chart.point>()
+    array<chart.point> upperPts = array.new<chart.point>()
+    array<chart.point> lowerPts = array.new<chart.point>()
+    array<chart.point> fillPts  = array.new<chart.point>()
+
+    for i = 0 to lengthInput - 1
+        int idx = startIdx + i
+        float f = fitted.get(i)
+        float e = envW.get(i)
+        fitPts.push(chart.point.from_index(idx, f))
+        upperPts.push(chart.point.from_index(idx, f + e))
+        lowerPts.push(chart.point.from_index(idx, f - e))
+        fillPts.push(chart.point.from_index(idx, f + e))
+
+    // Trace lower envelope in reverse for closed fill polygon
+    for i = lengthInput - 1 to 0
+        fillPts.push(chart.point.from_index(startIdx + i, fitted.get(i) - envW.get(i)))
+
+    // Color based on price position
+    bool priceAbove = close > fitted.get(lengthInput - 1)
+    color envColor  = priceAbove ? bullCol : bearCol
+
+    // Draw historical fit
+    fillPoly  := polyline.new(fillPts, closed = true, fill_color = color.new(envColor, 85), line_color = na)
+    fitLine   := polyline.new(fitPts, line_color = color.new(color.white, 20), line_width = 2)
+    upperLine := polyline.new(upperPts, line_color = color.new(envColor, 55), line_width = 1)
+    lowerLine := polyline.new(lowerPts, line_color = color.new(envColor, 55), line_width = 1)
+
+    // Extrapolation — project using last slope, envelope gradually widens
+    if extrapInput > 0
+        float slope   = fitted.get(lengthInput - 1) - fitted.get(lengthInput - 2)
+        float lastFit = fitted.get(lengthInput - 1)
+        float lastEnv = envW.get(lengthInput - 1)
+        float envGrow = lastEnv * 0.01
+
+        array<chart.point> eFitPts  = array.new<chart.point>()
+        array<chart.point> eFillPts = array.new<chart.point>()
+
+        eFitPts.push(chart.point.from_index(bar_index, lastFit))
+        eFillPts.push(chart.point.from_index(bar_index, lastFit + lastEnv))
+
+        for i = 1 to extrapInput
+            float f = lastFit + slope * i
+            float e = lastEnv + envGrow * i
+            eFitPts.push(chart.point.from_index(bar_index + i, f))
+            eFillPts.push(chart.point.from_index(bar_index + i, f + e))
+
+        for i = extrapInput to 0
+            float f = i == 0 ? lastFit : lastFit + slope * i
+            float e = i == 0 ? lastEnv : lastEnv + envGrow * i
+            eFillPts.push(chart.point.from_index(bar_index + i, f - e))
+
+        extFitLine  := polyline.new(eFitPts, line_color = color.new(color.white, 50), line_width = 2, line_style = line.style_dashed)
+        extFillPoly := polyline.new(eFillPts, closed = true, fill_color = color.new(envColor, 92), line_color = na)
+
+    // Info label — position within envelope, R², direction
+    if showInfoInput
+        float lastF = fitted.get(lengthInput - 1)
+        float lastE = envW.get(lengthInput - 1)
+        float pos   = lastE > 0 ? ((close - (lastF - lastE)) / (2.0 * lastE)) * 100.0 : 50.0
+        pos := math.max(0.0, math.min(100.0, pos))
+
+        float recentSlope = fitted.get(lengthInput - 1) - fitted.get(math.max(0, lengthInput - 6))
+        string dir  = recentSlope >= 0 ? "▲" : "▼"
+        color dirC  = recentSlope >= 0 ? bullCol : bearCol
+
+        float extY = extrapInput > 0 ? lastF + (fitted.get(lengthInput - 1) - fitted.get(lengthInput - 2)) * extrapInput : lastF
+
+        infoLabel := label.new(
+             bar_index + extrapInput + 3, extY,
+             dir + " R²: " + str.tostring(rSquared, "#.###") + "\nEnv Pos: " + str.tostring(pos, "#.#") + "%",
+             color = #00000000, textcolor = dirC,
+             style = label.style_label_left, size = size.large)

@@ -1,0 +1,350 @@
+//@version=6
+indicator("Yuki 2.0", overlay=true, max_lines_count=500, max_boxes_count=500, max_labels_count=500)
+
+//────────────────────────────────────────────────────────────
+// Inputs
+//────────────────────────────────────────────────────────────
+use5  = input.bool(true,  "Enable 5m alerts")
+use15 = input.bool(true,  "Enable 15m alerts")
+use30 = input.bool(true,  "Enable 30m alerts")
+
+tf5  = input.timeframe("5",  "TF 5m")
+tf15 = input.timeframe("15", "TF 15m")
+tf30 = input.timeframe("30", "TF 30m")
+
+minFvgTicks     = input.int(8,  "Min FVG size (ticks)", minval=1)
+minEngulfTicks  = input.int(6,  "Min Engulfing body size (ticks)", minval=1)
+
+showLabels      = input.bool(true, "Show TF tags")
+showTP          = input.bool(true, "Show TP 1R & 2R lines")
+showLevelTags   = input.bool(true, "Show Entry/SL/TP1/TP2 tags")
+
+// Draw behavior
+stopOnFvgTouch       = input.bool(true, "Stop extending drawings when FVG is touched?")
+extraBarsAfterTouch  = input.int(10, "After touch, extend only +N bars", minval=0, maxval=200)
+
+keepLast = input.int(30, "Keep last N signals (current TF only)", minval=5, maxval=200)
+
+// Colors
+colLong  = color.new(color.green, 0)
+colShort = color.new(color.red, 0)
+colBoxL  = color.new(color.green, 85)
+colBoxS  = color.new(color.red, 85)
+
+tick  = syminfo.mintick
+barMs = timeframe.in_seconds(timeframe.period) * 1000
+
+//────────────────────────────────────────────────────────────
+// Core MTF function
+// Returns:
+// time, earlyL, earlyS, confL, confS, entry, sl, fvgTop, fvgBot, dir
+//────────────────────────────────────────────────────────────
+f_mtfSignal() =>
+    canCalc = bar_index >= 2
+
+    bullFVG = canCalc and (low > high[2])
+    bearFVG = canCalc and (high < low[2])
+
+    bullTop = low
+    bullBot = high[2]
+    bearTop = low[2]
+    bearBot = high
+
+    bullOkSize = bullFVG and ((bullTop - bullBot) >= minFvgTicks * tick)
+    bearOkSize = bearFVG and ((bearTop - bearBot) >= minFvgTicks * tick)
+
+    var float lastBullTop = na
+    var float lastBullBot = na
+    var bool  bullActive  = false
+    var float lastBearTop = na
+    var float lastBearBot = na
+    var bool  bearActive  = false
+
+    if bullOkSize
+        lastBullTop := bullTop
+        lastBullBot := bullBot
+        bullActive  := true
+
+    if bearOkSize
+        lastBearTop := bearTop
+        lastBearBot := bearBot
+        bearActive  := true
+
+    prevBull = close[1] > open[1]
+    prevBear = close[1] < open[1]
+    curBull  = close > open
+    curBear  = close < open
+
+    prevBodyHigh = math.max(open[1], close[1])
+    prevBodyLow  = math.min(open[1], close[1])
+    curBodyHigh  = math.max(open, close)
+    curBodyLow   = math.min(open, close)
+
+    // ✅ NEW: Min size filter for engulfing (body in ticks)
+    bodyTicks = math.abs(close - open) / tick
+    bigEnoughEngulf = bodyTicks >= minEngulfTicks
+
+    bullEngulfConfirmed = bigEnoughEngulf and prevBear and curBull and (curBodyHigh >= prevBodyHigh) and (curBodyLow <= prevBodyLow)
+    bearEngulfConfirmed = bigEnoughEngulf and prevBull and curBear and (curBodyHigh >= prevBodyHigh) and (curBodyLow <= prevBodyLow)
+
+    // EARLY (intra-bar): dépassement du corps précédent + englobe déjà en range
+    // (On garde aussi le filtre minEngulfTicks via bodyTicks)
+    bullEarly = bigEnoughEngulf and prevBear and (close > open) and (high >= prevBodyHigh) and (low <= prevBodyLow)
+    bearEarly = bigEnoughEngulf and prevBull and (close < open) and (low <= prevBodyLow) and (high >= prevBodyHigh)
+
+    bullReady = bullActive and not na(lastBullTop) and not na(lastBullBot)
+    bearReady = bearActive and not na(lastBearTop) and not na(lastBearBot)
+
+    bullTouched = bullReady and (high >= lastBullBot) and (low <= lastBullTop)
+    bearTouched = bearReady and (high >= lastBearBot) and (low <= lastBearTop)
+
+    bullCloseOutside = bullReady and (close > lastBullTop)
+    bearCloseOutside = bearReady and (close < lastBearBot)
+
+    confL = bullEngulfConfirmed and bullTouched and bullCloseOutside
+    confS = bearEngulfConfirmed and bearTouched and bearCloseOutside
+
+    earlyL = bullEarly and bullTouched
+    earlyS = bearEarly and bearTouched
+
+    entry = close
+    slL = math.min(low, low[1])
+    slS = math.max(high, high[1])
+    sl = (confL or earlyL) ? slL : (confS or earlyS) ? slS : na
+
+    fvgTop = (confL or earlyL) ? lastBullTop : (confS or earlyS) ? lastBearTop : na
+    fvgBot = (confL or earlyL) ? lastBullBot : (confS or earlyS) ? lastBearBot : na
+    dir = (confL or earlyL) ? 1 : (confS or earlyS) ? -1 : 0
+
+    [time, earlyL, earlyS, confL, confS, entry, sl, fvgTop, fvgBot, dir]
+
+//────────────────────────────────────────────────────────────
+// Pull MTF
+//────────────────────────────────────────────────────────────
+[t5,  e5L,  e5S,  c5L,  c5S,  en5,  sl5,  top5,  bot5,  d5 ]  = request.security(syminfo.tickerid, tf5,  f_mtfSignal())
+[t15, e15L, e15S, c15L, c15S, en15, sl15, top15, bot15, d15] = request.security(syminfo.tickerid, tf15, f_mtfSignal())
+[t30, e30L, e30S, c30L, c30S, en30, sl30, top30, bot30, d30] = request.security(syminfo.tickerid, tf30, f_mtfSignal())
+
+// CONFIRM once per bar
+newC5L  = use5  and c5L  and not c5L[1]
+newC5S  = use5  and c5S  and not c5S[1]
+newC15L = use15 and c15L and not c15L[1]
+newC15S = use15 and c15S and not c15S[1]
+newC30L = use30 and c30L and not c30L[1]
+newC30S = use30 and c30S and not c30S[1]
+
+// EARLY realtime-only (avoid spam)
+var int lastEarly5  = na
+var int lastEarly15 = na
+var int lastEarly30 = na
+
+fireE5  = barstate.isrealtime and use5  and (e5L or e5S)   and (na(lastEarly5)  or t5  != lastEarly5)
+fireE15 = barstate.isrealtime and use15 and (e15L or e15S) and (na(lastEarly15) or t15 != lastEarly15)
+fireE30 = barstate.isrealtime and use30 and (e30L or e30S) and (na(lastEarly30) or t30 != lastEarly30)
+
+if fireE5
+    lastEarly5 := t5
+if fireE15
+    lastEarly15 := t15
+if fireE30
+    lastEarly30 := t30
+
+//────────────────────────────────────────────────────────────
+// ✅ SHOW ONLY CURRENT CHART TIMEFRAME
+//────────────────────────────────────────────────────────────
+isTF5  = (timeframe.period == tf5)
+isTF15 = (timeframe.period == tf15)
+isTF30 = (timeframe.period == tf30)
+
+// effective draw triggers (only on matching chart TF)
+doDrawC5  = isTF5  and (newC5L or newC5S)
+doDrawC15 = isTF15 and (newC15L or newC15S)
+doDrawC30 = isTF30 and (newC30L or newC30S)
+
+doDrawE5  = isTF5  and fireE5
+doDrawE15 = isTF15 and fireE15
+doDrawE30 = isTF30 and fireE30
+
+//────────────────────────────────────────────────────────────
+// Draw storage (current TF only)
+//────────────────────────────────────────────────────────────
+var box[]   gBoxes      = array.new_box()
+var line[]  gEntry      = array.new_line()
+var line[]  gSL         = array.new_line()
+var line[]  gTP1        = array.new_line()
+var line[]  gTP2        = array.new_line()
+var label[] gLabels     = array.new_label()
+var int[]   gLabelCount = array.new_int()
+var float[] gTop    = array.new_float()
+var float[] gBot    = array.new_float()
+var bool[]  gDone   = array.new_bool()
+var int[]   gStartT = array.new_int()
+var int[]   gEndT   = array.new_int()
+
+f_trimAll() =>
+    while array.size(gBoxes) > keepLast
+        box.delete(array.shift(gBoxes))
+        line.delete(array.shift(gEntry))
+        line.delete(array.shift(gSL))
+
+        if showTP
+            line.delete(array.shift(gTP1))
+            line.delete(array.shift(gTP2))
+
+        // ✅ delete the right number of labels for that signal
+        lblN = array.shift(gLabelCount)
+        for _ = 0 to lblN - 1
+            if array.size(gLabels) > 0
+                label.delete(array.shift(gLabels))
+
+        array.shift(gTop)
+        array.shift(gBot)
+        array.shift(gDone)
+        array.shift(gStartT)
+        array.shift(gEndT)
+
+f_draw(tag, dir, t, entry, sl, top, bot) =>
+    // initial end = "infinite" until touch; we will update each bar
+    endT = time + barMs
+
+    bcol = dir == 1 ? colBoxL : colBoxS
+    lc   = dir == 1 ? colLong : colShort
+
+    b  = box.new(left=t, top=top, right=endT, bottom=bot, xloc=xloc.bar_time, bgcolor=bcol, border_color=color.new(color.gray, 40))
+    lE = line.new(x1=t, y1=entry, x2=endT, y2=entry, xloc=xloc.bar_time, color=lc, width=2)
+    lS = line.new(x1=t, y1=sl,    x2=endT, y2=sl,    xloc=xloc.bar_time, color=color.new(lc, 25), width=1, style=line.style_dashed)
+
+    // TP 1R / 2R (repères)
+    line tp1Line = na
+    line tp2Line = na
+    float tp1 = na
+    float tp2 = na
+    if showTP
+        r = math.abs(entry - sl)
+        tp1 := dir == 1 ? entry + r * 1.0 : entry - r * 1.0
+        tp2 := dir == 1 ? entry + r * 2.0 : entry - r * 2.0
+        tp1Line := line.new(x1=t, y1=tp1, x2=endT, y2=tp1, xloc=xloc.bar_time, color=color.new(lc, 45), width=1)
+        tp2Line := line.new(x1=t, y1=tp2, x2=endT, y2=tp2, xloc=xloc.bar_time, color=color.new(lc, 70), width=1)
+
+    // Labels count for this signal
+    int lblCount = 0
+
+    // Tag label (TF)
+    if showLabels
+        offset = syminfo.mintick * 20
+        yTag = dir == 1 ? low - offset : high + offset
+        labTag = label.new(x=t, y=yTag, xloc=xloc.bar_time, text=tag,
+            style=dir==1?label.style_label_up:label.style_label_down,
+            textcolor=color.white, color=lc, size=size.tiny)
+        array.push(gLabels, labTag)
+        lblCount += 1
+
+    // Level tags on their lines
+    if showLevelTags
+        labEntry = label.new(x=t, y=entry, xloc=xloc.bar_time, text="Entry",
+            style=label.style_label_right, textcolor=color.white, color=color.new(color.black, 40), size=size.tiny)
+        labSL = label.new(x=t, y=sl, xloc=xloc.bar_time, text="SL",
+            style=label.style_label_right, textcolor=color.white, color=color.new(color.black, 40), size=size.tiny)
+        array.push(gLabels, labEntry), array.push(gLabels, labSL)
+        lblCount += 2
+
+        if showTP and not na(tp1) and not na(tp2)
+            labTP1 = label.new(x=t, y=tp1, xloc=xloc.bar_time, text="TP1",
+                style=label.style_label_right, textcolor=color.white, color=color.new(color.black, 40), size=size.tiny)
+            labTP2 = label.new(x=t, y=tp2, xloc=xloc.bar_time, text="TP2",
+                style=label.style_label_right, textcolor=color.white, color=color.new(color.black, 40), size=size.tiny)
+            array.push(gLabels, labTP1), array.push(gLabels, labTP2)
+            lblCount += 2
+
+    // store
+    array.push(gBoxes, b)
+    array.push(gEntry, lE)
+    array.push(gSL, lS)
+    if showTP
+        array.push(gTP1, tp1Line)
+        array.push(gTP2, tp2Line)
+
+    array.push(gLabelCount, lblCount)
+
+    array.push(gTop, top)
+    array.push(gBot, bot)
+    array.push(gDone, false)
+    array.push(gStartT, t)
+    array.push(gEndT, endT)
+
+    f_trimAll()
+
+//────────────────────────────────────────────────────────────
+// Draw triggers (only current chart TF)
+//────────────────────────────────────────────────────────────
+if doDrawC5
+    dir = newC5L ? 1 : -1
+    f_draw("5m", dir, t5, en5, sl5, top5, bot5)
+
+if doDrawC15
+    dir = newC15L ? 1 : -1
+    f_draw("15m", dir, t15, en15, sl15, top15, bot15)
+
+if doDrawC30
+    dir = newC30L ? 1 : -1
+    f_draw("30m", dir, t30, en30, sl30, top30, bot30)
+
+if doDrawE5
+    dir = e5L ? 1 : -1
+    f_draw("5m", dir, t5, en5, sl5, top5, bot5)
+    alert("EARLY " + (dir==1?"LONG":"SHORT") + " 5m: pre-close engulfing forming in FVG.", alert.freq_once_per_bar)
+
+if doDrawE15
+    dir = e15L ? 1 : -1
+    f_draw("15m", dir, t15, en15, sl15, top15, bot15)
+    alert("EARLY " + (dir==1?"LONG":"SHORT") + " 15m: pre-close engulfing forming in FVG.", alert.freq_once_per_bar)
+
+if doDrawE30
+    dir = e30L ? 1 : -1
+    f_draw("30m", dir, t30, en30, sl30, top30, bot30)
+    alert("EARLY " + (dir==1?"LONG":"SHORT") + " 30m: pre-close engulfing forming in FVG.", alert.freq_once_per_bar)
+
+//────────────────────────────────────────────────────────────
+// Updater (SAFE): extend drawings until FVG touched, then stop (+extraBarsAfterTouch)
+//────────────────────────────────────────────────────────────
+n = array.size(gBoxes)
+if n > 0
+    for i = 0 to n - 1
+        b = array.get(gBoxes, i)
+        lE = array.get(gEntry, i)
+        lS = array.get(gSL, i)
+        top = array.get(gTop, i)
+        bot = array.get(gBot, i)
+        done = array.get(gDone, i)
+        endT = array.get(gEndT, i)
+
+        if not done
+            touchedNow = (high >= bot) and (low <= top)
+
+            if stopOnFvgTouch and touchedNow
+                finalEnd = time + extraBarsAfterTouch * barMs
+                array.set(gEndT, i, finalEnd)
+                array.set(gDone, i, true)
+                endT := finalEnd
+            else
+                endT := time + barMs
+                array.set(gEndT, i, endT)
+
+        box.set_right(b, endT)
+        line.set_x2(lE, endT)
+        line.set_x2(lS, endT)
+
+        if showTP
+            if array.size(gTP1) == array.size(gBoxes)
+                line.set_x2(array.get(gTP1, i), endT)
+                line.set_x2(array.get(gTP2, i), endT)
+
+//────────────────────────────────────────────────────────────
+// Confirm alertconditions (easy setup)
+//────────────────────────────────────────────────────────────
+alertcondition(newC5L,  "CONFIRM LONG 5m",  "CONFIRM LONG 5m: engulfing closed outside FVG.")
+alertcondition(newC5S,  "CONFIRM SHORT 5m", "CONFIRM SHORT 5m: engulfing closed outside FVG.")
+alertcondition(newC15L, "CONFIRM LONG 15m", "CONFIRM LONG 15m: engulfing closed outside FVG.")
+alertcondition(newC15S, "CONFIRM SHORT 15m","CONFIRM SHORT 15m: engulfing closed outside FVG.")
+alertcondition(newC30L, "CONFIRM LONG 30m", "CONFIRM LONG 30m: engulfing closed outside FVG.")
+alertcondition(newC30S, "CONFIRM SHORT 30m","CONFIRM SHORT 30m: engulfing closed outside FVG.")

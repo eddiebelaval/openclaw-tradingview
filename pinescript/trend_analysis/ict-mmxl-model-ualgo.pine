@@ -1,0 +1,388 @@
+// This work is licensed under Creative Commons Attribution-NonCommercial-ShareAlike 4.0 International  
+// https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © UAlgo
+//@version=6
+indicator("ICT MMXL Model [UAlgo]",
+     overlay=true,
+     max_lines_count=500, max_labels_count=500, max_boxes_count=200)
+
+grpDet = "● Detection"
+pivLeft  = input.int(5,  "Pivot Left Bars",  minval=1, maxval=50, group=grpDet,
+     inline="pvt", tooltip="Bars to the left required to confirm a swing pivot.")
+pivRight = input.int(5,  "Right Bars",        minval=1, maxval=50, group=grpDet,
+     inline="pvt")
+maxSwings = input.int(5, "Max Prior Swings to Track", minval=1, maxval=10,
+     group=grpDet,
+     tooltip="How many recent swing highs/lows are kept in memory for sweep checks.")
+
+grpFlt = "● Filters"
+useVolFilter  = input.bool(true,  "Volume Filter",       group=grpFlt, inline="vf")
+volMult       = input.float(1.2,  "× Avg Volume",        group=grpFlt, inline="vf",
+     minval=1.0, maxval=10.0, step=0.1)
+volLookback   = input.int(20,     "Volume Avg Period",   group=grpFlt, minval=5,
+     maxval=200)
+useWickFilter = input.bool(false,  "Wick Filter",          group=grpFlt, inline="wf")
+wickRatio     = input.float(1.2,  "Wick ≥ Body ×",       group=grpFlt, inline="wf",
+     minval=0.5, maxval=10.0, step=0.1,
+     tooltip="Lower wick (for bullish) or upper wick (for bearish) must be at least this multiple of the candle body.")
+maxZones      = input.int(10,     "Max Active Zones",    group=grpFlt, minval=1,
+     maxval=50,
+     tooltip="Maximum number of concurrent active zones drawn on the chart.")
+useMomFilter  = input.bool(true,  "Momentum Fade Filter", group=grpFlt, inline="mf",
+     tooltip="Requires slowing displacement before the sweep candle: candle bodies and ATR must shrink over the lookback window.")
+momLookback   = input.int(3,      "Lookback Bars",        group=grpFlt, inline="mf",
+     minval=2, maxval=20)
+
+grpVis = "● Visual"
+bullZoneCol  = input.color(color.new(#00BCD4, 82), "Bullish Zone",    group=grpVis, inline="zc")
+bearZoneCol  = input.color(color.new(#FF5252, 82), "Bearish Zone",    group=grpVis, inline="zc")
+bullBordCol  = input.color(color.new(#00BCD4, 30), "Bullish Border",  group=grpVis, inline="bc")
+bearBordCol  = input.color(color.new(#FF5252, 30), "Bearish Border",  group=grpVis, inline="bc")
+violatedCol  = input.color(color.new(#78909C, 88), "Violated Zone",   group=grpVis)
+showMidLine  = input.bool(true,  "Show Mid-Line",        group=grpVis, inline="ml")
+showSweepMark = input.bool(true, "Show Sweep Marker",    group=grpVis, inline="ml")
+sweepMarkSize = input.string("Small", "Marker Size",     group=grpVis,
+     options=["Tiny","Small","Normal","Large"])
+
+grpAlerts = "● Alerts"
+
+type SwingPoint
+    int   barIdx
+    float price
+    bool  isHigh
+
+type ExhaustionZone
+    float  zoneTop
+    float  zoneBot
+    bool   isBullish
+    int    formBar
+    int    formTime
+    int    retests
+    bool   isActive
+    bool   inZone
+    bool   hasMomentumFade
+    box    zoneBox
+    line   midLine
+    label  zoneLabel
+    label  sweepLabel
+
+type MMXLStats
+    int   totalBull
+    int   totalBear
+
+var array<SwingPoint>    swingHighs = array.new<SwingPoint>()
+var array<SwingPoint>    swingLows  = array.new<SwingPoint>()
+var array<ExhaustionZone> zones     = array.new<ExhaustionZone>()
+var MMXLStats stats = MMXLStats.new(0, 0)
+
+isPinBar(bool isUpperWick) =>
+    bodySize = math.abs(close - open)
+    if bodySize == 0.0
+        false
+    else if isUpperWick
+        upperWick = high - math.max(close, open)
+        upperWick >= bodySize * wickRatio
+    else
+        lowerWick = math.min(close, open) - low
+        lowerWick >= bodySize * wickRatio
+
+isVolumeSpike() =>
+    avgVol = ta.sma(volume, volLookback)
+    volume >= avgVol * volMult
+
+priorSwingPrice(array<SwingPoint> arr) =>
+    arr.size() == 0 ? na : arr.last().price
+
+isMomentumFading(int offset, int lookback) =>
+    bodyNow   = math.abs(close[offset]     - open[offset])
+    bodyPrev  = math.abs(close[offset + lookback] - open[offset + lookback])
+    atrNow    = ta.atr(14)[offset]
+    atrPrev   = ta.atr(14)[offset + lookback]
+    bodyFade  = bodyNow  < bodyPrev
+    atrFade   = atrNow   < atrPrev
+    bodyFade and atrFade
+
+method draw(ExhaustionZone this, int sweepBar, float sweepHigh, float sweepLow) =>
+    color fillCol   = this.isBullish ? bullZoneCol : bearZoneCol
+    color bordCol   = this.isBullish ? bullBordCol : bearBordCol
+    float midPrice  = (this.zoneTop + this.zoneBot) / 2.0
+    string emoji    = this.isBullish ? "▲" : "▼"
+    labelSize = switch sweepMarkSize
+        "Tiny"   => size.tiny
+        "Small"  => size.small
+        "Normal" => size.normal
+        "Large"  => size.large
+        => size.small
+
+    this.zoneBox := box.new(
+         left       = this.formTime,
+         top        = this.zoneTop,
+         right      = time,
+         bottom     = this.zoneBot,
+         border_color = bordCol,
+         border_width = 1,
+         bgcolor    = fillCol,
+         xloc       = xloc.bar_time)
+
+    if showMidLine
+        midLineCol = color.new(this.isBullish ? #00BCD4 : #FF5252, 55)
+        this.midLine := line.new(
+             x1   = this.formTime,
+             y1   = midPrice,
+             x2   = time,
+             y2   = midPrice,
+             color = midLineCol,
+             style = line.style_dashed,
+             width = 1,
+             xloc  = xloc.bar_time)
+
+    fadeTag   = this.hasMomentumFade ? "\n⚡ Fading" : ""
+    labelText = (this.isBullish ? "MMXL ▲" : "MMXL ▼") +
+         "\nRetests: " + str.tostring(this.retests) + fadeTag
+    labelYPos  = this.isBullish ? this.zoneBot : this.zoneTop
+    labelColor = this.isBullish ? color.new(#00BCD4, 0) : color.new(#FF5252, 0)
+    this.zoneLabel := label.new(
+         x     = time,
+         y     = labelYPos,
+         text  = labelText,
+         xloc  = xloc.bar_time,
+         style = this.isBullish ? label.style_label_upper_right : label.style_label_lower_right,
+         color = color.new(color.white, 100),
+         textcolor = labelColor,
+         size  = size.small)
+
+    if showSweepMark
+        markerY   = this.isBullish ? sweepLow : sweepHigh
+        markerStyle = this.isBullish ? label.style_label_up : label.style_label_down
+        this.sweepLabel := label.new(
+             x     = this.formTime,
+             y     = markerY,
+             text  = emoji,
+             xloc  = xloc.bar_time,
+             style = markerStyle,
+             color = color.new(color.white, 100),
+             textcolor = labelColor,
+             size  = labelSize)
+
+method updateRight(ExhaustionZone this) =>
+    if not na(this.zoneBox)
+        box.set_right(this.zoneBox, time)
+    if showMidLine and not na(this.midLine)
+        line.set_x2(this.midLine, time)
+    if not na(this.zoneLabel)
+        label.set_x(this.zoneLabel, time)
+        fadeTagU  = this.hasMomentumFade ? "\n⚡ Fading" : ""
+        label.set_text(this.zoneLabel,
+             (this.isBullish ? "MMXL ▲" : "MMXL ▼") +
+             "\nRetests: " + str.tostring(this.retests) + fadeTagU)
+
+method violate(ExhaustionZone this) =>
+    this.isActive := false
+    if not na(this.zoneBox)
+        box.set_bgcolor(this.zoneBox, violatedCol)
+        box.set_border_color(this.zoneBox, color.new(#78909C, 50))
+    if showMidLine and not na(this.midLine)
+        line.set_color(this.midLine, color.new(#78909C, 70))
+    if not na(this.zoneLabel)
+        label.set_textcolor(this.zoneLabel, color.new(#78909C, 40))
+        label.set_text(this.zoneLabel,
+             (this.isBullish ? "MMXL ▲" : "MMXL ▼") +
+             "\nVIOLATED")
+
+method checkViolation(ExhaustionZone this) =>
+    if this.isBullish
+        close < this.zoneBot
+    else
+        close > this.zoneTop
+
+method isInsideZone(ExhaustionZone this) =>
+    high >= this.zoneBot and low <= this.zoneTop
+
+method deleteDrawings(ExhaustionZone this) =>
+    if not na(this.zoneBox)
+        box.delete(this.zoneBox)
+    if not na(this.midLine)
+        line.delete(this.midLine)
+    if not na(this.zoneLabel)
+        label.delete(this.zoneLabel)
+    if not na(this.sweepLabel)
+        label.delete(this.sweepLabel)
+
+phPrice = ta.pivothigh(high, pivLeft, pivRight)
+plPrice = ta.pivotlow (low,  pivLeft, pivRight)
+
+pivBarIdx  = bar_index - pivRight
+pivBarTime = time[pivRight]
+
+if not na(phPrice)
+    sp = SwingPoint.new(barIdx=pivBarIdx, price=phPrice, isHigh=true)
+    swingHighs.push(sp)
+    if swingHighs.size() > maxSwings
+        swingHighs.shift()
+
+if not na(plPrice)
+    sp = SwingPoint.new(barIdx=pivBarIdx, price=plPrice, isHigh=false)
+    swingLows.push(sp)
+    if swingLows.size() > maxSwings
+        swingLows.shift()
+
+sweepBar   = bar_index - pivRight
+sweepHigh  = high[pivRight]
+sweepLow   = low[pivRight]
+sweepClose = close[pivRight]
+sweepOpen  = open[pivRight]
+sweepVol   = volume[pivRight]
+sweepTime  = time[pivRight]
+
+avgVol = ta.sma(volume, volLookback)[pivRight]
+
+volOk = not useVolFilter or (sweepVol >= avgVol * volMult)
+momFade = isMomentumFading(pivRight, momLookback)
+
+bool newBearZone = false
+if swingHighs.size() > 0 and barstate.isconfirmed
+    priorHigh = swingHighs.last().price
+    bearSweepCondition = sweepHigh > priorHigh and sweepClose < priorHigh
+    sweepBody  = math.abs(sweepClose - sweepOpen)
+    upperWick  = sweepHigh - math.max(sweepClose, sweepOpen)
+    bearWickOk = not useWickFilter or (sweepBody == 0.0 or upperWick >= sweepBody * wickRatio)
+    bearMomFade = momFade
+    momOkBear  = not useMomFilter or bearMomFade
+    alreadyExists = false
+    for z in zones
+        if z.formTime == sweepTime
+            alreadyExists := true
+            break
+
+    if bearSweepCondition and volOk and bearWickOk and momOkBear and not alreadyExists
+        activeCount = 0
+        for z in zones
+            if z.isActive
+                activeCount += 1
+        if activeCount >= maxZones
+            for idx = 0 to zones.size() - 1
+                z = zones.get(idx)
+                if z.isActive
+                    z.deleteDrawings()
+                    z.isActive := false
+                    break
+
+        newZone = ExhaustionZone.new(
+             zoneTop          = sweepHigh,
+             zoneBot          = priorHigh,
+             isBullish        = false,
+             formBar          = sweepBar,
+             formTime         = sweepTime,
+             retests          = 0,
+             isActive         = true,
+             inZone           = false,
+             hasMomentumFade  = bearMomFade,
+             zoneBox          = na,
+             midLine          = na,
+             zoneLabel        = na,
+             sweepLabel       = na)
+        newZone.draw(sweepBar, sweepHigh, sweepLow)
+        zones.push(newZone)
+        stats.totalBear += 1
+        newBearZone := true
+
+bool newBullZone = false
+if swingLows.size() > 0 and barstate.isconfirmed
+    priorLow = swingLows.last().price
+    bullSweepCondition = sweepLow < priorLow and sweepClose > priorLow
+    sweepBody  = math.abs(sweepClose - sweepOpen)
+    lowerWick  = math.min(sweepClose, sweepOpen) - sweepLow
+    bullWickOk = not useWickFilter or (sweepBody == 0.0 or lowerWick >= sweepBody * wickRatio)
+    bullMomFade = momFade
+    momOkBull  = not useMomFilter or bullMomFade
+
+    alreadyExists = false
+    for z in zones
+        if z.formTime == sweepTime
+            alreadyExists := true
+            break
+
+    if bullSweepCondition and volOk and bullWickOk and momOkBull and not alreadyExists
+        activeCount = 0
+        for z in zones
+            if z.isActive
+                activeCount += 1
+        if activeCount >= maxZones
+            for idx = 0 to zones.size() - 1
+                z = zones.get(idx)
+                if z.isActive
+                    z.deleteDrawings()
+                    z.isActive := false
+                    break
+
+        newZone = ExhaustionZone.new(
+             zoneTop          = priorLow,
+             zoneBot          = sweepLow,
+             isBullish        = true,
+             formBar          = sweepBar,
+             formTime         = sweepTime,
+             retests          = 0,
+             isActive         = true,
+             inZone           = false,
+             hasMomentumFade  = bullMomFade,
+             zoneBox          = na,
+             midLine          = na,
+             zoneLabel        = na,
+             sweepLabel       = na)
+        newZone.draw(sweepBar, sweepHigh, sweepLow)
+        zones.push(newZone)
+        stats.totalBull += 1
+        newBullZone := true
+
+if barstate.isconfirmed
+    for z in zones
+        if z.isActive
+            z.updateRight()
+            nowInside = z.isInsideZone()
+            if nowInside and not z.inZone
+                z.retests += 1
+            z.inZone := nowInside
+            if z.checkViolation()
+                z.violate()
+
+alertcondition(newBearZone,
+     title   = "MMXL — Bearish Exhaustion Zone Formed",
+     message = "MMXL: BSL sweep detected on {{ticker}} {{interval}}. Bearish exhaustion zone created.")
+
+alertcondition(newBullZone,
+     title   = "MMXL — Bullish Exhaustion Zone Formed",
+     message = "MMXL: SSL sweep detected on {{ticker}} {{interval}}. Bullish exhaustion zone created.")
+
+bullRetest = false
+bearRetest = false
+if barstate.isconfirmed
+    for z in zones
+        if z.isActive and z.retests == 1 and z.isInsideZone()
+            if z.isBullish
+                bullRetest := true
+            else
+                bearRetest := true
+
+alertcondition(bullRetest,
+     title   = "MMXL — Bullish Zone Retest",
+     message = "MMXL: Price retesting bullish exhaustion zone on {{ticker}} {{interval}}.")
+
+alertcondition(bearRetest,
+     title   = "MMXL — Bearish Zone Retest",
+     message = "MMXL: Price retesting bearish exhaustion zone on {{ticker}} {{interval}}.")
+
+bullViolated = false
+bearViolated = false
+if barstate.isconfirmed
+    for z in zones
+        if not z.isActive and z.checkViolation()
+            if z.isBullish
+                bullViolated := true
+            else
+                bearViolated := true
+
+alertcondition(bullViolated or bearViolated,
+     title   = "MMXL — Zone Violated",
+     message = "MMXL: An exhaustion zone was violated (close outside zone) on {{ticker}} {{interval}}.")
+
+plot(na, display=display.none)

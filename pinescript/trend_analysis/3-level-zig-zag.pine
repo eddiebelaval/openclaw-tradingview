@@ -1,0 +1,244 @@
+//@version=6
+// ============================================================
+// 3 Level Zig Zag
+// Original: 3_Level_Zig_Zag_Mt5.ex5  Copyright 2026, FxAutomated
+// Source:   https://www.fxautomated.com  |  Version 1.04
+// Pine v6:  Reconstructed from compiled EX5 (binary — no readable source).
+//           Logic mirrors the standard FxAutomated 3LZZ algorithm.
+// ──────────────────────────────────────────────────────────────
+// MT5 → Pine adaptation notes:
+//   • MT5 uses Depth / Deviation / Backstep per level.
+//     Pine has no built-in ZigZag; the nearest equivalent is
+//     ta.pivothigh() / ta.pivotlow() with Left / Right bar counts:
+//       Left bars  ≈ Depth    (bars to the left for pivot confirmation)
+//       Right bars ≈ Backstep (bars to the right before pivot is locked)
+//     Deviation (min pip move filter) has no exact Pine equivalent;
+//     the left/right confirmation window filters the same noise.
+//   • MT5 ZigZag's last segment repaints in real time as price moves.
+//     Pine pivots are confirmed only after rightBars close, adding that
+//     many bars of lag.  The optional dashed "Extend Last" line replicates
+//     the MT5 live-segment repaint behaviour.
+//   • MT5 indicator buffers 0/1 (high/low dot arrays) → Pine line.new()
+//     and label.new() calls (nearest visual equivalent).
+//   • Strict H-L-H-L alternation enforced: consecutive same-direction
+//     pivots keep only the more extreme value (higher high / lower low),
+//     exactly matching MT5 ZigZag logic.
+// ============================================================
+
+indicator("3 Level Zig Zag", shorttitle = "3LZZ", overlay = true,
+         max_lines_count = 500, max_labels_count = 500)
+
+// ── INPUTS ──────────────────────────────────────────────────
+var string G1 = "── Level 1  (Small Swings)"
+var string G2 = "── Level 2  (Medium Swings)"
+var string G3 = "── Level 3  (Large Swings)"
+var string GA = "── Alerts"
+
+// ── Level 1 ─────────────────────────────────────────────────
+l1_show   = input.bool(true,  title = "Show",        group = G1, inline = "l1v")
+l1_labels = input.bool(true,  title = "H/L Labels",  group = G1, inline = "l1v")
+l1_extend = input.bool(true,  title = "Extend Last", group = G1, inline = "l1v",
+             tooltip = "Draw a live dashed line from the last confirmed pivot to the current bar (repaints, mirrors MT5 behaviour)")
+l1_left   = input.int(5,      title = "Left",        group = G1, inline = "l1p", minval = 1)
+l1_right  = input.int(3,      title = "Right",       group = G1, inline = "l1p", minval = 1,
+             tooltip = "Left ≈ MT5 Depth  |  Right ≈ MT5 Backstep\nHigher values = fewer, larger swings")
+l1_col    = input.color(color.new(#2962FF, 0), title = "Color", group = G1, inline = "l1s")
+l1_width  = input.int(1,      title = "Width",       group = G1, inline = "l1s", minval = 1, maxval = 4)
+
+// ── Level 2 ─────────────────────────────────────────────────
+l2_show   = input.bool(true,  title = "Show",        group = G2, inline = "l2v")
+l2_labels = input.bool(true,  title = "H/L Labels",  group = G2, inline = "l2v")
+l2_extend = input.bool(true,  title = "Extend Last", group = G2, inline = "l2v")
+l2_left   = input.int(13,     title = "Left",        group = G2, inline = "l2p", minval = 1)
+l2_right  = input.int(5,      title = "Right",       group = G2, inline = "l2p", minval = 1)
+l2_col    = input.color(color.new(#FF1744, 0), title = "Color", group = G2, inline = "l2s")
+l2_width  = input.int(2,      title = "Width",       group = G2, inline = "l2s", minval = 1, maxval = 4)
+
+// ── Level 3 ─────────────────────────────────────────────────
+l3_show   = input.bool(true,  title = "Show",        group = G3, inline = "l3v")
+l3_labels = input.bool(true,  title = "H/L Labels",  group = G3, inline = "l3v")
+l3_extend = input.bool(true,  title = "Extend Last", group = G3, inline = "l3v")
+l3_left   = input.int(34,     title = "Left",        group = G3, inline = "l3p", minval = 1)
+l3_right  = input.int(8,      title = "Right",       group = G3, inline = "l3p", minval = 1)
+l3_col    = input.color(color.new(#00C853, 0), title = "Color", group = G3, inline = "l3s")
+l3_width  = input.int(3,      title = "Width",       group = G3, inline = "l3s", minval = 1, maxval = 4)
+
+// ── Alerts ──────────────────────────────────────────────────
+al_newH   = input.bool(true, title = "Alert — New High Pivot", group = GA)
+al_newL   = input.bool(true, title = "Alert — New Low Pivot",  group = GA)
+
+// ── ZIG ZAG ENGINE ──────────────────────────────────────────
+// f_zz() — ZigZag state machine for a single level.
+//
+// Behaviour (matches MT5 ZigZag alternating rule):
+//   The engine tracks two pivots:
+//     p0 = anchor  — committed, never changes until next direction flip
+//     p1 = tip     — current end of the active line, may be updated
+//                    if a better same-direction pivot appears
+//   On H→L / L→H transition: p1 becomes the new anchor p0, a new line
+//     is drawn from p0 → new p1.
+//   On same-direction better pivot: delete active line + label,
+//     redraw from current p0 → new (better) p1.
+//   On same-direction worse pivot: silently ignored.
+//
+// Returns [alertHigh, alertLow]:
+//   Each is true on the confirmation bar of a newly accepted pivot.
+//
+f_zz(lBars, rBars, col, lw, showLbl, extLast, doShow) =>
+
+    // ── persistent state (survives bar by bar) ───────────────
+    var float p0Price  = na    // anchor: price
+    var int   p0Bar    = na    // anchor: bar index
+    var float p1Price  = na    // tip: price
+    var int   p1Bar    = na    // tip: bar index
+    var int   p1Dir    = 0     // tip direction: 1=High, -1=Low, 0=uninitialised
+    var line  p1Line   = na    // active committed line (p0→p1), may be redrawn
+    var label p1Lbl    = na    // label at tip, may be redrawn
+    var line  extLine  = na    // live extension line (repaints every bar)
+
+    // ── detect pivots this bar ───────────────────────────────
+    ph   = ta.pivothigh(high, lBars, rBars)   // pivot high value (or na)
+    pl   = ta.pivotlow(low,   lBars, rBars)   // pivot low  value (or na)
+    isH  = not na(ph)
+    isL  = not na(pl)
+    pBar = bar_index - rBars   // the bar where the pivot actually occurred
+
+    // ── alert return values ──────────────────────────────────
+    aH = false
+    aL = false
+
+    // ── HIGH pivot processing ────────────────────────────────
+    if isH
+        if p1Dir == 1
+            // Consecutive high: keep only if strictly higher
+            if ph > p1Price
+                if not na(p1Line)
+                    line.delete(p1Line)
+                if not na(p1Lbl)
+                    label.delete(p1Lbl)
+                p1Price := ph
+                p1Bar   := pBar
+                // Redraw from existing anchor to new (higher) tip
+                if doShow and not na(p0Bar)
+                    p1Line := line.new(p0Bar, p0Price, pBar, ph,
+                                 color = col, width = lw, style = line.style_solid)
+                if doShow and showLbl
+                    p1Lbl := label.new(pBar, ph, "H",
+                                style = label.style_label_down,
+                                color = color.new(col, 70),
+                                textcolor = col, size = size.tiny)
+                aH := true
+            // Lower high → silent discard
+
+        else
+            // Direction change L→H (or very first pivot)
+            // Commit current tip as new anchor
+            p0Price := p1Price
+            p0Bar   := p1Bar
+            p1Line  := na    // release ref — committed line stays on chart
+            p1Lbl   := na    // release ref — committed label stays on chart
+            p1Price := ph
+            p1Bar   := pBar
+            p1Dir   := 1
+            if doShow and not na(p0Bar)
+                p1Line := line.new(p0Bar, p0Price, pBar, ph,
+                             color = col, width = lw, style = line.style_solid)
+            if doShow and showLbl
+                p1Lbl := label.new(pBar, ph, "H",
+                            style = label.style_label_down,
+                            color = color.new(col, 70),
+                            textcolor = col, size = size.tiny)
+            aH := true
+
+    // ── LOW pivot processing ─────────────────────────────────
+    if isL
+        if p1Dir == -1
+            // Consecutive low: keep only if strictly lower
+            if pl < p1Price
+                if not na(p1Line)
+                    line.delete(p1Line)
+                if not na(p1Lbl)
+                    label.delete(p1Lbl)
+                p1Price := pl
+                p1Bar   := pBar
+                if doShow and not na(p0Bar)
+                    p1Line := line.new(p0Bar, p0Price, pBar, pl,
+                                 color = col, width = lw, style = line.style_solid)
+                if doShow and showLbl
+                    p1Lbl := label.new(pBar, pl, "L",
+                                style = label.style_label_up,
+                                color = color.new(col, 70),
+                                textcolor = col, size = size.tiny)
+                aL := true
+
+        else
+            // Direction change H→L
+            p0Price := p1Price
+            p0Bar   := p1Bar
+            p1Line  := na
+            p1Lbl   := na
+            p1Price := pl
+            p1Bar   := pBar
+            p1Dir   := -1
+            if doShow and not na(p0Bar)
+                p1Line := line.new(p0Bar, p0Price, pBar, pl,
+                             color = col, width = lw, style = line.style_solid)
+            if doShow and showLbl
+                p1Lbl := label.new(pBar, pl, "L",
+                            style = label.style_label_up,
+                            color = color.new(col, 70),
+                            textcolor = col, size = size.tiny)
+            aL := true
+
+    // ── live extension line (repaints — mirrors MT5 real-time segment)
+    // Extends from the last confirmed pivot toward current price.
+    // Drawn dashed to distinguish from confirmed (solid) segments.
+    if doShow and extLast and not na(p1Bar) and p1Dir != 0
+        if not na(extLine)
+            line.delete(extLine)
+        // Project toward the opposite extreme (if last pivot is High,
+        // the pending leg tracks toward a Low, so use current low)
+        extTip  = p1Dir == 1 ? low : high
+        extLine := line.new(p1Bar, p1Price, bar_index, extTip,
+                             color = color.new(col, 55), width = lw,
+                             style = line.style_dashed)
+
+    [aH, aL]
+
+// ── SIGNAL COMPUTATION ──────────────────────────────────────
+[l1H, l1L] = f_zz(l1_left, l1_right, l1_col, l1_width, l1_labels, l1_extend, l1_show)
+[l2H, l2L] = f_zz(l2_left, l2_right, l2_col, l2_width, l2_labels, l2_extend, l2_show)
+[l3H, l3L] = f_zz(l3_left, l3_right, l3_col, l3_width, l3_labels, l3_extend, l3_show)
+
+// ── ALERTS ──────────────────────────────────────────────────
+alertcondition(al_newH and (l1H or l2H or l3H),
+     title   = "Any Level — New High Pivot",
+     message = "3LZZ ▲ New HIGH pivot confirmed (any level)")
+
+alertcondition(al_newL and (l1L or l2L or l3L),
+     title   = "Any Level — New Low Pivot",
+     message = "3LZZ ▼ New LOW pivot confirmed (any level)")
+
+alertcondition(al_newH and l1H,
+     title   = "Level 1 — New High Pivot",
+     message = "3LZZ ▲ Level 1 (Small) — new HIGH pivot confirmed")
+
+alertcondition(al_newL and l1L,
+     title   = "Level 1 — New Low Pivot",
+     message = "3LZZ ▼ Level 1 (Small) — new LOW pivot confirmed")
+
+alertcondition(al_newH and l2H,
+     title   = "Level 2 — New High Pivot",
+     message = "3LZZ ▲ Level 2 (Medium) — new HIGH pivot confirmed")
+
+alertcondition(al_newL and l2L,
+     title   = "Level 2 — New Low Pivot",
+     message = "3LZZ ▼ Level 2 (Medium) — new LOW pivot confirmed")
+
+alertcondition(al_newH and l3H,
+     title   = "Level 3 — New High Pivot",
+     message = "3LZZ ▲ Level 3 (Large) — new HIGH pivot confirmed")
+
+alertcondition(al_newL and l3L,
+     title   = "Level 3 — New Low Pivot",
+     message = "3LZZ ▼ Level 3 (Large) — new LOW pivot confirmed")

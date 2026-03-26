@@ -1,0 +1,293 @@
+// This work is licensed under Creative Commons Attribution-NonCommercial-ShareAlike 4.0 International  
+// https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © UAlgo
+//@version=6
+indicator("Wolfe Wave Pattern [UAlgo]", overlay=true, max_lines_count=500, max_labels_count=500, max_bars_back=5000)
+
+// =============================================================================
+// TYPES
+// =============================================================================
+
+type PivotPoint
+    int index
+    float price
+    bool isHigh
+
+// Method to format pivot for debugging or display
+method toString(PivotPoint this) =>
+    (this.isHigh ? "High" : "Low") + " @ " + str.tostring(this.price) + " (Bar: " + str.tostring(this.index) + ")"
+
+type WolfeWave
+    PivotPoint p1
+    PivotPoint p2
+    PivotPoint p3
+    PivotPoint p4
+    PivotPoint p5
+    bool isBullish
+    array<line> patternLines
+    array<label> pointLabels
+    line epaLine
+    line sweetZoneLine
+
+// =============================================================================
+// INPUTS
+// =============================================================================
+
+grp_zigzag = "ZigZag Settings"
+int lenLeft = input.int(5, "Pivot Left Bars", minval=1, group=grp_zigzag)
+int lenRight = input.int(5, "Pivot Right Bars", minval=1, group=grp_zigzag)
+
+grp_visuals = "Visuals"
+color colorBullish = input.color(color.new(color.green, 0), "Bullish Color", group=grp_visuals)
+color colorBearish = input.color(color.new(color.red, 0), "Bearish Color", group=grp_visuals)
+int widthLine = input.int(2, "Line Width", minval=1, group=grp_visuals)
+string lineStyleInput = input.string("Solid", "Line Style", options=["Solid", "Dotted", "Dashed"], group=grp_visuals)
+
+// =============================================================================
+// GLOBAL STORAGE
+// =============================================================================
+
+// Store historical pivots
+var pivotArray = array.new<PivotPoint>()
+// Store active waves to manage garbage collection if needed (optional for this scope but good practice)
+var wavesArray = array.new<WolfeWave>()
+
+// =============================================================================
+// HELPER FUNCTIONS & METHODS
+// =============================================================================
+
+// Helper to convert string input to line style
+getLineStyle(string style) =>
+    switch style
+        "Solid" => line.style_solid
+        "Dotted" => line.style_dotted
+        "Dashed" => line.style_dashed
+        => line.style_solid
+
+// Method to add a new pivot
+method addPivot(array<PivotPoint> pivots, int idx, float prc, bool high) =>
+    PivotPoint newPivot = PivotPoint.new(idx, prc, high)
+    pivots.push(newPivot)
+    // Keep array size manageable, though we need enough history for patterns
+    if pivots.size() > 100
+        pivots.shift()
+
+// Method to calculate slope between two pivots
+method getSlope(PivotPoint pA, PivotPoint pB) =>
+    (pB.price - pA.price) / (pB.index - pA.index)
+
+// Method to get projected price at a specific bar index based on two pivots
+method getProjectedPrice(PivotPoint pA, PivotPoint pB, int targetIndex) =>
+    float slope = (pB.price - pA.price) / (pB.index - pA.index)
+    pA.price + slope * (targetIndex - pA.index)
+
+// Helper to add label
+autoLabel(PivotPoint p, string txt, color c, string yloc = yloc.price, string style = label.style_none) =>
+    label.new(p.index, p.price, txt, xloc=xloc.bar_index, yloc=yloc, style=style, textcolor=c, size=size.normal)
+
+// Method to draw the pattern
+method draw(WolfeWave this) =>
+    color c = this.isBullish ? colorBullish : colorBearish
+    string styleStr = lineStyleInput
+    string _style = getLineStyle(styleStr)
+    
+    // Initialize arrays if null (constructors don't init arrays by default in some contexts, safer to check or init in `new`)
+    if na(this.patternLines)
+        this.patternLines := array.new<line>()
+    if na(this.pointLabels)
+        this.pointLabels := array.new<label>()
+
+    // 1-2
+    this.patternLines.push(line.new(this.p1.index, this.p1.price, this.p2.index, this.p2.price, color=c, width=widthLine, style=line.style_solid))
+    // 2-3
+    this.patternLines.push(line.new(this.p2.index, this.p2.price, this.p3.index, this.p3.price, color=c, width=widthLine, style=line.style_solid))
+    // 3-4
+    this.patternLines.push(line.new(this.p3.index, this.p3.price, this.p4.index, this.p4.price, color=c, width=widthLine, style=line.style_solid))
+    // 4-5
+    this.patternLines.push(line.new(this.p4.index, this.p4.price, this.p5.index, this.p5.price, color=c, width=widthLine, style=line.style_solid))
+    // 1-3 (Sweet Zone Base) - Extended slightly past 5
+    this.sweetZoneLine := line.new(this.p1.index, this.p1.price, this.p5.index, this.p1.getProjectedPrice(this.p3, this.p5.index), color=color.new(c, 50), width=1, style=line.style_dashed)
+    
+    // 2-4 (Top/Bottom Channel)
+    this.patternLines.push(line.new(this.p2.index, this.p2.price, this.p4.index, this.p4.price, color=color.new(c, 50), width=1, style=line.style_dashed))
+
+    // EPA Line (1-4 Extended)
+    // We extend it into the future to show target
+    int dist14 = this.p4.index - this.p1.index
+    int targetIdx = this.p5.index + dist14 // Arbitrary projection length
+    float targetPrice = this.p1.getProjectedPrice(this.p4, targetIdx)
+    
+    this.epaLine := line.new(this.p1.index, this.p1.price, targetIdx, targetPrice, color=color.yellow, width=2, style=line.style_arrow_right)
+    
+    // Labels Positioning Logic
+    // Bullish:
+    // 1 (Low) -> Below
+    // 2 (High) -> Above
+    // 3 (Low) -> Below
+    // 4 (High) -> Above
+    // 5 (Low) -> Below
+    
+    // Bearish:
+    // 1 (High) -> Above
+    // 2 (Low) -> Below
+    // 3 (High) -> Above
+    // 4 (Low) -> Below
+    // 5 (High) -> Above
+
+    string yloc1 = this.isBullish ? yloc.belowbar : yloc.abovebar
+    string yloc2 = this.isBullish ? yloc.abovebar : yloc.belowbar
+    string yloc3 = this.isBullish ? yloc.belowbar : yloc.abovebar
+    string yloc4 = this.isBullish ? yloc.abovebar : yloc.belowbar
+    string yloc5 = this.isBullish ? yloc.belowbar : yloc.abovebar
+
+    this.pointLabels.push(autoLabel(this.p1, "1", c, yloc1))
+    this.pointLabels.push(autoLabel(this.p2, "2", c, yloc2))
+    this.pointLabels.push(autoLabel(this.p3, "3", c, yloc3))
+    this.pointLabels.push(autoLabel(this.p4, "4", c, yloc4))
+    this.pointLabels.push(autoLabel(this.p5, "5", c, yloc5))
+
+    // Pattern Name Label at P5 (or slightly offset)
+    string patName = this.isBullish ? "Bullish Wolfe Wave" : "Bearish Wolfe Wave"
+    // Place name above/below P5 depending on type
+    string nameYloc = this.isBullish ? yloc.belowbar : yloc.abovebar
+    // Create a label for the pattern name
+    label nameLbl = label.new(this.p5.index, this.p5.price, patName, xloc=xloc.bar_index, yloc=nameYloc, style=label.style_none, textcolor=c, size=size.normal)
+    // Shift the name label slightly to not overlap with "5"
+    // Since we can't easily pixel shift without valid y-axis, we rely on newlines or just accept proximity.
+    // Alternatively, put name label on the EPA line start or somewhere else.
+    // Let's add a newline to separate "5" and Name if they are on same side
+    nameLbl.set_text("5\n" + patName)
+    // We already added "5" label separately. Let's remove the separate "5" label logic and combine or just update the last label?
+    // Let's just update the last label pushed (P5)
+    label p5Label = this.pointLabels.get(this.pointLabels.size() - 1)
+    p5Label.set_text("5\n" + patName)
+    // And ensure yloc is correct (already set above)
+
+
+// =============================================================================
+// MAIN LOGIC
+// =============================================================================
+
+// 1. Identify Pivots
+float ph = ta.pivothigh(high, lenLeft, lenRight)
+float pl = ta.pivotlow(low, lenLeft, lenRight)
+
+if not na(ph)
+    // Pivot High found at bar_index - lenRight
+    pivotArray.addPivot(bar_index - lenRight, ph, true)
+
+if not na(pl)
+    // Pivot Low found at bar_index - lenRight
+    pivotArray.addPivot(bar_index - lenRight, pl, false)
+
+// 2. Pattern Recognition
+// We need at least 5 pivots to check for a pattern
+if pivotArray.size() >= 5
+    // Get the last 5 pivots
+    PivotPoint p5 = pivotArray.get(pivotArray.size() - 1)
+    PivotPoint p4 = pivotArray.get(pivotArray.size() - 2)
+    PivotPoint p3 = pivotArray.get(pivotArray.size() - 3)
+    PivotPoint p2 = pivotArray.get(pivotArray.size() - 4)
+    PivotPoint p1 = pivotArray.get(pivotArray.size() - 5)
+
+    // Only process if the new pivot (P5) was just added
+    // The inputs ph/pl are not na only on the specific bar the pivot is confirmed
+    // So this block runs once per pivot confirmation
+    bool newPivotConfirmed = not na(ph) or not na(pl)
+    
+    if newPivotConfirmed
+        // Check Alternation
+        bool alternating = (p1.isHigh != p2.isHigh) and (p2.isHigh != p3.isHigh) and (p3.isHigh != p4.isHigh) and (p4.isHigh != p5.isHigh)
+
+        if alternating
+            bool detected = false
+            bool isBull = false
+
+            // --- BULLISH WOLFE WAVE RULES ---
+            // Pattern: Low(1), High(2), Low(3), High(4), Low(5)
+            // P1(L), P2(H), P3(L), P4(H), P5(L)
+            if not p1.isHigh and p2.isHigh and not p3.isHigh and p4.isHigh and not p5.isHigh
+                // Rule 1: P3 < P1 (Strict rule often debated, but strictly: 3 is lower than 1? 
+                // Wait, standard Wolfe Wave:
+                // Point 1 is a base. Point 2 is a top. Point 3 is a new bottom BELOW Point 1.
+                // Point 4 is a top BELOW Point 2 but ABOVE Point 1? No.
+                // Let's re-verify strict rules. 
+                // Many sources say 3 should be lower than 1 for Bullish.
+                // And 4 should be higher than 1? 
+                // Point 4 must be within the channel of 1-2 extended? 
+                // Key constraint: 1-3 and 2-4 converge.
+                
+                // Let's apply the rules derived from research:
+                // Bullish: 1(L), 2(H), 3(L), 4(H), 5(L)
+                // 3 < 1 (Price) -> Lower Low
+                // 4 < 2 (Price) -> Lower High (Channeling down)
+                // 4 > 1 ? Usually yes, but not strictly required if converging.
+                // Convergence: Line 1-3 and 2-4 intersect on the right side.
+                // Overshoot: P5 < Project(1,3) at P5.
+                
+                if p3.price < p1.price and p4.price < p2.price
+                    // Check convergence
+                    // Slope 1-3
+                    float m13 = p1.getSlope(p3) // Negative
+                    // Slope 2-4
+                    float m24 = p2.getSlope(p4) // Negative
+                    
+                    // For wedge, they must converge. 
+                    // Since both slope down, convergence means 1-3 is flatter than 2-4? 
+                    // Or 2-4 is steeper? 
+                    // If 1-3 is bottom, 2-4 is top.
+                    // If they converge to the right, the top line (2-4) must come down FASTER than the bottom line (1-3).
+                    // So m24 < m13 (since both negative, e.g. -2 < -1).
+                    // Or simply calculate intersection time.
+                    
+                    // Intersection formula: x = (b2 - b1) / (m1 - m2) + x_base
+                    // Check if intersection > p5.index
+                    
+                    // Let's use simpler logic: 
+                    // Project 1-3 to P4 index. P4 should be ABOVE that projection? No, that's channel check.
+                    // Convergence check:
+                    // dist(1-3, 2-4) at P1 > dist(1-3, 2-4) at P5?
+                    // Let's calculate projected price of line 1-3 at P5 index.
+                    float proj13_at_5 = p1.getProjectedPrice(p3, p5.index)
+                    
+                    // Rule: P5 should overshoot (be below) the 1-3 line
+                    if p5.price < proj13_at_5
+                        // Convergence check: projected 2-4 at some future point vs projected 1-3.
+                        // Or simply: m24 < m13 ?
+                        // If m24 (top) is steeper down than m13 (bottom), they will cross.
+                        if m24 < m13 
+                            isBull := true
+                            detected := true
+
+            // --- BEARISH WOLFE WAVE RULES ---
+            // Pattern: High(1), Low(2), High(3), Low(4), High(5)
+            // P1(H), P2(L), P3(H), P4(L), P5(H)
+            else if p1.isHigh and not p2.isHigh and p3.isHigh and not p4.isHigh and p5.isHigh
+                // 3 > 1 (Higher High)
+                // 4 > 2 (Higher Low)
+                if p3.price > p1.price and p4.price > p2.price
+                    // Slope 1-3 (Positive)
+                    float m13 = p1.getSlope(p3)
+                    // Slope 2-4 (Positive)
+                    float m24 = p2.getSlope(p4)
+                    
+                    // For wedge (rising), they converge if bottom line (2-4) rises FASTER than top line (1-3)?
+                    // Wait, rising wedge:
+                    // Top line (1-3) connects Highs.
+                    // Bottom line (2-4) connects Lows.
+                    // Convergence: Bottom line rises faster than Top line.
+                    // m24 > m13
+                    
+                    // Overshoot: P5 > Project(1,3) at P5
+                    float proj13_at_5 = p1.getProjectedPrice(p3, p5.index)
+                    
+                    if p5.price > proj13_at_5
+                        if m24 > m13
+                            isBull := false
+                            detected := true
+            
+            if detected
+                WolfeWave ww = WolfeWave.new(p1, p2, p3, p4, p5, isBull)
+                ww.draw()
+                // Alert
+                alert("Wolfe Wave " + (isBull ? "Bullish" : "Bearish") + " Detected", alert.freq_once_per_bar_close)

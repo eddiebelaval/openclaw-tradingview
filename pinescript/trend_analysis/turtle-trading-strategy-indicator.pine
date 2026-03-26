@@ -1,0 +1,225 @@
+//@version=6
+indicator("Turtle Trading Strategy Indicator", overlay=true)
+
+// ================================ INPUTS ================================
+show20Day     = input.bool(true, "Show 20-Day Breakout System")
+show55Day     = input.bool(true, "Show 55-Day Breakout System")
+showAtrStop   = input.bool(true, "Show ATR Stop")
+showPyramids  = input.bool(true, "Show Pyramids")
+atrMult       = input.float(2.0, "ATR Stop Multiplier", minval=0.1, maxval=10.0)
+
+// Modern, readable color palette
+day20EntryColor = input.color(#00CED1, "20-Day Entry Color")    // Bright Cyan
+day20ExitColor  = input.color(#FF6B6B, "20-Day Exit Color")     // Soft Red
+day55EntryColor = input.color(#4169E1, "55-Day Entry Color")    // Royal Blue
+day55ExitColor  = input.color(#9370DB, "55-Day Exit Color")     // Medium Purple
+atrStopColor    = input.color(#FF1493, "ATR Stop Color")        // Deep Pink
+
+// ================================ FIXED TURTLE PARAMETERS ================================
+entryLen20  = 20   // 20-Day Breakout: entry channel length
+entryLen55  = 55   // 55-Day Breakout: entry channel length
+exitLen10   = 10   // 20-Day Breakout: exit channel length
+exitLen20   = 20   // 55-Day Breakout: exit channel length
+atrLen      = 20   // ATR length
+pyramidStep = 0.5  // Pyramid step in N units (ATR)
+maxUnits    = 4    // Maximum position units (1 initial + 3 adds)
+
+// ================================ SERIES CALCULATIONS ================================
+// Donchian channels (highest high / lowest low over specified periods)
+chan20Hi = ta.highest(high, entryLen20)  // 20-Day entry breakout level
+chan55Hi = ta.highest(high, entryLen55)  // 55-Day entry breakout level
+chan10Lo = ta.lowest(low, exitLen10)    // 20-Day system exit level
+chan20Lo = ta.lowest(low, exitLen20)    // 55-Day system exit level
+atrN     = ta.atr(atrLen)
+
+// ================================ PERSISTENT STATE VARIABLES ================================
+var bool  inTrade         = false  // Currently in a trade?
+var int   activeSystem    = 0      // Which system (20 or 55)
+var float entryPrice      = 0.0    // Entry fill price
+var float stopPrice       = 0.0    // Current ATR stop level
+var int   units           = 0      // Current position units (1-4)
+var float nextAdd         = 0.0    // Next pyramid add trigger level
+var bool  lastTradeWinner = false  // Was last closed trade a winner?
+var bool  skipNext20Day   = false  // Skip next 20-Day entry (after winner)
+
+// ================================ CURRENT BAR SIGNALS (reset each bar) ================================
+var bool exitTriggered     = false
+var bool pyramidTriggered  = false
+var bool entryTriggered    = false
+var color candleColor      = na
+var string labelText       = na
+var color labelBgColor     = na
+var string labelStyle      = na
+
+// Reset current bar variables
+exitTriggered    := false
+pyramidTriggered := false
+entryTriggered   := false
+candleColor      := na
+labelText        := na
+labelBgColor     := na
+labelStyle       := na
+
+// ================================ MAIN TRADING LOGIC ================================
+// Only proceed if we have enough historical bars
+if bar_index >= math.max(entryLen55, atrLen)
+    
+    // Get PREVIOUS bar's channel values for breakout/exit comparisons
+    // (Turtle rules: compare current bar vs previous bar's channel)
+    prevChan20Hi = chan20Hi[1]
+    prevChan55Hi = chan55Hi[1]
+    prevChan10Lo = chan10Lo[1]
+    prevChan20Lo = chan20Lo[1]
+    
+    currentHigh  = high
+    currentLow   = low
+    currentClose = close
+    currentAtr   = atrN
+    
+    // -------------------- EXIT LOGIC (takes priority) --------------------
+    if inTrade
+        
+        // 1) ATR Stop Exit
+        if showAtrStop and currentLow <= stopPrice
+            exitTriggered   := true
+            labelText       := "ATR STOP"
+            labelBgColor    := color.new(#EF4444, 0)  // Red background
+            labelStyle      := "exit"
+            candleColor     := atrStopColor
+            lastTradeWinner := currentClose > entryPrice
+            skipNext20Day   := lastTradeWinner
+        
+        // 2) 20-Day System Channel Exit (10-day low)
+        else if activeSystem == 20 and currentLow <= prevChan10Lo
+            exitTriggered   := true
+            labelText       := "20D EXIT"
+            labelBgColor    := color.new(day20ExitColor, 0)
+            labelStyle      := "exit"
+            candleColor     := day20ExitColor
+            lastTradeWinner := currentClose > entryPrice
+            skipNext20Day   := lastTradeWinner
+        
+        // 3) 55-Day System Channel Exit (20-day low)
+        else if activeSystem == 55 and currentLow <= prevChan20Lo
+            exitTriggered   := true
+            labelText       := "55D EXIT"
+            labelBgColor    := color.new(day55ExitColor, 0)
+            labelStyle      := "exit"
+            candleColor     := day55ExitColor
+            lastTradeWinner := currentClose > entryPrice
+            skipNext20Day   := lastTradeWinner
+        
+        // 4) Pyramid Add (only if no exit and conditions met)
+        else if showPyramids and units < maxUnits and currentHigh >= nextAdd
+            pyramidTriggered := true
+            units            += 1
+            
+            // Real-time fill: use the add trigger level directly
+            fillPrice = nextAdd
+            
+            // Re-anchor stop: fillPrice - (atrMult * N)
+            stopPrice := fillPrice - (atrMult * currentAtr)
+            
+            // Set next add level: fillPrice + (pyramidStep * N)
+            nextAdd := fillPrice + (pyramidStep * currentAtr)
+            
+            labelText    := "ADD +" + str.tostring(units)
+            labelBgColor := color.new(#F97316, 0)  // Orange background
+            labelStyle   := "entry"
+            candleColor  := activeSystem == 20 ? day20EntryColor : day55EntryColor
+        
+        // Reset state after exit
+        if exitTriggered
+            inTrade      := false
+            activeSystem := 0
+            entryPrice   := 0.0
+            stopPrice    := 0.0
+            units        := 0
+            nextAdd      := 0.0
+    
+    // -------------------- ENTRY LOGIC (only if flat and no exit this bar) --------------------
+    if not inTrade and not exitTriggered
+        
+        // 55-Day Breakout Entry (always allowed)
+        if show55Day and currentHigh > prevChan55Hi
+            entryTriggered := true
+            
+            // Real-time fill: use the breakout level directly
+            fillPrice = currentHigh
+            
+            inTrade      := true
+            activeSystem := 55
+            entryPrice   := fillPrice
+            stopPrice    := fillPrice - (atrMult * currentAtr)
+            units        := 1
+            nextAdd      := fillPrice + (pyramidStep * currentAtr)
+            
+            labelText    := "55D ENTRY"
+            labelBgColor := color.new(#22C55E, 0)  // Green background
+            labelStyle   := "entry"
+            candleColor  := day55EntryColor
+        
+        // 20-Day Breakout Entry (skip once after a winner)
+        else if show20Day and currentHigh > prevChan20Hi
+            if not skipNext20Day
+                entryTriggered := true
+                
+                // Real-time fill: use the breakout level directly
+                fillPrice = currentHigh
+                
+                inTrade      := true
+                activeSystem := 20
+                entryPrice   := fillPrice
+                stopPrice    := fillPrice - (atrMult * currentAtr)
+                units        := 1
+                nextAdd      := fillPrice + (pyramidStep * currentAtr)
+                
+                labelText    := "20D ENTRY"
+                labelBgColor := color.new(#22C55E, 0)  // Green background
+                labelStyle   := "entry"
+                candleColor  := day20EntryColor
+            else
+                // Skip this 20-Day breakout (used the one-time skip), then reset flag
+                skipNext20Day := false
+
+// ================================ PLOTS ================================
+
+// Donchian Channel Lines (stepline style with offset=1 to show breakout trigger levels)
+plot(show20Day ? chan20Hi : na, "20-Day Entry (20-high)", day20EntryColor, 2, plot.style_stepline, offset=1)
+plot(show20Day ? chan10Lo : na, "20-Day Exit (10-low)",   day20ExitColor,  2, plot.style_stepline, offset=1)
+plot(show55Day ? chan55Hi : na, "55-Day Entry (55-high)", day55EntryColor, 2, plot.style_stepline, offset=1)
+plot(show55Day ? chan20Lo : na, "55-Day Exit (20-low)",   day55ExitColor,  2, plot.style_stepline, offset=1)
+
+// ATR Stop Line (only visible while in trade, no offset needed)
+plot(showAtrStop and inTrade ? stopPrice : na, "ATR Stop", atrStopColor, 2, plot.style_stepline)
+
+// ================================ CANDLE COLORING ================================
+barcolor(candleColor, title="Signal Bar Color")
+
+// ================================ TRADE MARKERS ================================
+// Create styled labels for entries, exits, and adds
+if not na(labelText)
+    if labelStyle == "entry"
+        // Entry labels (below bar, green background)
+        label.new(
+             bar_index, low, 
+             text = labelText, 
+             color = labelBgColor,
+             textcolor = color.white, 
+             style = label.style_label_up, 
+             yloc = yloc.belowbar, 
+             size = size.normal,
+             textalign = text.align_center
+         )
+    else if labelStyle == "exit"
+        // Exit labels (above bar, red/purple/pink background)
+        label.new(
+             bar_index, high, 
+             text = labelText, 
+             color = labelBgColor,
+             textcolor = color.white, 
+             style = label.style_label_down, 
+             yloc = yloc.abovebar, 
+             size = size.normal,
+             textalign = text.align_center
+         )

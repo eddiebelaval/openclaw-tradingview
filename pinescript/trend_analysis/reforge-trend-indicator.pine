@@ -1,0 +1,1227 @@
+//@version=6
+// Build v3.0 - 20260209 HYBRID TRENDLINE
+indicator("[ReForge] Trend Indicator", overlay=true, max_labels_count=500, max_lines_count=500)
+
+//====================================================
+// PROFILE (Auto / Manual) + MODE
+//====================================================
+groupProfile = "Profile"
+
+profile = input.string("Auto", "Profile", options=["Auto", "Manual"], group=groupProfile)
+mode    = input.string("Balanced", "Mode", options=["Aggressive", "Balanced", "Strict"], group=groupProfile)
+
+isManual = profile == "Manual"
+
+// Manual overrides (used only when Profile = Manual)  ✅ preserved
+factorManual        = input.float(1.45, "Factor (Manual)", step=0.01, group=groupProfile)
+distLenManual       = input.int(180, "Dist Length (Manual)", minval=20, group=groupProfile)
+useTRManual         = input.bool(true, "Use True Range Dist (Manual)", group=groupProfile)
+
+useConfirmManual    = input.bool(true, "Use Flip Confirmation (Manual)", group=groupProfile)
+confirmAggManual    = input.int(1, "Confirm Bars Aggressive (Manual)", minval=1, maxval=5, group=groupProfile)
+confirmBalManual    = input.int(2, "Confirm Bars Balanced (Manual)", minval=1, maxval=5, group=groupProfile)
+confirmStrManual    = input.int(2, "Confirm Bars Strict (Manual)", minval=1, maxval=5, group=groupProfile)
+
+useChopManual       = input.bool(true, "Gate by BB Width (Manual)", group=groupProfile)
+bbWidthThrManual    = input.float(0.22, "Min BB Width % (Manual)", step=0.01, group=groupProfile)
+
+useHTFManual        = input.bool(true, "Gate by HTF Bias (Manual)", group=groupProfile)
+htfTFManual         = input.timeframe("60", "HTF Timeframe (Manual)", group=groupProfile)
+
+pullbackEntryManual = input.string("CloseBack", "Pullback Re-entry Trigger (Manual)", options=["CrossBack", "CloseBack"], group=groupProfile)
+
+// Pullback touch trigger (kept)
+pullbackTouchMode = input.string("WickTouch", "Pullback Touch Trigger", options=["WickTouch", "CloseTouch"], group=groupProfile)
+
+//====================================================
+// AUTO MODEL
+//====================================================
+f_clamp(_x, _lo, _hi) =>
+    float _y = _x
+    if _y < _lo
+        _y := _lo
+    if _y > _hi
+        _y := _hi
+    _y
+
+tfSec = timeframe.in_seconds(timeframe.period)
+tfMin = tfSec / 60.0
+
+// Auto distLen baseline: longer on higher TF
+baseDistLenF = 80.0 + tfMin * 2.0
+distLenAuto  = int(math.round(f_clamp(baseDistLenF, 60.0, 260.0)))
+
+// Auto factor baseline: slightly higher on higher TF and for higher-vol symbols
+float baseFactorF = 1.35 + (math.log(tfMin + 1.0) / math.log(10.0)) * 0.35
+
+// Gentle asset-type bias (kept simple & robust)
+if syminfo.type == "crypto"
+    baseFactorF += 0.20
+if str.contains(str.upper(syminfo.ticker), "XAU")
+    baseFactorF += 0.10
+
+float factorAuto = baseFactorF
+if mode == "Aggressive"
+    factorAuto := baseFactorF * 0.92
+if mode == "Balanced"
+    factorAuto := baseFactorF * 1.00
+if mode == "Strict"
+    factorAuto := baseFactorF * 1.08
+
+// Auto confirmation bars (mode-based)
+int confirmAggAuto = 1
+int confirmBalAuto = 2
+int confirmStrAuto = 3
+
+// Auto BB width threshold (mode + asset-type bias)
+float bbThrAuto = 0.22
+if syminfo.type == "crypto"
+    bbThrAuto := 0.30
+if mode == "Aggressive"
+    bbThrAuto := bbThrAuto - 0.04
+if mode == "Strict"
+    bbThrAuto := bbThrAuto + 0.04
+
+// Auto HTF TF (simple mapping)
+string htfTFAuto = "60"
+if tfMin > 20
+    htfTFAuto := "240"
+if tfMin > 240
+    htfTFAuto := "D"
+
+// Auto pullback re-entry trigger
+string pbEntryAuto = "CloseBack"
+if tfMin >= 15
+    pbEntryAuto := "CrossBack"
+
+// Auto toggles (sane defaults)
+useTRAuto      = true
+useConfirmAuto = true
+useChopAuto    = true
+useHTFAuto     = true
+
+//====================================================
+// APPLY ACTIVE SETTINGS
+//====================================================
+factor           = isManual ? factorManual       : factorAuto
+distLen          = isManual ? distLenManual      : distLenAuto
+useTrueRangeDist = isManual ? useTRManual        : useTRAuto
+
+useConfirm = isManual ? useConfirmManual : useConfirmAuto
+confirmAgg = isManual ? confirmAggManual : confirmAggAuto
+confirmBal = isManual ? confirmBalManual : confirmBalAuto
+confirmStr = isManual ? confirmStrManual : confirmStrAuto
+
+useChopFilter = isManual ? useChopManual    : useChopAuto
+bbWidthThr    = isManual ? bbWidthThrManual : bbThrAuto
+
+useHTFBias = isManual ? useHTFManual : useHTFAuto
+htfTF      = isManual ? htfTFManual  : htfTFAuto
+
+pullbackEntryMode = isManual ? pullbackEntryManual : pbEntryAuto
+
+//====================================================
+// OTHER INPUTS
+//====================================================
+
+// Distance model (H1 retained: "Hybrid")
+groupDist = "Distance Model"
+distModel = input.string("Hybrid", "Distance Model", options=["Hybrid", "Points", "Percent"], group=groupDist)
+
+// % distance responsiveness (kept)
+pctLenMult  = input.float(0.35, "Pct Dist Length Mult", step=0.05, minval=0.10, maxval=1.00, group=groupDist)
+pctAmplify  = input.float(1.00, "Pct Dist Amplifier", step=0.05, minval=0.10, maxval=10.0, group=groupDist)
+
+// Regression Channel
+groupReg = "Regression Channel"
+showReg      = input.bool(true,  "Show Regression Channel", group=groupReg)
+useLogReg    = input.bool(false, "Use Log Regression (exp channel)", group=groupReg)
+regLen       = input.int(120,    "Regression Length", minval=20, group=groupReg)
+regMult      = input.float(2.0,  "Channel StDev Mult", minval=0.1, step=0.1, group=groupReg)
+regLineCol   = input.color(color.white, "Midline Colour", group=groupReg)
+regBandCol   = input.color(color.gray,  "Band Colour", group=groupReg)
+regLineW     = input.int(1, "Midline Width", minval=1, maxval=4, group=groupReg)
+regBandW     = input.int(1, "Band Width", minval=1, maxval=4, group=groupReg)
+regFillOn    = input.bool(true, "Fill Channel", group=groupReg)
+regFillAlpha = input.int(90, "Fill Transparency", minval=0, maxval=100, group=groupReg)
+
+// Optional slope gate
+useRegSlopeGate = input.bool(false, "Gate Signals by Regression Slope", group=groupReg)
+slopeThrPct     = input.float(0.01, "Slope Threshold (% per bar)", step=0.001, group=groupReg)
+
+// Volume Support (dots)
+groupVol = "Volume Support"
+showVolDots      = input.bool(true,  "Show Trend Quality Dots", group=groupVol)
+volLenShort      = input.int(20, "Volume Support Short Length", minval=5, group=groupVol)
+volLenLong       = input.int(50, "Volume Support Long Length", minval=5, group=groupVol)
+gateByVolSup     = input.bool(false, "Gate Signals by Volume Support", group=groupVol)
+requireBothLens  = input.bool(false, "Vol Support: Require Short + Long agree", group=groupVol)
+
+dotBullCol = input.color(color.lime, "Dot Colour (Bull Supported)", group=groupVol)
+dotBearCol = input.color(color.red,  "Dot Colour (Bear Supported)", group=groupVol)
+dotWeakCol = input.color(color.gray, "Dot Colour (Weak/Mixed)", group=groupVol)
+
+// ✅ NEW (safe): dot-tuning controls (do not break existing UI logic)
+rvolMinShort = input.float(1.25, "Dot RVOL Min (Short)", step=0.05, group=groupVol)
+rvolMinLong  = input.float(1.15, "Dot RVOL Min (Long)",  step=0.05, group=groupVol)
+useDpvBaseline = input.bool(true, "Dot DPV must beat baseline", group=groupVol)
+
+// Arming logic
+groupArm = "Arming"
+useArming = input.bool(true, "Arm entries if dot not aligned", group=groupArm)
+armBars   = input.int(5, "Max bars to wait for dot alignment", minval=1, maxval=50, group=groupArm)
+
+// Dashboard
+groupDash = "Dashboard"
+dashShow     = input.bool(true, "Show Dashboard Table", group=groupDash)
+dashPosition = input.string("Top Right", "Dashboard Position", options=["Top Right", "Top Left", "Bottom Right", "Bottom Left"], group=groupDash)
+dashTextSize = input.string("Small", "Dashboard Text Size", options=["Tiny", "Small", "Normal", "Large"], group=groupDash)
+
+// Signals
+showBuySell   = input.bool(true, "Show BUY / SELL")
+showReentries = input.bool(true, "Show Continuation (B2 / S2)")
+
+//====================================================
+// MOMENTUM CANDLES (colour coding)
+//====================================================
+groupMom = "Momentum Candles"
+showMomCandles   = input.bool(true, "Colour Momentum Candles", group=groupMom)
+momBodyPct       = input.float(0.65, "Body / TR Threshold", step=0.05, minval=0.10, maxval=1.00, group=groupMom)
+momClvMin        = input.float(0.35, "CLV Min Abs", step=0.05, minval=0.0, maxval=1.0, group=groupMom)
+momUseClvFilter  = input.bool(true, "Require CLV Direction", group=groupMom)
+momUseTrendDir   = input.bool(false, "Only Colour If Matches Trend Regime", group=groupMom)
+momBullCol       = input.color(color.new(#06fc43, 0), "Momentum Bull Candle Colour", group=groupMom)
+momBearCol       = input.color(color.new(#fa0505, 0),  "Momentum Bear Candle Colour", group=groupMom)
+
+//====================================================
+// EXITS
+//====================================================
+groupExitLab = "Exits"
+enableExits  = input.bool(true, "Enable Exit Markers", group=groupExitLab)
+
+// Flip exit toggle
+useFlipExit = input.bool(true, "Use Flip Exit (close + marker)", group=groupExitLab)
+
+// Per-exit toggles
+useE1 = input.bool(true,  "Use E1: TrendLine + ATR Buffer", group=groupExitLab)
+useE2 = input.bool(true,  "Use E2: Anchored VWAP Reclaim Fail", group=groupExitLab)
+useE3 = input.bool(false, "Use E3: Vol Contraction After Expansion", group=groupExitLab)
+useE4 = input.bool(false, "Use E4: Volume Divergence", group=groupExitLab)
+
+// Exit 1 settings
+atrLen   = input.int(14, "E1 ATR Length", minval=1, group=groupExitLab)
+atrMult  = input.float(0.8, "E1 ATR Mult", step=0.1, group=groupExitLab)
+
+// Exit 2 settings
+vwapAnchor       = input.string("Flip", "E2 VWAP Anchor", options=["Flip","Session"], group=groupExitLab)
+vwapRequireTouch = input.bool(true, "E2 Require VWAP Touch (avoid instant fails)", group=groupExitLab)
+
+// Exit 3 settings
+volExpMin        = input.float(0.35, "E3 Expansion Min BB Width %", step=0.01, group=groupExitLab)
+volContractFrac  = input.float(0.55, "E3 Contract to % of Peak (0-1)", step=0.05, group=groupExitLab)
+volMinBars       = input.int(6, "E3 Min bars in trade", minval=1, group=groupExitLab)
+
+// Exit 4 settings
+divLookback      = input.int(20, "E4 Lookback (new extreme)", minval=5, group=groupExitLab)
+divSlopeFallBars = input.int(2, "E4 Slope falling bars", minval=1, maxval=10, group=groupExitLab)
+
+//====================================================
+// Classic exits (RSI/MACD)
+//====================================================
+groupExitClassic = "Classic Exit Signals (RSI/MACD)"
+useRSIWarn   = input.bool(true, "Use E5: RSI Cross (warning)", group=groupExitClassic)
+rsiLen       = input.int(14, "RSI Length", minval=2, group=groupExitClassic)
+rsiMaLen     = input.int(14, "RSI MA Length", minval=2, group=groupExitClassic)
+
+useMACDExit  = input.bool(true, "Use E6: MACD Cross (hard exit)", group=groupExitClassic)
+macdFast     = input.int(12, "MACD Fast", minval=1, group=groupExitClassic)
+macdSlow     = input.int(26, "MACD Slow", minval=1, group=groupExitClassic)
+macdSig      = input.int(9,  "MACD Signal (for MACD calc)", minval=1, group=groupExitClassic)
+macdSmaLen   = input.int(9,  "MACD SMA Length", minval=1, group=groupExitClassic)
+
+// Exit label styling
+warnShapeCol = input.color(color.white, "WARN Shape Colour", group=groupExitClassic)
+warnTextCol  = input.color(color.black, "WARN Text Colour", group=groupExitClassic)
+exitShapeCol = input.color(color.white, "EXIT Shape Colour", group=groupExitClassic)
+exitTextCol  = input.color(color.black, "EXIT Text Colour", group=groupExitClassic)
+
+// Colours
+colTrendUp   = input.color(color.rgb(28, 194, 216), "Trend Line Up")
+colTrendDown = input.color(color.rgb(228, 144, 19), "Trend Line Down")
+colBuy       = input.color(color.white, "BUY Shape Colour")
+colSell      = input.color(color.red,   "SELL Shape Colour")
+colBuyText   = input.color(color.white, "BUY Text Colour")
+colSellText  = input.color(color.white, "SELL Text Colour")
+
+// BB (visual + shared logic)  ✅ unchanged plotting later
+showBB      = input.bool(true, "Show Bollinger Bands")
+bbLen       = input.int(20, "BB Length", minval=1)
+bbMult      = input.float(2.0, "BB Multiplier", step=0.1)
+bbLineCol   = input.color(color.blue, "BB Line Colour")
+bbLineWidth = input.int(1, "BB Line Width", minval=1, maxval=3)
+
+//====================================================
+// DERIVED
+//====================================================
+confirmBars = confirmAgg
+if mode == "Balanced"
+    confirmBars := confirmBal
+if mode == "Strict"
+    confirmBars := confirmStr
+
+dashPos = switch dashPosition
+    "Top Left"     => position.top_left
+    "Bottom Left"  => position.bottom_left
+    "Bottom Right" => position.bottom_right
+    => position.top_right
+
+dashSize = switch dashTextSize
+    "Tiny"   => size.tiny
+    "Normal" => size.normal
+    "Large"  => size.large
+    => size.small
+
+//====================================================
+// HELPERS
+//====================================================
+bbWidthPct(_src) =>
+    basis = ta.sma(_src, bbLen)
+    dev   = bbMult * ta.stdev(_src, bbLen)
+    upper = basis + dev
+    lower = basis - dev
+    (upper - lower) / basis * 100.0
+
+// returns BOTH dist-in-points and dist-in-percent (fraction)
+_distSeries(_len) =>
+    distPts = useTrueRangeDist ? ta.hma(ta.tr(true), _len) : ta.hma(high - low, _len)
+
+    pctLen  = math.max(5, int(math.round(_len * pctLenMult)))
+    basePct = useTrueRangeDist ? (ta.tr(true) / math.max(hl2, 1e-10)) : ((high - low) / math.max(hl2, 1e-10))
+    distPct = ta.hma(basePct, pctLen) * pctAmplify
+
+    [distPts, distPct]
+
+// H1 distance chooser: Points / Percent / Hybrid
+f_distModeId() =>
+    int _m = 2
+    if distModel == "Points"
+        _m := 0
+    if distModel == "Percent"
+        _m := 1
+    _m
+
+// compile-safe HTF direction function
+htf_dir(_factor, _distLen) =>
+    float src = hl2
+
+    [distPts, distPct] = _distSeries(_distLen)
+
+    int m = f_distModeId()
+
+    // Convert points->pct for hybrid
+    float pctFromPts = distPts / math.max(src, 1e-10)
+    float pctHybrid  = (pctFromPts + distPct) * 0.5
+
+    bool distReady = false
+    if m == 0
+        distReady := not na(distPts)
+    if m == 1
+        distReady := not na(distPct)
+    if m == 2
+        distReady := not na(pctHybrid)
+
+    float upper = na
+    float lower = na
+
+    if m == 0
+        upper := src + _factor * distPts
+        lower := src - _factor * distPts
+    else
+        float usePct = m == 1 ? distPct : pctHybrid
+        upper := src * (1 + _factor * usePct)
+        lower := src * (1 - _factor * usePct)
+
+    float prevLower = nz(lower[1])
+    float prevUpper = nz(upper[1])
+
+    lower := (lower > prevLower or close[1] < prevLower) ? lower : prevLower
+    upper := (upper < prevUpper or close[1] > prevUpper) ? upper : prevUpper
+
+    var float trend = na
+    var int   d     = na
+
+    float prevTrend = trend[1]
+
+    bool prevNa = false
+    if m == 0
+        prevNa := na(distPts[1])
+    else if m == 1
+        prevNa := na(distPct[1])
+    else
+        prevNa := na(pctHybrid[1])
+
+    if not distReady
+        d := d[1]
+    else if prevNa
+        d := -1
+    else if prevTrend == prevUpper
+        d := close > upper ? -1 : 1
+    else
+        d := close < lower ? 1 : -1
+
+    trend := d == -1 ? lower : upper
+    d
+
+//====================================================
+// REGIME ENGINE Hybrid / Points / Percent
+//====================================================
+src2 = hl2
+[distPts, distPct] = _distSeries(distLen)
+int mNow = f_distModeId()
+
+float pctFromPtsNow = distPts / math.max(src2, 1e-10)
+float pctHybridNow  = (pctFromPtsNow + distPct) * 0.5
+
+bool distReady = false
+bool distPrevNa = false
+
+if mNow == 0
+    distReady  := not na(distPts)
+    distPrevNa := na(distPts[1])
+else if mNow == 1
+    distReady  := not na(distPct)
+    distPrevNa := na(distPct[1])
+else
+    distReady  := not na(pctHybridNow)
+    distPrevNa := na(pctHybridNow[1])
+
+float upperBand = na
+float lowerBand = na
+
+if mNow == 0
+    upperBand := src2 + factor * distPts
+    lowerBand := src2 - factor * distPts
+else
+    float usePctNow = mNow == 1 ? distPct : pctHybridNow
+    upperBand := src2 * (1 + factor * usePctNow)
+    lowerBand := src2 * (1 - factor * usePctNow)
+
+prevLower = nz(lowerBand[1])
+prevUpper = nz(upperBand[1])
+
+lowerBand := (lowerBand > prevLower or close[1] < prevLower) ? lowerBand : prevLower
+upperBand := (upperBand < prevUpper or close[1] > prevUpper) ? upperBand : prevUpper
+
+var float trendLine = na
+var int   dir = na   // -1 bullish, +1 bearish
+prevTrend = trendLine[1]
+
+if not distReady
+    dir := dir[1]
+else if distPrevNa
+    dir := -1
+else if prevTrend == prevUpper
+    dir := close > upperBand ? -1 : 1
+else
+    dir := close < lowerBand ? 1 : -1
+
+trendLine := dir == -1 ? lowerBand : upperBand
+rawFlipEvent = distReady and not na(dir[1]) and dir != dir[1]
+
+//====================================================
+// MOMENTUM CANDLE DETECTION
+//====================================================
+momBody = math.abs(close - open)
+momTR   = ta.tr(true)
+momBodyTR = momTR > 0 ? (momBody / momTR) : 0.0
+
+momRng = high - low
+momClv = momRng > 0 ? (2.0 * close - high - low) / momRng : 0.0
+momClv := math.max(-1.0, math.min(1.0, momClv))
+
+momBull = close > open and (momBodyTR >= momBodyPct) and (not momUseClvFilter or momClv >=  momClvMin)
+momBear = close < open and (momBodyTR >= momBodyPct) and (not momUseClvFilter or momClv <= -momClvMin)
+
+// Optional: only colour if candle momentum matches current regime direction
+momBullOK = not momUseTrendDir or dir == -1
+momBearOK = not momUseTrendDir or dir == 1
+
+//====================================================
+// FILTERS
+//====================================================
+bw = bbWidthPct(close)
+bbWidthOK = (not useChopFilter) or (bw >= bbWidthThr)
+
+dirHTF = request.security(syminfo.tickerid, htfTF, htf_dir(factor, distLen), barmerge.gaps_off, barmerge.lookahead_off)
+biasOKLong  = (not useHTFBias) or (dirHTF == -1)
+biasOKShort = (not useHTFBias) or (dirHTF == 1)
+
+//====================================================
+// FLIP QUALITY SCORE (FQS) + PRE-FLIP COMPRESSION BREAK
+//====================================================
+groupFQS = "Flip Quality Score"
+useFQS          = input.bool(true, "Use Flip Quality Score for Best Entry", group=groupFQS)
+fqsMinBest      = input.int(6, "Best Entry Min Score (0-8)", minval=0, maxval=8, group=groupFQS)
+
+fqsBodyMin      = input.float(0.65, "Body/TR min", step=0.05, group=groupFQS)
+fqsClvMin       = input.float(0.35, "CLV min abs", step=0.05, group=groupFQS)
+fqsTrMult       = input.float(1.20, "TR expand x", step=0.05, group=groupFQS)
+fqsTrLen        = input.int(10, "TR baseline length", minval=5, group=groupFQS)
+
+compRankLen     = input.int(120, "Compression rank length", minval=30, group=groupFQS)
+compRankMax     = input.float(25.0, "Compression max rank %", minval=1, maxval=60, step=1, group=groupFQS)
+bwExpandMult     = input.float(1.20, "BW expand x (vs SMA)", step=0.05, group=groupFQS)
+bwExpandLen      = input.int(20, "BW expand baseline length", minval=5, group=groupFQS)
+
+thrustLookback   = input.int(3, "Thrust lookback bars", minval=2, maxval=5, group=groupFQS)
+thrustNeed       = input.int(2, "Thrust bars needed", minval=1, maxval=5, group=groupFQS)
+
+// Candle stats
+body = math.abs(close - open)
+tr   = ta.tr(true)
+bodyTR = tr > 0 ? body / tr : 0.0
+
+// CLV in [-1..+1]
+rngC = high - low
+clvC = rngC > 0 ? (2.0 * close - high - low) / rngC : 0.0
+clvC := math.max(-1.0, math.min(1.0, clvC))
+
+clvOKLong  = clvC >=  fqsClvMin
+clvOKShort = clvC <= -fqsClvMin
+
+// TR expansion vs baseline
+trBase = ta.sma(tr, fqsTrLen)
+trExp  = trBase > 0 ? (tr / trBase) : 0.0
+trExpOK = trExp >= fqsTrMult
+
+// Pre-flip compression (BB width percentile rank)
+bwRank = ta.percentrank(bw, compRankLen)  // 0..100
+
+// Require compression existed pre-flip (stronger than a single-bar check)
+wasCompressed = ta.lowest(bwRank, 3)[1] <= compRankMax
+
+// Compression break now (BB width expanding)
+bwBase = ta.sma(bw, bwExpandLen)
+bwExp  = bwBase > 0 ? (bw / bwBase) : 0.0
+bwBreakNow = bwExp >= bwExpandMult
+
+// Thrust (last N bars in direction)
+bullBar = close > open
+bearBar = close < open
+bullThrustCount = ta.sma(bullBar ? 1.0 : 0.0, thrustLookback) * thrustLookback
+bearThrustCount = ta.sma(bearBar ? 1.0 : 0.0, thrustLookback) * thrustLookback
+thrustOKLong  = bullThrustCount >= thrustNeed
+thrustOKShort = bearThrustCount >= thrustNeed
+
+// Score (0..6) + Compression(1) + Break(1) = 0..8 
+scoreBody  = bodyTR >= fqsBodyMin ? 1 : 0
+scoreTR    = trExpOK ? 1 : 0
+scoreComp  = wasCompressed ? 1 : 0
+scoreBreak = bwBreakNow ? 1 : 0
+scoreThL   = thrustOKLong  ? 1 : 0
+scoreThS   = thrustOKShort ? 1 : 0
+scoreClvL  = clvOKLong  ? 1 : 0
+scoreClvS  = clvOKShort ? 1 : 0
+
+baseLong  = scoreBody + scoreTR + scoreThL + scoreClvL          // 0..4 (impulse quality) 
+baseShort = scoreBody + scoreTR + scoreThS + scoreClvS          // 0..4
+bonusCB   = scoreComp + scoreBreak                               // 0..2 (compression-break bonus)
+
+fqsLong  = baseLong  + bonusCB                                   // 0..6
+fqsShort = baseShort + bonusCB                                   // 0..6
+
+//====================================================
+// FINAL BEST-FLIP DECISION (single definition only)
+//====================================================
+impulseScoreLong  = scoreBody + scoreTR + scoreClvL + scoreThL
+impulseScoreShort = scoreBody + scoreTR + scoreClvS + scoreThS
+
+impulseLong  = impulseScoreLong  >= 2
+impulseShort = impulseScoreShort >= 2
+
+compBreak = wasCompressed and bwBreakNow
+
+bestFlipLong  = (not useFQS) or (impulseLong or compBreak)
+bestFlipShort = (not useFQS) or (impulseShort or compBreak)
+
+//====================================================
+// CONFIRMATION
+//====================================================
+var int lastFlipBar = na
+var int lastFlipDir = 0
+var bool confFired  = false
+
+if rawFlipEvent
+    lastFlipBar := bar_index
+    lastFlipDir := dir
+    confFired := false
+
+barsSinceFlip = na(lastFlipBar) ? na : (bar_index - lastFlipBar)
+confirmReady  = distReady and not na(barsSinceFlip) and (barsSinceFlip >= (confirmBars - 1)) and (dir == lastFlipDir) and (not confFired)
+
+confirmedFlipEvent = useConfirm and confirmReady
+if confirmedFlipEvent
+    confFired := true
+
+bullEvent = useConfirm ? (confirmedFlipEvent and lastFlipDir == -1) : (rawFlipEvent and dir == -1)
+bearEvent = useConfirm ? (confirmedFlipEvent and lastFlipDir == 1)  : (rawFlipEvent and dir == 1)
+
+//====================================================
+// REGRESSION CHANNEL + SLOPE GATE
+//====================================================
+safeClose = math.max(close, 1e-10)
+srcReg = useLogReg ? math.log(safeClose) : close
+
+regMidSrc   = ta.linreg(srcReg, regLen, 0)
+regResidSrc = srcReg - regMidSrc
+regDevSrc   = ta.stdev(regResidSrc, regLen)
+
+int x1 = bar_index - (regLen - 1)
+int x2 = bar_index
+
+float y1Mid = useLogReg ? math.exp(regMidSrc[regLen - 1]) : regMidSrc[regLen - 1]
+float y2Mid = useLogReg ? math.exp(regMidSrc) : regMidSrc
+
+float y1Up = useLogReg ? math.exp(regMidSrc[regLen - 1] + regMult * regDevSrc) : (y1Mid + regMult * regDevSrc)
+float y2Up = useLogReg ? math.exp(regMidSrc + regMult * regDevSrc) : (y2Mid + regMult * regDevSrc)
+float y1Lo = useLogReg ? math.exp(regMidSrc[regLen - 1] - regMult * regDevSrc) : (y1Mid - regMult * regDevSrc)
+float y2Lo = useLogReg ? math.exp(regMidSrc - regMult * regDevSrc) : (y2Mid - regMult * regDevSrc)
+
+float slopePct = na
+if regLen > 1 and not na(y1Mid) and not na(y2Mid)
+    slopePct := useLogReg ? (math.pow((y2Mid / y1Mid), (1.0 / (regLen - 1))) - 1.0) * 100.0 : (((y2Mid - y1Mid) / (regLen - 1)) / safeClose) * 100.0
+
+regSlopeOKLong  = (not useRegSlopeGate) or (not na(slopePct) and slopePct >  slopeThrPct)
+regSlopeOKShort = (not useRegSlopeGate) or (not na(slopePct) and slopePct < -slopeThrPct)
+
+// Regression lines (draw) ✅ unchanged
+var line regMidLine = na
+var line regUpLine  = na
+var line regLoLine  = na
+var linefill regFill = na
+
+if barstate.isfirst
+    regMidLine := line.new(na, na, na, na, xloc=xloc.bar_index, extend=extend.none, color=regLineCol, width=regLineW)
+    regUpLine  := line.new(na, na, na, na, xloc=xloc.bar_index, extend=extend.none, color=regBandCol, width=regBandW)
+    regLoLine  := line.new(na, na, na, na, xloc=xloc.bar_index, extend=extend.none, color=regBandCol, width=regBandW)
+    regFill    := linefill.new(regUpLine, regLoLine, color=color.new(regBandCol, 100))
+
+regReady = showReg and not na(y1Mid) and not na(y2Mid) and x1 >= 0
+if regReady
+    line.set_xy1(regMidLine, x1, y1Mid)
+    line.set_xy2(regMidLine, x2, y2Mid)
+    line.set_xy1(regUpLine, x1, y1Up)
+    line.set_xy2(regUpLine, x2, y2Up)
+    line.set_xy1(regLoLine, x1, y1Lo)
+    line.set_xy2(regLoLine, x2, y2Lo)
+
+linefill.set_color(regFill, (regReady and regFillOn) ? color.new(regBandCol, regFillAlpha) : color.new(regBandCol, 100))
+
+//====================================================
+// ✅ NEW VOLUME DOT REGIME v2 (DPV + RVOL) with Persistence + Single Dot
+//   - Option 1: persistence (N of M)
+//   - Option 3: separate support from direction (avoid red on single counter candle)
+//====================================================
+
+// --- Persistence controls (hard-coded to keep UI unchanged)
+// If you want these as inputs later, we can add them to groupVol.
+int persWindow = 3
+int persNeed   = 2
+
+// CLV in [-1..+1]
+rngV = high - low
+clv  = rngV > 0 ? (2.0 * close - high - low) / rngV : 0.0
+clv  := math.max(-1.0, math.min(1.0, clv))
+
+dpv = volume * clv
+
+// RVOL short/long
+volMaS = ta.sma(volume, volLenShort)
+volMaL = ta.sma(volume, volLenLong)
+rvolS  = volMaS > 0 ? volume / volMaS : 0.0
+rvolL  = volMaL > 0 ? volume / volMaL : 0.0
+
+// DPV baseline short/long
+dpvMaS = ta.sma(dpv, volLenShort)
+dpvMaL = ta.sma(dpv, volLenLong)
+
+// --- Raw directional signals per lens (your logic)
+volSupLongS_raw  = (clv > 0) and (rvolS >= rvolMinShort) and ((not useDpvBaseline) or (dpv > dpvMaS))
+volSupShortS_raw = (clv < 0) and (rvolS >= rvolMinShort) and ((not useDpvBaseline) or (dpv < dpvMaS))
+
+volSupLongL_raw  = (clv > 0) and (rvolL >= rvolMinLong)  and ((not useDpvBaseline) or (dpv > dpvMaL))
+volSupShortL_raw = (clv < 0) and (rvolL >= rvolMinLong)  and ((not useDpvBaseline) or (dpv < dpvMaL))
+
+// --- Backward-compatible aliases (keeps E4 divergence + dashboard working)
+bool volSupLongS  = volSupLongS_raw
+bool volSupShortS = volSupShortS_raw
+bool volSupLongL  = volSupLongL_raw
+bool volSupShortL = volSupShortL_raw
+
+// --- Combine lenses first (directional intent)
+dirLong_raw  = requireBothLens ? (volSupLongS_raw and volSupLongL_raw)   : (volSupLongS_raw or volSupLongL_raw)
+dirShort_raw = requireBothLens ? (volSupShortS_raw and volSupShortL_raw) : (volSupShortS_raw or volSupShortL_raw)
+
+// --- Option 1: persistence (N of M)
+longCount  = ta.sma(dirLong_raw  ? 1.0 : 0.0, persWindow) * persWindow
+shortCount = ta.sma(dirShort_raw ? 1.0 : 0.0, persWindow) * persWindow
+
+volSupLong  = longCount  >= persNeed
+volSupShort = shortCount >= persNeed
+
+// --- Option 3: separate “support present” from “direction”
+// Support = RVOL elevated on either lens (regardless of CLV direction on this candle)
+supportNow = (rvolS >= rvolMinShort) or (rvolL >= rvolMinLong)
+
+// --- Gate signals (unchanged behaviour: only allow when directionally aligned)
+volGateOKLong  = (not gateByVolSup) or volSupLong
+volGateOKShort = (not gateByVolSup) or volSupShort
+
+dotAlignedLong  = volSupLong
+dotAlignedShort = volSupShort
+
+// --- Single-dot colour logic:
+// Green: persistent bullish pressure
+// Red: persistent bearish pressure
+// Grey: volume elevated but mixed / not persistent direction
+// Grey: no support
+dotCol =
+     volSupLong  ? dotBullCol :
+     volSupShort ? dotBearCol :
+     supportNow  ? dotWeakCol :
+                   dotWeakCol
+
+//====================================================
+// TWO-TIER ENTRY (Best flip vs Pullback-only)
+//====================================================
+
+// Tier A: Best/Early entries on flip (FQS-driven), still respects your core gates
+tierA_Long  = showBuySell and bullEvent and biasOKLong  and bestFlipLong
+tierA_Short = showBuySell and bearEvent and biasOKShort and bestFlipShort
+
+// Tier B: Flip is valid but not "best" → DO NOT enter; arm pullback engine only
+tierB_Long  = showBuySell and bullEvent and biasOKLong  and bbWidthOK and regSlopeOKLong and (not bestFlipLong)
+tierB_Short = showBuySell and bearEvent and biasOKShort and bbWidthOK and regSlopeOKShort and (not bestFlipShort)
+
+// Primary entries ONLY come from Tier A
+baseBullCandidate = tierA_Long
+baseBearCandidate = tierA_Short
+
+//====================================================
+// CONTINUATION RE-ENTRY (armed by Tier A OR Tier B)
+//====================================================
+var int  activeDir = 0
+var bool waitPB = false
+var bool touched = false
+var bool reFired = false
+
+// Arm pullback tracking on ANY flip that passes the core gates (Tier A or B)
+if tierA_Long or tierB_Long
+    activeDir := -1
+    waitPB := true
+    touched := false
+    reFired := false
+
+if tierA_Short or tierB_Short
+    activeDir := 1
+    waitPB := true
+    touched := false
+    reFired := false
+
+// Cancel pullback tracking if regime flips against us
+if activeDir != 0 and dir != activeDir
+    activeDir := 0
+    waitPB := false
+    touched := false
+    reFired := false
+
+touchBull = pullbackTouchMode == "WickTouch" ? (low <= trendLine)  : (close <= trendLine)
+touchBear = pullbackTouchMode == "WickTouch" ? (high >= trendLine) : (close >= trendLine)
+
+reclaimBull = pullbackEntryMode == "CrossBack" ? ta.crossover(close, trendLine)  : (close > trendLine and close[1] <= trendLine)
+rejectBear  = pullbackEntryMode == "CrossBack" ? ta.crossunder(close, trendLine) : (close < trendLine and close[1] >= trendLine)
+
+if showReentries and waitPB and not touched and activeDir == -1 and dir == -1 and touchBull
+    touched := true
+if showReentries and waitPB and not touched and activeDir == 1 and dir == 1 and touchBear
+    touched := true
+
+// Continuations (B2/S2) — keep your existing gates.
+// NOTE: I recommend NOT gating B2/S2 by vol dots; let dots be arming/size instead.
+// If you want, change volGateOKLong/Short to true here.
+baseB2Candidate = showReentries and (not reFired) and touched and (activeDir == -1) and (dir == -1) and reclaimBull and bbWidthOK and biasOKLong and regSlopeOKLong and volGateOKLong
+baseS2Candidate = showReentries and (not reFired) and touched and (activeDir == 1)  and (dir == 1)  and rejectBear  and bbWidthOK and biasOKShort and regSlopeOKShort and volGateOKShort
+
+if baseB2Candidate or baseS2Candidate
+    reFired := true
+    waitPB := false
+
+//====================================================
+// ARMING STATE (entries)
+//====================================================
+var bool pendLong = false
+var int  pendLongLeft = 0
+var bool pendLongIsB2 = false
+
+var bool pendShort = false
+var int  pendShortLeft = 0
+var bool pendShortIsS2 = false
+
+newLongCandidate  = baseBullCandidate or baseB2Candidate
+newShortCandidate = baseBearCandidate or baseS2Candidate
+
+newLongIsB2  = baseB2Candidate and not baseBullCandidate
+newShortIsS2 = baseS2Candidate and not baseBearCandidate
+
+bullSignal  = false
+bearSignal  = false
+buyReentry  = false
+sellReentry = false
+
+if newLongCandidate
+    if (not useArming) or dotAlignedLong
+        bullSignal := baseBullCandidate
+        buyReentry := baseB2Candidate
+        pendLong := false
+        pendLongLeft := 0
+    else
+        pendLong := true
+        pendLongLeft := armBars
+        pendLongIsB2 := newLongIsB2
+
+if newShortCandidate
+    if (not useArming) or dotAlignedShort
+        bearSignal := baseBearCandidate
+        sellReentry := baseS2Candidate
+        pendShort := false
+        pendShortLeft := 0
+    else
+        pendShort := true
+        pendShortLeft := armBars
+        pendShortIsS2 := newShortIsS2
+
+if pendLong
+    if dotAlignedLong
+        if pendLongIsB2
+            buyReentry := true
+        else
+            bullSignal := true
+        pendLong := false
+        pendLongLeft := 0
+    else
+        pendLongLeft -= 1
+        if pendLongLeft <= 0
+            pendLong := false
+            pendLongLeft := 0
+
+if pendShort
+    if dotAlignedShort
+        if pendShortIsS2
+            sellReentry := true
+        else
+            bearSignal := true
+        pendShort := false
+        pendShortLeft := 0
+    else
+        pendShortLeft -= 1
+        if pendShortLeft <= 0
+            pendShort := false
+            pendShortLeft := 0
+//====================================================
+// ATR (needed early for 1R arming + label offsets)
+//====================================================
+atrVal = ta.atr(atrLen)
+
+//====================================================
+// POSITION STATE
+//====================================================
+var bool inLong = false
+var bool inShort = false
+
+var int   entryBar   = na
+var float entryPrice = na
+var float entryRisk  = na  // "1R" distance
+var bool  peakArmed  = false
+var float peakBw     = na
+
+// E6 one-shot (per position)
+var bool e6FiredLong  = false
+var bool e6FiredShort = false
+
+// VWAP state flags
+var bool vwapTouchedLong  = false
+var bool vwapTouchedShort = false
+var bool lostVWAPLong = false
+var bool lostVWAPShort = false
+
+// E5/E6 ARMED STATE (wave catch-up)
+var bool e5ArmedLong  = false
+var bool e5ArmedShort = false
+var bool e6ArmedLong  = false
+var bool e6ArmedShort = false
+
+enteredThisBar = (bullSignal or buyReentry or bearSignal or sellReentry)
+
+if bullSignal or buyReentry
+    inLong := true
+    inShort := false
+    entryBar := bar_index
+    entryPrice := close
+    // 1R definition: distance to trendLine at entry (fallback to ATR buffer if tiny)
+    entryRisk := math.max(math.abs(close - trendLine), atrVal * atrMult)
+    peakArmed := false
+    peakBw := na
+    e6FiredLong := false
+    e6FiredShort := false
+    vwapTouchedLong := false
+    vwapTouchedShort := false
+    lostVWAPLong := false
+    lostVWAPShort := false
+    e5ArmedLong := false
+    e6ArmedLong := false
+    e5ArmedShort := false
+    e6ArmedShort := false
+
+if bearSignal or sellReentry
+    inShort := true
+    inLong := false
+    entryBar := bar_index
+    entryPrice := close
+    // 1R definition: distance to trendLine at entry (fallback to ATR buffer if tiny)
+    entryRisk := math.max(math.abs(close - trendLine), atrVal * atrMult)
+    peakArmed := false
+    peakBw := na
+    e6FiredLong := false
+    e6FiredShort := false
+    vwapTouchedLong := false
+    vwapTouchedShort := false
+    lostVWAPLong := false
+    lostVWAPShort := false
+    e5ArmedLong := false
+    e6ArmedLong := false
+    e5ArmedShort := false
+    e6ArmedShort := false
+
+// --- update peakBw only while in a position
+if inLong or inShort
+    // Arm peak tracking only after price moves > 1R in favour
+    float favMove = inLong ? (high - entryPrice) : (entryPrice - low)
+
+    if (not peakArmed) and (favMove >= entryRisk)
+        peakArmed := true
+        peakBw := bw  // start peak from the moment 1R is achieved
+    else if peakArmed
+        peakBw := na(peakBw) ? bw : math.max(peakBw, bw)
+
+barsInTrade = (inLong or inShort) and not na(entryBar) ? (bar_index - entryBar) : 0
+
+//====================================================
+// CLASSIC RSI/MACD (for E5/E6)
+//====================================================
+rsiVal = ta.rsi(close, rsiLen)
+rsiMA  = ta.sma(rsiVal, rsiMaLen)
+
+[macdLine, macdSignal, macdHist] = ta.macd(close, macdFast, macdSlow, macdSig)
+macdSMA = ta.sma(macdLine, macdSmaLen)
+
+//====================================================
+// EXIT 1) TrendLine + ATR buffer
+//====================================================
+exitLongE1  = enableExits and useE1 and inLong  and (close < (trendLine - atrVal * atrMult))
+exitShortE1 = enableExits and useE1 and inShort and (close > (trendLine + atrVal * atrMult))
+
+//====================================================
+// EXIT 2) Anchored VWAP reclaim failure
+//====================================================
+sessionVWAP = ta.vwap(hlc3)
+
+var float cumPV = na
+var float cumV  = na
+
+flipForAnchor = rawFlipEvent
+if flipForAnchor
+    cumPV := hlc3 * volume
+    cumV  := volume
+else
+    cumPV := na(cumPV) ? (hlc3 * volume) : (cumPV + hlc3 * volume)
+    cumV  := na(cumV)  ? volume          : (cumV + volume)
+
+flipVWAP = (cumV != 0) ? (cumPV / cumV) : na
+vwap = vwapAnchor == "Session" ? sessionVWAP : flipVWAP
+
+if inLong and not vwapTouchedLong and (low <= vwap and high >= vwap)
+    vwapTouchedLong := true
+if inShort and not vwapTouchedShort and (low <= vwap and high >= vwap)
+    vwapTouchedShort := true
+
+if not (inLong or inShort)
+    lostVWAPLong := false
+    lostVWAPShort := false
+
+if inLong and close < vwap
+    lostVWAPLong := true
+if inShort and close > vwap
+    lostVWAPShort := true
+
+failReclaimLong  = inLong  and lostVWAPLong  and (high >= vwap) and (close < vwap) and (not vwapRequireTouch or vwapTouchedLong)
+failReclaimShort = inShort and lostVWAPShort and (low  <= vwap) and (close > vwap) and (not vwapRequireTouch or vwapTouchedShort)
+
+exitLongE2  = enableExits and useE2 and failReclaimLong
+exitShortE2 = enableExits and useE2 and failReclaimShort
+
+//====================================================
+// EXIT 3) Vol contraction after expansion (BB width peak decay)
+//====================================================
+expSeen     = peakArmed and (not na(peakBw)) and (peakBw >= volExpMin)
+contractNow = expSeen and (bw <= peakBw * volContractFrac) and (barsInTrade >= volMinBars)
+
+exitLongE3  = enableExits and useE3 and inLong  and contractNow
+exitShortE3 = enableExits and useE3 and inShort and contractNow
+
+//====================================================
+// EXIT 4) Volume divergence  ✅ updated for DPV/RVOL regime
+//====================================================
+newHigh = high > ta.highest(high[1], divLookback)
+newLow  = low  < ta.lowest(low[1],  divLookback)
+
+// DPV slope short-lens (simple)
+dpvSlopeS = ta.linreg(dpv, volLenShort, 0) - ta.linreg(dpv, volLenShort, 1)
+
+// Divergence heuristics:
+// Long: making new highs but DPV not supporting + not in bullish dot lens
+// Short: making new lows but DPV not supporting + not in bearish dot lens
+divLong  = inLong  and newHigh and (dpvSlopeS <= 0 or (useDpvBaseline and dpv <= dpvMaS) or rvolS < rvolMinShort or clv <= 0) and (not volSupLongS)
+divShort = inShort and newLow  and (dpvSlopeS >= 0 or (useDpvBaseline and dpv >= dpvMaS) or rvolS < rvolMinShort or clv >= 0) and (not volSupShortS)
+
+exitLongE4  = enableExits and useE4 and divLong
+exitShortE4 = enableExits and useE4 and divShort
+
+//====================================================
+// APPLY EXIT TOGGLES TO POSITION STATE
+//====================================================
+// E5/E6 arming logic
+if enableExits and useRSIWarn and inLong and not e5ArmedLong and not enteredThisBar and (rsiVal > rsiMA)
+    e5ArmedLong := true
+if enableExits and useRSIWarn and inShort and not e5ArmedShort and not enteredThisBar and (rsiVal < rsiMA)
+    e5ArmedShort := true
+
+if enableExits and useMACDExit and inLong and not e6ArmedLong and not enteredThisBar and (macdLine > macdSMA)
+    e6ArmedLong := true
+if enableExits and useMACDExit and inShort and not e6ArmedShort and not enteredThisBar and (macdLine < macdSMA)
+    e6ArmedShort := true
+
+e5Long  = enableExits and useRSIWarn and inLong  and e5ArmedLong  and ta.crossunder(rsiVal, rsiMA)
+e5Short = enableExits and useRSIWarn and inShort and e5ArmedShort and ta.crossover(rsiVal, rsiMA)
+
+e6LongRaw  = enableExits and useMACDExit and inLong  and e6ArmedLong  and ta.crossunder(macdLine, macdSMA)
+e6ShortRaw = enableExits and useMACDExit and inShort and e6ArmedShort and ta.crossover(macdLine, macdSMA)
+
+e6Long  = e6LongRaw  and not e6FiredLong
+e6Short = e6ShortRaw and not e6FiredShort
+if e6Long
+    e6FiredLong := true
+if e6Short
+    e6FiredShort := true
+
+exitLongOther  = exitLongE1 or exitLongE2 or exitLongE3 or exitLongE4
+exitShortOther = exitShortE1 or exitShortE2 or exitShortE3 or exitShortE4
+
+flipExitLong  = enableExits and useFlipExit and (inLong  and dir == 1)
+flipExitShort = enableExits and useFlipExit and (inShort and dir == -1)
+
+exitLongPrimary  = exitLongOther  or e6Long  or flipExitLong
+exitShortPrimary = exitShortOther or e6Short or flipExitShort
+
+if exitLongPrimary or exitShortPrimary
+    inLong := false
+    inShort := false
+    entryBar := na
+    peakBw := na
+    e6FiredLong := false
+    e6FiredShort := false
+    vwapTouchedLong := false
+    vwapTouchedShort := false
+    lostVWAPLong := false
+    lostVWAPShort := false
+    e5ArmedLong := false
+    e5ArmedShort := false
+    e6ArmedLong := false
+    e6ArmedShort := false
+    entryPrice := na
+    entryRisk  := na
+    peakArmed  := false
+
+//====================================================
+// BOLLINGER BANDS (visual only) 
+//====================================================
+bbBasis = ta.sma(close, bbLen)
+bbDev2  = bbMult * ta.stdev(close, bbLen)
+bbUpper = bbBasis + bbDev2
+bbLower = bbBasis - bbDev2
+
+plot(showBB ? bbUpper : na, title="BB Upper", color=bbLineCol, linewidth=bbLineWidth)
+plot(showBB ? bbLower : na, title="BB Lower", color=bbLineCol, linewidth=bbLineWidth)
+
+//====================================================
+// PLOTS (trend line + fill + dots) 
+//====================================================
+tColor = dir == -1 ? colTrendUp : colTrendDown
+pTrend = plot(trendLine, "Trend Line", color=tColor, linewidth=2)
+pMid   = plot(hl2, "HL2", color=color.new(color.gray, 100))
+fill(pTrend, pMid, color.new(tColor, 90))
+plot(showVolDots ? trendLine : na, title="Trend Quality Dots", style=plot.style_circles, linewidth=3, color=dotCol)
+
+//====================================================
+// ENTRY MARKERS 
+//====================================================
+plotshape(bullSignal, title="BUY",  style=shape.triangleup,   location=location.belowbar, size=size.small, color=colBuy,  text="BUY", textcolor=colBuyText)
+plotshape(bearSignal, title="SELL", style=shape.triangledown, location=location.abovebar, size=size.small, color=colSell, text="SELL", textcolor=colSellText)
+plotshape(buyReentry,  title="BUY Re-entry",  style=shape.triangleup,   location=location.belowbar, size=size.tiny, color=colBuy,  text="B2", textcolor=colBuyText)
+plotshape(sellReentry, title="SELL Re-entry", style=shape.triangledown, location=location.abovebar, size=size.tiny, color=colSell, text="S2", textcolor=colSellText)
+
+//====================================================
+// EXIT MARKERS (combined label per bar) 
+//====================================================
+exitComboOffsetATR = input.float(0.25, "Exit Combined Label Offset (ATR)", step=0.05, group=groupExitLab)
+
+f_addTag(_s, _cond, _tag) =>
+    _cond ? (_s == "" ? _tag : (_s + "+" + _tag)) : _s
+
+string longTxt = ""
+longTxt := f_addTag(longTxt, exitLongE1,  "E1")
+longTxt := f_addTag(longTxt, exitLongE2,  "E2")
+longTxt := f_addTag(longTxt, exitLongE3,  "E3")
+longTxt := f_addTag(longTxt, exitLongE4,  "E4")
+longTxt := f_addTag(longTxt, e5Long,      "E5")
+longTxt := f_addTag(longTxt, e6Long,      "E6")
+longTxt := f_addTag(longTxt, flipExitLong,"FLIP")
+
+string shortTxt = ""
+shortTxt := f_addTag(shortTxt, exitShortE1,  "E1")
+shortTxt := f_addTag(shortTxt, exitShortE2,  "E2")
+shortTxt := f_addTag(shortTxt, exitShortE3,  "E3")
+shortTxt := f_addTag(shortTxt, exitShortE4,  "E4")
+shortTxt := f_addTag(shortTxt, e5Short,      "E5")
+shortTxt := f_addTag(shortTxt, e6Short,      "E6")
+shortTxt := f_addTag(shortTxt, flipExitShort,"FLIP")
+
+longHardExit  = exitLongE1 or exitLongE2 or exitLongE3 or exitLongE4 or e6Long or flipExitLong
+shortHardExit = exitShortE1 or exitShortE2 or exitShortE3 or exitShortE4 or e6Short or flipExitShort
+
+longBg  = longHardExit  ? exitShapeCol : warnShapeCol
+longTc  = longHardExit  ? exitTextCol  : warnTextCol
+shortBg = shortHardExit ? exitShapeCol : warnShapeCol
+shortTc = shortHardExit ? exitTextCol  : warnTextCol
+
+if longTxt != ""
+    label.new(bar_index, high + atrVal * exitComboOffsetATR, longTxt,
+        style=label.style_label_down, color=longBg, textcolor=longTc, size=size.small)
+
+if shortTxt != ""
+    label.new(bar_index, low - atrVal * exitComboOffsetATR, shortTxt,
+        style=label.style_label_up, color=shortBg, textcolor=shortTc, size=size.small)
+
+//====================================================
+// APPLY MOMENTUM CANDLE COLOURS
+//====================================================
+barcolor(showMomCandles and momBull and momBullOK ? momBullCol : na)
+barcolor(showMomCandles and momBear and momBearOK ? momBearCol : na)
+
+//====================================================
+// DASHBOARD (compact) 
+//====================================================
+var table dash = na
+if barstate.isfirst and dashShow
+    dash := table.new(dashPos, 2, 9, border_width=1)
+
+if dashShow and not na(dash) and barstate.islast
+    regimeTxt = dir == -1 ? "Bullish" : "Bearish"
+    regimeCol = dir == -1 ? color.new(color.green, 0) : color.new(color.red, 0)
+
+    bbTxt = str.tostring(bw, "#.##") + "%  " + (bbWidthOK ? "✓" : "✕")
+    bbCol = bbWidthOK ? color.new(color.green, 0) : color.new(color.red, 0)
+
+    slopeOK = dir == -1 ? regSlopeOKLong : regSlopeOKShort
+    slopeTxt = na(slopePct) ? "na" : (str.tostring(slopePct, "#.###") + "%/bar")
+    slopeTxt := slopeTxt + (useRegSlopeGate ? ("  " + (slopeOK ? "✓" : "✕")) : "  (Off)")
+    slopeCol = (not useRegSlopeGate) ? color.new(color.gray, 0) : (slopeOK ? color.new(color.green, 0) : color.new(color.red, 0))
+
+    // DPV/RVOL dashboard strings (short/long lens)
+    volTxtS = volSupLongS ? "Short:Bullish" : volSupShortS ? "Short:Bearish" : "Short:Neutral"
+    volTxtL = volSupLongL ? "Long:Bullish"  : volSupShortL ? "Long:Bearish"  : "Long:Neutral"
+    volTxt  = volTxtS + " | " + volTxtL + (gateByVolSup ? " (gate)" : "")
+    volCol  = volSupLong ? color.new(color.green, 0) : volSupShort ? color.new(color.red, 0) : color.new(color.gray, 0)
+
+    htfTxt = useHTFBias ? (dirHTF == -1 ? "Bullish" : "Bearish") : "Off"
+    htfCol = not useHTFBias ? color.new(color.gray, 0) : (dirHTF == -1 ? color.new(color.green, 0) : color.new(color.red, 0))
+
+    posTxt = inLong ? "Long" : inShort ? "Short" : "Neutral"
+    posCol = inLong ? color.new(color.green, 0) : inShort ? color.new(color.red, 0) : color.new(color.gray, 0)
+
+    profTxt = isManual ? "Manual" : "Auto"
+    distTxt = distModel == "Points" ? "Pts" : distModel == "Percent" ? "%" : "Hybrid"
+
+    head = profTxt + " / " + mode + " | Dist:" + distTxt
+    vals = "F:" + str.tostring(factor, "#.##") + "  L:" + str.tostring(distLen)
+
+    table.cell(dash, 0, 0, "Profile", text_color=color.white, bgcolor=color.new(color.black, 0), text_size=dashSize)
+    table.cell(dash, 1, 0, head + " | " + vals, text_color=color.white, bgcolor=color.new(color.black, 80), text_size=dashSize)
+
+    table.cell(dash, 0, 1, "Exit Toggles", text_color=color.white, bgcolor=color.new(color.black, 0), text_size=dashSize)
+    table.cell(dash, 1, 1,
+         "E1:" + (useE1 ? "On" : "Off") +
+         " E2:" + (useE2 ? "On" : "Off") +
+         " E3:" + (useE3 ? "On" : "Off") +
+         " E4:" + (useE4 ? "On" : "Off") +
+         " E5:" + (useRSIWarn ? "On" : "Off") +
+         " E6:" + (useMACDExit ? "On" : "Off") +
+         " FLIP:" + (useFlipExit ? "On" : "Off"),
+         text_color=color.white, bgcolor=color.new(color.black, 80), text_size=dashSize)
+
+    table.cell(dash, 0, 2, "Regime", text_color=color.white, bgcolor=color.new(color.black, 0), text_size=dashSize)
+    table.cell(dash, 1, 2, regimeTxt, text_color=color.white, bgcolor=color.new(regimeCol, 50), text_size=dashSize)
+
+    table.cell(dash, 0, 3, "BB Width", text_color=color.white, bgcolor=color.new(color.black, 0), text_size=dashSize)
+    table.cell(dash, 1, 3, bbTxt, text_color=color.white, bgcolor=color.new(bbCol, 50), text_size=dashSize)
+
+    table.cell(dash, 0, 4, "Reg Slope", text_color=color.white, bgcolor=color.new(color.black, 0), text_size=dashSize)
+    table.cell(dash, 1, 4, slopeTxt, text_color=color.white, bgcolor=color.new(slopeCol, 50), text_size=dashSize)
+
+    table.cell(dash, 0, 5, "Vol Support", text_color=color.white, bgcolor=color.new(color.black, 0), text_size=dashSize)
+    table.cell(dash, 1, 5, volTxt, text_color=color.white, bgcolor=color.new(volCol, 50), text_size=dashSize)
+
+    table.cell(dash, 0, 6, "HTF Bias", text_color=color.white, bgcolor=color.new(color.black, 0), text_size=dashSize)
+    table.cell(dash, 1, 6, htfTxt, text_color=color.white, bgcolor=color.new(htfCol, 50), text_size=dashSize)
+
+    table.cell(dash, 0, 7, "Buy/Sell State", text_color=color.white, bgcolor=color.new(color.black, 0), text_size=dashSize)
+    table.cell(dash, 1, 7, posTxt, text_color=color.white, bgcolor=color.new(posCol, 50), text_size=dashSize)
+
+    // --- BB Peak (colour aligned with position state)
+    bbPeakCol = na(peakBw) ? color.new(color.gray, 0) : posCol
+
+    peakNowPct = (not na(peakBw) and peakBw > 0) ? (bw / peakBw) * 100.0 : na
+    bbPeakTxt  = na(peakBw) ? "Neutral" : ("Peak " + str.tostring(peakBw, "#.##") + "% | Now " + str.tostring(bw, "#.##") + "% (" + str.tostring(peakNowPct, "#.0") + "%)")
+
+    table.cell(dash, 0, 8, "BB Peak",
+        text_color=color.white,
+        bgcolor=color.new(color.black, 0),
+        text_size=dashSize)
+
+    table.cell(dash, 1, 8, bbPeakTxt,
+        text_color=color.white,
+        bgcolor=color.new(bbPeakCol, 50),
+        text_size=dashSize)
+
+//====================================================
+// ALERTS
+//====================================================
+alertcondition(bullSignal, "LONG - Primary", "Primary Long Signal")
+alertcondition(bearSignal, "SHORT - Primary", "Primary Short Signal")
+
+alertcondition(buyReentry, "LONG - Continuation", "Long Re-entry (B2)")
+alertcondition(sellReentry, "SHORT - Continuation", "Short Re-entry (S2)")
+
+alertcondition(exitLongPrimary, "EXIT - Long", "Hard Exit Long")
+alertcondition(exitShortPrimary, "EXIT - Short", "Hard Exit Short")
+
+alertcondition(confirmedFlipEvent, "Regime Flip Confirmed", "Confirmed Regime Flip")

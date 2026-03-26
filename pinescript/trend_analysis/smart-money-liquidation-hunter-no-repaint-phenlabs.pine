@@ -1,0 +1,825 @@
+// ══════════════════════════════════════════════════════════════════════════════
+// SMART MONEY LIQUIDATION HUNTER [NO REPAINT] — DECLUTTERED v2.1
+// ══════════════════════════════════════════════════════════════════════════════
+// Fixed: Show/hide toggles now only control visuals, not data generation.
+// All structural data (OB, FVG) is always computed for signal logic.
+// ══════════════════════════════════════════════════════════════════════════════
+
+//@version=5
+indicator("Smart Money Liquidation Hunter [No Repaint]", overlay=true, max_labels_count=500, max_lines_count=500, max_boxes_count=500)
+
+// ──────────────────────────────────────────────────────────────────────────────
+// INPUT PARAMETERS
+// ──────────────────────────────────────────────────────────────────────────────
+
+grp_liq    = "══ Liquidity Pool Settings ══"
+i_lookback = input.int(50,    "Lookback Period",              minval=10,  maxval=200,  group=grp_liq)
+i_tickTol  = input.int(5,     "Tick Tolerance (Equal H/L)",   minval=1,   maxval=20,   group=grp_liq)
+i_maxPools = input.int(5,     "Max Liquidity Pools Visible",  minval=2,   maxval=30,   group=grp_liq,
+     tooltip="Only the strongest pools are kept on screen.")
+i_minZoneDist = input.int(10, "Min Ticks Between Zones",      minval=1,   maxval=100,  group=grp_liq,
+     tooltip="Zones closer than this merge into one.")
+i_zoneExtend  = input.int(10, "Zone Right Extension (bars)",  minval=3,   maxval=50,   group=grp_liq)
+
+grp_sweep  = "══ Sweep Detection Settings ══"
+i_sweepMin = input.int(5,     "Min Sweep Distance (Ticks)",   minval=1,   maxval=50,   group=grp_sweep)
+i_volMult  = input.float(2.1, "Volume Spike Multiplier",      minval=1.0, maxval=5.0,  step=0.1, group=grp_sweep)
+i_volLen   = input.int(20,    "Volume Average Length",         minval=5,   maxval=100,  group=grp_sweep)
+i_sweepBars= input.int(3,     "Max Bars for Close-Back",      minval=1,   maxval=5,    group=grp_sweep)
+
+grp_struct = "══ Structural Settings ══"
+i_htfTF    = input.timeframe("60", "HTF Timeframe",           group=grp_struct)
+i_htfLen   = input.int(20,    "HTF Trend EMA Length",         minval=5,   maxval=100,  group=grp_struct)
+i_obLook   = input.int(15,    "Order Block Lookback",         minval=5,   maxval=50,   group=grp_struct)
+
+grp_sig    = "══ Signal Settings ══"
+i_qualMin  = input.int(60,    "Min Quality for Signal",       minval=0,   maxval=100,  group=grp_sig)
+i_alertMin = input.int(85,    "Alert Quality Threshold",      minval=50,  maxval=100,  group=grp_sig)
+i_rrTarget = input.float(3.0, "Default R:R Multiplier",       minval=1.0, maxval=10.0, step=0.5, group=grp_sig)
+i_minSigBars = input.int(10,  "Min Bars Between Signals",     minval=1,   maxval=50,   group=grp_sig,
+     tooltip="Prevents signal clustering.")
+i_maxSignals = input.int(5,   "Max Visible Signals",          minval=1,   maxval=20,   group=grp_sig)
+
+grp_vis    = "══ Visual Settings ══"
+i_showLiq  = input.bool(true,  "Show Liquidity Zones",        group=grp_vis)
+i_showSwp  = input.bool(false,  "Show Sweep Markers (⚡)",     group=grp_vis)
+i_showOB   = input.bool(false, "Show Order Blocks",           group=grp_vis,
+     tooltip="Visual only — OB data is always used for signal logic.")
+i_showFVG  = input.bool(false,  "Show Fair Value Gaps",        group=grp_vis)
+i_showSig  = input.bool(true,  "Show Entry Signals",          group=grp_vis)
+i_showDash = input.bool(true,  "Show Dashboard",              group=grp_vis)
+i_compact  = input.bool(true,  "Compact Labels",              group=grp_vis,
+     tooltip="Single-line signal labels instead of multi-line blocks.")
+i_showSLTP = input.bool(false, "Show SL/TP Lines on Signals", group=grp_vis,
+     tooltip="Off by default. Draws dotted lines at SL and TP.")
+i_dashPos  = input.string("Top Right", "Dashboard Position",
+     options=["Top Right", "Top Left", "Bottom Right", "Bottom Left"], group=grp_vis)
+
+// ──────────────────────────────────────────────────────────────────────────────
+// CONSTANTS & COLORS
+// ──────────────────────────────────────────────────────────────────────────────
+
+color C_LIQ_ZONE   = color.new(#9C27B0, 75)
+color C_LIQ_BORDER = color.new(#9C27B0, 40)
+color C_BULL_OB     = color.new(#4CAF50, 85)
+color C_BEAR_OB     = color.new(#F44336, 85)
+color C_BULL_FVG_B  = color.new(#4CAF50, 85)
+color C_BEAR_FVG_B  = color.new(#F44336, 85)
+color C_BULL_SIG    = #00E676
+color C_BEAR_SIG    = #FF1744
+color C_DASH_BG     = color.new(#1E1E2F, 10)
+color C_DASH_TXT    = color.new(color.white, 0)
+
+float tickSize      = syminfo.mintick
+
+// ──────────────────────────────────────────────────────────────────────────────
+// CUSTOM TYPES
+// ──────────────────────────────────────────────────────────────────────────────
+
+type LiqPool
+    float priceLevel
+    bool  isBuySide
+    int   touchCount
+    int   birthBar
+    bool  isSwept
+    int   sweptBar
+    box   zoneBox
+    label zoneLbl
+
+type OrderBlock
+    float top
+    float bottom
+    bool  isBullish
+    int   birthBar
+    bool  isActive
+    box   obBox             // na when i_showOB is false — data still exists
+
+type FVG
+    float top
+    float bottom
+    bool  isBullish
+    int   birthBar
+    bool  isActive
+    box   fvgBox            // na when i_showFVG is false — data still exists
+
+type PendingSweep
+    int   poolIndex
+    int   startBar
+    float sweepHigh
+    float sweepLow
+    bool  isBuySide
+
+type SignalTracker
+    label sigLabel
+    int   sigBar
+
+// ──────────────────────────────────────────────────────────────────────────────
+// PERSISTENT STATE
+// ──────────────────────────────────────────────────────────────────────────────
+
+var array<LiqPool>       pools          = array.new<LiqPool>()
+var array<OrderBlock>    orderBlocks    = array.new<OrderBlock>()
+var array<FVG>           allFVGs        = array.new<FVG>()
+var array<PendingSweep>  pendingSweeps  = array.new<PendingSweep>()
+var array<SignalTracker> signalHistory  = array.new<SignalTracker>()
+
+var int   lastSweepBar       = na
+var bool  lastSweepBuySide   = na
+var float lastSweepPrice     = na
+var float lastSignalQuality  = 0.0
+var float lastRR             = 0.0
+var int   activeLiqCount     = 0
+var float lastEntryPrice     = na
+var float lastStopPrice      = na
+var float lastTargetPrice    = na
+var bool  lastSignalLong     = na
+var int   lastSignalBar      = 0
+
+var float obTop    = na
+var float obBot    = na
+var bool  obBull   = na
+var int   obBar    = na
+
+var float fvgTop   = na
+var float fvgBot   = na
+var bool  fvgBull  = na
+var int   fvgBar   = na
+
+// ──────────────────────────────────────────────────────────────────────────────
+// HELPER FUNCTIONS
+// ──────────────────────────────────────────────────────────────────────────────
+
+f_ticks2price(int ticks) =>
+    ticks * tickSize
+
+f_isEqual(float a, float b) =>
+    math.abs(a - b) <= f_ticks2price(i_tickTol)
+
+f_volumeSpike() =>
+    avgVol = ta.sma(volume, i_volLen)
+    volume >= avgVol * i_volMult
+
+f_tooCloseToExisting(float level, bool isBuySide) =>
+    bool tooClose = false
+    minDist = f_ticks2price(i_minZoneDist)
+    for k = 0 to (array.size(pools) > 0 ? array.size(pools) - 1 : na)
+        if not na(k)
+            p = array.get(pools, k)
+            if not p.isSwept and p.isBuySide == isBuySide
+                if math.abs(p.priceLevel - level) < minDist
+                    tooClose := true
+                    break
+    tooClose
+
+// ──────────────────────────────────────────────────────────────────────────────
+// HTF TREND FILTER (Non-Repaint)
+// ──────────────────────────────────────────────────────────────────────────────
+
+htfClose   = request.security(syminfo.tickerid, i_htfTF, close[1], barmerge.gaps_off, barmerge.lookahead_on)
+htfEma     = request.security(syminfo.tickerid, i_htfTF, ta.ema(close, i_htfLen)[1], barmerge.gaps_off, barmerge.lookahead_on)
+htfBullish = not na(htfClose) and htfClose > htfEma
+htfBearish = not na(htfClose) and htfClose < htfEma
+
+// ──────────────────────────────────────────────────────────────────────────────
+// LAYER 1 – LIQUIDITY POOL MAPPING
+// ──────────────────────────────────────────────────────────────────────────────
+
+f_detectLiquidityPools() =>
+    if barstate.isconfirmed
+        // --- Equal Highs (Buy-Side Liquidity) ---
+        for i = 1 to i_lookback
+            touchCount = 0
+            float lvl  = high[i]
+            for j = 1 to i_lookback
+                if j != i and f_isEqual(high[j], lvl)
+                    touchCount += 1
+            if touchCount >= 2
+                alreadyTracked = false
+                for k = 0 to (array.size(pools) > 0 ? array.size(pools) - 1 : na)
+                    if not na(k)
+                        p = array.get(pools, k)
+                        if not p.isSwept and p.isBuySide and f_isEqual(p.priceLevel, lvl)
+                            alreadyTracked := true
+                            break
+                if not alreadyTracked and not f_tooCloseToExisting(lvl, true)
+                    newPool = LiqPool.new()
+                    newPool.priceLevel := lvl
+                    newPool.isBuySide  := true
+                    newPool.touchCount := touchCount
+                    newPool.birthBar   := bar_index - i
+                    newPool.isSwept    := false
+                    newPool.sweptBar   := na
+                    newPool.zoneBox    := na
+                    newPool.zoneLbl    := na
+                    if array.size(pools) >= i_maxPools
+                        oldest = array.shift(pools)
+                        if not na(oldest.zoneBox)
+                            box.delete(oldest.zoneBox)
+                        if not na(oldest.zoneLbl)
+                            label.delete(oldest.zoneLbl)
+                    array.push(pools, newPool)
+                    break
+
+        // --- Equal Lows (Sell-Side Liquidity) ---
+        for i = 1 to i_lookback
+            touchCount = 0
+            float lvl  = low[i]
+            for j = 1 to i_lookback
+                if j != i and f_isEqual(low[j], lvl)
+                    touchCount += 1
+            if touchCount >= 2
+                alreadyTracked = false
+                for k = 0 to (array.size(pools) > 0 ? array.size(pools) - 1 : na)
+                    if not na(k)
+                        p = array.get(pools, k)
+                        if not p.isSwept and not p.isBuySide and f_isEqual(p.priceLevel, lvl)
+                            alreadyTracked := true
+                            break
+                if not alreadyTracked and not f_tooCloseToExisting(lvl, false)
+                    newPool = LiqPool.new()
+                    newPool.priceLevel := lvl
+                    newPool.isBuySide  := false
+                    newPool.touchCount := touchCount
+                    newPool.birthBar   := bar_index - i
+                    newPool.isSwept    := false
+                    newPool.sweptBar   := na
+                    newPool.zoneBox    := na
+                    newPool.zoneLbl    := na
+                    if array.size(pools) >= i_maxPools
+                        oldest = array.shift(pools)
+                        if not na(oldest.zoneBox)
+                            box.delete(oldest.zoneBox)
+                        if not na(oldest.zoneLbl)
+                            label.delete(oldest.zoneLbl)
+                    array.push(pools, newPool)
+                    break
+
+f_detectLiquidityPools()
+
+// ──────────────────────────────────────────────────────────────────────────────
+// LAYER 1 (cont.) – DRAW LIQUIDITY ZONES
+// ──────────────────────────────────────────────────────────────────────────────
+
+if barstate.isconfirmed
+    cnt = 0
+    for i = 0 to (array.size(pools) > 0 ? array.size(pools) - 1 : na)
+        if not na(i)
+            p = array.get(pools, i)
+            if not p.isSwept
+                cnt += 1
+                // Always clean up old drawings
+                if not na(p.zoneBox)
+                    box.delete(p.zoneBox)
+                if not na(p.zoneLbl)
+                    label.delete(p.zoneLbl)
+                // Only redraw if visual toggle is on
+                if i_showLiq
+                    halfZone = f_ticks2price(i_tickTol)
+                    topP  = p.priceLevel + halfZone
+                    botP  = p.priceLevel - halfZone
+                    p.zoneBox := box.new(p.birthBar, topP, bar_index + i_zoneExtend, botP,
+                         border_color=C_LIQ_BORDER, border_width=1,
+                         border_style=line.style_dashed,
+                         bgcolor=C_LIQ_ZONE)
+                    lblText  = p.isBuySide ? "BSL" : "SSL"
+                    lblY     = p.isBuySide ? topP : botP
+                    lblStyle = p.isBuySide ? label.style_label_down : label.style_label_up
+                    p.zoneLbl := label.new(bar_index + i_zoneExtend, lblY, lblText,
+                         color=color.new(#9C27B0, 80), textcolor=color.white,
+                         style=lblStyle, size=size.tiny)
+    activeLiqCount := cnt
+
+// ──────────────────────────────────────────────────────────────────────────────
+// LAYER 2 – SWEEP DETECTION
+// ──────────────────────────────────────────────────────────────────────────────
+
+var bool sweepBuySideNow  = false
+var bool sweepSellSideNow = false
+sweepBuySideNow  := false
+sweepSellSideNow := false
+
+// Step A: Register pending sweeps
+if barstate.isconfirmed
+    for i = 0 to (array.size(pools) > 0 ? array.size(pools) - 1 : na)
+        if not na(i)
+            p = array.get(pools, i)
+            if not p.isSwept
+                minSweepDist = f_ticks2price(i_sweepMin)
+                if p.isBuySide
+                    if high > p.priceLevel + minSweepDist
+                        ps = PendingSweep.new()
+                        ps.poolIndex := i
+                        ps.startBar  := bar_index
+                        ps.sweepHigh := high
+                        ps.sweepLow  := low
+                        ps.isBuySide := true
+                        array.push(pendingSweeps, ps)
+                else
+                    if low < p.priceLevel - minSweepDist
+                        ps = PendingSweep.new()
+                        ps.poolIndex := i
+                        ps.startBar  := bar_index
+                        ps.sweepHigh := high
+                        ps.sweepLow  := low
+                        ps.isBuySide := false
+                        array.push(pendingSweeps, ps)
+
+// Step B: Confirm sweeps with close-back + volume
+if barstate.isconfirmed
+    indicesToRemove = array.new_int()
+    for i = 0 to (array.size(pendingSweeps) > 0 ? array.size(pendingSweeps) - 1 : na)
+        if not na(i)
+            ps = array.get(pendingSweeps, i)
+            barsElapsed = bar_index - ps.startBar
+            if barsElapsed >= 1 and barsElapsed <= i_sweepBars
+                poolIdx = ps.poolIndex
+                if poolIdx < array.size(pools)
+                    p = array.get(pools, poolIdx)
+                    if not p.isSwept
+                        halfZone = f_ticks2price(i_tickTol)
+                        zoneTop  = p.priceLevel + halfZone
+                        zoneBot  = p.priceLevel - halfZone
+                        closedBack = false
+                        if ps.isBuySide
+                            closedBack := close <= zoneTop
+                        else
+                            closedBack := close >= zoneBot
+                        if closedBack and f_volumeSpike()
+                            // ── CONFIRMED SWEEP ──
+                            p.isSwept  := true
+                            p.sweptBar := bar_index
+                            lastSweepBar     := bar_index
+                            lastSweepBuySide := ps.isBuySide
+                            lastSweepPrice   := ps.isBuySide ? ps.sweepHigh : ps.sweepLow
+
+                            if ps.isBuySide
+                                sweepBuySideNow := true
+                            else
+                                sweepSellSideNow := true
+
+                            // Sweep marker (visual only)
+                            if i_showSwp
+                                sweepY     = ps.isBuySide ? ps.sweepHigh : ps.sweepLow
+                                sweepStyle = ps.isBuySide ? label.style_label_down : label.style_label_up
+                                sweepColor = ps.isBuySide ? C_BEAR_SIG : C_BULL_SIG
+                                label.new(ps.startBar, sweepY, "⚡",
+                                     color=color.new(color.black, 100),
+                                     textcolor=sweepColor,
+                                     style=sweepStyle, size=size.tiny)
+
+                            // ── ORDER BLOCK (always computed) ──
+                            for ob_i = 1 to i_obLook
+                                refBar = ps.startBar - bar_index + ob_i
+                                if refBar > 0
+                                    if ps.isBuySide
+                                        if close[refBar] > open[refBar]
+                                            obTop  := high[refBar]
+                                            obBot  := low[refBar]
+                                            obBull := true
+                                            obBar  := bar_index - refBar
+                                            break
+                                    else
+                                        if close[refBar] < open[refBar]
+                                            obTop  := high[refBar]
+                                            obBot  := low[refBar]
+                                            obBull := false
+                                            obBar  := bar_index - refBar
+                                            break
+
+                            // ── FVG (always computed) ──
+                            if ps.isBuySide == false
+                                if low[0] > high[2]
+                                    fvgTop  := low[0]
+                                    fvgBot  := high[2]
+                                    fvgBull := true
+                                    fvgBar  := bar_index - 1
+                            else
+                                if high[0] < low[2]
+                                    fvgTop  := low[2]
+                                    fvgBot  := high[0]
+                                    fvgBull := false
+                                    fvgBar  := bar_index - 1
+
+                            // Close the zone box visually
+                            if not na(p.zoneBox)
+                                box.set_right(p.zoneBox, bar_index)
+
+                            array.push(indicesToRemove, i)
+            else if barsElapsed > i_sweepBars
+                array.push(indicesToRemove, i)
+
+    if array.size(indicesToRemove) > 0
+        for j = array.size(indicesToRemove) - 1 to 0
+            idx = array.get(indicesToRemove, j)
+            if idx < array.size(pendingSweeps)
+                array.remove(pendingSweeps, idx)
+
+// ──────────────────────────────────────────────────────────────────────────────
+// LAYER 3B – ORDER BLOCK STORAGE + OPTIONAL DRAWING
+// Data is ALWAYS stored. Box is ONLY drawn when i_showOB is true.
+// ──────────────────────────────────────────────────────────────────────────────
+
+if barstate.isconfirmed and not na(obBar) and (sweepBuySideNow or sweepSellSideNow)
+    newOB = OrderBlock.new()
+    newOB.top       := obTop
+    newOB.bottom    := obBot
+    newOB.isBullish := obBull
+    newOB.birthBar  := obBar
+    newOB.isActive  := true
+    newOB.obBox     := na       // Default: no visual
+
+    // Draw box ONLY if toggle is on
+    if i_showOB
+        obColor = obBull ? C_BULL_OB : C_BEAR_OB
+        newOB.obBox := box.new(obBar, obTop, bar_index + i_zoneExtend, obBot,
+             border_color=obBull ? color.new(#4CAF50, 60) : color.new(#F44336, 60),
+             border_width=1, bgcolor=obColor)
+
+    // Cap stored OBs
+    if array.size(orderBlocks) >= 5
+        old = array.shift(orderBlocks)
+        if not na(old.obBox)
+            box.delete(old.obBox)
+    array.push(orderBlocks, newOB)
+
+// Invalidate OBs that price has traded through
+if barstate.isconfirmed
+    for i = 0 to (array.size(orderBlocks) > 0 ? array.size(orderBlocks) - 1 : na)
+        if not na(i)
+            ob = array.get(orderBlocks, i)
+            if ob.isActive
+                if ob.isBullish and close < ob.bottom
+                    ob.isActive := false
+                    if not na(ob.obBox)
+                        box.delete(ob.obBox)
+                if not ob.isBullish and close > ob.top
+                    ob.isActive := false
+                    if not na(ob.obBox)
+                        box.delete(ob.obBox)
+
+// ──────────────────────────────────────────────────────────────────────────────
+// LAYER 3C – FVG STORAGE + OPTIONAL DRAWING
+// Data is ALWAYS stored. Box is ONLY drawn when i_showFVG is true.
+// ──────────────────────────────────────────────────────────────────────────────
+
+if barstate.isconfirmed
+    // Bullish FVG
+    if low > high[2]
+        newFVG = FVG.new()
+        newFVG.top       := low
+        newFVG.bottom    := high[2]
+        newFVG.isBullish := true
+        newFVG.birthBar  := bar_index - 1
+        newFVG.isActive  := true
+        newFVG.fvgBox    := na
+
+        if i_showFVG
+            newFVG.fvgBox := box.new(bar_index - 2, low, bar_index + i_zoneExtend, high[2],
+                 border_color=color.new(#4CAF50, 80), border_width=0,
+                 bgcolor=C_BULL_FVG_B)
+
+        if array.size(allFVGs) >= 10
+            old = array.shift(allFVGs)
+            if not na(old.fvgBox)
+                box.delete(old.fvgBox)
+        array.push(allFVGs, newFVG)
+
+    // Bearish FVG
+    if high < low[2]
+        newFVG = FVG.new()
+        newFVG.top       := low[2]
+        newFVG.bottom    := high
+        newFVG.isBullish := false
+        newFVG.birthBar  := bar_index - 1
+        newFVG.isActive  := true
+        newFVG.fvgBox    := na
+
+        if i_showFVG
+            newFVG.fvgBox := box.new(bar_index - 2, low[2], bar_index + i_zoneExtend, high,
+                 border_color=color.new(#F44336, 80), border_width=0,
+                 bgcolor=C_BEAR_FVG_B)
+
+        if array.size(allFVGs) >= 10
+            old = array.shift(allFVGs)
+            if not na(old.fvgBox)
+                box.delete(old.fvgBox)
+        array.push(allFVGs, newFVG)
+
+// Invalidate filled FVGs
+if barstate.isconfirmed
+    for i = 0 to (array.size(allFVGs) > 0 ? array.size(allFVGs) - 1 : na)
+        if not na(i)
+            f = array.get(allFVGs, i)
+            if f.isActive
+                if f.isBullish and low <= f.bottom
+                    f.isActive := false
+                    if not na(f.fvgBox)
+                        box.delete(f.fvgBox)
+                if not f.isBullish and high >= f.top
+                    f.isActive := false
+                    if not na(f.fvgBox)
+                        box.delete(f.fvgBox)
+
+// ──────────────────────────────────────────────────────────────────────────────
+// LAYER 4 – QUALITY SCORE
+// ──────────────────────────────────────────────────────────────────────────────
+
+f_qualityScore(bool _isSellSideSweep, float _sweepPrice, bool _htfAligned, bool _hasFVG, bool _hasOB) =>
+    float score = 0.0
+    sweepDist  = math.abs(close - _sweepPrice)
+    minDist    = f_ticks2price(i_sweepMin)
+    score += math.min(sweepDist / (minDist * 3) * 25, 25.0)
+    avgVol   = ta.sma(volume, i_volLen)
+    volRatio = nz(volume / avgVol, 1.0)
+    score += math.max(math.min((volRatio - 1.0) / 2.0 * 25, 25.0), 0)
+    score += _htfAligned ? 25.0 : 0.0
+    score += _hasFVG ? 15.0 : 0.0
+    score += _hasOB  ? 10.0 : 0.0
+    math.round(math.min(score, 100))
+
+// ──────────────────────────────────────────────────────────────────────────────
+// LAYER 4 – ENTRY SIGNAL LOGIC
+// ──────────────────────────────────────────────────────────────────────────────
+
+var bool longSignal  = false
+var bool shortSignal = false
+longSignal  := false
+shortSignal := false
+
+f_findEntryZone(bool _bullish) =>
+    float _entTop = na
+    float _entBot = na
+    bool  _found  = false
+    // Check FVGs first
+    for i = array.size(allFVGs) - 1 to 0
+        f = array.get(allFVGs, i)
+        if f.isActive and f.isBullish == _bullish
+            _entTop := f.top
+            _entBot := f.bottom
+            _found  := true
+            break
+    // Fallback to OBs
+    if not _found
+        for i = array.size(orderBlocks) - 1 to 0
+            ob = array.get(orderBlocks, i)
+            if ob.isActive and ob.isBullish == _bullish
+                _entTop := ob.top
+                _entBot := ob.bottom
+                _found  := true
+                break
+    [_entTop, _entBot, _found]
+
+canSignal = (bar_index - lastSignalBar) >= i_minSigBars
+
+f_capSignals() =>
+    while array.size(signalHistory) > i_maxSignals
+        old = array.shift(signalHistory)
+        if not na(old.sigLabel)
+            label.delete(old.sigLabel)
+
+if barstate.isconfirmed and canSignal
+    // ── LONG SETUP ──
+    if sweepSellSideNow and htfBullish
+        [entTop, entBot, entFound] = f_findEntryZone(true)
+        if entFound
+            entryMid = (entTop + entBot) / 2
+            priceNearZone = low <= entTop and high >= entBot
+            if priceNearZone
+                hasFVG = false
+                hasOB  = false
+                for i = array.size(allFVGs) - 1 to 0
+                    f = array.get(allFVGs, i)
+                    if f.isActive and f.isBullish
+                        hasFVG := true
+                        break
+                for i = array.size(orderBlocks) - 1 to 0
+                    ob = array.get(orderBlocks, i)
+                    if ob.isActive and ob.isBullish
+                        hasOB := true
+                        break
+
+                quality = f_qualityScore(true, nz(lastSweepPrice), true, hasFVG, hasOB)
+                if quality >= i_qualMin
+                    entryPrice  = entryMid
+                    stopPrice   = nz(lastSweepPrice, entBot) - f_ticks2price(5)
+                    riskDist    = math.abs(entryPrice - stopPrice)
+                    targetPrice = entryPrice + riskDist * i_rrTarget
+                    rrRatio     = riskDist > 0 ? (targetPrice - entryPrice) / riskDist : 0
+
+                    lastSignalQuality := quality
+                    lastRR            := rrRatio
+                    lastEntryPrice    := entryPrice
+                    lastStopPrice     := stopPrice
+                    lastTargetPrice   := targetPrice
+                    lastSignalLong    := true
+                    lastSignalBar     := bar_index
+                    longSignal        := true
+
+                    if i_showSig
+                        lbl_text = i_compact ?
+                             "L " + str.tostring(entryPrice, format.mintick) + " Q:" + str.tostring(quality) :
+                             "LONG\nEntry: " + str.tostring(entryPrice, format.mintick) +
+                             "\nSL: " + str.tostring(stopPrice, format.mintick) +
+                             "\nTP: " + str.tostring(targetPrice, format.mintick) +
+                             "\nQuality: " + str.tostring(quality)
+
+                        newLbl = label.new(bar_index, low - f_ticks2price(8), lbl_text,
+                             color=color.new(C_BULL_SIG, 30),
+                             textcolor=color.white,
+                             style=label.style_label_up,
+                             size=size.tiny)
+
+                        tracker = SignalTracker.new()
+                        tracker.sigLabel := newLbl
+                        tracker.sigBar   := bar_index
+                        array.push(signalHistory, tracker)
+                        f_capSignals()
+
+                        if i_showSLTP
+                            line.new(bar_index, stopPrice, bar_index + i_zoneExtend, stopPrice,
+                                 color=color.new(C_BEAR_SIG, 40), style=line.style_dotted, width=1)
+                            line.new(bar_index, targetPrice, bar_index + i_zoneExtend, targetPrice,
+                                 color=color.new(C_BULL_SIG, 40), style=line.style_dotted, width=1)
+
+    // ── SHORT SETUP ──
+    if sweepBuySideNow and htfBearish and canSignal
+        [entTop, entBot, entFound] = f_findEntryZone(false)
+        if entFound
+            entryMid = (entTop + entBot) / 2
+            priceNearZone = low <= entTop and high >= entBot
+            if priceNearZone
+                hasFVG = false
+                hasOB  = false
+                for i = array.size(allFVGs) - 1 to 0
+                    f = array.get(allFVGs, i)
+                    if f.isActive and not f.isBullish
+                        hasFVG := true
+                        break
+                for i = array.size(orderBlocks) - 1 to 0
+                    ob = array.get(orderBlocks, i)
+                    if ob.isActive and not ob.isBullish
+                        hasOB := true
+                        break
+
+                quality = f_qualityScore(false, nz(lastSweepPrice), true, hasFVG, hasOB)
+                if quality >= i_qualMin
+                    entryPrice  = entryMid
+                    stopPrice   = nz(lastSweepPrice, entTop) + f_ticks2price(5)
+                    riskDist    = math.abs(stopPrice - entryPrice)
+                    targetPrice = entryPrice - riskDist * i_rrTarget
+                    rrRatio     = riskDist > 0 ? math.abs(entryPrice - targetPrice) / riskDist : 0
+
+                    lastSignalQuality := quality
+                    lastRR            := rrRatio
+                    lastEntryPrice    := entryPrice
+                    lastStopPrice     := stopPrice
+                    lastTargetPrice   := targetPrice
+                    lastSignalLong    := false
+                    lastSignalBar     := bar_index
+                    shortSignal       := true
+
+                    if i_showSig
+                        lbl_text = i_compact ?
+                             "S " + str.tostring(entryPrice, format.mintick) + " Q:" + str.tostring(quality) :
+                             "SHORT\nEntry: " + str.tostring(entryPrice, format.mintick) +
+                             "\nSL: " + str.tostring(stopPrice, format.mintick) +
+                             "\nTP: " + str.tostring(targetPrice, format.mintick) +
+                             "\nQuality: " + str.tostring(quality)
+
+                        newLbl = label.new(bar_index, high + f_ticks2price(8), lbl_text,
+                             color=color.new(C_BEAR_SIG, 30),
+                             textcolor=color.white,
+                             style=label.style_label_down,
+                             size=size.tiny)
+
+                        tracker = SignalTracker.new()
+                        tracker.sigLabel := newLbl
+                        tracker.sigBar   := bar_index
+                        array.push(signalHistory, tracker)
+                        f_capSignals()
+
+                        if i_showSLTP
+                            line.new(bar_index, stopPrice, bar_index + i_zoneExtend, stopPrice,
+                                 color=color.new(C_BEAR_SIG, 40), style=line.style_dotted, width=1)
+                            line.new(bar_index, targetPrice, bar_index + i_zoneExtend, targetPrice,
+                                 color=color.new(C_BULL_SIG, 40), style=line.style_dotted, width=1)
+// ──────────────────────────────────────────────────────────────────────────────
+// VISUAL – ENTRY ARROWS
+// ──────────────────────────────────────────────────────────────────────────────
+
+plotshape(longSignal  and i_showSig ? low  - f_ticks2price(15) : na,
+     title="Long Arrow",  style=shape.triangleup,
+     location=location.absolute, color=C_BULL_SIG, size=size.tiny)
+plotshape(shortSignal and i_showSig ? high + f_ticks2price(15) : na,
+     title="Short Arrow", style=shape.triangledown,
+     location=location.absolute, color=C_BEAR_SIG, size=size.tiny)
+
+// ──────────────────────────────────────────────────────────────────────────────
+// VISUAL – HTF TREND BACKGROUND
+// ──────────────────────────────────────────────────────────────────────────────
+
+bgcolor(htfBullish ? color.new(#4CAF50, 97) : htfBearish ? color.new(#F44336, 97) : na,
+     title="HTF Trend Background")
+
+// ──────────────────────────────────────────────────────────────────────────────
+// DASHBOARD
+// ──────────────────────────────────────────────────────────────────────────────
+
+var table dashboard = na
+
+if i_showDash and barstate.islast
+    dashYPos = switch i_dashPos
+        "Top Left"     => position.top_left
+        "Bottom Left"  => position.bottom_left
+        "Bottom Right" => position.bottom_right
+        => position.top_right
+
+    if not na(dashboard)
+        table.delete(dashboard)
+
+    dashboard := table.new(dashYPos, 2, 6,
+         bgcolor=C_DASH_BG, border_width=1,
+         border_color=color.new(color.gray, 60),
+         frame_width=2, frame_color=color.new(#9C27B0, 40))
+
+    table.cell(dashboard, 0, 0, "Smart Money Hunter", text_color=#9C27B0,
+         text_size=size.tiny, bgcolor=color.new(#1E1E2F, 0), text_halign=text.align_center)
+    table.merge_cells(dashboard, 0, 0, 1, 0)
+
+    table.cell(dashboard, 0, 1, "Pools:",
+         text_color=C_DASH_TXT, text_size=size.tiny,
+         bgcolor=color.new(#1E1E2F, 0), text_halign=text.align_left)
+    table.cell(dashboard, 1, 1, str.tostring(activeLiqCount) + " detected",
+         text_color=activeLiqCount > 0 ? #FFD740 : color.gray,
+         text_size=size.tiny, bgcolor=color.new(#1E1E2F, 0),
+         text_halign=text.align_right)
+
+    table.cell(dashboard, 0, 2, "HTF:",
+         text_color=C_DASH_TXT, text_size=size.tiny,
+         bgcolor=color.new(#1E1E2F, 0), text_halign=text.align_left)
+    htfText  = htfBullish ? "Bull (1H)" : htfBearish ? "Bear (1H)" : "Neutral"
+    htfColor = htfBullish ? C_BULL_SIG : htfBearish ? C_BEAR_SIG : color.gray
+    table.cell(dashboard, 1, 2, htfText,
+         text_color=htfColor, text_size=size.tiny,
+         bgcolor=color.new(#1E1E2F, 0), text_halign=text.align_right)
+
+    table.cell(dashboard, 0, 3, "Sweep:",
+         text_color=C_DASH_TXT, text_size=size.tiny,
+         bgcolor=color.new(#1E1E2F, 0), text_halign=text.align_left)
+    sweepAgoText = na(lastSweepBar) ? "—" :
+         str.tostring(math.round((bar_index - lastSweepBar) * timeframe.multiplier)) + "m ago"
+    sweepAgoClr  = na(lastSweepBar) ? color.gray :
+         (lastSweepBuySide ? C_BEAR_SIG : C_BULL_SIG)
+    table.cell(dashboard, 1, 3, sweepAgoText,
+         text_color=sweepAgoClr, text_size=size.tiny,
+         bgcolor=color.new(#1E1E2F, 0), text_halign=text.align_right)
+
+    table.cell(dashboard, 0, 4, "Quality:",
+         text_color=C_DASH_TXT, text_size=size.tiny,
+         bgcolor=color.new(#1E1E2F, 0), text_halign=text.align_left)
+    qualClr = lastSignalQuality >= 85 ? C_BULL_SIG :
+         lastSignalQuality >= 60 ? #FFD740 : color.gray
+    table.cell(dashboard, 1, 4, str.tostring(lastSignalQuality) + "/100",
+         text_color=qualClr, text_size=size.tiny,
+         bgcolor=color.new(#1E1E2F, 0), text_halign=text.align_right)
+
+    table.cell(dashboard, 0, 5, "R:R:",
+         text_color=C_DASH_TXT, text_size=size.tiny,
+         bgcolor=color.new(#1E1E2F, 0), text_halign=text.align_left)
+    rrText = lastRR > 0 ? "1:" + str.tostring(lastRR, "#.#") : "—"
+    rrClr  = lastRR >= 3 ? C_BULL_SIG : lastRR >= 2 ? #FFD740 : color.gray
+    table.cell(dashboard, 1, 5, rrText,
+         text_color=rrClr, text_size=size.tiny,
+         bgcolor=color.new(#1E1E2F, 0), text_halign=text.align_right)
+
+// ──────────────────────────────────────────────────────────────────────────────
+// ALERT CONDITIONS
+// ──────────────────────────────────────────────────────────────────────────────
+
+alertcondition(sweepBuySideNow,
+     title="Buy-Side Liquidity Swept",
+     message="⚡ Buy-side liquidity swept on {{ticker}} ({{interval}}). Price: {{close}}")
+
+alertcondition(sweepSellSideNow,
+     title="Sell-Side Liquidity Swept",
+     message="⚡ Sell-side liquidity swept on {{ticker}} ({{interval}}). Price: {{close}}")
+
+alertcondition((longSignal or shortSignal) and lastSignalQuality >= i_alertMin,
+     title="High-Probability Setup",
+     message="🎯 High-probability setup detected on {{ticker}} ({{interval}}). Check dashboard for quality score. Price: {{close}}")
+
+if (longSignal or shortSignal) and lastSignalQuality >= i_alertMin
+    direction = longSignal ? "LONG" : "SHORT"
+    alert("🎯 High-probability " + direction + " setup on " + syminfo.ticker +
+         " (" + timeframe.period + "). Quality: " +
+         str.tostring(lastSignalQuality) + "/100. Price: " +
+         str.tostring(close, format.mintick),
+         alert.freq_once_per_bar_close)
+
+entryZoneTouched = not na(lastEntryPrice) and not na(obTop) and not na(obBot) and
+     low <= math.max(nz(obTop), nz(fvgTop, obTop)) and
+     high >= math.min(nz(obBot), nz(fvgBot, obBot))
+
+alertcondition(entryZoneTouched and barstate.isconfirmed,
+     title="Entry Zone Touched",
+     message="📍 Price entered FVG/OB retest zone on {{ticker}} ({{interval}}). Price: {{close}}")

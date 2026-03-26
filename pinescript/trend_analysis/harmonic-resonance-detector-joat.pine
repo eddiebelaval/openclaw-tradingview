@@ -1,0 +1,543 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © officialjackofalltrades
+//@version=6
+indicator("Harmonic Resonance Detector [JOAT]", overlay=true, max_lines_count=500, max_labels_count=500)
+
+// ────────────────────────────────────────────────────────────────────────────────
+// INPUTS
+// ────────────────────────────────────────────────────────────────────────────────
+swing1Length = input.int(20, "Primary Wave", minval=10, maxval=100, group="Harmonic Waves")
+swing2Length = input.int(50, "Secondary Wave", minval=20, maxval=150, group="Harmonic Waves")
+swing3Length = input.int(100, "Tertiary Wave", minval=50, maxval=200, group="Harmonic Waves")
+showGoldenZone = input.bool(true, "Golden Pocket (0.618-0.65)", group="Harmonic Waves")
+
+confluenceTolerance = input.float(0.3, "Resonance Tolerance (%)", minval=0.1, maxval=1.0, group="Confluence Engine")
+minConfluence = input.int(3, "Min Harmonic Count", minval=2, maxval=5, group="Confluence Engine")
+showMagneticZones = input.bool(true, "Magnetic Zones", group="Confluence Engine")
+
+showFibLines = input.bool(true, "Fibonacci Levels", group="Visualization")
+showConfluenceZones = input.bool(true, "Confluence Zones", group="Visualization")
+showHeatmap = input.bool(true, "Density Heatmap", group="Visualization")
+showExtensions = input.bool(true, "Extensions (1.272, 1.618)", group="Visualization")
+showEquilibrium = input.bool(true, "Equilibrium Boxes", group="Visualization")
+showLiquiditySweeps = input.bool(true, "Liquidity Sweeps", group="Visualization")
+showGradientBg = input.bool(true, "Gradient Backgrounds", group="Visualization")
+showEnhancedCandles = input.bool(true, "Enhanced Candlesticks", group="Visualization")
+
+// ────────────────────────────────────────────────────────────────────────────────
+// COLOR SCHEME - Golden Ratio Aesthetic
+// ────────────────────────────────────────────────────────────────────────────────
+COLOR_FIB_236 = color.new(#00d4ff, 70)
+COLOR_FIB_382 = color.new(#00ffaa, 70)
+COLOR_FIB_500 = color.new(#ffd700, 70)
+COLOR_FIB_618 = color.new(#ff8c00, 70)
+COLOR_FIB_786 = color.new(#ff1493, 70)
+COLOR_FIB_GOLDEN = color.new(#ffd700, 50)
+
+COLOR_CONFLUENCE_EXTREME = color.new(#ff0000, 55)
+COLOR_CONFLUENCE_HIGH = color.new(#ff8c00, 65)
+COLOR_CONFLUENCE_MED = color.new(#ffd700, 75)
+COLOR_CONFLUENCE_LOW = color.new(#00d4ff, 85)
+
+// ────────────────────────────────────────────────────────────────────────────────
+// FIBONACCI LEVELS
+// ────────────────────────────────────────────────────────────────────────────────
+fibLevels = array.from(0.236, 0.382, 0.5, 0.618, 0.786)
+fibNames = array.from("23.6%", "38.2%", "50%", "61.8%", "78.6%")
+fibColors = array.from(COLOR_FIB_236, COLOR_FIB_382, COLOR_FIB_500, COLOR_FIB_618, COLOR_FIB_786)
+
+extLevels = array.from(1.272, 1.414, 1.618)
+extNames = array.from("127.2%", "141.4%", "161.8%")
+extColors = array.from(color.new(#9D00FF, 70), color.new(#B000FF, 70), color.new(#C300FF, 70))
+
+// ────────────────────────────────────────────────────────────────────────────────
+// SWING CALCULATIONS
+// ────────────────────────────────────────────────────────────────────────────────
+calculateSwingFibs(swingLen) =>
+    swingHigh = ta.highest(high, swingLen)
+    swingLow = ta.lowest(low, swingLen)
+    
+    // Determine trend direction
+    highBar = 0
+    lowBar = 0
+    for i = 0 to swingLen - 1
+        if high[i] == swingHigh
+            highBar := i
+        if low[i] == swingLow
+            lowBar := i
+    
+    isUptrend = lowBar > highBar
+    
+    fibStart = isUptrend ? swingLow : swingHigh
+    fibEnd = isUptrend ? swingHigh : swingLow
+    fibDiff = fibEnd - fibStart
+    
+    var array<float> levels = array.new<float>()
+    array.clear(levels)
+    
+    // Retracement levels
+    for i = 0 to array.size(fibLevels) - 1
+        level = array.get(fibLevels, i)
+        price = fibStart + (fibDiff * level)
+        array.push(levels, price)
+    
+    // Extension levels
+    if showExtensions
+        for i = 0 to array.size(extLevels) - 1
+            extLevel = array.get(extLevels, i)
+            extPrice = isUptrend ? fibStart + (fibDiff * extLevel) : fibStart - (fibDiff * (extLevel - 1))
+            array.push(levels, extPrice)
+    
+    levels
+
+// Calculate Fibonacci levels for each swing
+fib1 = calculateSwingFibs(swing1Length)
+fib2 = calculateSwingFibs(swing2Length)
+fib3 = calculateSwingFibs(swing3Length)
+
+// ────────────────────────────────────────────────────────────────────────────────
+// CONFLUENCE DETECTION
+// ────────────────────────────────────────────────────────────────────────────────
+type ConfluenceZone
+    float price
+    int count
+    string levels
+    box zoneBox
+
+var array<ConfluenceZone> confluenceZones = array.new<ConfluenceZone>()
+var array<float> allLevels = array.new<float>()
+
+if barstate.islast
+    // Clear old zones
+    if array.size(confluenceZones) > 0
+        for zone in confluenceZones
+            box.delete(zone.zoneBox)
+        array.clear(confluenceZones)
+    
+    // Collect all Fib levels
+    array.clear(allLevels)
+    
+    for i = 0 to array.size(fib1) - 1
+        array.push(allLevels, array.get(fib1, i))
+    for i = 0 to array.size(fib2) - 1
+        array.push(allLevels, array.get(fib2, i))
+    for i = 0 to array.size(fib3) - 1
+        array.push(allLevels, array.get(fib3, i))
+    
+    // Find confluences
+    for i = 0 to array.size(allLevels) - 1
+        level = array.get(allLevels, i)
+        confluenceCount = 0
+        levelNames = ""
+        
+        // Count how many levels are near this one
+        for j = 0 to array.size(allLevels) - 1
+            if i != j
+                otherLevel = array.get(allLevels, j)
+                diff = math.abs(level - otherLevel) / level * 100
+                if diff <= confluenceTolerance
+                    confluenceCount += 1
+        
+        // If significant confluence found
+        if confluenceCount >= minConfluence - 1
+            // Check if already added
+            isNew = true
+            if array.size(confluenceZones) > 0
+                for zone in confluenceZones
+                    if math.abs(level - zone.price) / level * 100 <= confluenceTolerance
+                        isNew := false
+                        break
+            
+            if isNew and showConfluenceZones
+                zoneHeight = close * 0.002
+                zoneColor = confluenceCount >= 4 ? COLOR_CONFLUENCE_HIGH : confluenceCount >= 2 ? COLOR_CONFLUENCE_MED : COLOR_CONFLUENCE_LOW
+                
+                zoneBox = box.new(bar_index - 50, level + zoneHeight, bar_index + 20, level - zoneHeight, border_color=zoneColor, bgcolor=zoneColor, border_width=2)
+                
+                newZone = ConfluenceZone.new(level, confluenceCount + 1, "", zoneBox)
+                array.push(confluenceZones, newZone)
+                
+                // Enhanced label with box background
+                labelText = str.tostring(confluenceCount + 1) + "x CONFLUENCE"
+                labelBgColor = confluenceCount >= 4 ? color.new(#ff0000, 30) : confluenceCount >= 2 ? color.new(#ffd700, 30) : color.new(#00d4ff, 30)
+                label.new(bar_index, level, labelText, style=label.style_label_left, color=labelBgColor, textcolor=color.white, size=size.normal)
+
+// ────────────────────────────────────────────────────────────────────────────────
+// FIBONACCI LINES
+// ────────────────────────────────────────────────────────────────────────────────
+var line[] fibLines = array.new_line()
+var label[] fibLabels = array.new_label()
+
+if showFibLines and barstate.islast
+    // Clear old lines
+    for l in fibLines
+        line.delete(l)
+    for lab in fibLabels
+        label.delete(lab)
+    array.clear(fibLines)
+    array.clear(fibLabels)
+    
+    // Draw retracement Fibs
+    for i = 0 to math.min(array.size(fib1), array.size(fibLevels)) - 1
+        price = array.get(fib1, i)
+        fibColor = array.get(fibColors, i)
+        fibName = array.get(fibNames, i)
+        
+        fibLine = line.new(bar_index - swing1Length, price, bar_index + 10, price, color=fibColor, width=1, style=line.style_dotted)
+        array.push(fibLines, fibLine)
+        
+        fibLabel = label.new(bar_index + 12, price, fibName, style=label.style_label_left, color=fibColor, textcolor=color.white, size=size.small)
+        array.push(fibLabels, fibLabel)
+    
+    // Draw extension levels
+    if showExtensions
+        extStartIdx = array.size(fibLevels)
+        for i = 0 to array.size(extLevels) - 1
+            if extStartIdx + i < array.size(fib1)
+                price = array.get(fib1, extStartIdx + i)
+                extColor = array.get(extColors, i)
+                extName = array.get(extNames, i)
+                
+                extLine = line.new(bar_index - swing1Length, price, bar_index + 10, price, color=extColor, width=2, style=line.style_dashed)
+                array.push(fibLines, extLine)
+                
+                extLabel = label.new(bar_index + 12, price, extName + " EXT", style=label.style_label_left, color=extColor, textcolor=color.white, size=size.small)
+                array.push(fibLabels, extLabel)
+
+// ────────────────────────────────────────────────────────────────────────────────
+// GOLDEN ZONE VISUALIZATION
+// ────────────────────────────────────────────────────────────────────────────────
+var bool inGoldenZone = false
+var float goldenTop = na
+var float goldenBot = na
+
+if showGoldenZone and barstate.islast
+    if array.size(fib1) >= 4
+        fib618 = array.get(fib1, 3)
+        fib65 = fib618 * 1.052
+        
+        goldenTop := math.max(fib618, fib65)
+        goldenBot := math.min(fib618, fib65)
+        
+        // Create gradient golden zone
+        goldenColor1 = color.new(#FFD700, 75)
+        goldenColor2 = color.new(#FFA500, 70)
+        goldenColor3 = color.new(#FF8C00, 75)
+        
+        // Multiple layers for gradient effect
+        box.new(bar_index - 40, goldenTop, bar_index + 15, goldenBot, border_color=goldenColor1, bgcolor=goldenColor1, border_width=1)
+        box.new(bar_index - 40, goldenTop * 0.9995 + goldenBot * 0.0005, bar_index + 15, goldenTop * 0.0005 + goldenBot * 0.9995, border_color=goldenColor2, bgcolor=goldenColor2, border_width=0)
+        
+        label.new(bar_index - 20, (goldenTop + goldenBot) / 2, "GOLDEN POCKET", style=label.style_label_center, color=color.new(#FFD700, 50), textcolor=color.white, size=size.small)
+
+// Check if current price is in golden zone
+if not na(goldenTop) and not na(goldenBot)
+    inGoldenZone := close >= goldenBot and close <= goldenTop
+
+// ────────────────────────────────────────────────────────────────────────────────
+// GOLDEN ZONE CANDLESTICK COLORING
+// ────────────────────────────────────────────────────────────────────────────────
+// Check if near confluence zone
+nearConfluenceZone = false
+confluenceStrength = 0
+if array.size(confluenceZones) > 0
+    for zone in confluenceZones
+        if math.abs(close - zone.price) / close * 100 < 1.0 and zone.count >= 3
+            nearConfluenceZone := true
+            confluenceStrength := zone.count
+            break
+
+// Candlestick coloring priority: Golden Zone > Confluence Zone > Normal
+color candleColor = na
+if showEnhancedCandles
+    if inGoldenZone
+        candleColor := close > open ? color.new(#FFD700, 0) : color.new(#8B4513, 0)
+    else if nearConfluenceZone
+        if confluenceStrength >= 4
+            candleColor := close > open ? color.new(#FF6B35, 0) : color.new(#8B0000, 0)
+        else
+            candleColor := close > open ? color.new(#FFA500, 0) : color.new(#8B4513, 0)
+
+barcolor(candleColor, title="Enhanced Candles")
+
+// ────────────────────────────────────────────────────────────────────────────────
+// GRADIENT BACKGROUND COLORS
+// ────────────────────────────────────────────────────────────────────────────────
+color finalBgColor = na
+if showGradientBg
+    // Golden zone background
+    goldenBgColor = inGoldenZone ? color.new(#FFD700, 92) : na
+    
+    // Confluence zone background (already calculated above)
+    confluenceBgColor = nearConfluenceZone and not inGoldenZone ? color.new(#FF8C00, 94) : na
+    
+    // Premium/Discount zones
+    rangeHigh = ta.highest(high, 100)
+    rangeLow = ta.lowest(low, 100)
+    rangeSize = rangeHigh - rangeLow
+    premiumZone = close > rangeLow + (rangeSize * 0.7)
+    discountZone = close < rangeLow + (rangeSize * 0.3)
+    
+    premiumBgColor = premiumZone and not inGoldenZone and not nearConfluenceZone ? color.new(#4A0E0E, 96) : na
+    discountBgColor = discountZone and not inGoldenZone and not nearConfluenceZone ? color.new(#0E4A0E, 96) : na
+    
+    // Apply backgrounds in priority order
+    finalBgColor := inGoldenZone ? goldenBgColor : nearConfluenceZone ? confluenceBgColor : premiumZone ? premiumBgColor : discountZone ? discountBgColor : na
+
+bgcolor(finalBgColor, title="Dynamic Background")
+
+// ────────────────────────────────────────────────────────────────────────────────
+// HEATMAP
+// ────────────────────────────────────────────────────────────────────────────────
+var array<int> heatmapCounts = array.new<int>()
+
+if showHeatmap and barstate.islast
+    // Create price grid
+    gridSize = 20
+    rangeHigh = ta.highest(high, 100)
+    rangeLow = ta.lowest(low, 100)
+    priceStep = (rangeHigh - rangeLow) / gridSize
+    
+    array.clear(heatmapCounts)
+    for i = 0 to gridSize - 1
+        array.push(heatmapCounts, 0)
+    
+    // Count Fib levels in each grid cell
+    for i = 0 to array.size(fib1) - 1
+        price = array.get(fib1, i)
+        if price >= rangeLow and price <= rangeHigh
+            gridIndex = math.floor((price - rangeLow) / priceStep)
+            gridIndex := math.min(gridSize - 1, math.max(0, gridIndex))
+            array.set(heatmapCounts, gridIndex, array.get(heatmapCounts, gridIndex) + 1)
+    
+    for i = 0 to array.size(fib2) - 1
+        price = array.get(fib2, i)
+        if price >= rangeLow and price <= rangeHigh
+            gridIndex = math.floor((price - rangeLow) / priceStep)
+            gridIndex := math.min(gridSize - 1, math.max(0, gridIndex))
+            array.set(heatmapCounts, gridIndex, array.get(heatmapCounts, gridIndex) + 1)
+    
+    for i = 0 to array.size(fib3) - 1
+        price = array.get(fib3, i)
+        if price >= rangeLow and price <= rangeHigh
+            gridIndex = math.floor((price - rangeLow) / priceStep)
+            gridIndex := math.min(gridSize - 1, math.max(0, gridIndex))
+            array.set(heatmapCounts, gridIndex, array.get(heatmapCounts, gridIndex) + 1)
+    
+    // Find max count for gradient scaling
+    maxCount = 0
+    for i = 0 to array.size(heatmapCounts) - 1
+        count = array.get(heatmapCounts, i)
+        if count > maxCount
+            maxCount := count
+    
+    // Draw heatmap with gradient colors
+    if maxCount > 0
+        for i = 0 to array.size(heatmapCounts) - 1
+            count = array.get(heatmapCounts, i)
+            if count > 0
+                priceTop = rangeLow + (priceStep * (i + 1))
+                priceBot = rangeLow + (priceStep * i)
+                
+                intensity = count / maxCount
+                heatColor = color.from_gradient(intensity, 0, 1, color.new(#0066FF, 92), color.new(#FF0066, 70))
+                
+                box.new(bar_index - 35, priceTop, bar_index - 30, priceBot, border_color=heatColor, bgcolor=heatColor, border_width=1)
+
+// ────────────────────────────────────────────────────────────────────────────────
+// HARMONIC PATTERN DETECTION
+// ────────────────────────────────────────────────────────────────────────────────
+pivotHigh = ta.pivothigh(high, 5, 5)
+pivotLow = ta.pivotlow(low, 5, 5)
+
+if not na(pivotHigh) and barstate.islast
+    // Check if pivot aligns with Fibonacci level
+    for i = 0 to array.size(fib1) - 1
+        fibPrice = array.get(fib1, i)
+        if math.abs(pivotHigh - fibPrice) / pivotHigh * 100 < 0.5
+            label.new(bar_index - 5, pivotHigh, "HARMONIC HIGH", style=label.style_label_down, color=color.new(#FF00FF, 40), textcolor=color.white, size=size.small)
+            break
+
+if not na(pivotLow) and barstate.islast
+    // Check if pivot aligns with Fibonacci level
+    for i = 0 to array.size(fib1) - 1
+        fibPrice = array.get(fib1, i)
+        if math.abs(pivotLow - fibPrice) / pivotLow * 100 < 0.5
+            label.new(bar_index - 5, pivotLow, "HARMONIC LOW", style=label.style_label_up, color=color.new(#00FFFF, 40), textcolor=color.white, size=size.small)
+            break
+
+// ────────────────────────────────────────────────────────────────────────────────
+// LIQUIDITY SWEEPS WITH DASHED LINES
+// ────────────────────────────────────────────────────────────────────────────────
+var float prevSwingHigh = na
+var float prevSwingLow = na
+var int lastSweepBar = 0
+
+if showLiquiditySweeps
+    swingHighCurrent = ta.highest(high, 20)
+    swingLowCurrent = ta.lowest(low, 20)
+    
+    // Detect liquidity sweep (price breaks previous high but closes below)
+    if not na(prevSwingHigh) and high > prevSwingHigh and close < prevSwingHigh and bar_index > lastSweepBar + 10
+        if barstate.islast
+            // Draw dashed line from sweep point
+            line.new(bar_index - 1, prevSwingHigh, bar_index + 5, prevSwingHigh, color=color.new(#FF6B6B, 50), width=1, style=line.style_dashed)
+            label.new(bar_index, high, "LIQ SWEEP", style=label.style_label_down, color=color.new(#FF6B6B, 30), textcolor=color.white, size=size.small, yloc=yloc.abovebar)
+        lastSweepBar := bar_index
+    
+    // Detect liquidity sweep low (price breaks previous low but closes above)
+    if not na(prevSwingLow) and low < prevSwingLow and close > prevSwingLow and bar_index > lastSweepBar + 10
+        if barstate.islast
+            // Draw dashed line from sweep point
+            line.new(bar_index - 1, prevSwingLow, bar_index + 5, prevSwingLow, color=color.new(#6BFF6B, 50), width=1, style=line.style_dashed)
+            label.new(bar_index, low, "LIQ SWEEP", style=label.style_label_up, color=color.new(#6BFF6B, 30), textcolor=color.white, size=size.small, yloc=yloc.belowbar)
+        lastSweepBar := bar_index
+    
+    prevSwingHigh := swingHighCurrent
+    prevSwingLow := swingLowCurrent
+
+// ────────────────────────────────────────────────────────────────────────────────
+// EQUILIBRIUM BOXES (EQH/EQL)
+// ────────────────────────────────────────────────────────────────────────────────
+var line[] eqLines = array.new_line()
+var box[] eqBoxes = array.new_box()
+var label[] eqLabels = array.new_label()
+
+if showEquilibrium and barstate.islast
+    // Clear old equilibrium drawings
+    for l in eqLines
+        line.delete(l)
+    for b in eqBoxes
+        box.delete(b)
+    for lab in eqLabels
+        label.delete(lab)
+    array.clear(eqLines)
+    array.clear(eqBoxes)
+    array.clear(eqLabels)
+    
+    // Find equilibrium zones (50% retracement areas) throughout chart
+    lookback = 100
+    eqCount = 0
+    for i = 20 to lookback by 12
+        if i < bar_index and eqCount < 8
+            rangeHigh = ta.highest(high[i], 15)
+            rangeLow = ta.lowest(low[i], 15)
+            eqLevel = (rangeHigh + rangeLow) / 2
+            rangeSize = rangeHigh - rangeLow
+            
+            // Only draw significant equilibrium zones
+            if rangeSize > close * 0.008
+                boxTop = eqLevel + (rangeSize * 0.06)
+                boxBot = eqLevel - (rangeSize * 0.06)
+                
+                // Draw equilibrium box with gradient grey
+                eqBox = box.new(bar_index - i - 5, boxTop, bar_index - i + 15, boxBot, border_color=color.new(#707070, 50), bgcolor=color.new(#505050, 88), border_width=1)
+                array.push(eqBoxes, eqBox)
+                
+                // Draw dashed line through middle
+                eqLine = line.new(bar_index - i - 5, eqLevel, bar_index - i + 15, eqLevel, color=color.new(#909090, 30), width=1, style=line.style_dashed)
+                array.push(eqLines, eqLine)
+                
+                // Add EQH label with gradient background
+                eqLabel = label.new(bar_index - i + 5, eqLevel, "EQH", style=label.style_label_center, color=color.new(#606060, 40), textcolor=color.new(#E0E0E0, 0), size=size.tiny)
+                array.push(eqLabels, eqLabel)
+                
+                eqCount += 1
+
+// ────────────────────────────────────────────────────────────────────────────────
+// CONFLUENCE SIGNALS
+// ────────────────────────────────────────────────────────────────────────────────
+var bool signalActive = false
+var int signalBar = 0
+
+if array.size(confluenceZones) > 0
+    for zone in confluenceZones
+        distToZone = math.abs(close - zone.price) / close * 100
+        if distToZone < 0.3 and zone.count >= 4 and not signalActive
+            signalActive := true
+            signalBar := bar_index
+            
+            isAbove = close > zone.price
+            signalLabel = isAbove ? "RESISTANCE CONFLUENCE" : "SUPPORT CONFLUENCE"
+            signalColor = isAbove ? color.new(#FF0000, 20) : color.new(#00FF00, 20)
+            signalStyle = isAbove ? label.style_label_down : label.style_label_up
+            
+            label.new(bar_index, isAbove ? high : low, signalLabel, style=signalStyle, color=signalColor, textcolor=color.white, size=size.normal, yloc=isAbove ? yloc.abovebar : yloc.belowbar)
+            break
+
+if signalActive and bar_index > signalBar + 5
+    signalActive := false
+
+// ────────────────────────────────────────────────────────────────────────────────
+// ENHANCED DASHBOARD
+// ────────────────────────────────────────────────────────────────────────────────
+if barstate.islast
+    var table dashboard = table.new(position.top_right, 2, 8, bgcolor=color.new(#0a0a0a, 5), border_width=3, border_color=color.new(#ffd700, 40))
+    
+    table.cell(dashboard, 0, 0, "HARMONIC RESONANCE DETECTOR", text_color=color.new(#ffd700, 0), text_size=size.normal, bgcolor=color.new(#1a1a2e, 20))
+    table.merge_cells(dashboard, 0, 0, 1, 0)
+    
+    table.cell(dashboard, 0, 1, "Active Zones", text_color=color.new(#a0a0a0, 0), text_size=size.small, bgcolor=color.new(#1a1a2e, 40))
+    zoneCount = str.tostring(array.size(confluenceZones))
+    zoneColor = array.size(confluenceZones) > 3 ? color.new(#ff0000, 0) : array.size(confluenceZones) > 1 ? color.new(#ffd700, 0) : color.gray
+    table.cell(dashboard, 1, 1, zoneCount, text_color=zoneColor, text_size=size.small, bgcolor=color.new(#1a1a2e, 40))
+    
+    table.cell(dashboard, 0, 2, "Peak Confluence", text_color=color.new(#a0a0a0, 0), text_size=size.small, bgcolor=color.new(#1a1a2e, 40))
+    maxConf = 0
+    if array.size(confluenceZones) > 0
+        for zone in confluenceZones
+            if zone.count > maxConf
+                maxConf := zone.count
+    confText = str.tostring(maxConf) + "x"
+    confColor = maxConf >= 5 ? COLOR_CONFLUENCE_EXTREME : maxConf >= 4 ? COLOR_CONFLUENCE_HIGH : maxConf >= 3 ? COLOR_CONFLUENCE_MED : COLOR_CONFLUENCE_LOW
+    table.cell(dashboard, 1, 2, confText, text_color=confColor, text_size=size.small, bgcolor=color.new(#1a1a2e, 40))
+    
+    table.cell(dashboard, 0, 3, "Nearest Zone", text_color=color.new(#a0a0a0, 0), text_size=size.small, bgcolor=color.new(#1a1a2e, 40))
+    nearestDist = 999999.0
+    nearestConf = 0
+    if array.size(confluenceZones) > 0
+        for zone in confluenceZones
+            dist = math.abs(close - zone.price) / close * 100
+            if dist < nearestDist
+                nearestDist := dist
+                nearestConf := zone.count
+    distText = nearestDist < 999999 ? str.tostring(nearestDist, "#.##") + "%" : "N/A"
+    distColor = nearestDist < 0.5 ? color.new(#ff0000, 0) : nearestDist < 1.0 ? color.new(#ffd700, 0) : color.gray
+    table.cell(dashboard, 1, 3, distText, text_color=distColor, text_size=size.small, bgcolor=color.new(#1a1a2e, 40))
+    
+    table.cell(dashboard, 0, 4, "Magnetic Pull", text_color=color.new(#a0a0a0, 0), text_size=size.small, bgcolor=color.new(#1a1a2e, 40))
+    magneticStrength = nearestDist < 0.5 and nearestConf >= 4 ? "EXTREME" : nearestDist < 1.0 and nearestConf >= 3 ? "STRONG" : nearestDist < 2.0 ? "MODERATE" : "WEAK"
+    magneticColor = magneticStrength == "EXTREME" ? COLOR_CONFLUENCE_EXTREME : magneticStrength == "STRONG" ? COLOR_CONFLUENCE_HIGH : magneticStrength == "MODERATE" ? COLOR_CONFLUENCE_MED : color.gray
+    table.cell(dashboard, 1, 4, magneticStrength, text_color=magneticColor, text_size=size.small, bgcolor=color.new(#1a1a2e, 40))
+    
+    table.cell(dashboard, 0, 5, "Golden Zone", text_color=color.new(#a0a0a0, 0), text_size=size.small, bgcolor=color.new(#1a1a2e, 40))
+    inGolden = false
+    if array.size(fib1) >= 4
+        fib618 = array.get(fib1, 3)
+        fib65 = fib618 * 1.052
+        inGolden := close >= math.min(fib618, fib65) and close <= math.max(fib618, fib65)
+    goldenText = inGolden ? "ACTIVE" : "INACTIVE"
+    goldenColor = inGolden ? color.new(#ffd700, 0) : color.gray
+    table.cell(dashboard, 1, 5, goldenText, text_color=goldenColor, text_size=size.small, bgcolor=color.new(#1a1a2e, 40))
+    
+    table.cell(dashboard, 0, 6, "Heatmap Density", text_color=color.new(#a0a0a0, 0), text_size=size.small, bgcolor=color.new(#1a1a2e, 40))
+    totalFibs = array.size(fib1) + array.size(fib2) + array.size(fib3)
+    densityText = str.tostring(totalFibs) + " Levels"
+    table.cell(dashboard, 1, 6, densityText, text_color=color.new(#00d4ff, 0), text_size=size.small, bgcolor=color.new(#1a1a2e, 40))
+    
+    table.cell(dashboard, 0, 7, "Trade Signal", text_color=color.new(#a0a0a0, 0), text_size=size.small, bgcolor=color.new(#1a1a2e, 40))
+    signal = nearestDist < 0.5 and maxConf >= 4 ? "SNIPER ENTRY" : nearestDist < 1.0 and maxConf >= 3 ? "VALID SETUP" : "WAIT"
+    signalColor = signal == "SNIPER ENTRY" ? color.new(#00ff00, 0) : signal == "VALID SETUP" ? color.new(#ffd700, 0) : color.gray
+    table.cell(dashboard, 1, 7, signal, text_color=signalColor, text_size=size.small, bgcolor=color.new(#1a1a2e, 40))
+
+// ────────────────────────────────────────────────────────────────────────────────
+// ALERTS
+// ────────────────────────────────────────────────────────────────────────────────
+nearConfluence = false
+if array.size(confluenceZones) > 0
+    for zone in confluenceZones
+        if math.abs(close - zone.price) / close * 100 < 0.5 and zone.count >= 3
+            nearConfluence := true
+            break
+
+alertcondition(nearConfluence, "Near Confluence", "Price approaching high confluence zone")

@@ -1,0 +1,259 @@
+// ─────────────────────────────────────────────────────────────────────────────
+// DAILY BIAS — Clean & Minimal (v7)
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// Each daily value is pulled with its OWN request.security() call.
+// The [1] and [2] shifts are INSIDE the security call so they reference
+// actual daily bars, not chart bars. This works on any chart timeframe.
+//
+// lookahead = barmerge.lookahead_on with [N] is the standard method to
+// get a confirmed historical bar from a higher timeframe without repainting.
+//
+// Works on any asset: futures, stocks, crypto, forex.
+// ─────────────────────────────────────────────────────────────────────────────
+
+//@version=6
+indicator("Daily Bias", overlay = true, max_labels_count = 500)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// INPUTS
+// ─────────────────────────────────────────────────────────────────────────────
+
+biasTF   = input.timeframe("D", "Bias Timeframe",
+             tooltip = "Timeframe for bias calculation. D = Daily, W = Weekly, 240 = 4H, etc.")
+showCount = input.int(5, "Number of Bias Markers", minval = 1, maxval = 365,
+             tooltip = "How many bias markers to show on the chart.")
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PULL EACH VALUE INDIVIDUALLY FROM THE BIAS TIMEFRAME
+// ─────────────────────────────────────────────────────────────────────────────
+// Yesterday = [1] inside security with lookahead_on  (the SIGNAL candle)
+// Day before yesterday = [2] inside security with lookahead_on  (the REFERENCE range)
+//
+// Each call explicitly shifts on the BIAS TIMEFRAME's bars.
+// This is 6 security calls but it's the most reliable method.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// SIGNAL candle: the last COMPLETED bar on the bias TF (yesterday if daily)
+sigHigh  = request.security(syminfo.tickerid, biasTF, high[1],  lookahead = barmerge.lookahead_on)
+sigLow   = request.security(syminfo.tickerid, biasTF, low[1],   lookahead = barmerge.lookahead_on)
+sigClose = request.security(syminfo.tickerid, biasTF, close[1], lookahead = barmerge.lookahead_on)
+
+// REFERENCE range: two completed bars back on the bias TF (day before yesterday)
+refHigh = request.security(syminfo.tickerid, biasTF, high[2], lookahead = barmerge.lookahead_on)
+refLow  = request.security(syminfo.tickerid, biasTF, low[2],  lookahead = barmerge.lookahead_on)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// DEBUG: Uncomment these plots to verify the values are correct.
+// On a 1-min chart they should show flat daily levels that step once per day.
+// ─────────────────────────────────────────────────────────────────────────────
+// plot(sigHigh,  "sigHigh",  color.blue)
+// plot(sigLow,   "sigLow",   color.blue)
+// plot(sigClose, "sigClose", color.orange)
+// plot(refHigh,  "refHigh",  color.green)
+// plot(refLow,   "refLow",   color.red)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// BIAS LOGIC
+// ─────────────────────────────────────────────────────────────────────────────
+// Compare the SIGNAL candle (yesterday) to the REFERENCE range
+// (day before yesterday's high and low).
+// Result = TODAY's bias.
+// ─────────────────────────────────────────────────────────────────────────────
+
+closedAboveRef = sigClose > refHigh
+closedBelowRef = sigClose < refLow
+closedInRange  = sigClose <= refHigh and sigClose >= refLow
+wickedAboveRef = sigHigh  > refHigh
+wickedBelowRef = sigLow   < refLow
+
+// ─── BULLISH ───
+bullCont   = closedAboveRef and not wickedBelowRef
+bullOutRev = closedAboveRef and wickedBelowRef
+bullWIC    = wickedBelowRef and closedInRange and not wickedAboveRef
+isBullish  = bullCont or bullOutRev or bullWIC
+
+// ─── BEARISH ───
+bearCont   = closedBelowRef and not wickedAboveRef
+bearOutRev = closedBelowRef and wickedAboveRef
+bearWIC    = wickedAboveRef and closedInRange and not wickedBelowRef
+isBearish  = bearCont or bearOutRev or bearWIC
+
+// ─── NEUTRAL ───
+neutInside    = not wickedAboveRef and not wickedBelowRef
+neutDoubleWIC = wickedAboveRef and wickedBelowRef and closedInRange
+isNeutral     = neutInside or neutDoubleWIC
+
+// ─────────────────────────────────────────────────────────────────────────────
+// TOOLTIP DETAIL
+// ─────────────────────────────────────────────────────────────────────────────
+
+bullDetail = bullOutRev ? "Outside reversal up"
+           : bullWIC   ? "WIC below — fade the wick"
+           :              "Closed above previous high"
+
+bearDetail = bearOutRev ? "Outside reversal down"
+           : bearWIC   ? "WIC above — fade the wick"
+           :              "Closed below previous low"
+
+neutDetail = neutDoubleWIC ? "Double WIC — both sides"
+           :                  "Inside bar"
+
+// ─────────────────────────────────────────────────────────────────────────────
+// BADGE TITLE (dynamic based on timeframe)
+// ─────────────────────────────────────────────────────────────────────────────
+
+tfLabel = switch biasTF
+    "1"   => "1 MIN"
+    "3"   => "3 MIN"
+    "5"   => "5 MIN"
+    "15"  => "15 MIN"
+    "30"  => "30 MIN"
+    "45"  => "45 MIN"
+    "60"  => "1H"
+    "120" => "2H"
+    "180" => "3H"
+    "240" => "4H"
+    "D"   => "DAILY"
+    "W"   => "WEEKLY"
+    "M"   => "MONTHLY"
+    => biasTF
+
+badgeTitle = tfLabel + " BIAS"
+
+// ─────────────────────────────────────────────────────────────────────────────
+// MARKER PLACEMENT — one per bias period, limited to showCount
+// ─────────────────────────────────────────────────────────────────────────────
+// Detect when a new bias-timeframe period starts on the chart.
+// Count periods from the left, then compare to total to get distance
+// from the right edge.
+// ─────────────────────────────────────────────────────────────────────────────
+
+newPeriod = ta.change(time(biasTF)) != 0
+
+var int pNum = 0
+if newPeriod
+    pNum += 1
+
+// Count total periods across the entire chart
+var int lastPNum = 0
+if newPeriod
+    lastPNum := pNum
+
+// On the last bar, lastPNum = total number of periods
+// But we need this value available on all bars. We use a workaround:
+// after the chart loads, last_bar_index is known, so we check proximity.
+// 
+// Simpler approach: count periods from the RIGHT by using bar_index math.
+// We know the last bar's pNum. For any bar, (lastPNum - pNum) gives
+// periods from the end. But lastPNum is only final on the last bar.
+//
+// SOLUTION: Since we can't look ahead, we delete old labels.
+// We create labels on every new period and maintain only the last N.
+
+var label[] bullLabels = array.new<label>()
+var label[] bearLabels = array.new<label>()
+var label[] neutLabels = array.new<label>()
+
+if newPeriod and isBullish
+    lbl = label.new(bar_index, low, "▲",
+         style     = label.style_label_up,
+         color     = color.new(color.green, 60),
+         textcolor = color.green,
+         size      = size.small,
+         tooltip   = badgeTitle + ": BULLISH\n" + bullDetail)
+    array.push(bullLabels, lbl)
+
+if newPeriod and isBearish
+    lbl = label.new(bar_index, high, "▼",
+         style     = label.style_label_down,
+         color     = color.new(color.red, 60),
+         textcolor = color.red,
+         size      = size.small,
+         tooltip   = badgeTitle + ": BEARISH\n" + bearDetail)
+    array.push(bearLabels, lbl)
+
+if newPeriod and isNeutral
+    lbl = label.new(bar_index, low, "●",
+         style     = label.style_label_up,
+         color     = color.new(color.gray, 70),
+         textcolor = color.gray,
+         size      = size.tiny,
+         tooltip   = badgeTitle + ": NEUTRAL\n" + neutDetail)
+    array.push(neutLabels, lbl)
+
+// Trim each array to keep only the most recent markers.
+// Total labels across all three arrays should not exceed showCount.
+// We use a single combined tracking approach.
+
+var label[] allLabels = array.new<label>()
+
+if newPeriod
+    // Add whichever label was just created
+    if isBullish and array.size(bullLabels) > 0
+        array.push(allLabels, array.get(bullLabels, array.size(bullLabels) - 1))
+    else if isBearish and array.size(bearLabels) > 0
+        array.push(allLabels, array.get(bearLabels, array.size(bearLabels) - 1))
+    else if isNeutral and array.size(neutLabels) > 0
+        array.push(allLabels, array.get(neutLabels, array.size(neutLabels) - 1))
+
+    // If we have more than showCount labels, delete the oldest
+    while array.size(allLabels) > showCount
+        oldLabel = array.shift(allLabels)
+        label.delete(oldLabel)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// STATUS BADGE (top-right corner)
+// ─────────────────────────────────────────────────────────────────────────────
+// Shows the bias based on the selected timeframe, NOT the chart timeframe.
+// This never changes when you switch chart timeframes — it always reads
+// from the bias timeframe you selected in settings.
+// ─────────────────────────────────────────────────────────────────────────────
+
+badgeText  = isBullish ? "🟢 BULLISH" : isBearish ? "🔴 BEARISH" : "⚪ NEUTRAL"
+badgeColor = isBullish ? color.green   : isBearish ? color.red    : color.gray
+
+if barstate.islast
+    var tbl = table.new(position.top_right, 1, 2,
+                 bgcolor = color.new(#131722, 10),
+                 border_width = 0)
+
+    table.cell(tbl, 0, 0, badgeTitle,
+         text_color = color.new(color.white, 40),
+         text_size  = size.tiny)
+
+    table.cell(tbl, 0, 1, badgeText,
+         text_color = badgeColor,
+         text_size  = size.normal)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ALERT CONDITIONS
+// ─────────────────────────────────────────────────────────────────────────────
+// Same isBullish / isBearish / isNeutral as the badge.
+// The data comes from request.security on the bias timeframe,
+// so it's correct regardless of chart timeframe.
+//
+// Set alert trigger to "Once Per Bar Close" for clean notifications.
+// ─────────────────────────────────────────────────────────────────────────────
+
+alertcondition(
+     isBullish,
+     title = "Bullish Bias",
+     message = "🟢 BULLISH BIAS — {{ticker}} bias is bullish. Look for long setups."
+     )
+
+alertcondition(
+     isBearish,
+     title = "Bearish Bias",
+     message = "🔴 BEARISH BIAS — {{ticker}} bias is bearish. Look for short setups."
+     )
+
+alertcondition(
+     isNeutral,
+     title = "Neutral Bias",
+     message = "⚪ NEUTRAL BIAS — {{ticker}} shows no clear directional bias."
+     )
+
+// ─────────────────────────────────────────────────────────────────────────────
+// END
+// ─────────────────────────────────────────────────────────────────────────────

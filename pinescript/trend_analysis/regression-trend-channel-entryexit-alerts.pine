@@ -1,0 +1,271 @@
+//@version=6
+indicator("Regression Channel Entry/Exit Alerts", overlay = true, max_lines_count = 500, max_labels_count = 500)               
+
+// ==================== LINEAR REGRESSION SETTINGS ====================
+lengthInput = input.int(100,      "LinReg Length", minval = 1, maxval = 5000)
+sourceInput = input.source(close, "LinReg Source")
+
+group1 = "Channel Settings"
+useUpperDevInput = input.bool(true, "Upper Deviation",             inline = "Upper Deviation", group = group1)
+upperMultInput   = input.float(2.0, "", active = useUpperDevInput, inline = "Upper Deviation", group = group1)
+useLowerDevInput = input.bool(true, "Lower Deviation",             inline = "Lower Deviation", group = group1)
+lowerMultInput   = input.float(2.0, "", active = useLowerDevInput, inline = "Lower Deviation", group = group1)
+
+group2 = "Display Settings"
+showPearsonInput = input.bool(true,  "Show Pearson's R",   group = group2)
+extendLeftInput  = input.bool(false, "Extend Lines Left",  group = group2)
+extendRightInput = input.bool(true,  "Extend Lines Right", group = group2)
+
+extendStyle = switch
+    extendLeftInput and extendRightInput => extend.both
+    extendLeftInput => extend.left
+    extendRightInput => extend.right
+    => extend.none
+
+group3 = "Color Settings"
+colorUpper = input.color(color.new(color.blue, 85), "", inline = group3, group = group3)
+colorLower = input.color(color.new(color.red,  85), "", inline = group3, group = group3)
+
+// ==================== CHANNEL ALERT SETTINGS ====================
+alert_group = "Channel Alert Settings"
+alert_channel_entry = input.bool(true, "Alert when price re-enters channel?", group=alert_group)
+alert_channel_exit = input.bool(true, "Alert when price exits channel?", group=alert_group)
+lookback_period = input.int(5, "Lookback period for channel entry/exit", minval=1, maxval=20, group=alert_group)
+
+// ==================== LINEAR REGRESSION CALCULATIONS ====================
+calcSlope(source, length) =>
+    if length <= 1
+        [float(na), float(na), float(na)]
+    else
+        sumX = 0.0
+        sumY = 0.0
+        sumXSqr = 0.0
+        sumXY = 0.0
+        for idx = 0 to length - 1 by 1
+            val = source[idx]
+            per = idx + 1.0
+            sumX += per
+            sumY += val
+            sumXSqr += per * per
+            sumXY += val * per
+        slope = (length * sumXY - sumX * sumY) / (length * sumXSqr - sumX * sumX)
+        average = sumY / length
+        intercept = average - slope * sumX / length + slope
+        [slope, average, intercept]
+        
+calcDev(source, length, slope, average, intercept) =>
+    upDev = 0.0
+    dnDev = 0.0
+    stdDevAcc = 0.0
+    dsxx = 0.0
+    dsyy = 0.0
+    dsxy = 0.0
+    calc_periods = length - 1
+    daY = intercept + slope * calc_periods / 2
+    val = intercept
+    for j = 0 to calc_periods by 1
+        price = high[j] - val
+        if price > upDev
+            upDev := price
+        price := val - low[j]
+        if price > dnDev
+            dnDev := price
+        price := source[j]
+        dxt = price - average
+        dyt = val - daY
+        price -= val
+        stdDevAcc += price * price
+        dsxx += dxt * dxt
+        dsyy += dyt * dyt
+        dsxy += dxt * dyt
+        val += slope
+    stdDev = math.sqrt(stdDevAcc / (calc_periods == 0 ? 1 : calc_periods))
+    pearsonR = dsxx == 0 or dsyy == 0 ? 0 : dsxy / math.sqrt(dsxx * dsyy)
+    [stdDev, pearsonR, upDev, dnDev]
+
+// Store historical channel values for accurate lookback
+var float[] upper_history = array.new_float(0)
+var float[] lower_history = array.new_float(0)
+var float[] base_history = array.new_float(0)
+var float[] trend_history = array.new_float(0)
+
+// Calculate current regression values
+[s, a, i_val] = calcSlope(sourceInput, lengthInput)
+startPrice = i_val + s * (lengthInput - 1)
+endPrice = i_val
+
+// Calculate deviations
+[stdDev, pearsonR, upDev, dnDev] = calcDev(sourceInput, lengthInput, s, a, i_val)
+
+// Calculate channel boundaries for current bar
+current_upper = endPrice + (useUpperDevInput ? upperMultInput * stdDev : upDev)
+current_lower = endPrice + (useLowerDevInput ? -lowerMultInput * stdDev : -dnDev)
+current_base = endPrice
+
+// Store current values in history arrays
+array.unshift(upper_history, current_upper)
+array.unshift(lower_history, current_lower)
+array.unshift(base_history, current_base)
+array.unshift(trend_history, math.sign(endPrice - startPrice))
+
+// Keep arrays at reasonable size
+if array.size(upper_history) > math.max(lookback_period + 5, 50)
+    array.pop(upper_history)
+if array.size(lower_history) > math.max(lookback_period + 5, 50)
+    array.pop(lower_history)
+if array.size(base_history) > math.max(lookback_period + 5, 50)
+    array.pop(base_history)
+if array.size(trend_history) > math.max(lookback_period + 5, 50)
+    array.pop(trend_history)
+
+// ==================== CHANNEL ENTRY/EXIT DETECTION ====================
+// Current price position relative to channel
+price_in_channel = low <= current_upper and high >= current_lower
+price_above_channel = low > current_upper
+price_below_channel = high < current_lower
+
+// Track if price was outside channel in lookback period
+var bool was_outside_channel = false
+var bool was_inside_channel = false
+
+// Check last 'lookback_period' bars using actual historical values
+if array.size(upper_history) >= lookback_period + 1
+    was_outside = true
+    for i = 1 to lookback_period
+        hist_upper = array.get(upper_history, i)
+        hist_lower = array.get(lower_history, i)
+        hist_low = low[i]
+        hist_high = high[i]
+        
+        // Check if price was inside channel at this historical bar
+        if hist_low <= hist_upper and hist_high >= hist_lower
+            was_outside := false
+            break
+    
+    was_outside_channel := was_outside
+else
+    was_outside_channel := false
+
+// Check if price was inside channel in previous bar (using actual historical values)
+if array.size(upper_history) >= 2
+    prev_upper = array.get(upper_history, 1)
+    prev_lower = array.get(lower_history, 1)
+    prev_low = low[1]
+    prev_high = high[1]
+    was_inside_channel := prev_low <= prev_upper and prev_high >= prev_lower
+else
+    was_inside_channel := price_in_channel
+
+// Detect channel entry (price was outside and now enters)
+channel_entry = false
+channel_entry_direction = 0  // 1 = from below, -1 = from above
+
+if was_outside_channel and price_in_channel
+    channel_entry := true
+    // Determine entry direction based on where price came from
+    if price_below_channel
+        channel_entry_direction := 1   // Entering from below (bullish)
+    else if price_above_channel
+        channel_entry_direction := -1  // Entering from above (bearish)
+
+// Detect channel exit (price was inside and now exits)
+channel_exit = false
+channel_exit_direction = 0  // 1 = above, -1 = below
+
+if was_inside_channel and not price_in_channel
+    channel_exit := true
+    if price_above_channel
+        channel_exit_direction := 1    // Exiting above (bearish)
+    else if price_below_channel
+        channel_exit_direction := -1   // Exiting below (bullish)
+
+// ==================== TREND DETERMINATION ====================
+// Get current trend
+current_trend = array.size(trend_history) > 0 ? array.get(trend_history, 0) : 0
+
+// Alert conditions with confirmation
+alert_entry_buy = false
+alert_entry_sell = false
+alert_exit_buy = false
+alert_exit_sell = false
+
+// Generate alerts based on trend and channel position
+if channel_entry and alert_channel_entry
+    if channel_entry_direction == 1  // Entering from below
+        alert_entry_buy := true
+    else if channel_entry_direction == -1  // Entering from above
+        alert_entry_sell := true
+
+if channel_exit and alert_channel_exit
+    if channel_exit_direction == -1  // Exiting below
+        alert_exit_buy := true
+    else if channel_exit_direction == 1  // Exiting above
+        alert_exit_sell := true
+
+// ==================== CREATE ALERTS ====================
+// Channel entry/exit alerts with more accurate conditions
+alertcondition(alert_entry_buy, 
+              title='Buy Signal - Price Enters Channel from Below', 
+              message='Price has re-entered the regression channel from below - BUY signal')
+
+alertcondition(alert_entry_sell, 
+              title='Sell Signal - Price Enters Channel from Above', 
+              message='Price has re-entered the regression channel from above - SELL signal')
+
+alertcondition(alert_exit_buy, 
+              title='Buy Signal - Price Exits Channel Below', 
+              message='Price has exited the regression channel to the downside - BUY signal')
+
+alertcondition(alert_exit_sell, 
+              title='Sell Signal - Price Exits Channel Above', 
+              message='Price has exited the regression channel to the upside - SELL signal')
+
+// ==================== VISUAL INDICATORS ====================
+// Create regression lines
+var line baseLine = na
+if na(baseLine) and not na(startPrice)
+    baseLine := line.new(bar_index - lengthInput + 1, startPrice, bar_index, endPrice, width=1, extend=extendStyle, color=color.new(colorLower, 0))
+else if not na(startPrice)
+    line.set_xy1(baseLine, bar_index - lengthInput + 1, startPrice)
+    line.set_xy2(baseLine, bar_index, endPrice)
+
+// Calculate upper and lower channel prices for lines
+upperStartPrice = startPrice + (useUpperDevInput ? upperMultInput * stdDev : upDev)
+upperEndPrice = endPrice + (useUpperDevInput ? upperMultInput * stdDev : upDev)
+lowerStartPrice = startPrice + (useLowerDevInput ? -lowerMultInput * stdDev : -dnDev)
+lowerEndPrice = endPrice + (useLowerDevInput ? -lowerMultInput * stdDev : -dnDev)
+
+var line upper = na
+if na(upper) and not na(startPrice)
+    upper := line.new(bar_index - lengthInput + 1, upperStartPrice, bar_index, upperEndPrice, width=1, extend=extendStyle, color=color.new(colorUpper, 0))
+else if not na(startPrice)
+    line.set_xy1(upper, bar_index - lengthInput + 1, upperStartPrice)
+    line.set_xy2(upper, bar_index, upperEndPrice)
+
+var line lower = na
+if na(lower) and not na(startPrice)
+    lower := line.new(bar_index - lengthInput + 1, lowerStartPrice, bar_index, lowerEndPrice, width=1, extend=extendStyle, color=color.new(colorUpper, 0))
+else if not na(startPrice)
+    line.set_xy1(lower, bar_index - lengthInput + 1, lowerStartPrice)
+    line.set_xy2(lower, bar_index, lowerEndPrice)
+
+// Create fills for regression channel
+if not na(upper) and not na(baseLine)
+    linefill.new(upper, baseLine, color = colorUpper)
+if not na(baseLine) and not na(lower)
+    linefill.new(baseLine, lower, color = colorLower)
+
+// Display signals
+plotshape(alert_entry_buy, style=shape.triangleup, location=location.belowbar, color=color.green, size=size.small, title="Entry Buy")
+plotshape(alert_entry_sell, style=shape.triangledown, location=location.abovebar, color=color.red, size=size.small, title="Entry Sell")
+plotshape(alert_exit_buy, style=shape.circle, location=location.belowbar, color=color.blue, size=size.small, title="Exit Buy")
+plotshape(alert_exit_sell, style=shape.circle, location=location.abovebar, color=color.orange, size=size.small, title="Exit Sell")
+
+// Pearson's R label
+var label r = na
+if showPearsonInput and not na(pearsonR) and barstate.islast
+    label.delete(r)
+    trend_text = current_trend > 0 ? "UPTREND" : current_trend < 0 ? "DOWNTREND" : "NEUTRAL"
+    r := label.new(bar_index, high, color=color.new(color.white, 100), textcolor=color.white, style=label.style_label_left, 
+          text="Pearson's R: " + str.tostring(pearsonR, "#.##") + "\nTrend: " + trend_text,
+          yloc=yloc.price, size=size.normal)

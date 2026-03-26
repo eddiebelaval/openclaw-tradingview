@@ -1,0 +1,674 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © officialjackofalltrades
+//@version=6
+indicator("Signal Qualification Engine [JOAT]", shorttitle="SQE [JOAT]", overlay=true, max_bars_back=500, max_lines_count=100, max_labels_count=100)
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// SIGNAL QUALIFICATION ENGINE
+// Quantitative Trading Systems - Multi-Layer Signal Filtering & Qualification
+// Purpose: Generate high-quality trade signals through multi-factor confluence
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+//───────────────────────────────────────────────────────────────────────────────
+// CONFIGURATION
+//───────────────────────────────────────────────────────────────────────────────
+
+g_trend = "═══════════ Trend Filter ═══════════"
+int     i_trend_fast    = input.int(21, "Fast Trend MA", minval=5, maxval=50, group=g_trend)
+int     i_trend_slow    = input.int(55, "Slow Trend MA", minval=20, maxval=200, group=g_trend)
+int     i_adx_len       = input.int(14, "ADX Period", minval=5, maxval=30, group=g_trend)
+float   i_adx_thresh    = input.float(20, "ADX Threshold", minval=10, maxval=40, group=g_trend)
+
+g_momentum = "═══════════ Momentum Filter ═══════════"
+int     i_rsi_len       = input.int(14, "RSI Period", minval=5, maxval=30, group=g_momentum)
+float   i_rsi_ob        = input.float(70, "RSI Overbought", minval=60, maxval=90, group=g_momentum)
+float   i_rsi_os        = input.float(30, "RSI Oversold", minval=10, maxval=40, group=g_momentum)
+int     i_stoch_k       = input.int(14, "Stochastic K", minval=5, maxval=30, group=g_momentum)
+int     i_stoch_d       = input.int(3, "Stochastic D", minval=1, maxval=10, group=g_momentum)
+
+g_vol = "═══════════ Volume Filter ═══════════"
+int     i_vol_len       = input.int(20, "Volume MA Period", minval=5, maxval=50, group=g_vol)
+float   i_vol_mult      = input.float(1.2, "Volume Multiplier", minval=1.0, maxval=3.0, step=0.1, group=g_vol)
+bool    i_use_vol       = input.bool(true, "Require Volume Confirmation", group=g_vol)
+
+g_structure = "═══════════ Structure Filter ═══════════"
+int     i_swing_left    = input.int(5, "Swing Left Bars", minval=2, maxval=20, group=g_structure)
+int     i_swing_right   = input.int(2, "Swing Right Bars", minval=1, maxval=10, group=g_structure)
+bool    i_use_structure = input.bool(true, "Require Structure Confirmation", group=g_structure)
+
+g_signal = "═══════════ Signal Settings ═══════════"
+int     i_min_score     = input.int(4, "Minimum Qualification Score", minval=2, maxval=6, group=g_signal)
+int     i_cooldown      = input.int(5, "Signal Cooldown Bars", minval=1, maxval=20, group=g_signal)
+bool    i_confirm_close = input.bool(true, "Require Bar Close Confirmation", group=g_signal)
+
+g_quality = "═══════════ Quality Filters ═══════════"
+float   i_min_rr        = input.float(1.5, "Minimum R:R Ratio", minval=1.0, maxval=5.0, step=0.5, group=g_quality)
+bool    i_filter_time   = input.bool(false, "Filter by Session Time", group=g_quality)
+int     i_start_hour    = input.int(9, "Session Start Hour", minval=0, maxval=23, group=g_quality)
+int     i_end_hour      = input.int(16, "Session End Hour", minval=0, maxval=23, group=g_quality)
+
+g_visual = "═══════════ Visual Settings ═══════════"
+color   i_bull_col      = input.color(color.new(#00ff88, 0), "Bullish Signal", group=g_visual)
+color   i_bull_glow     = input.color(color.new(#00ffcc, 0), "Bull Glow", group=g_visual)
+color   i_bear_col      = input.color(color.new(#ff3366, 0), "Bearish Signal", group=g_visual)
+color   i_bear_glow     = input.color(color.new(#ff6699, 0), "Bear Glow", group=g_visual)
+color   i_zone_col      = input.color(color.new(#9966ff, 0), "Entry Zone", group=g_visual)
+color   i_premium_col   = input.color(color.new(#ffcc00, 0), "Premium Signal", group=g_visual)
+bool    i_show_zones    = input.bool(true, "Show Entry Zones", group=g_visual)
+bool    i_show_levels   = input.bool(true, "Show Stop/Target Levels", group=g_visual)
+bool    i_show_quality  = input.bool(true, "Show Quality Meter", group=g_visual)
+bool    i_show_glow     = input.bool(true, "Enable Glow Effects", group=g_visual)
+bool    i_show_dash     = input.bool(true, "Show Dashboard", group=g_visual)
+
+//───────────────────────────────────────────────────────────────────────────────
+// TREND LAYER CALCULATIONS
+//───────────────────────────────────────────────────────────────────────────────
+
+// Moving averages
+float ma_fast = ta.ema(close, i_trend_fast)
+float ma_slow = ta.ema(close, i_trend_slow)
+
+// MA relationship
+bool ma_bullish = ma_fast > ma_slow
+bool ma_bearish = ma_fast < ma_slow
+
+// Price position
+bool price_above_ma = close > ma_fast and close > ma_slow
+bool price_below_ma = close < ma_fast and close < ma_slow
+
+// ADX calculation
+f_adx(int len) =>
+    float tr_val = ta.tr(true)
+    float plus_dm = math.max(high - high[1], 0)
+    float minus_dm = math.max(low[1] - low, 0)
+    if plus_dm > minus_dm
+        minus_dm := 0
+    else
+        plus_dm := 0
+    float smooth_tr = ta.rma(tr_val, len)
+    float smooth_plus = ta.rma(plus_dm, len)
+    float smooth_minus = ta.rma(minus_dm, len)
+    float plus_di = smooth_tr > 0 ? 100 * smooth_plus / smooth_tr : 0
+    float minus_di = smooth_tr > 0 ? 100 * smooth_minus / smooth_tr : 0
+    float di_sum = plus_di + minus_di
+    float dx = di_sum > 0 ? 100 * math.abs(plus_di - minus_di) / di_sum : 0
+    float adx_val = ta.rma(dx, len)
+    [adx_val, plus_di, minus_di]
+
+[adx, plus_di, minus_di] = f_adx(i_adx_len)
+bool trend_strong = adx >= i_adx_thresh
+
+// Trend score
+int trend_score = 0
+if ma_bullish
+    trend_score += 1
+if price_above_ma
+    trend_score += 1
+if trend_strong and plus_di > minus_di
+    trend_score += 1
+    
+int trend_score_bear = 0
+if ma_bearish
+    trend_score_bear += 1
+if price_below_ma
+    trend_score_bear += 1
+if trend_strong and minus_di > plus_di
+    trend_score_bear += 1
+
+//───────────────────────────────────────────────────────────────────────────────
+// MOMENTUM LAYER CALCULATIONS
+//───────────────────────────────────────────────────────────────────────────────
+
+// RSI
+float rsi = ta.rsi(close, i_rsi_len)
+bool rsi_bullish = rsi > 50 and rsi < i_rsi_ob
+bool rsi_bearish = rsi < 50 and rsi > i_rsi_os
+bool rsi_momentum_up = rsi > rsi[3]
+bool rsi_momentum_down = rsi < rsi[3]
+
+// Stochastic
+float stoch_k = ta.stoch(close, high, low, i_stoch_k)
+float stoch_d = ta.sma(stoch_k, i_stoch_d)
+bool stoch_bullish = stoch_k > stoch_d and stoch_k < 80
+bool stoch_bearish = stoch_k < stoch_d and stoch_k > 20
+
+// Momentum score
+int momentum_score = 0
+if rsi_bullish
+    momentum_score += 1
+if rsi_momentum_up
+    momentum_score += 1
+if stoch_bullish
+    momentum_score += 1
+
+int momentum_score_bear = 0
+if rsi_bearish
+    momentum_score_bear += 1
+if rsi_momentum_down
+    momentum_score_bear += 1
+if stoch_bearish
+    momentum_score_bear += 1
+
+//───────────────────────────────────────────────────────────────────────────────
+// VOLUME LAYER CALCULATIONS
+//───────────────────────────────────────────────────────────────────────────────
+
+float vol_ma = ta.sma(volume, i_vol_len)
+bool volume_confirm = volume > vol_ma * i_vol_mult
+bool volume_above_avg = volume > vol_ma
+
+// Volume score
+int volume_score = 0
+if volume_above_avg
+    volume_score += 1
+if volume_confirm
+    volume_score += 1
+
+//───────────────────────────────────────────────────────────────────────────────
+// STRUCTURE LAYER CALCULATIONS
+//───────────────────────────────────────────────────────────────────────────────
+
+// Swing detection
+float swing_high = ta.pivothigh(high, i_swing_left, i_swing_right)
+float swing_low = ta.pivotlow(low, i_swing_left, i_swing_right)
+
+// Track recent swings
+var float last_swing_high = na
+var float last_swing_low = na
+var int last_sh_bar = 0
+var int last_sl_bar = 0
+
+if not na(swing_high)
+    last_swing_high := swing_high
+    last_sh_bar := bar_index - i_swing_right
+
+if not na(swing_low)
+    last_swing_low := swing_low
+    last_sl_bar := bar_index - i_swing_right
+
+// Structure analysis
+bool higher_high = not na(last_swing_high) and high > last_swing_high
+bool lower_low = not na(last_swing_low) and low < last_swing_low
+bool above_swing_low = close > nz(last_swing_low, low)
+bool below_swing_high = close < nz(last_swing_high, high)
+
+// Structure score
+int structure_score = 0
+int structure_score_bear = 0
+
+if i_use_structure
+    if above_swing_low
+        structure_score += 1
+    if higher_high
+        structure_score += 1
+    if below_swing_high
+        structure_score_bear += 1
+    if lower_low
+        structure_score_bear += 1
+else
+    structure_score := 1
+    structure_score_bear := 1
+
+//───────────────────────────────────────────────────────────────────────────────
+// COMPOSITE QUALIFICATION
+//───────────────────────────────────────────────────────────────────────────────
+
+// Total qualification scores
+int bull_total = trend_score + momentum_score + (i_use_vol ? volume_score : 2) + structure_score
+int bear_total = trend_score_bear + momentum_score_bear + (i_use_vol ? volume_score : 2) + structure_score_bear
+
+// Maximum possible score
+int max_score = 3 + 3 + 2 + 2  // trend + momentum + volume + structure = 10
+
+// Qualification percentage
+float bull_qual_pct = float(bull_total) / float(max_score) * 100
+float bear_qual_pct = float(bear_total) / float(max_score) * 100
+
+// Signal qualification
+bool bull_qualified = bull_total >= i_min_score
+bool bear_qualified = bear_total >= i_min_score
+
+// Premium signal detection (exceptional quality)
+bool bull_premium = bull_total >= i_min_score + 2 and trend_score >= 2 and momentum_score >= 2
+bool bear_premium = bear_total >= i_min_score + 2 and trend_score_bear >= 2 and momentum_score_bear >= 2
+
+//───────────────────────────────────────────────────────────────────────────────
+// SESSION AND TIME FILTERS
+//───────────────────────────────────────────────────────────────────────────────
+
+int current_hour = hour(time, "America/New_York")
+bool in_session = i_filter_time ? (current_hour >= i_start_hour and current_hour < i_end_hour) : true
+
+//───────────────────────────────────────────────────────────────────────────────
+// SIGNAL QUALITY SCORING
+//───────────────────────────────────────────────────────────────────────────────
+
+// Signal quality grade (A, B, C, D)
+f_calc_quality_grade(int total, int trend, int mom, int vol, int struct_score) =>
+    float grade = 0.0
+    // Base score contribution
+    grade += float(total) / 10.0 * 40  // Max 40
+    // Trend weight (most important)
+    grade += float(trend) / 3.0 * 25   // Max 25
+    // Momentum confirmation
+    grade += float(mom) / 3.0 * 20     // Max 20
+    // Volume & structure bonus
+    grade += float(vol + struct_score) / 4.0 * 15  // Max 15
+    math.min(grade, 100)
+
+float bull_quality = f_calc_quality_grade(bull_total, trend_score, momentum_score, volume_score, structure_score)
+float bear_quality = f_calc_quality_grade(bear_total, trend_score_bear, momentum_score_bear, volume_score, structure_score_bear)
+
+// Quality grade letter
+f_grade_letter(float quality) =>
+    quality >= 80 ? "A" : quality >= 60 ? "B" : quality >= 40 ? "C" : "D"
+
+string bull_grade = f_grade_letter(bull_quality)
+string bear_grade = f_grade_letter(bear_quality)
+
+//───────────────────────────────────────────────────────────────────────────────
+// SIGNAL GENERATION WITH COOLDOWN
+//───────────────────────────────────────────────────────────────────────────────
+
+var int bars_since_bull = 999
+var int bars_since_bear = 999
+
+bars_since_bull := bars_since_bull + 1
+bars_since_bear := bars_since_bear + 1
+
+// Trigger conditions - assign to global variables for consistency
+bool ma_cross_up = ta.crossover(close, ma_fast)
+bool ma_cross_down = ta.crossunder(close, ma_fast)
+bool stoch_cross_up = ta.crossover(stoch_k, stoch_d)
+bool stoch_cross_down = ta.crossunder(stoch_k, stoch_d)
+
+bool bull_trigger = ma_cross_up or (rsi_momentum_up and stoch_cross_up)
+bool bear_trigger = ma_cross_down or (rsi_momentum_down and stoch_cross_down)
+
+// Apply confirmation filter
+bool bar_confirmed = i_confirm_close ? barstate.isconfirmed : true
+
+// Final signals with session filter
+bool long_signal = bull_qualified and bull_trigger and bars_since_bull > i_cooldown and bar_confirmed and in_session
+bool short_signal = bear_qualified and bear_trigger and bars_since_bear > i_cooldown and bar_confirmed and in_session
+
+// Premium signals
+bool long_premium_signal = long_signal and bull_premium
+bool short_premium_signal = short_signal and bear_premium
+
+// Reset cooldown on signal
+if long_signal
+    bars_since_bull := 0
+
+if short_signal
+    bars_since_bear := 0
+
+//───────────────────────────────────────────────────────────────────────────────
+// STOP AND TARGET CALCULATIONS
+//───────────────────────────────────────────────────────────────────────────────
+
+float atr_val = ta.atr(14)
+
+// Dynamic stop based on structure
+float long_stop = na(last_swing_low) ? close - atr_val * 2 : math.min(last_swing_low - atr_val * 0.2, close - atr_val * 1.5)
+float short_stop = na(last_swing_high) ? close + atr_val * 2 : math.max(last_swing_high + atr_val * 0.2, close + atr_val * 1.5)
+
+// Risk calculation
+float long_risk = close - long_stop
+float short_risk = short_stop - close
+
+// Targets based on R:R
+float long_target_1 = close + long_risk * i_min_rr
+float long_target_2 = close + long_risk * (i_min_rr + 1.0)
+float long_target_3 = close + long_risk * (i_min_rr + 2.0)
+float short_target_1 = close - short_risk * i_min_rr
+float short_target_2 = close - short_risk * (i_min_rr + 1.0)
+float short_target_3 = close - short_risk * (i_min_rr + 2.0)
+
+// R:R validation
+float long_rr = long_risk > 0 ? (long_target_1 - close) / long_risk : 0
+float short_rr = short_risk > 0 ? (close - short_target_1) / short_risk : 0
+bool rr_valid_long = long_rr >= i_min_rr
+bool rr_valid_short = short_rr >= i_min_rr
+
+//───────────────────────────────────────────────────────────────────────────────
+// VISUALIZATION
+//───────────────────────────────────────────────────────────────────────────────
+
+// Dynamic MA colors based on trend with enhanced styling
+color ma_fast_col = ma_bullish ? i_bull_col : ma_bearish ? i_bear_col : color.new(#78909c, 50)
+color ma_slow_col = ma_bullish ? color.new(i_bull_col, 30) : ma_bearish ? color.new(i_bear_col, 30) : color.new(#78909c, 70)
+
+// Enhanced MA lines with gradient effect
+plot(ma_fast, "Fast MA", color=ma_fast_col, linewidth=2, style=plot.style_line)
+plot(ma_slow, "Slow MA", color=ma_slow_col, linewidth=3, style=plot.style_line)
+
+// MA fill for trend visualization
+fill(plot(ma_fast), plot(ma_slow), color=ma_bullish ? color.new(i_bull_col, 90) : ma_bearish ? color.new(i_bear_col, 90) : na)
+
+// Signal background with intensity based on quality
+color long_bg = na
+color short_bg = na
+
+if long_signal
+    if long_premium_signal
+        long_bg := color.new(i_premium_col, 75)
+    else
+        long_bg := color.new(i_bull_col, math.round(90 - bull_quality * 0.2))
+
+if short_signal
+    if short_premium_signal
+        short_bg := color.new(i_premium_col, 75)
+    else
+        short_bg := color.new(i_bear_col, math.round(90 - bear_quality * 0.2))
+
+bgcolor(long_bg)
+bgcolor(short_bg)
+
+// Enhanced quality meter with gradient
+float quality_display = bull_qual_pct > bear_qual_pct ? bull_qual_pct : -bear_qual_pct
+color quality_col = i_show_quality ? (quality_display > 0 ? color.new(i_bull_col, math.round(70 - bull_quality * 0.3)) :
+                    quality_display < 0 ? color.new(i_bear_col, math.round(70 - bear_quality * 0.3)) :
+                    color.new(#78909c, 70)) : na
+
+// Multi-layer quality meter
+plot(i_show_quality ? quality_display / 10 : na, "Quality Base", color=quality_col, style=plot.style_area, histbase=0, linewidth=1)
+plot(i_show_quality ? quality_display / 10 : na, "Quality Glow", color=color.new(quality_col, 50), style=plot.style_area, histbase=0, linewidth=1)
+plot(i_show_quality ? quality_display / 10 : na, "Quality Core", color=color.new(quality_col, 20), style=plot.style_columns, histbase=0, linewidth=2)
+
+// Entry zone visualization
+var box entry_box = na
+var line stop_line = na
+var line target1_line = na
+var line target2_line = na
+
+// Entry zone with glow effect
+var box glow_box = na
+var line target3_line = na
+var label signal_label = na
+
+// TP and STOP labels
+var label tp1_label = na
+var label tp2_label = na
+var label tp3_label = na
+var label stop_label = na
+
+if long_signal and i_show_zones
+    // Clean up previous drawings
+    if not na(entry_box)
+        box.delete(entry_box)
+    if not na(glow_box)
+        box.delete(glow_box)
+    if not na(stop_line)
+        line.delete(stop_line)
+    if not na(target1_line)
+        line.delete(target1_line)
+    if not na(target2_line)
+        line.delete(target2_line)
+    if not na(target3_line)
+        line.delete(target3_line)
+    if not na(signal_label)
+        label.delete(signal_label)
+    if not na(tp1_label)
+        label.delete(tp1_label)
+    if not na(tp2_label)
+        label.delete(tp2_label)
+    if not na(tp3_label)
+        label.delete(tp3_label)
+    if not na(stop_label)
+        label.delete(stop_label)
+    
+    // Determine colors based on premium status
+    color zone_border = long_premium_signal ? i_premium_col : i_bull_col
+    color zone_bg = long_premium_signal ? color.new(i_premium_col, 80) : color.new(i_bull_col, 85)
+    color zone_glow = long_premium_signal ? color.new(i_premium_col, 90) : color.new(i_bull_glow, 92)
+    
+    // Glow box (larger, more transparent)
+    if i_show_glow
+        glow_box := box.new(bar_index - 1, close + atr_val * 0.5, bar_index + 12, close - atr_val * 0.5,
+                            border_color=na, bgcolor=zone_glow)
+    
+    // Main entry box
+    entry_box := box.new(bar_index, close + atr_val * 0.3, bar_index + 10, close - atr_val * 0.3,
+                         border_color=color.new(zone_border, 30), bgcolor=zone_bg, border_width=2)
+    
+    // Signal quality label
+    string label_text = (long_premium_signal ? "★ " : "") + "LONG " + bull_grade
+    signal_label := label.new(bar_index + 5, close + atr_val * 0.6, label_text,
+                              style=label.style_label_down, color=zone_border,
+                              textcolor=color.white, size=size.small)
+    
+    if i_show_levels
+        stop_line := line.new(bar_index, long_stop, bar_index + 20, long_stop,
+                              color=color.new(i_bear_col, 30), style=line.style_dashed, width=3)
+        target1_line := line.new(bar_index, long_target_1, bar_index + 20, long_target_1,
+                                 color=color.new(i_bull_col, 40), style=line.style_dashed, width=2)
+        target2_line := line.new(bar_index, long_target_2, bar_index + 20, long_target_2,
+                                 color=color.new(i_bull_col, 60), style=line.style_dashed, width=2)
+        target3_line := line.new(bar_index, long_target_3, bar_index + 20, long_target_3,
+                                 color=color.new(i_bull_col, 80), style=line.style_dashed, width=2)
+        
+        // TP labels with price at the front with arrows
+        tp1_label := label.new(bar_index - 5, long_target_1, "TP 1\n" + str.tostring(long_target_1, "#.##"), 
+                  style=label.style_label_right, color=color.new(i_bull_col, 70), 
+                  textcolor=color.white, size=size.tiny, yloc=yloc.price)
+        tp2_label := label.new(bar_index - 5, long_target_2, "TP 2\n" + str.tostring(long_target_2, "#.##"), 
+                  style=label.style_label_right, color=color.new(i_bull_col, 50), 
+                  textcolor=color.white, size=size.tiny, yloc=yloc.price)
+        tp3_label := label.new(bar_index - 5, long_target_3, "TP 3\n" + str.tostring(long_target_3, "#.##"), 
+                  style=label.style_label_right, color=color.new(i_bull_col, 30), 
+                  textcolor=color.white, size=size.tiny, yloc=yloc.price)
+        stop_label := label.new(bar_index - 5, long_stop, "STOP\n" + str.tostring(long_stop, "#.##"), 
+                  style=label.style_label_right, color=color.new(i_bear_col, 50), 
+                  textcolor=color.white, size=size.tiny, yloc=yloc.price)
+
+if short_signal and i_show_zones
+    // Clean up previous drawings
+    if not na(entry_box)
+        box.delete(entry_box)
+    if not na(glow_box)
+        box.delete(glow_box)
+    if not na(stop_line)
+        line.delete(stop_line)
+    if not na(target1_line)
+        line.delete(target1_line)
+    if not na(target2_line)
+        line.delete(target2_line)
+    if not na(target3_line)
+        line.delete(target3_line)
+    if not na(signal_label)
+        label.delete(signal_label)
+    if not na(tp1_label)
+        label.delete(tp1_label)
+    if not na(tp2_label)
+        label.delete(tp2_label)
+    if not na(tp3_label)
+        label.delete(tp3_label)
+    if not na(stop_label)
+        label.delete(stop_label)
+    
+    // Determine colors based on premium status
+    color zone_border = short_premium_signal ? i_premium_col : i_bear_col
+    color zone_bg = short_premium_signal ? color.new(i_premium_col, 80) : color.new(i_bear_col, 85)
+    color zone_glow = short_premium_signal ? color.new(i_premium_col, 90) : color.new(i_bear_glow, 92)
+    
+    // Glow box
+    if i_show_glow
+        glow_box := box.new(bar_index - 1, close + atr_val * 0.5, bar_index + 12, close - atr_val * 0.5,
+                            border_color=na, bgcolor=zone_glow)
+    
+    // Main entry box
+    entry_box := box.new(bar_index, close + atr_val * 0.3, bar_index + 10, close - atr_val * 0.3,
+                         border_color=color.new(zone_border, 30), bgcolor=zone_bg, border_width=2)
+    
+    // Signal quality label
+    string label_text = (short_premium_signal ? "★ " : "") + "SHORT " + bear_grade
+    signal_label := label.new(bar_index + 5, close - atr_val * 0.6, label_text,
+                              style=label.style_label_up, color=zone_border,
+                              textcolor=color.white, size=size.small)
+    
+    if i_show_levels
+        stop_line := line.new(bar_index, short_stop, bar_index + 20, short_stop,
+                              color=color.new(i_bull_col, 30), style=line.style_dashed, width=3)
+        target1_line := line.new(bar_index, short_target_1, bar_index + 20, short_target_1,
+                                 color=color.new(i_bear_col, 40), style=line.style_dashed, width=2)
+        target2_line := line.new(bar_index, short_target_2, bar_index + 20, short_target_2,
+                                 color=color.new(i_bear_col, 60), style=line.style_dashed, width=2)
+        target3_line := line.new(bar_index, short_target_3, bar_index + 20, short_target_3,
+                                 color=color.new(i_bear_col, 80), style=line.style_dashed, width=2)
+        
+        // TP labels with price at the front with arrows
+        tp1_label := label.new(bar_index - 5, short_target_1, "TP 1\n" + str.tostring(short_target_1, "#.##"), 
+                  style=label.style_label_right, color=color.new(i_bear_col, 70), 
+                  textcolor=color.white, size=size.tiny, yloc=yloc.price)
+        tp2_label := label.new(bar_index - 5, short_target_2, "TP 2\n" + str.tostring(short_target_2, "#.##"), 
+                  style=label.style_label_right, color=color.new(i_bear_col, 50), 
+                  textcolor=color.white, size=size.tiny, yloc=yloc.price)
+        tp3_label := label.new(bar_index - 5, short_target_3, "TP 3\n" + str.tostring(short_target_3, "#.##"), 
+                  style=label.style_label_right, color=color.new(i_bear_col, 30), 
+                  textcolor=color.white, size=size.tiny, yloc=yloc.price)
+        stop_label := label.new(bar_index - 5, short_stop, "STOP\n" + str.tostring(short_stop, "#.##"), 
+                  style=label.style_label_right, color=color.new(i_bull_col, 50), 
+                  textcolor=color.white, size=size.tiny, yloc=yloc.price)
+
+// Premium signal markers
+plotshape(long_premium_signal, "Premium Long", shape.diamond, location.belowbar, 
+          color=color.new(i_premium_col, 0), size=size.small)
+plotshape(short_premium_signal, "Premium Short", shape.diamond, location.abovebar, 
+          color=color.new(i_premium_col, 0), size=size.small)
+
+// Blue zone signals (before big moves)
+bool blue_zone_signal = ma_bullish and adx > i_adx_thresh and rsi_momentum_up and volume_score >= 1
+plotshape(blue_zone_signal and not long_signal, "Blue Zone", shape.triangleup, location.belowbar,
+          color=color.new(#00ffcc, 0), size=size.tiny, offset=-1)
+
+// Purple zone signals (at tops)
+bool purple_zone_signal = ma_bearish and adx > i_adx_thresh and rsi_momentum_down and volume_score >= 1
+plotshape(purple_zone_signal and not short_signal, "Purple Zone", shape.triangledown, location.abovebar,
+          color=color.new(#9966ff, 0), size=size.tiny, offset=-1)
+
+//───────────────────────────────────────────────────────────────────────────────
+// DASHBOARD
+//───────────────────────────────────────────────────────────────────────────────
+
+// Calculate dashboard metrics globally for consistency
+float rsi_value = ta.rsi(close, i_rsi_len)
+float vol_sma_value = ta.sma(volume, i_vol_len)
+float vol_ratio = vol_sma_value > 0 ? volume / vol_sma_value * 100 : 0
+
+if i_show_dash and barstate.islast
+    var table dash = table.new(position.top_right, 4, 10, bgcolor=color.new(#000000, 95),
+                               border_width=2, border_color=color.new(#00ffcc, 50), frame_width=2, frame_color=color.new(#00ffcc, 30))
+    
+    // Headers with enhanced visibility
+    table.merge_cells(dash, 0, 0, 3, 0)
+    table.cell(dash, 0, 0, "SIGNAL QUALIFIER", text_color=color.new(#00ffcc, 0), 
+               text_size=size.normal, bgcolor=color.new(#00ffcc, 10))
+    
+    // Column headers
+    table.cell(dash, 0, 1, "FILTER", text_color=color.new(#ffffff, 0), text_size=size.tiny, bgcolor=color.new(#1a1f2e, 80))
+    table.cell(dash, 1, 1, "LONG", text_color=i_bull_col, text_size=size.tiny, bgcolor=color.new(#1a1f2e, 80))
+    table.cell(dash, 2, 1, "SHORT", text_color=i_bear_col, text_size=size.tiny, bgcolor=color.new(#1a1f2e, 80))
+    table.cell(dash, 3, 1, "METRICS", text_color=color.new(#00ffcc, 0), text_size=size.tiny, bgcolor=color.new(#1a1f2e, 80))
+    
+    // Trend
+    table.cell(dash, 0, 2, "TREND", text_color=color.new(#ffffff, 0), text_size=size.small, bgcolor=color.new(#1a1f2e, 80))
+    table.cell(dash, 1, 2, str.tostring(trend_score) + "/3", 
+               text_color=color.new(#000000, 0), text_size=size.small, bgcolor=color.new(trend_score >= 2 ? i_bull_col : color.new(#78909c, 0), 30))
+    table.cell(dash, 2, 2, str.tostring(trend_score_bear) + "/3", 
+               text_color=color.new(#000000, 0), text_size=size.small, bgcolor=color.new(trend_score_bear >= 2 ? i_bear_col : color.new(#78909c, 0), 30))
+    table.cell(dash, 3, 2, "ADX: " + str.tostring(math.round(adx), "#"), text_color=color.new(#00ffcc, 0), text_size=size.small, bgcolor=color.new(#1a1f2e, 80))
+    
+    // Momentum
+    table.cell(dash, 0, 3, "MOMENTUM", text_color=color.new(#ffffff, 0), text_size=size.small, bgcolor=color.new(#1a1f2e, 80))
+    table.cell(dash, 1, 3, str.tostring(momentum_score) + "/3", 
+               text_color=color.new(#000000, 0), text_size=size.small, bgcolor=color.new(momentum_score >= 2 ? i_bull_col : color.new(#78909c, 0), 30))
+    table.cell(dash, 2, 3, str.tostring(momentum_score_bear) + "/3", 
+               text_color=color.new(#000000, 0), text_size=size.small, bgcolor=color.new(momentum_score_bear >= 2 ? i_bear_col : color.new(#78909c, 0), 30))
+    table.cell(dash, 3, 3, "RSI: " + str.tostring(math.round(rsi_value), "#"), text_color=color.new(#00ffcc, 0), text_size=size.small, bgcolor=color.new(#1a1f2e, 80))
+    
+    // Volume
+    table.cell(dash, 0, 4, "VOLUME", text_color=color.new(#ffffff, 0), text_size=size.small, bgcolor=color.new(#1a1f2e, 80))
+    table.cell(dash, 1, 4, str.tostring(volume_score) + "/2", 
+               text_color=color.new(#000000, 0), text_size=size.small, bgcolor=color.new(volume_score >= 1 ? i_bull_col : color.new(#78909c, 0), 30))
+    table.cell(dash, 2, 4, str.tostring(volume_score) + "/2", 
+               text_color=color.new(#000000, 0), text_size=size.small, bgcolor=color.new(volume_score >= 1 ? i_bear_col : color.new(#78909c, 0), 30))
+    table.cell(dash, 3, 4, "VOL: " + str.tostring(math.round(vol_ratio), "#") + "%", 
+               text_color=color.new(#00ffcc, 0), text_size=size.small, bgcolor=color.new(#1a1f2e, 80))
+    
+    // Structure
+    table.cell(dash, 0, 5, "STRUCTURE", text_color=color.new(#ffffff, 0), text_size=size.small, bgcolor=color.new(#1a1f2e, 80))
+    table.cell(dash, 1, 5, str.tostring(structure_score) + "/2", 
+               text_color=color.new(#000000, 0), text_size=size.small, bgcolor=color.new(structure_score >= 1 ? i_bull_col : color.new(#78909c, 0), 30))
+    table.cell(dash, 2, 5, str.tostring(structure_score_bear) + "/2", 
+               text_color=color.new(#000000, 0), text_size=size.small, bgcolor=color.new(structure_score_bear >= 1 ? i_bear_col : color.new(#78909c, 0), 30))
+    table.cell(dash, 3, 5, na(last_swing_high) ? "NO SWING" : "SWING OK", 
+               text_color=na(last_swing_high) ? color.new(#ff6666, 0) : color.new(#00ff88, 0), text_size=size.small, bgcolor=color.new(#1a1f2e, 80))
+    
+    // Total
+    table.cell(dash, 0, 6, "TOTAL", text_color=color.new(#ffffff, 0), text_size=size.small, bgcolor=color.new(#1a1f2e, 80))
+    table.cell(dash, 1, 6, str.tostring(bull_total) + "/" + str.tostring(max_score), 
+               text_color=color.new(#000000, 0), text_size=size.small, bgcolor=color.new(bull_qualified ? i_bull_col : color.new(#78909c, 0), 30))
+    table.cell(dash, 2, 6, str.tostring(bear_total) + "/" + str.tostring(max_score), 
+               text_color=color.new(#000000, 0), text_size=size.small, bgcolor=color.new(bear_qualified ? i_bear_col : color.new(#78909c, 0), 30))
+    table.cell(dash, 3, 6, "R:R " + str.tostring(i_min_rr, "#.#"), 
+               text_color=color.new(#ffcc00, 0), text_size=size.small, bgcolor=color.new(#1a1f2e, 80))
+    
+    // Status
+    string long_status = bull_qualified ? "QUALIFIED" : "NOT READY"
+    string short_status = bear_qualified ? "QUALIFIED" : "NOT READY"
+    table.cell(dash, 0, 7, "STATUS", text_color=color.new(#ffffff, 0), text_size=size.small, bgcolor=color.new(#1a1f2e, 80))
+    table.cell(dash, 1, 7, long_status, text_color=color.new(#000000, 0), text_size=size.small, bgcolor=color.new(bull_qualified ? i_bull_col : color.new(#78909c, 0), 30))
+    table.cell(dash, 2, 7, short_status, text_color=color.new(#000000, 0), text_size=size.small, bgcolor=color.new(bear_qualified ? i_bear_col : color.new(#78909c, 0), 30))
+    table.cell(dash, 3, 7, long_premium_signal or short_premium_signal ? "PREMIUM" : "STANDARD", 
+               text_color=long_premium_signal or short_premium_signal ? color.new(#ffcc00, 0) : color.new(#78909c, 0), text_size=size.small, bgcolor=color.new(#1a1f2e, 80))
+    
+    // Quality
+    table.cell(dash, 0, 8, "QUALITY", text_color=color.new(#ffffff, 0), text_size=size.small, bgcolor=color.new(#1a1f2e, 80))
+    table.cell(dash, 1, 8, bull_grade + " (" + str.tostring(math.round(bull_quality), "#") + "%)", 
+               text_color=color.new(#000000, 0), text_size=size.small, bgcolor=color.new(bull_quality >= 60 ? i_bull_col : color.new(#78909c, 0), 30))
+    table.cell(dash, 2, 8, bear_grade + " (" + str.tostring(math.round(bear_quality), "#") + "%)", 
+               text_color=color.new(#000000, 0), text_size=size.small, bgcolor=color.new(bear_quality >= 60 ? i_bear_col : color.new(#78909c, 0), 30))
+    table.cell(dash, 3, 8, "ATR: " + str.tostring(atr_val, "#.##"), 
+               text_color=color.new(#00ffcc, 0), text_size=size.small, bgcolor=color.new(#1a1f2e, 80))
+    
+    // Signal with enhanced visibility
+    table.merge_cells(dash, 0, 9, 3, 9)
+    string signal_text = long_signal ? "LONG SIGNAL ACTIVE" : short_signal ? "SHORT SIGNAL ACTIVE" : "WAITING FOR SETUP"
+    color signal_color = long_signal ? i_bull_col : short_signal ? i_bear_col : color.new(#78909c, 0)
+    table.cell(dash, 0, 9, signal_text, text_color=color.new(#000000, 0), 
+               text_size=size.normal, bgcolor=color.new(signal_color, 25))
+
+//───────────────────────────────────────────────────────────────────────────────
+// EXPORT PLOTS (for strategy integration)
+//───────────────────────────────────────────────────────────────────────────────
+
+plot(long_signal ? 1 : 0, "Long Signal Export", display=display.none)
+plot(short_signal ? 1 : 0, "Short Signal Export", display=display.none)
+plot(float(bull_total), "Bull Score Export", display=display.none)
+plot(float(bear_total), "Bear Score Export", display=display.none)
+plot(bull_qual_pct, "Bull Qualification % Export", display=display.none)
+plot(bear_qual_pct, "Bear Qualification % Export", display=display.none)
+plot(long_stop, "Long Stop Export", display=display.none)
+plot(short_stop, "Short Stop Export", display=display.none)
+plot(long_target_1, "Long Target 1 Export", display=display.none)
+plot(short_target_1, "Short Target 1 Export", display=display.none)
+plot(atr_val, "ATR Export", display=display.none)
+plot(bull_quality, "Bull Quality Export", display=display.none)
+plot(bear_quality, "Bear Quality Export", display=display.none)
+plot(long_premium_signal ? 1 : 0, "Long Premium Export", display=display.none)
+plot(short_premium_signal ? 1 : 0, "Short Premium Export", display=display.none)
+plot(long_target_3, "Long Target 3 Export", display=display.none)
+plot(short_target_3, "Short Target 3 Export", display=display.none)
+plot(in_session ? 1 : 0, "Session Active Export", display=display.none)
+
+//───────────────────────────────────────────────────────────────────────────────
+// ALERTS
+//───────────────────────────────────────────────────────────────────────────────
+
+alertcondition(long_signal, "Long Signal", "Qualified long signal generated")
+alertcondition(short_signal, "Short Signal", "Qualified short signal generated")
+alertcondition(bull_qualified and not bull_qualified[1], "Long Qualification Met", "Long trade qualification criteria met")
+alertcondition(bear_qualified and not bear_qualified[1], "Short Qualification Met", "Short trade qualification criteria met")
+alertcondition(long_premium_signal, "Premium Long Signal", "Premium quality long signal generated")
+alertcondition(short_premium_signal, "Premium Short Signal", "Premium quality short signal generated")

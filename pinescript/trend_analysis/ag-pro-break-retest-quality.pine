@@ -1,0 +1,303 @@
+//@version=6
+// ------------------------------------
+// AG Pro Break-Retest Quality [AGPro Series] V1.1
+// ------------------------------------
+indicator("AG Pro Break-Retest Quality [AGPro Series]", overlay=true, max_labels_count=500, max_lines_count=500)
+
+//------------------------------------------------------------------------------
+// Inputs
+//------------------------------------------------------------------------------
+groupStructure = "Structure"
+groupRetest    = "Retest"
+groupScoring   = "Scoring"
+groupVisuals   = "Visuals"
+groupRuntime   = "Runtime"
+
+pivotLength           = input.int(5, "Pivot Length", minval=2, maxval=20, group=groupStructure)
+useCloseConfirmation  = input.bool(true, "Use Close Confirmation", group=groupStructure)
+minBreakAtrFilter     = input.float(0.10, "Min Break ATR Filter", minval=0.0, maxval=2.0, step=0.05, group=groupStructure)
+atrLength             = input.int(14, "ATR Length", minval=5, maxval=100, group=groupStructure)
+
+maxBarsForRetest      = input.int(10, "Max Bars For Retest", minval=1, maxval=50, group=groupRetest)
+retestToleranceAtr    = input.float(0.20, "Retest Tolerance ATR", minval=0.05, maxval=2.0, step=0.05, group=groupRetest)
+retestCooldownBars    = input.int(15, "Cooldown Bars After Completed Setup", minval=0, maxval=300, group=groupRetest)
+
+showNumericScore      = input.bool(true, "Show Numeric Score", group=groupScoring)
+showGrade             = input.bool(true, "Show Grade", group=groupScoring)
+useVolumeConfirmation = input.bool(false, "Use Volume Confirmation", group=groupScoring)
+minGradeForConfirm    = input.string("B", "Min Grade For Confirmation", options=["A", "B", "C", "F"], group=groupScoring)
+minGradeForDisplay    = input.string("B", "Min Grade To Display", options=["A", "B", "C", "F"], group=groupScoring)
+
+showBreakLine         = input.bool(true, "Show Break Line", group=groupVisuals)
+showBreakLabels       = input.bool(true, "Show Break Labels", group=groupVisuals)
+showRetestMarker      = input.bool(true, "Show Retest Marker", group=groupVisuals)
+showInvalidationLine  = input.bool(false, "Show Invalidation Line", group=groupVisuals)
+labelSizeInput        = input.string("Normal", "Label Size", options=["Tiny", "Small", "Normal"], group=groupVisuals)
+showOutcomeText       = input.bool(true, "Show Outcome Text", group=groupVisuals)
+
+keepLastSetups        = input.int(8, "Keep Last Setups", minval=3, maxval=100, group=groupRuntime)
+
+//------------------------------------------------------------------------------
+// Visual palette
+//------------------------------------------------------------------------------
+bullBreakLineColor    = color.new(color.lime, 18)
+bearBreakLineColor    = color.new(color.red, 18)
+bullRetestColor       = color.new(color.green, 8)
+bearRetestColor       = color.new(color.red, 8)
+neutralRetestColor    = color.new(color.gray, 28)
+invalidationLineColor = color.new(color.orange, 18)
+
+//------------------------------------------------------------------------------
+// Helpers
+//------------------------------------------------------------------------------
+f_clamp(float value, float minValue, float maxValue) =>
+    math.max(minValue, math.min(maxValue, value))
+
+f_label_size(string sizeText) =>
+    sizeText == "Tiny" ? size.tiny : sizeText == "Normal" ? size.normal : size.small
+
+f_grade_threshold(string gradeText) =>
+    gradeText == "A" ? 80 : gradeText == "B" ? 65 : gradeText == "C" ? 50 : 0
+
+f_grade_from_score(int score) =>
+    score >= 80 ? "A" : score >= 65 ? "B" : score >= 50 ? "C" : "F"
+
+f_outcome_from_score(int score) =>
+    score >= 80 ? "Strong Retest" : score >= 65 ? "Valid Retest" : score >= 50 ? "Weak Retest" : "Failed Retest"
+
+f_reclaim_score(int dir, float closePrice, float level, float atr) =>
+    atrSafe = math.max(atr, syminfo.mintick)
+    raw = dir == 1 ? (closePrice - level) / (atrSafe * 0.60) : (level - closePrice) / (atrSafe * 0.60)
+    int(math.round(f_clamp(raw, 0.0, 1.0) * 25.0))
+
+f_rejection_score(int dir, float openPrice, float highPrice, float lowPrice, float closePrice) =>
+    candleRange = math.max(highPrice - lowPrice, syminfo.mintick)
+    bullishLowerWick = math.max(math.min(openPrice, closePrice) - lowPrice, 0.0)
+    bearishUpperWick = math.max(highPrice - math.max(openPrice, closePrice), 0.0)
+    body = math.abs(closePrice - openPrice)
+    wickPart = dir == 1 ? bullishLowerWick / candleRange : bearishUpperWick / candleRange
+    bodyBonus = dir == 1 ? (closePrice > openPrice ? 0.20 : 0.0) : (closePrice < openPrice ? 0.20 : 0.0)
+    raw = wickPart + bodyBonus + (body / candleRange) * 0.20
+    int(math.round(f_clamp(raw / 1.20, 0.0, 1.0) * 20.0))
+
+f_depth_score(int dir, float level, float extremePrice, float atr) =>
+    atrSafe = math.max(atr, syminfo.mintick)
+    overshoot = dir == 1 ? math.max(level - extremePrice, 0.0) : math.max(extremePrice - level, 0.0)
+    raw = 1.0 - (overshoot / (atrSafe * 0.80))
+    int(math.round(f_clamp(raw, 0.0, 1.0) * 20.0))
+
+f_speed_score(int barsSinceBreak, int maxBars) =>
+    maxBarsSafe = math.max(maxBars, 1)
+    raw = 1.0 - ((barsSinceBreak - 1.0) / math.max(maxBarsSafe - 1.0, 1.0))
+    int(math.round(f_clamp(raw, 0.0, 1.0) * 15.0))
+
+f_volatility_score(float highPrice, float lowPrice, float atr) =>
+    atrSafe = math.max(atr, syminfo.mintick)
+    barRange = highPrice - lowPrice
+    raw = 1.0 - math.max(barRange - atrSafe, 0.0) / (atrSafe * 2.0)
+    int(math.round(f_clamp(raw, 0.0, 1.0) * 10.0))
+
+f_volume_score(bool useVolumeFactor) =>
+    if not useVolumeFactor
+        10
+    else
+        volBase = math.max(ta.sma(volume, 20), 1.0)
+        raw = volume / volBase
+        int(math.round(f_clamp(raw / 1.50, 0.0, 1.0) * 10.0))
+
+f_total_score(int dir, float level, float atr, int barsSinceBreak) =>
+    reclaimPart    = f_reclaim_score(dir, close, level, atr)
+    rejectionPart  = f_rejection_score(dir, open, high, low, close)
+    depthPart      = f_depth_score(dir, level, dir == 1 ? low : high, atr)
+    speedPart      = f_speed_score(barsSinceBreak, maxBarsForRetest)
+    volatilityPart = f_volatility_score(high, low, atr)
+    volumePart     = f_volume_score(useVolumeConfirmation)
+    reclaimPart + rejectionPart + depthPart + speedPart + volatilityPart + volumePart
+
+f_compact_label_text(string grade, int score, string outcome, bool includeGrade, bool includeScore, bool includeOutcome) =>
+    labelTxt = "RT"
+    if includeGrade or includeScore
+        labelTxt += " | "
+        labelTxt += includeGrade ? grade : ""
+        labelTxt += includeGrade and includeScore ? " " : ""
+        labelTxt += includeScore ? str.tostring(score) : ""
+    if includeOutcome
+        labelTxt += "\n" + outcome
+    labelTxt
+
+f_push_line(array<line> lineArr, line lineId, int maxCount) =>
+    array.push(lineArr, lineId)
+    if array.size(lineArr) > maxCount
+        oldLine = array.shift(lineArr)
+        line.delete(oldLine)
+
+f_push_label(array<label> labelArr, label labelId, int maxCount) =>
+    array.push(labelArr, labelId)
+    if array.size(labelArr) > maxCount
+        oldLabel = array.shift(labelArr)
+        label.delete(oldLabel)
+
+//------------------------------------------------------------------------------
+// Core series
+//------------------------------------------------------------------------------
+atrValue         = ta.atr(atrLength)
+minBreakDistance = atrValue * minBreakAtrFilter
+labelSize        = f_label_size(labelSizeInput)
+confirmThreshold = f_grade_threshold(minGradeForConfirm)
+displayThreshold = f_grade_threshold(minGradeForDisplay)
+
+pivotHigh = ta.pivothigh(high, pivotLength, pivotLength)
+pivotLow  = ta.pivotlow(low, pivotLength, pivotLength)
+
+var float lastPivotHigh    = na
+var float lastPivotLow     = na
+var int   lastPivotHighBar = na
+var int   lastPivotLowBar  = na
+
+if not na(pivotHigh)
+    lastPivotHigh := pivotHigh
+    lastPivotHighBar := bar_index - pivotLength
+
+if not na(pivotLow)
+    lastPivotLow := pivotLow
+    lastPivotLowBar := bar_index - pivotLength
+
+//------------------------------------------------------------------------------
+// Persistent storage
+//------------------------------------------------------------------------------
+var array<line>  breakLines        = array.new_line()
+var array<line>  invalidationLines = array.new_line()
+var array<label> signalLabels      = array.new_label()
+
+//------------------------------------------------------------------------------
+// Setup state
+//------------------------------------------------------------------------------
+var int   activeDirection    = 0
+var float activeLevel        = na
+var float activeAtrAtBreak   = na
+var int   activeBreakBar     = na
+var int   activePivotBar     = na
+var bool  activeRetestSeen   = false
+var float activeInvalidation = na
+
+var int lastUsedBullPivotBar = na
+var int lastUsedBearPivotBar = na
+var int nextEligibleBreakBar = 0
+
+breakAlert   = false
+retestAlert  = false
+confirmAlert = false
+
+//------------------------------------------------------------------------------
+// Break detection
+//------------------------------------------------------------------------------
+canLookForNewBreak = activeDirection == 0 and bar_index >= nextEligibleBreakBar
+
+bullBreakNow = canLookForNewBreak and not na(lastPivotHigh) and not na(lastPivotHighBar) and (na(lastUsedBullPivotBar) or lastPivotHighBar != lastUsedBullPivotBar) and bar_index > lastPivotHighBar and ((useCloseConfirmation and close > lastPivotHigh + minBreakDistance) or (not useCloseConfirmation and high > lastPivotHigh + minBreakDistance))
+
+bearBreakNow = canLookForNewBreak and not na(lastPivotLow) and not na(lastPivotLowBar) and (na(lastUsedBearPivotBar) or lastPivotLowBar != lastUsedBearPivotBar) and bar_index > lastPivotLowBar and ((useCloseConfirmation and close < lastPivotLow - minBreakDistance) or (not useCloseConfirmation and low < lastPivotLow - minBreakDistance))
+
+if bullBreakNow
+    activeDirection := 1
+    activeLevel := lastPivotHigh
+    activeAtrAtBreak := atrValue
+    activeBreakBar := bar_index
+    activePivotBar := lastPivotHighBar
+    activeRetestSeen := false
+    activeInvalidation := activeLevel - (activeAtrAtBreak * retestToleranceAtr)
+    lastUsedBullPivotBar := lastPivotHighBar
+    breakAlert := true
+
+    if showBreakLine
+        newBreakLine = line.new(activePivotBar, activeLevel, bar_index + 1, activeLevel, extend=extend.right, color=bullBreakLineColor, width=2)
+        f_push_line(breakLines, newBreakLine, keepLastSetups)
+
+    if showBreakLabels
+        newBreakLabel = label.new(bar_index, high, "BRK▲", style=label.style_label_down, textcolor=color.white, color=bullBreakLineColor, size=labelSize)
+        f_push_label(signalLabels, newBreakLabel, keepLastSetups * 2)
+
+if bearBreakNow
+    activeDirection := -1
+    activeLevel := lastPivotLow
+    activeAtrAtBreak := atrValue
+    activeBreakBar := bar_index
+    activePivotBar := lastPivotLowBar
+    activeRetestSeen := false
+    activeInvalidation := activeLevel + (activeAtrAtBreak * retestToleranceAtr)
+    lastUsedBearPivotBar := lastPivotLowBar
+    breakAlert := true
+
+    if showBreakLine
+        newBreakLine = line.new(activePivotBar, activeLevel, bar_index + 1, activeLevel, extend=extend.right, color=bearBreakLineColor, width=2)
+        f_push_line(breakLines, newBreakLine, keepLastSetups)
+
+    if showBreakLabels
+        newBreakLabel = label.new(bar_index, low, "BRK▼", style=label.style_label_up, textcolor=color.white, color=bearBreakLineColor, size=labelSize)
+        f_push_label(signalLabels, newBreakLabel, keepLastSetups * 2)
+
+//------------------------------------------------------------------------------
+// Retest detection and grading
+//------------------------------------------------------------------------------
+if activeDirection != 0
+    barsSinceBreak = bar_index - activeBreakBar
+    retestBand = math.max(activeAtrAtBreak * retestToleranceAtr, syminfo.mintick)
+
+    bullRetestNow = activeDirection == 1 and barsSinceBreak > 0 and barsSinceBreak <= maxBarsForRetest and low <= activeLevel + retestBand and high >= activeLevel - retestBand
+    bearRetestNow = activeDirection == -1 and barsSinceBreak > 0 and barsSinceBreak <= maxBarsForRetest and high >= activeLevel - retestBand and low <= activeLevel + retestBand
+
+    retestNow = not activeRetestSeen and (bullRetestNow or bearRetestNow)
+
+    if retestNow
+        activeRetestSeen := true
+        retestAlert := true
+
+        score = f_total_score(activeDirection, activeLevel, activeAtrAtBreak, barsSinceBreak)
+        grade = f_grade_from_score(score)
+        outcome = f_outcome_from_score(score)
+        accepted = score >= confirmThreshold and ((activeDirection == 1 and close >= activeLevel) or (activeDirection == -1 and close <= activeLevel))
+        shouldDisplay = score >= displayThreshold
+        confirmAlert := accepted
+
+        activeInvalidation := activeDirection == 1 ? low : high
+
+        if showInvalidationLine and shouldDisplay
+            newInvalidationLine = line.new(bar_index, activeInvalidation, bar_index + 1, activeInvalidation, extend=extend.right, color=invalidationLineColor, style=line.style_dashed, width=1)
+            f_push_line(invalidationLines, newInvalidationLine, keepLastSetups)
+
+        if showRetestMarker and shouldDisplay
+            labelText = f_compact_label_text(grade, score, outcome, showGrade, showNumericScore, showOutcomeText)
+            markerColor = accepted ? (activeDirection == 1 ? bullRetestColor : bearRetestColor) : neutralRetestColor
+
+            if activeDirection == 1
+                newRetestLabel = label.new(bar_index, low, labelText, style=label.style_label_up, textcolor=color.white, color=markerColor, size=labelSize)
+                f_push_label(signalLabels, newRetestLabel, keepLastSetups * 2)
+            else
+                newRetestLabel = label.new(bar_index, high, labelText, style=label.style_label_down, textcolor=color.white, color=markerColor, size=labelSize)
+                f_push_label(signalLabels, newRetestLabel, keepLastSetups * 2)
+
+        // Publish-safe behavior: always process only the first retest per break
+        nextEligibleBreakBar := bar_index + retestCooldownBars
+        activeDirection := 0
+        activeLevel := na
+        activeAtrAtBreak := na
+        activeBreakBar := na
+        activePivotBar := na
+        activeRetestSeen := false
+        activeInvalidation := na
+
+    if barsSinceBreak > maxBarsForRetest and not activeRetestSeen
+        nextEligibleBreakBar := bar_index + retestCooldownBars
+        activeDirection := 0
+        activeLevel := na
+        activeAtrAtBreak := na
+        activeBreakBar := na
+        activePivotBar := na
+        activeRetestSeen := false
+        activeInvalidation := na
+
+//------------------------------------------------------------------------------
+// Alert conditions
+//------------------------------------------------------------------------------
+alertcondition(breakAlert, "Structure Break Detected", "AG Pro Break-Retest Quality: Structure break detected.")
+alertcondition(retestAlert, "First Retest Detected", "AG Pro Break-Retest Quality: First retest detected.")
+alertcondition(confirmAlert, "High-Quality Retest Confirmed", "AG Pro Break-Retest Quality: High-quality retest confirmed.")

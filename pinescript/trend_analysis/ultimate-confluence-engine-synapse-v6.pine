@@ -1,0 +1,576 @@
+//@version=6
+indicator("Ultimate Confluence Engine v6", overlay=true, max_labels_count=500, max_bars_back=2000, max_boxes_count=300)
+
+// ═══════════════════════════════════════════════════════════════
+// CONSTANTS
+// ═══════════════════════════════════════════════════════════════
+const color BULL_C  = #00ffcc
+const color BEAR_C  = #e43a72
+const color VWAP_C  = #ffd700
+const color DASH_BG = #111725
+const color DASH_HDR= #18233a
+const color DASH_TXT= #b0b2b9
+
+// ═══════════════════════════════════════════════════════════════
+// INPUTS
+// ═══════════════════════════════════════════════════════════════
+
+grpPRE = "① Trading Style"
+styleIn = input.string("Auto", "Preset",
+     ["Auto","Scalping","Day Trading","Swing","Position","Custom"], group=grpPRE)
+
+detect_style() =>
+    if timeframe.isminutes
+        timeframe.multiplier <= 5 ? "Scalping" : "Day Trading"
+    else if timeframe.isintraday
+        timeframe.multiplier <= 1 ? "Day Trading" : "Swing"
+    else if timeframe.isdaily
+        "Swing"
+    else
+        "Position"
+
+actualStyle = styleIn == "Auto" ? detect_style() : styleIn
+
+grpST    = "② Evasive SuperTrend"
+stLenIn  = input.int(10,   "ATR Length",  minval=1,         group=grpST)
+stMultIn = input.float(3.0,"Multiplier",  step=0.1,         group=grpST)
+stThresh = input.float(1.0,"Noise Threshold (xATR)",step=0.1, group=grpST)
+stAlpha  = input.float(0.5,"Expansion Alpha (xATR)",step=0.1, group=grpST)
+useAdapt = input.bool(true, "Adaptive Multiplier",           group=grpST)
+stSmooth = input.float(0.15,"Smoothing",minval=0.0,maxval=0.5,step=0.05, group=grpST)
+
+stLen  = actualStyle == "Custom" ? stLenIn  : actualStyle == "Scalping" ? 7 : actualStyle == "Day Trading" ? 10 : actualStyle == "Swing" ? 14 : 21
+stMult = actualStyle == "Custom" ? stMultIn : actualStyle == "Scalping" ? 2.0 : actualStyle == "Day Trading" ? 2.5 : actualStyle == "Swing" ? 3.0 : 4.0
+
+grpML   = "③ KNN Machine Learning"
+useML   = input.bool(true,   "Enable ML Filter",   group=grpML)
+kN      = input.int(8,       "K-Neighbors",   minval=1, maxval=20,   group=grpML)
+sampWin = input.int(150,     "Window ↓=faster", minval=50, maxval=500, group=grpML)
+mlStr   = input.int(25,      "Stride ↑=faster", minval=5, group=grpML)
+probThr = input.float(0.65,  "Threshold",  step=0.01, group=grpML)
+
+grpCVD  = "④ CVD"
+useCVD  = input.bool(true, "Enable CVD Filter", group=grpCVD)
+cvdLen  = input.int(20,    "CVD MA Length",      group=grpCVD)
+
+grpVWAP = "⑤ VWAP Bands"
+useVWAP = input.bool(true, "Enable VWAP Filter", group=grpVWAP)
+showVWAP= input.bool(true, "Show VWAP + Bands",  group=grpVWAP)
+vwapM1  = input.float(1.0, "±1σ",                group=grpVWAP)
+vwapM2  = input.float(2.0, "±2σ",                group=grpVWAP)
+
+grpPat  = "⑥ Candlestick Patterns"
+minPat  = input.int(1,"Min Patterns (0=off)",minval=0,maxval=5, group=grpPat)
+
+grpVol  = "⑦ Volume + MTF"
+useVol  = input.bool(true,  "Volume Spike Required", group=grpVol)
+volLen  = input.int(20,     "Volume MA Length",       group=grpVol)
+volMult = input.float(1.3,  "Volume Multiplier",      group=grpVol)
+useMTF  = input.bool(false, "MTF Filter (slow)",      group=grpVol)
+mtfMin  = input.int(4,      "Min Bull TFs (of 6)", minval=1, maxval=6, group=grpVol)
+
+grpVIS  = "⑧ Visuals"
+showRib = input.bool(true, "Gradient Ribbon",   group=grpVIS)
+showSig = input.bool(true, "Buy/Sell Signals",  group=grpVIS)
+showDash= input.bool(true, "Dashboard",         group=grpVIS)
+
+grpPRED = "⑨ Trend Prediction"
+usePred = input.bool(true, "Show Prediction Boxes", group=grpPRED)
+predMode= input.string("Advanced","Mode",["Simple","Standard","Advanced"], group=grpPRED)
+stockTyp= input.string("Blue Chip / Large Cap","Asset Type",
+     ["Small Cap","Biotech / Speculative","Blue Chip / Large Cap",
+      "Tech Growth","Dividend / Value","Cyclical","Crypto / High Volatility"], group=grpPRED)
+useEWA  = input.bool(true,  "Exponential Weighting", group=grpPRED)
+ewaDec  = input.float(0.9,  "Decay Factor",minval=0.5,maxval=0.99,step=0.05, group=grpPRED)
+
+// ═══════════════════════════════════════════════════════════════
+// ② EVASIVE SUPERTREND
+// ═══════════════════════════════════════════════════════════════
+float estAtr  = ta.atr(stLen)
+float volWt   = nz(volume / ta.sma(volume, stLen), 1.0)
+float tStr    = nz(math.abs(ta.correlation(close, bar_index, stLen)), 0.5)
+float adapMult= useAdapt ? stMult * (0.8 + tStr * 0.4) * math.sqrt(math.max(0.1, volWt)) : stMult
+
+var float stBand = na
+var int   stDir  = 1
+var float upLine = na
+var float dnLine = na
+
+float upRaw = hl2 - adapMult * estAtr
+float dnRaw = hl2 + adapMult * estAtr
+
+if na(upLine[1])
+    upLine := upRaw
+    dnLine := dnRaw
+else
+    upLine := close > upLine[1] ? upLine[1] * (1 - stSmooth) + upRaw * stSmooth : upRaw
+    dnLine := close < dnLine[1] ? dnLine[1] * (1 - stSmooth) + dnRaw * stSmooth : dnRaw
+
+float prevBnd = nz(stBand[1], stDir == 1 ? upLine : dnLine)
+bool  isNoisy = math.abs(close - prevBnd) < (estAtr * stThresh)
+
+if stDir == 1
+    stBand := isNoisy ? prevBnd - (estAtr * stAlpha) : math.max(upLine, prevBnd)
+    if close < stBand
+        stDir  := -1
+        stBand := dnLine
+else
+    stBand := isNoisy ? prevBnd + (estAtr * stAlpha) : math.min(dnLine, prevBnd)
+    if close > stBand
+        stDir  := 1
+        stBand := upLine
+
+bool  stFlip = stDir != stDir[1]
+bool  stBull = stDir == 1
+
+// ═══════════════════════════════════════════════════════════════
+// ③ KNN MACHINE LEARNING
+// ═══════════════════════════════════════════════════════════════
+ml_norm(float s, int l) =>
+    float m = ta.sma(s[1], l)
+    float d = ta.stdev(s[1], l)
+    (s - m) / math.max(d, 0.00001)
+
+ml_chop(int l) =>
+    float hi = math.max(ta.highest(high, l), close[1])
+    float lo = math.min(ta.lowest(low, l), close[1])
+    100.0 * math.log10(math.sum(ta.tr, l) / (hi - lo)) / math.log10(l)
+
+[_stL, _stD] = ta.supertrend(2.0, 10)
+var int ml_target = 0
+ml_target := int(_stD) * -1
+for _i = 1 to 5
+    if _stD[_i] != _stD
+        ml_target := 0
+
+int   nW    = 500
+float rsiS  = ta.rsi(close, 20)
+float rsiM  = ta.rsi(close[mlStr], 20)
+float maSrc = nz(ta.sma(close[1], 20), close)
+float maDev = maSrc > 0 ? (close - maSrc) / maSrc : 0.0
+float sigS  = nz(ta.sma(rsiS[1], 10), 50.0)
+float rsiSD = sigS > 0 ? (rsiS - sigS) / sigS : 0.0
+float chopV = ml_chop(14)
+
+float pc1 = ml_norm((ml_norm(rsiS, nW) + ml_norm(maDev, nW) + ml_norm(rsiSD, nW) * 0.5), nW)
+float pc2 = ml_norm((ml_norm(rsiM, nW) + ml_norm(maDev, nW)), nW) * 0.9
+float pc3 = ml_norm(rsiSD, nW)
+float pc4 = ml_norm(chopV, nW) * 0.8
+
+var float prob_up   = 0.0
+var float prob_down = 0.0
+var float[] kd  = array.new_float(0)
+var float[] kl  = array.new_float(0)
+
+// Recalculate KNN every 3 bars only — major performance gain
+bool doKNN = useML and barstate.isconfirmed and bar_index > nW + mlStr and bar_index % 3 == 0
+
+if doKNN
+    array.clear(kd)
+    array.clear(kl)
+    for i = mlStr to sampWin + mlStr by mlStr
+        if ml_target[i] != 0
+            float d1 = math.abs(pc1 - pc1[i])
+            float d2 = math.abs(pc2 - pc2[i])
+            float d3 = math.abs(pc3 - pc3[i])
+            float d4 = math.abs(pc4 - pc4[i])
+            array.push(kd, math.sqrt(d1*d1 + d2*d2 + d3*d3 + d4*d4))
+            array.push(kl, float(ml_target[i]))
+
+    if array.size(kd) >= kN
+        int[]   si    = array.sort_indices(kd, order.ascending)
+        float[] dSort = array.copy(kd)
+        array.sort(dSort)
+        float sigma = math.max(array.get(dSort, math.min(int(kN/2), array.size(dSort)-1)), 0.0001)
+        float wU = 0.0, float wD = 0.0, float wT = 0.0
+        for j = 0 to kN - 1
+            int   idx = array.get(si, j)
+            float d   = array.get(kd, idx)
+            float lb  = array.get(kl, idx)
+            float w   = math.exp(-d*d / (2.0*sigma*sigma))
+            if lb ==  1.0
+                wU += w
+            else if lb == -1.0
+                wD += w
+            wT += w
+        prob_up   := wT > 0 ? wU / wT : 0.0
+        prob_down := wT > 0 ? wD / wT : 0.0
+
+bool mlBull = not useML or prob_up   > probThr
+bool mlBear = not useML or prob_down > probThr
+
+// ═══════════════════════════════════════════════════════════════
+// ④ CVD
+// ═══════════════════════════════════════════════════════════════
+float bRng  = high - low
+float upVol = bRng > 0 ? volume * (close - low)  / bRng : volume * 0.5
+float dnVol = bRng > 0 ? volume * (high - close) / bRng : volume * 0.5
+float cvd   = ta.cum(upVol - dnVol)
+float cvdMa = ta.sma(cvd, cvdLen)
+bool  cvdBull = not useCVD or cvd > cvdMa
+
+// ═══════════════════════════════════════════════════════════════
+// ⑤ VWAP BANDS
+// ═══════════════════════════════════════════════════════════════
+float vwapV  = ta.vwap(close)
+float cumV2  = ta.cum(volume * close * close)
+float cumVol = ta.cum(volume)
+float cumVP  = ta.cum(volume * close)
+float vStd   = math.sqrt(math.max(cumV2/cumVol - math.pow(cumVP/cumVol, 2), 0.0))
+float vU1    = vwapV + vwapM1 * vStd
+float vL1    = vwapV - vwapM1 * vStd
+float vU2    = vwapV + vwapM2 * vStd
+float vL2    = vwapV - vwapM2 * vStd
+bool  vwapBull = not useVWAP or close > vwapV
+
+// ═══════════════════════════════════════════════════════════════
+// ⑥ CANDLESTICK PATTERNS
+// ═══════════════════════════════════════════════════════════════
+float body = math.abs(close - open)
+float rng  = high - low
+float lwk  = math.min(close, open) - low
+float uwk  = high - math.max(close, open)
+bool  isBullC = close > open
+bool  isBearC = close < open
+float midC = (open + close) / 2.0
+
+bool patEngulf = isBearC[1] and isBullC and open < close[1] and close > open[1] and body > body[1]
+bool patHammer = lwk >= body * 2.0 and uwk <= body * 0.5 and rng > 0
+bool patMStar  = isBearC[2] and body[1] < body[2] * 0.3 and isBullC and close > midC[2]
+bool patHarami = isBearC[1] and isBullC and open > close[1] and close < open[1]
+bool pat3Sol   = isBullC and isBullC[1] and isBullC[2] and close > close[1] and close[1] > close[2]
+
+int  patScore = (patEngulf?1:0) + (patHammer?1:0) + (patMStar?1:0) + (patHarami?1:0) + (pat3Sol?1:0)
+bool patOk    = minPat == 0 or patScore >= minPat
+
+// ═══════════════════════════════════════════════════════════════
+// ⑦ VOLUME + MTF
+// ═══════════════════════════════════════════════════════════════
+float volMa   = ta.sma(volume, volLen)
+float volRatio= nz(volume / volMa, 1.0)
+bool  volOk   = not useVol or volRatio >= volMult
+
+float atrCurr = ta.atr(14)
+float atrMa   = ta.sma(atrCurr, 20)
+float atrRat  = nz(atrCurr / atrMa, 1.0)
+
+[_diP, _diM, _adxVal] = ta.dmi(14, 14)
+float medAdx  = ta.sma(_adxVal, 14)
+int   adxTrnd = _adxVal > medAdx * 1.2 ? 1 : _adxVal < medAdx * 0.8 ? -1 : 0
+
+// 3 TFs only (1h / 4h / Daily) — fewer security calls = faster
+fetchTF(string tf) => request.security(syminfo.tickerid, tf, adxTrnd[1], lookahead=barmerge.lookahead_on)
+float tf1h  = useMTF ? fetchTF("60")   : 0.0
+float tf4h  = useMTF ? fetchTF("240")  : 0.0
+float tf1d  = useMTF ? fetchTF("1440") : 0.0
+float tf5m  = 0.0
+float tf15m = 0.0
+float tf12h = 0.0
+
+int  bullTFs = (tf1h>0?1:0) + (tf4h>0?1:0) + (tf1d>0?1:0)
+bool mtfOk   = not useMTF or bullTFs >= math.min(mtfMin, 3)
+
+// ═══════════════════════════════════════════════════════════════
+// QUALITY SCORE
+// ═══════════════════════════════════════════════════════════════
+bool volSpike = volRatio >= 2.5
+bool volHigh  = volRatio >= 1.5
+bool volBasic = volRatio >= 1.0
+bool volExpnd = atrRat >= 1.2
+bool volRise  = atrRat >= 1.0 and atrRat < 1.2
+
+int    qualScore = (volSpike?30:volHigh?20:volBasic?10:0) + (volExpnd?30:volRise?15:0)
+string qualLbl   = qualScore >= 60 ? "⭐⭐⭐ EXCELLENT" : qualScore >= 45 ? "⭐⭐ STRONG" : qualScore >= 30 ? "⭐ GOOD" : "⚠️ WEAK"
+
+// ═══════════════════════════════════════════════════════════════
+// FINAL SIGNAL — FLIP bar only
+// ═══════════════════════════════════════════════════════════════
+bool bullSignal = barstate.isconfirmed and stFlip and stBull
+     and mlBull and cvdBull and vwapBull and patOk and volOk and mtfOk
+
+bool sellSignal = barstate.isconfirmed and stFlip and not stBull
+     and mlBear and not cvdBull and not vwapBull and volOk
+     and (not useMTF or (6 - bullTFs) >= mtfMin)
+
+// ═══════════════════════════════════════════════════════════════
+// ⑨ TREND DURATION PREDICTION
+// ═══════════════════════════════════════════════════════════════
+PRED_N  = 50
+BOX_N   = 30
+
+var array<int>  bullDurs  = array.new_int(0)
+var array<int>  bearDurs  = array.new_int(0)
+var int         trendBars = 0
+var int         flipBar   = 0
+var float       flipST    = na
+
+var array<box>   predBoxes = array.new<box>(0)
+var array<label> predLbls  = array.new<label>(0)
+var array<int>   boxCnts   = array.new_int(0)
+var array<int>   lblCnts   = array.new_int(0)
+
+ewa_fn(arr, float decay) =>
+    int n = array.size(arr)
+    if n == 0
+        na
+    else
+        float sw = 0.0, float wt = 0.0
+        for i = 0 to n - 1
+            float w = math.pow(decay, n - 1 - i)
+            sw += array.get(arr, i) * w
+            wt += w
+        sw / wt
+
+stype_mult(string t) =>
+    t == "Small Cap" ? 0.65 : t == "Biotech / Speculative" ? 0.55 :
+     t == "Blue Chip / Large Cap" ? 1.35 : t == "Tech Growth" ? 1.10 :
+     t == "Dividend / Value" ? 1.25 : t == "Cyclical" ? 0.90 : 0.60
+
+if barstate.isconfirmed
+    if stFlip
+        if stDir == 1
+            array.push(bearDurs, trendBars)
+            if array.size(bearDurs) > PRED_N
+                array.shift(bearDurs)
+        else
+            array.push(bullDurs, trendBars)
+            if array.size(bullDurs) > PRED_N
+                array.shift(bullDurs)
+
+        flipBar   := bar_index
+        flipST    := stBand
+        trendBars := 1
+
+        if usePred
+            bool nb       = stDir == 1
+            array<int> src= nb ? bullDurs : bearDurs
+            int  ns       = array.size(src)
+
+            if ns >= 1
+                float rawMed = array.median(src)
+                float rawAvg = useEWA ? ewa_fn(src, ewaDec) : array.avg(src)
+                float base   = rawMed * 0.6 + rawAvg * 0.4
+
+                float stMlt  = actualStyle == "Scalping" ? 0.7 : actualStyle == "Day Trading" ? 0.85 : actualStyle == "Swing" ? 1.1 : 1.3
+                float sMlt   = predMode == "Advanced" ? stype_mult(stockTyp) : 1.0
+                float vCtx   = atrRat > 1.2 ? 0.85 : atrRat < 0.8 ? 1.15 : 1.0
+
+                float pEnd   = math.max(5, math.min(500, base * stMlt * sMlt * vCtx * 2.2))
+
+                // Remove oldest if 4 prediction sets already exist
+                if array.size(boxCnts) >= 4
+                    int bc = array.shift(boxCnts)
+                    int lc = array.shift(lblCnts)
+                    for _i = 0 to bc - 1
+                        box.delete(array.shift(predBoxes))
+                    for _i = 0 to lc - 1
+                        label.delete(array.shift(predLbls))
+
+                float bw   = pEnd / BOX_N
+                float bTop = nb ? flipST - (8  * syminfo.mintick) : flipST + (12 * syminfo.mintick)
+                float bBot = nb ? bTop   - (4  * syminfo.mintick) : bTop   - (4  * syminfo.mintick)
+                color bClr = nb ? color.green : color.red
+
+                int nbx = 0
+                for i = 0 to BOX_N - 1
+                    int bl = flipBar + int(i * bw)
+                    int br = flipBar + int((i + 1) * bw)
+                    int op = 5 + int((i / 29.0) * 90)
+                    array.push(predBoxes, box.new(bl, bTop, br, bBot,
+                         bgcolor=color.new(bClr, op), border_color=na))
+                    nbx += 1
+
+                int nlb = 0
+                // Probability % markers
+                float[] prP = array.from(0.25, 0.50, 0.75, 1.0)
+                string[] prT= array.from("85%","50%","20%","5%")
+                for i = 0 to 3
+                    int pb = flipBar + int(array.get(prP, i) * pEnd)
+                    array.push(predLbls, label.new(pb, bBot - 3 * syminfo.mintick,
+                         array.get(prT, i),
+                         style=label.style_none,
+                         textcolor=color.gray,
+                         text_formatting=text.format_bold,
+                         size=size.tiny))
+                    nlb += 1
+
+                // Center label
+                string tipTxt = (nb ? "▲ BULL" : "▼ BEAR") + " Trend Prediction\n" +
+                     "Median: " + str.tostring(int(rawMed)) + " bars\n" +
+                     "Avg: "    + str.tostring(int(rawAvg)) + " bars\n" +
+                     "Predicted end: ~" + str.tostring(int(pEnd)) + " bars\n" +
+                     "Style: " + actualStyle + "\n" +
+                     "Asset: " + stockTyp + "\n" +
+                     "Samples: " + str.tostring(ns)
+                array.push(predLbls, label.new(
+                     flipBar + int(pEnd * 0.5), bTop,
+                     (nb ? "▲" : "▼") + " ~" + str.tostring(int(base)) + "b",
+                     style=label.style_label_down,
+                     color=color.new(bClr, 20),
+                     textcolor=color.white,
+                     size=size.tiny,
+                     tooltip=tipTxt))
+                nlb += 1
+
+                array.push(boxCnts, nbx)
+                array.push(lblCnts, nlb)
+    else
+        trendBars += 1
+
+// ═══════════════════════════════════════════════════════════════
+// VISUALS — Gradient Ribbon (15-layer)
+// ═══════════════════════════════════════════════════════════════
+color rClr = stBull ? BULL_C : BEAR_C
+float volI = -(volRatio - 1.0) * 30.0
+get_op(float b) => math.max(5, math.min(95, int(b + volI)))
+get_ly(float s, float e, int i) => (s * (15 - i) + e * i) / 15.0
+
+float rS = close
+float rE = stBand
+
+r1  = plot(showRib ? rS                : na, display=display.none, editable=false)
+r2  = plot(showRib ? get_ly(rS,rE,2)  : na, display=display.none, editable=false)
+r3  = plot(showRib ? get_ly(rS,rE,4)  : na, display=display.none, editable=false)
+r4  = plot(showRib ? get_ly(rS,rE,6)  : na, display=display.none, editable=false)
+r5  = plot(showRib ? get_ly(rS,rE,8)  : na, display=display.none, editable=false)
+r6  = plot(showRib ? get_ly(rS,rE,10) : na, display=display.none, editable=false)
+r7  = plot(showRib ? get_ly(rS,rE,12) : na, display=display.none, editable=false)
+r8  = plot(showRib ? get_ly(rS,rE,14) : na, display=display.none, editable=false)
+r9  = plot(showRib ? rE                : na, display=display.none, editable=false)
+
+fill(r1, r2, showRib ? color.new(rClr, get_op(85)) : na, editable=false)
+fill(r2, r3, showRib ? color.new(rClr, get_op(76)) : na, editable=false)
+fill(r3, r4, showRib ? color.new(rClr, get_op(67)) : na, editable=false)
+fill(r4, r5, showRib ? color.new(rClr, get_op(58)) : na, editable=false)
+fill(r5, r6, showRib ? color.new(rClr, get_op(49)) : na, editable=false)
+fill(r6, r7, showRib ? color.new(rClr, get_op(40)) : na, editable=false)
+fill(r7, r8, showRib ? color.new(rClr, get_op(35)) : na, editable=false)
+fill(r8, r9, showRib ? color.new(rClr, get_op(30)) : na, editable=false)
+
+// ═══════════════════════════════════════════════════════════════
+// VISUALS — SuperTrend Line
+// ═══════════════════════════════════════════════════════════════
+color stC = stBull ? BULL_C : BEAR_C
+plot(stFlip              ? stBand : na, "ST Switch", color=stC, style=plot.style_circles, linewidth=4, join=false)
+plot(isNoisy             ? stBand : na, "ST Dotted", color=color.new(stC,50), style=plot.style_linebr, linewidth=2, linestyle=plot.linestyle_dotted)
+plot(not isNoisy and not stFlip ? stBand : na, "ST Solid", color=stC, style=plot.style_linebr, linewidth=2)
+
+// ═══════════════════════════════════════════════════════════════
+// VISUALS — VWAP
+// ═══════════════════════════════════════════════════════════════
+plot(showVWAP ? vwapV : na, "VWAP",    color=VWAP_C,                linewidth=2)
+plot(showVWAP ? vU1   : na, "VWAP+1σ", color=color.new(VWAP_C,55), linewidth=1)
+plot(showVWAP ? vL1   : na, "VWAP-1σ", color=color.new(VWAP_C,55), linewidth=1)
+plot(showVWAP ? vU2   : na, "VWAP+2σ", color=color.new(VWAP_C,75), linewidth=1, linestyle=plot.linestyle_dotted)
+plot(showVWAP ? vL2   : na, "VWAP-2σ", color=color.new(VWAP_C,75), linewidth=1, linestyle=plot.linestyle_dotted)
+
+// ═══════════════════════════════════════════════════════════════
+// VISUALS — KNN Bar Color
+// ═══════════════════════════════════════════════════════════════
+color mlC = prob_up > prob_down ?
+     color.from_gradient(prob_up,   0.5, 0.95, color.new(color.gray,40), color.new(BULL_C,20)) :
+     color.from_gradient(prob_down, 0.5, 0.95, color.new(color.gray,40), color.new(BEAR_C,20))
+barcolor(mlC, title="KNN Confidence")
+
+// ═══════════════════════════════════════════════════════════════
+// VISUALS — BUY / SELL (flip only, tooltip contains all details)
+// ═══════════════════════════════════════════════════════════════
+patName() =>
+    t = ""
+    if patEngulf
+        t += "Yutan "
+    if patHammer
+        t += "Çekiç "
+    if patMStar
+        t += "Sabah★ "
+    if patHarami
+        t += "Hamile "
+    if pat3Sol
+        t += "3Asker"
+    t
+
+if bullSignal and showSig
+    string tt = "🟢 BUY — " + syminfo.ticker + "\n" +
+         "Quality: " + qualLbl + " (" + str.tostring(qualScore) + "/60)\n" +
+         "ML ↑ " + str.tostring(math.round(prob_up*100)) + "%" +
+         " | CVD: " + (cvdBull?"▲":"▼") +
+         " | VWAP: " + (vwapBull?"Above":"Below") + "\n" +
+         "Volume: " + str.tostring(volRatio,"#.##") + "x" +
+         " | MTF ▲: " + str.tostring(bullTFs) + "/6\n" +
+         (patScore > 0 ? "Pattern: " + patName() : "No pattern filter")
+    label.new(bar_index, low, "ℹ️ BUY",
+         style=label.style_label_up,
+         color=BULL_C, textcolor=color.black,
+         size=size.normal, tooltip=tt)
+
+if sellSignal and showSig
+    string tt = "🔴 SELL — " + syminfo.ticker + "\n" +
+         "Quality: " + qualLbl + " (" + str.tostring(qualScore) + "/60)\n" +
+         "ML ↓ " + str.tostring(math.round(prob_down*100)) + "%" +
+         " | CVD: " + (not cvdBull?"▼":"▲") +
+         " | VWAP: " + (not vwapBull?"Below":"Above") + "\n" +
+         "Volume: " + str.tostring(volRatio,"#.##") + "x" +
+         " | MTF ▼: " + str.tostring(6-bullTFs) + "/6"
+    label.new(bar_index, high, "ℹ️ SELL",
+         style=label.style_label_down,
+         color=BEAR_C, textcolor=color.white,
+         size=size.normal, tooltip=tt)
+
+// ═══════════════════════════════════════════════════════════════
+// DASHBOARD
+// ═══════════════════════════════════════════════════════════════
+chk(bool v)  => v ? "✔" : "✘"
+chkC(bool v) => v ? color.green : color.red
+tTxt(float v)=> v > 0 ? "B" : v < 0 ? "Br" : "N"
+
+var table dash = table.new(position.bottom_right, 2, 12,
+     bgcolor=color.new(DASH_BG,15),
+     border_color=color.new(#373a46,100), border_width=1,
+     frame_color=#000000, frame_width=1)
+
+if showDash and barstate.islast
+    table.cell(dash, 0, 0, "ULTIMATE CONFLUENCE v6",
+         text_color=BULL_C, text_size=size.small, bgcolor=DASH_HDR, text_halign=text.align_left)
+    table.cell(dash, 1, 0,
+         bullSignal ? "🟢 BUY" : sellSignal ? "🔴 SELL" : (stBull ? "↑ Bull" : "↓ Bear"),
+         text_color=stBull?color.green:color.red, text_size=size.small, bgcolor=DASH_HDR)
+    table.cell(dash, 0, 1, "Style",      text_color=DASH_TXT, text_size=size.tiny)
+    table.cell(dash, 1, 1, actualStyle,  text_color=color.white, text_size=size.tiny)
+    table.cell(dash, 0, 2, "Quality",    text_color=DASH_TXT, text_size=size.tiny)
+    table.cell(dash, 1, 2, qualLbl,      text_color=color.white, text_size=size.tiny)
+    table.cell(dash, 0, 3, "① Evasive ST", text_color=DASH_TXT, text_size=size.tiny)
+    table.cell(dash, 1, 3, stBull?"Bullish":"Bearish",
+         text_color=stBull?color.green:color.red, text_size=size.tiny)
+    table.cell(dash, 0, 4, "② ML ↑" + str.tostring(math.round(prob_up*100)) + "%",
+         text_color=DASH_TXT, text_size=size.tiny)
+    table.cell(dash, 1, 4, chk(mlBull), text_color=chkC(mlBull), text_size=size.tiny)
+    table.cell(dash, 0, 5, "③ CVD",     text_color=DASH_TXT, text_size=size.tiny)
+    table.cell(dash, 1, 5, chk(cvdBull),text_color=chkC(cvdBull), text_size=size.tiny)
+    table.cell(dash, 0, 6, "④ VWAP",    text_color=DASH_TXT, text_size=size.tiny)
+    table.cell(dash, 1, 6, chk(vwapBull),text_color=chkC(vwapBull), text_size=size.tiny)
+    table.cell(dash, 0, 7, "⑤ Pat " + str.tostring(patScore) + "/5",
+         text_color=DASH_TXT, text_size=size.tiny)
+    table.cell(dash, 1, 7, chk(patOk),  text_color=chkC(patOk), text_size=size.tiny)
+    table.cell(dash, 0, 8, "⑥ Vol " + str.tostring(volRatio,"#.#") + "x",
+         text_color=DASH_TXT, text_size=size.tiny)
+    table.cell(dash, 1, 8, chk(volOk),  text_color=chkC(volOk), text_size=size.tiny)
+    table.cell(dash, 0, 9, "⑦ MTF " + str.tostring(bullTFs) + "/6",
+         text_color=DASH_TXT, text_size=size.tiny)
+    table.cell(dash, 1, 9, chk(mtfOk),  text_color=chkC(mtfOk), text_size=size.tiny)
+    table.cell(dash, 0, 10,
+         "  " + tTxt(tf5m) + "/" + tTxt(tf15m) + "/" + tTxt(tf1h) + " (5m/15m/1h)",
+         text_color=color.new(DASH_TXT,40), text_size=size.tiny)
+    table.cell(dash, 1, 10,
+         tTxt(tf4h) + "/" + tTxt(tf12h) + "/" + tTxt(tf1d) + " (4h/12h/D)",
+         text_color=color.new(DASH_TXT,40), text_size=size.tiny)
+    table.cell(dash, 0, 11, "Trend Bars", text_color=DASH_TXT, text_size=size.tiny)
+    table.cell(dash, 1, 11, str.tostring(trendBars) + " bars",
+         text_color=color.white, text_size=size.tiny)
+
+// ═══════════════════════════════════════════════════════════════
+// ALERTS
+// ═══════════════════════════════════════════════════════════════
+alertcondition(bullSignal, "🟢 Ultimate BUY",  "BUY — {{ticker}} @ {{close}} | {{interval}}")
+alertcondition(sellSignal, "🔴 Ultimate SELL", "SELL — {{ticker}} @ {{close}} | {{interval}}")
+alertcondition(stFlip and stBull,      "ST → Bull", "ST BULL — {{ticker}} | {{interval}}")
+alertcondition(stFlip and not stBull,  "ST → Bear", "ST BEAR — {{ticker}} | {{interval}}")

@@ -1,0 +1,191 @@
+// This Pine Script™ code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © Satoh.K
+
+//@version=5
+indicator("Support & Resistance KDE", overlay = true, max_boxes_count = 500, max_lines_count = 500)
+
+// --- Input Settings ---
+lookback_period = input.int(400, "Lookback Period (Bars)", minval = 100, maxval = 1000)
+piv_left  = input.int(10, "Pivot Left Strength", minval = 1)
+piv_right = input.int(5, "Pivot Right Strength", minval = 1)
+num_levels = input.int(5, "Number of Top Levels to Display (N)", minval = 1, maxval = 10)
+min_dist_atr = input.float(1.5, "Min Distance Between Levels (ATR Multiplier)", minval = 0.1)
+zone_width_atr = input.float(0.5, "Zone Display Width (ATR Multiplier)", minval = 0.1)
+kde_steps = input.int(100, "KDE Resolution (Scan Steps)", minval = 50, maxval = 200)
+
+// Display Settings
+show_kde_dist = input.bool(true, "Show KDE Distribution")
+kde_max_width_bars = input.int(30, "Max Distribution Width (Bars)", minval = 5, maxval = 200)
+kde_offset_bars = input.int(10, "Distribution Right Offset (Bars)", minval = 0)
+
+// Gradient Settings
+kde_color_min = input.color(color.new(#00e5ff, 90), "Low Density Color")
+kde_color_max = input.color(color.new(#00e5ff, 20), "High Density Color")
+sr_color_input = input.color(color.new(#00e5ff, 0), "S/R Line Color")
+range_hl_color = input.color(color.new(color.gray, 50), "Range High/Low Color")
+
+// --- Variables and Arrays (Global Scope) ---
+var float[] pivot_prices = array.new_float()
+var float[] pivot_widths = array.new_float()
+var int[]   pivot_times  = array.new_int()
+var box[]   boxes        = array.new_box()
+var line[]  dist_lines   = array.new_line()
+
+float atr = ta.atr(100)
+
+// --- Data Collection and Cleanup ---
+ph = ta.pivothigh(piv_left, piv_right)
+pl = ta.pivotlow(piv_left, piv_right)
+
+if not na(ph)
+    array.push(pivot_prices, ph)
+    array.push(pivot_widths, high[piv_right] - low[piv_right])
+    array.push(pivot_times, bar_index[piv_right])
+if not na(pl)
+    array.push(pivot_prices, pl)
+    array.push(pivot_widths, high[piv_right] - low[piv_right])
+    array.push(pivot_times, bar_index[piv_right])
+
+// Delete old data outside lookback period
+if array.size(pivot_times) > 0
+    while array.size(pivot_times) > 0 and array.get(pivot_times, 0) < bar_index - lookback_period
+        array.remove(pivot_prices, 0)
+        array.remove(pivot_widths, 0)
+        array.remove(pivot_times, 0)
+
+// --- KDE Calculation and Peak Detection ---
+if barstate.islast
+    // Reset drawings
+    if array.size(boxes) > 0
+        for b in boxes
+            box.delete(b)
+        array.clear(boxes)
+    
+    if array.size(dist_lines) > 0
+        for l in dist_lines
+            line.delete(l)
+        array.clear(dist_lines)
+
+    // Determine scan range (Range High/Low)
+    float min_p = low[0]
+    float max_p = high[0]
+    for i = 0 to math.min(lookback_period, last_bar_index)
+        min_p := math.min(min_p, low[i])
+        max_p := math.max(max_p, high[i])
+
+    // Draw Range High/Low lines
+    array.push(boxes, box.new(left = bar_index - lookback_period, top = max_p, right = bar_index + 10, bottom = max_p, border_color = range_hl_color, border_style = line.style_dashed, extend = extend.right, text = "Range High", text_size = size.tiny, text_color = range_hl_color))
+    array.push(boxes, box.new(left = bar_index - lookback_period, top = min_p, right = bar_index + 10, bottom = min_p, border_color = range_hl_color, border_style = line.style_dashed, extend = extend.right, text = "Range Low", text_size = size.tiny, text_color = range_hl_color, text_valign = text.align_bottom))
+
+    // Execute KDE scan
+    float step_size = (max_p - min_p) / math.max(1, kde_steps)
+    float[] kde_results_p = array.new_float()
+    float[] kde_results_d = array.new_float()
+    float max_density = 0.0
+
+    if array.size(pivot_prices) > 0
+        for i = 0 to kde_steps
+            float test_price = min_p + (i * step_size)
+            float density = 0.0
+            
+            for k = 0 to array.size(pivot_prices) - 1
+                float p_val = array.get(pivot_prices, k)
+                float p_wid = array.get(pivot_widths, k)
+                if p_wid > 0
+                    float u = math.abs(test_price - p_val) / p_wid
+                    if u <= 1.0
+                        density += (1.0 - u)
+            
+            array.push(kde_results_p, test_price)
+            array.push(kde_results_d, density)
+            max_density := math.max(max_density, density)
+
+    // --- Draw Distribution (Profile) ---
+    if show_kde_dist and max_density > 0
+        int start_x = bar_index + kde_offset_bars
+        
+        for i = 0 to array.size(kde_results_d) - 1
+            float d = array.get(kde_results_d, i)
+            float p = array.get(kde_results_p, i)
+            if d > 0
+                float ratio = d / max_density
+                int line_len = int(ratio * kde_max_width_bars)
+                
+                color current_color = color.from_gradient(d, 0, max_density, kde_color_min, kde_color_max)
+                
+                line l = line.new(
+                     x1 = start_x, 
+                     y1 = p, 
+                     x2 = start_x + line_len, 
+                     y2 = p, 
+                     color = current_color, 
+                     width = 2
+                     )
+                array.push(dist_lines, l)
+
+    // --- Identify Peaks (Local Maxima) ---
+    float[] peak_prices = array.new_float()
+    float[] peak_densities = array.new_float()
+
+    if array.size(kde_results_d) > 2
+        for i = 1 to array.size(kde_results_d) - 2
+            float d_prev = array.get(kde_results_d, i - 1)
+            float d_curr = array.get(kde_results_d, i)
+            float d_next = array.get(kde_results_d, i + 1)
+            
+            if d_curr > d_prev and d_curr > d_next and d_curr > 0
+                array.push(peak_prices, array.get(kde_results_p, i))
+                array.push(peak_densities, d_curr)
+
+    // --- Sorting ---
+    if array.size(peak_prices) > 1
+        for i = 0 to array.size(peak_prices) - 2
+            for j = i + 1 to array.size(peak_prices) - 1
+                if array.get(peak_densities, i) < array.get(peak_densities, j)
+                    float temp_p = array.get(peak_prices, i)
+                    float temp_d = array.get(peak_densities, i)
+                    array.set(peak_prices, i, array.get(peak_prices, j))
+                    array.set(peak_densities, i, array.get(peak_densities, j))
+                    array.set(peak_prices, j, temp_p)
+                    array.set(peak_densities, j, temp_d)
+
+    // --- Filter and Draw Top N Levels ---
+    float[] final_levels = array.new_float()
+    float min_diff = atr * min_dist_atr
+
+    if array.size(peak_prices) > 0
+        for i = 0 to array.size(peak_prices) - 1
+            float curr_p = array.get(peak_prices, i)
+            bool is_too_close = false
+            if array.size(final_levels) > 0
+                for k = 0 to array.size(final_levels) - 1
+                    if math.abs(curr_p - array.get(final_levels, k)) < min_diff
+                        is_too_close := true
+                        break
+            
+            if not is_too_close
+                array.push(final_levels, curr_p)
+                
+                float w = (atr * zone_width_atr) / 2
+                string r_text = "Level " + str.tostring(array.size(final_levels))
+                
+                color box_bg = color.new(sr_color_input, 85)
+                color box_brd = color.new(sr_color_input, 40)
+                
+                box b = box.new(
+                     left = bar_index - lookback_period, 
+                     top = curr_p + w, 
+                     right = bar_index + 10, 
+                     bottom = curr_p - w, 
+                     border_color = box_brd, 
+                     bgcolor = box_bg, 
+                     extend = extend.right, 
+                     text = r_text, 
+                     text_size = size.tiny, 
+                     text_color = sr_color_input, 
+                     text_halign = text.align_right
+                     )
+                array.push(boxes, b)
+            
+            if array.size(final_levels) >= num_levels
+                break

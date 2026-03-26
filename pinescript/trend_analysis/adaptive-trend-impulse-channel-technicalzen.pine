@@ -1,0 +1,277 @@
+//@version=6
+indicator("Adaptive_Trend_Impulse_Channel [TraderZen]", shorttitle="Adaptive_Trend_Channel [TZ]", overlay=true, max_lines_count=500)
+//──────────────────────────────────────────────────────────────────────────────
+// Logic Inputs
+//──────────────────────────────────────────────────────────────────────────────
+groupLogic = "Logic"
+atrLen        = input.int(50,   "ATR Length", minval=1, group=groupLogic)
+basisLen      = input.int(21,   "Local Basis Length", minval=2, group=groupLogic)
+flipATR       = input.float(0.35, "Flip Threshold Beyond Band (ATR)", step=0.05, minval=0.0, group=groupLogic)
+contATR       = input.float(0.15, "Continuation Threshold Beyond Band (ATR)", step=0.05, minval=0.0, group=groupLogic)
+confirmBars   = input.int(2, "Confirmation Bars", minval=1, group=groupLogic)
+cooldownBars  = input.int(1, "Cooldown Bars", minval=0, group=groupLogic)
+maxSegBars    = input.int(35, "Max Segment Age", minval=5, group=groupLogic)
+detachATR     = input.float(1.25, "Detach Threshold vs Basis (ATR)", step=0.05, minval=0.1, group=groupLogic)
+detachBars    = input.int(3, "Detach Bars", minval=1, group=groupLogic)
+basisBlend      = input.float(0.50, "Re-anchor Blend To Local Basis", step=0.05, minval=0.0, maxval=1.0, group=groupLogic)
+stepATR         = input.float(0.50, "Step Size On Event (ATR)", step=0.05, minval=0.0, group=groupLogic)
+adverseSlopeATR = input.float(0.015, "Adverse Slope Per Bar (ATR)", step=0.001, minval=0.0, group=groupLogic)
+widthATR      = input.float(1.05, "Base Half-Width (ATR)", step=0.05, minval=0.1, group=groupLogic)
+widthStdMult  = input.float(1.00, "Local Spread Multiplier", step=0.05, minval=0.0, group=groupLogic)
+widthCapATR   = input.float(2.20, "Max Half-Width (ATR)", step=0.05, minval=0.2, group=groupLogic)
+midView       = input.string("Lead", "Mid Line View", options=["Lead", "Follow"], group=groupLogic, tooltip="Lead: mid line sits on the opposite side of price (support/resistance), decaying away like the original Zeiierman. Follow: mid line tracks toward price, blending with local basis.")
+//──────────────────────────────────────────────────────────────────────────────
+// Style Inputs
+//──────────────────────────────────────────────────────────────────────────────
+groupStyle = "Style"
+groupGrad  = "Gradient"
+showFill        = input.bool(true,  "Show Fill", group=groupStyle)
+showBands       = input.bool(true,  "Show Band Edges", group=groupStyle)
+showRetests     = input.bool(true,  "Show Retests", group=groupStyle)
+showRegimeMarks = input.bool(true,  "Show Regime Change Markers", group=groupStyle)
+showStepMarks   = input.bool(true,  "Show Continuation Step Marks", group=groupStyle)
+showRefresh     = input.bool(false, "Show Refresh Marks", group=groupStyle)
+showCaps        = input.bool(true,  "Show Segment Cap Lines", group=groupStyle)
+connectSegments = input.bool(true,  "Connect Segment Endpoints", group=groupStyle)
+midGlowWidth    = input.int(5, "Mid Glow Width", minval=1, maxval=10, group=groupStyle)
+midMainWidth    = input.int(2, "Mid Main Width", minval=1, maxval=5, group=groupStyle)
+bandWidth       = input.int(1, "Band Edge Width", minval=1, maxval=3, group=groupStyle)
+glowTransp      = input.int(72, "Glow Transparency", minval=0, maxval=100, group=groupStyle)
+bandTransp      = input.int(84, "Band Edge Transparency", minval=0, maxval=100, group=groupStyle)
+colorUp         = input.color(color.lime, "Up Line Color", group=groupStyle)
+colorDown       = input.color(color.red,  "Down Line Color", group=groupStyle)
+colorNeutral    = input.color(color.gray, "Neutral Line Color", group=groupStyle)
+gradInnerRatio   = input.float(0.45, "Gradient Inner Ratio", minval=0.10, maxval=0.90, step=0.01, group=groupGrad)
+upGradColor      = input.color(color.lime, "Up Gradient Color", group=groupGrad)
+downGradColor    = input.color(color.red,  "Down Gradient Color", group=groupGrad)
+neutralGradColor = input.color(color.gray, "Neutral Gradient Color", group=groupGrad)
+upOuterTransp      = input.int(90, "Up Outer Transparency", minval=0, maxval=100, group=groupGrad)
+upInnerTransp      = input.int(97, "Up Inner Transparency", minval=0, maxval=100, group=groupGrad)
+downOuterTransp    = input.int(90, "Down Outer Transparency", minval=0, maxval=100, group=groupGrad)
+downInnerTransp    = input.int(97, "Down Inner Transparency", minval=0, maxval=100, group=groupGrad)
+neutralOuterTransp = input.int(92, "Neutral Outer Transparency", minval=0, maxval=100, group=groupGrad)
+neutralInnerTransp = input.int(98, "Neutral Inner Transparency", minval=0, maxval=100, group=groupGrad)
+//──────────────────────────────────────────────────────────────────────────────
+// Local context measures
+//──────────────────────────────────────────────────────────────────────────────
+atrRaw    = ta.atr(atrLen)
+atr       = na(atrRaw) ? ta.tr(true) : atrRaw
+basisRaw  = ta.ema(hl2, basisLen)
+basis     = na(basisRaw) ? hl2 : basisRaw
+spreadRaw = ta.stdev(hl2, basisLen)
+spread    = na(spreadRaw) ? 0.0 : spreadRaw
+basisSlope = basis - nz(basis[1], basis)
+widthSeedRaw = atr * widthATR + spread * widthStdMult
+widthSeedCap = atr * widthCapATR
+widthSeed    = math.min(widthSeedRaw, widthSeedCap)
+//──────────────────────────────────────────────────────────────────────────────
+// Persistent segment state
+//──────────────────────────────────────────────────────────────────────────────
+var float segMid0  = na
+var float segSlope = 0.0
+var float segWidth = na
+var int   segBar0  = na
+var int   segDir   = 0
+var int   segLock  = 0
+var int upFlipStreak = 0
+var int dnFlipStreak = 0
+var int upContStreak = 0
+var int dnContStreak = 0
+var int detachStreak = 0
+if na(segMid0)
+    initDir   = basisSlope > 0 ? 1 : basisSlope < 0 ? -1 : 0
+    segMid0   := basis
+    segSlope  := 0.0
+    segWidth  := widthSeed
+    segBar0   := bar_index
+    segDir    := initDir
+    segLock   := 0
+//──────────────────────────────────────────────────────────────────────────────
+// Current segment projection before any event
+//──────────────────────────────────────────────────────────────────────────────
+agePre   = bar_index - segBar0
+midPre   = segMid0 + segSlope * agePre
+widthPre = math.max(nz(segWidth, widthSeed), atr * 0.25)
+upperPre = midPre + widthPre
+lowerPre = midPre - widthPre
+//──────────────────────────────────────────────────────────────────────────────
+// Structural event logic
+// eventType:
+//  1  = bullish regime flip
+// -1  = bearish regime flip
+//  2  = bullish continuation step
+// -2  = bearish continuation step
+//  3  = local refresh / re-anchor only
+//──────────────────────────────────────────────────────────────────────────────
+upFlipQual = segDir != 1 and close > upperPre + atr * flipATR
+dnFlipQual = segDir != -1 and close < lowerPre - atr * flipATR
+upContQual = segDir == 1 and close > upperPre + atr * contATR
+dnContQual = segDir == -1 and close < lowerPre - atr * contATR
+upFlipStreak := upFlipQual ? upFlipStreak + 1 : 0
+dnFlipStreak := dnFlipQual ? dnFlipStreak + 1 : 0
+upContStreak := upContQual ? upContStreak + 1 : 0
+dnContStreak := dnContQual ? dnContStreak + 1 : 0
+detachedNow   = math.abs(basis - midPre) > atr * detachATR
+detachStreak := detachedNow ? detachStreak + 1 : 0
+flipUp   = segLock <= 0 and upFlipStreak >= confirmBars
+flipDn   = segLock <= 0 and dnFlipStreak >= confirmBars
+contUp   = segLock <= 0 and upContStreak >= confirmBars
+contDn   = segLock <= 0 and dnContStreak >= confirmBars
+stale    = agePre >= maxSegBars
+refresh  = segLock <= 0 and not (flipUp or flipDn or contUp or contDn) and (stale or detachStreak >= detachBars)
+eventType =
+     flipUp  ? 1  :
+     flipDn  ? -1 :
+     contUp  ? 2  :
+     contDn  ? -2 :
+     refresh ? 3  : 0
+didEvent = eventType != 0
+prevDir  = segDir
+//──────────────────────────────────────────────────────────────────────────────
+// Re-anchor locally on event
+//──────────────────────────────────────────────────────────────────────────────
+if didEvent
+    newDir =
+         eventType == 1  ? 1  :
+         eventType == -1 ? -1 :
+         eventType == 2  ? 1  :
+         eventType == -2 ? -1 :
+         segDir != 0 ? segDir :
+         basisSlope >= 0 ? 1 : -1
+    isLead   = midView == "Lead"
+    anchorBase = isLead ? close : midPre + basisBlend * (basis - midPre)
+    stepSize = eventType == 3 ? 0.0 : atr * stepATR
+    newMid0  = isLead ? anchorBase - newDir * stepSize : anchorBase + newDir * stepSize
+    slopeMag = atr * adverseSlopeATR
+    newSlope = -newDir * slopeMag
+    newWidth = widthSeed
+    segMid0  := newMid0
+    segSlope := newSlope
+    segWidth := newWidth
+    segBar0  := bar_index
+    segDir   := newDir
+    segLock  := cooldownBars
+    upFlipStreak := 0
+    dnFlipStreak := 0
+    upContStreak := 0
+    dnContStreak := 0
+    detachStreak := 0
+else
+    segLock := math.max(segLock - 1, 0)
+//──────────────────────────────────────────────────────────────────────────────
+// Final projection
+//──────────────────────────────────────────────────────────────────────────────
+age   = bar_index - segBar0
+mid   = segMid0 + segSlope * age
+width = math.max(nz(segWidth, widthSeed), atr * 0.25)
+upper = mid + width
+lower = mid - width
+upperInner = mid + (upper - mid) * gradInnerRatio
+lowerInner = mid - (mid - lower) * gradInnerRatio
+lineColor =
+     segDir == 1 ? colorUp :
+     segDir == -1 ? colorDown :
+     colorNeutral
+gradBaseColor =
+     segDir == 1 ? upGradColor :
+     segDir == -1 ? downGradColor :
+     neutralGradColor
+outerTransp =
+     segDir == 1 ? upOuterTransp :
+     segDir == -1 ? downOuterTransp :
+     neutralOuterTransp
+innerTransp =
+     segDir == 1 ? upInnerTransp :
+     segDir == -1 ? downInnerTransp :
+     neutralInnerTransp
+outerGradColor = color.new(gradBaseColor, outerTransp)
+innerGradColor = color.new(gradBaseColor, innerTransp)
+fadeColor      = color.new(gradBaseColor, 100)
+//──────────────────────────────────────────────────────────────────────────────
+// Marker semantics
+//──────────────────────────────────────────────────────────────────────────────
+bullRegimeFlip = didEvent and eventType == 1 and prevDir != 1
+bearRegimeFlip = didEvent and eventType == -1 and prevDir != -1
+bullStep = didEvent and eventType == 2
+bearStep = didEvent and eventType == -2
+refreshEvt = didEvent and eventType == 3
+//──────────────────────────────────────────────────────────────────────────────
+// Retests
+//──────────────────────────────────────────────────────────────────────────────
+crossLower = ta.crossunder(low, lower)
+crossUpper = ta.crossover(high, upper)
+retestLong  = segDir == 1 and crossLower
+retestShort = segDir == -1 and crossUpper
+//──────────────────────────────────────────────────────────────────────────────
+// Single active renderer
+//──────────────────────────────────────────────────────────────────────────────
+midPlot        = connectSegments ? mid        : (didEvent ? na : mid)
+upperPlot      = connectSegments ? upper      : (didEvent ? na : upper)
+lowerPlot      = connectSegments ? lower      : (didEvent ? na : lower)
+upperInnerPlot = connectSegments ? upperInner : (didEvent ? na : upperInner)
+lowerInnerPlot = connectSegments ? lowerInner : (didEvent ? na : lowerInner)
+pMidGlow = plot(midPlot, "Mid Glow", color=color.new(lineColor, glowTransp), linewidth=midGlowWidth, style=plot.style_linebr)
+pMid     = plot(midPlot, "Mid Line", color=lineColor, linewidth=midMainWidth, style=plot.style_linebr)
+bandCol   = color.new(lineColor, bandTransp)
+bandColHi = showBands ? bandCol : color.new(lineColor, 100)
+pUpper      = plot(upperPlot, "Upper Band", color=bandColHi, linewidth=bandWidth, style=plot.style_linebr)
+pUpperInner = plot(upperInnerPlot, "Upper Inner", color=color.new(lineColor, 100), linewidth=1, style=plot.style_linebr)
+pLowerInner = plot(lowerInnerPlot, "Lower Inner", color=color.new(lineColor, 100), linewidth=1, style=plot.style_linebr)
+pLower      = plot(lowerPlot, "Lower Band", color=bandColHi, linewidth=bandWidth, style=plot.style_linebr)
+//──────────────────────────────────────────────────────────────────────────────
+// Dual-layer gradient fills
+//──────────────────────────────────────────────────────────────────────────────
+fill(pUpper,      pUpperInner, showFill ? upperPlot      : na, showFill ? upperInnerPlot : na, outerGradColor, innerGradColor)
+fill(pUpperInner, pMid,        showFill ? upperInnerPlot : na, showFill ? midPlot        : na, innerGradColor, fadeColor)
+fill(pLowerInner, pLower,      showFill ? lowerInnerPlot : na, showFill ? lowerPlot      : na, innerGradColor, outerGradColor)
+fill(pMid,        pLowerInner, showFill ? midPlot        : na, showFill ? lowerInnerPlot : na, fadeColor,      innerGradColor)
+//──────────────────────────────────────────────────────────────────────────────
+// Segment cap lines
+//──────────────────────────────────────────────────────────────────────────────
+var line[] segCaps = array.new_line()
+maxCaps = 300
+if didEvent and showCaps
+    capCol = color.new(gradBaseColor, math.min(outerTransp + 4, 96))
+    cap = line.new(
+         x1=bar_index, y1=lower,
+         x2=bar_index, y2=upper,
+         xloc=xloc.bar_index, extend=extend.none,
+         color=capCol, width=1)
+    array.push(segCaps, cap)
+    if array.size(segCaps) > maxCaps
+        oldCap = array.shift(segCaps)
+        line.delete(oldCap)
+//──────────────────────────────────────────────────────────────────────────────
+// Regime change markers: ONLY true flips
+//──────────────────────────────────────────────────────────────────────────────
+plotshape(showRegimeMarks and bullRegimeFlip, title="Bull Regime Flip",
+     style=shape.triangleup, location=location.belowbar, color=colorUp, size=size.small)
+plotshape(showRegimeMarks and bearRegimeFlip, title="Bear Regime Flip",
+     style=shape.triangledown, location=location.abovebar, color=colorDown, size=size.small)
+plotshape(showRegimeMarks and bullRegimeFlip ? mid : na, title="Bull Regime Glow",
+     style=shape.circle, location=location.absolute, color=color.new(colorUp, 55), size=size.small)
+plotshape(showRegimeMarks and bearRegimeFlip ? mid : na, title="Bear Regime Glow",
+     style=shape.circle, location=location.absolute, color=color.new(colorDown, 55), size=size.small)
+//──────────────────────────────────────────────────────────────────────────────
+// Continuation step markers — on candles with glow
+//──────────────────────────────────────────────────────────────────────────────
+plotshape(showStepMarks and bullStep ? high : na, title="Bull Step",
+     style=shape.circle, location=location.absolute, color=colorUp, size=size.tiny)
+plotshape(showStepMarks and bullStep ? high : na, title="Bull Step Glow",
+     style=shape.circle, location=location.absolute, color=color.new(colorUp, 50), size=size.small)
+plotshape(showStepMarks and bearStep ? low : na, title="Bear Step",
+     style=shape.circle, location=location.absolute, color=colorDown, size=size.tiny)
+plotshape(showStepMarks and bearStep ? low : na, title="Bear Step Glow",
+     style=shape.circle, location=location.absolute, color=color.new(colorDown, 50), size=size.small)
+//──────────────────────────────────────────────────────────────────────────────
+// Quiet retest markers
+//──────────────────────────────────────────────────────────────────────────────
+plotshape(showRetests and retestLong, title="Lower Retest",
+     style=shape.triangleup, location=location.belowbar, color=color.new(colorUp, 8), size=size.tiny)
+plotshape(showRetests and retestShort, title="Upper Retest",
+     style=shape.triangledown, location=location.abovebar, color=color.new(colorDown, 8), size=size.tiny)
+//──────────────────────────────────────────────────────────────────────────────
+// Optional refresh marks
+//──────────────────────────────────────────────────────────────────────────────
+plotshape(showRefresh and refreshEvt ? mid : na, title="Refresh Event",
+     style=shape.square, location=location.absolute, color=color.new(colorNeutral, 35), size=size.tiny)

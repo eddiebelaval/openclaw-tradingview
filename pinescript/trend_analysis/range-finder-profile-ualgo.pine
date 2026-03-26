@@ -1,0 +1,333 @@
+// This work is licensed under Creative Commons Attribution-NonCommercial-ShareAlike 4.0 International  
+// https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © UAlgo
+//@version=6
+indicator("Range Finder & Profile [UAlgo]", overlay=true, max_boxes_count=500, max_lines_count=500, max_labels_count=500)
+
+int lengthInput = input.int(10, "Swing Length (Pivot)", minval=2, tooltip="Pivot period length. Larger values find wider ranges.", group="Core Settings")
+int minRangeLen = input.int(10, "Min Range Length (Bars)", minval=3, tooltip="Minimum bars required to confirm a range.", group="Core Settings")
+int profileRows = input.int(30, "Profile Rows", minval=5, maxval=100, tooltip="Number of rows/bins to divide the range height.", group="Volume Profile")
+float valAreaPct = input.float(70.0, "Value Area %", minval=10.0, maxval=100.0, tooltip="Value Area volume percentage.", group="Volume Profile")
+
+color colorBgTop = input.color(color.new(#2962FF, 85), "Range Zone Top Color", group="Styling")
+color colorBgBot = input.color(color.new(#FF5252, 90), "Range Zone Bottom Color", group="Styling")
+color colorBorder = input.color(color.new(#2962FF, 50), "Range Border Color", group="Styling")
+
+color colorProfileVA = input.color(color.new(#00B0FF, 30), "Value Area Histogram", group="Styling")
+color colorProfile = input.color(color.new(#787B86, 60), "Outside VA Histogram", group="Styling")
+
+color colorPOC = input.color(#FF5252, "POC Line/Label", group="Styling")
+color colorVA = input.color(color.new(#2962FF, 0), "VAH/VAL Lines/Labels", group="Styling")
+
+type ProfileRow
+    float priceTop
+    float priceBottom
+    float volumeTotal
+
+type RangeData
+    int startIndex
+    int startTime
+    int endIndex
+    int endTime
+    float topPrice
+    float bottomPrice
+    bool isActive
+    bool isConfirmed
+    array<ProfileRow> profile
+    float totalVolume
+    float pocPrice
+    float pocVolume
+    int pocIndex
+    float vah
+    float val
+    array<box> bgBoxes
+    array<box> histBoxes
+    line pocLine
+    line vahLine
+    line valLine
+    label pocLabel
+    label vahLabel
+    label valLabel
+
+method initProfile(RangeData this, int rowsCount) =>
+    float step = (this.topPrice - this.bottomPrice) / rowsCount
+    this.profile := array.new<ProfileRow>()
+    for i = 0 to rowsCount - 1
+        float pBottom = this.bottomPrice + (i * step)
+        float pTop = pBottom + step
+        this.profile.push(ProfileRow.new(pTop, pBottom, 0.0))
+
+method addVolume(RangeData this, float bHigh, float bLow, float bVol) =>
+    float overlapHigh = math.min(bHigh, this.topPrice)
+    float overlapLow = math.max(bLow, this.bottomPrice)
+    
+    int dummyVal = 0 
+    
+    if bHigh == bLow and bHigh <= this.topPrice and bHigh >= this.bottomPrice
+        for i = 0 to this.profile.size() - 1
+            ProfileRow row = this.profile.get(i)
+            if bHigh >= row.priceBottom and bHigh <= row.priceTop
+                row.volumeTotal += bVol
+                this.totalVolume += bVol
+                break
+        dummyVal := 1
+    else if overlapHigh > overlapLow
+        float overlapHeight = overlapHigh - overlapLow
+        float totalHeight = bHigh - bLow
+        float effectiveVol = totalHeight > 0 ? bVol * (overlapHeight / totalHeight) : bVol
+        
+        for i = 0 to this.profile.size() - 1
+            ProfileRow row = this.profile.get(i)
+            float rowOverlapHigh = math.min(overlapHigh, row.priceTop)
+            float rowOverlapLow = math.max(overlapLow, row.priceBottom)
+            
+            if rowOverlapHigh > rowOverlapLow
+                float rowOverlapHeight = rowOverlapHigh - rowOverlapLow
+                float rowRatio = rowOverlapHeight / overlapHeight
+                float addedVol = effectiveVol * rowRatio
+                
+                row.volumeTotal += addedVol
+                this.totalVolume += addedVol
+        dummyVal := 2
+
+method calcValueArea(RangeData this, float pct) =>
+    if this.totalVolume > 0 and this.profile.size() > 0
+        float maxVol = -1.0
+        int pIndex = -1
+        for i = 0 to this.profile.size() - 1
+            ProfileRow row = this.profile.get(i)
+            if row.volumeTotal > maxVol
+                maxVol := row.volumeTotal
+                pIndex := i
+                
+        this.pocIndex := pIndex
+        this.pocVolume := maxVol
+        
+        ProfileRow pocRow = this.profile.get(pIndex)
+        this.pocPrice := (pocRow.priceTop + pocRow.priceBottom) / 2.0
+        
+        float targetVol = this.totalVolume * (pct / 100.0)
+        float currentVol = maxVol
+        int upIndex = pIndex + 1
+        int downIndex = pIndex - 1
+        
+        while currentVol < targetVol and (upIndex < this.profile.size() or downIndex >= 0)
+            float upVol = upIndex < this.profile.size() ? this.profile.get(upIndex).volumeTotal : -1.0
+            float downVol = downIndex >= 0 ? this.profile.get(downIndex).volumeTotal : -1.0
+            
+            if upVol == -1.0 and downVol == -1.0
+                break
+                
+            bool addUp = false
+            if upVol > downVol
+                addUp := true
+            else if downVol > upVol
+                addUp := false
+            else
+                int distUp = upIndex - pIndex
+                int distDown = pIndex - downIndex
+                if distUp < distDown
+                    addUp := true
+                else if distDown < distUp
+                    addUp := false
+                else
+                    addUp := true
+                    
+            if addUp
+                if currentVol + upVol > targetVol and currentVol > maxVol
+                    break
+                currentVol += upVol
+                upIndex += 1
+            else
+                if currentVol + downVol > targetVol and currentVol > maxVol
+                    break
+                currentVol += downVol
+                downIndex -= 1
+                
+        int finalUp = math.min(upIndex - 1, this.profile.size() - 1)
+        int finalDown = math.max(downIndex + 1, 0)
+        
+        this.vah := this.profile.get(finalUp).priceTop
+        this.val := this.profile.get(finalDown).priceBottom
+
+method drawBg(RangeData this, color cBgTop, color cBgBot, color cBorder, int rTime) =>
+    if not na(this.bgBoxes)
+        for b in this.bgBoxes
+            b.delete()
+            
+    this.bgBoxes := array.new<box>()
+    int bgSlices = 10
+    float sliceStep = (this.topPrice - this.bottomPrice) / bgSlices
+    
+    for i = 0 to bgSlices - 1
+        float bBot = this.bottomPrice + (i * sliceStep)
+        float bTop = bBot + sliceStep
+        
+        float ratio = i / (bgSlices - 1)
+        int rM = math.round(color.r(cBgBot) + (color.r(cBgTop) - color.r(cBgBot)) * ratio)
+        int gM = math.round(color.g(cBgBot) + (color.g(cBgTop) - color.g(cBgBot)) * ratio)
+        int bM = math.round(color.b(cBgBot) + (color.b(cBgTop) - color.b(cBgBot)) * ratio)
+        int tM = math.round(color.t(cBgBot) + (color.t(cBgTop) - color.t(cBgBot)) * ratio)
+        color sliceCol = color.rgb(rM, gM, bM, tM)
+        
+        this.bgBoxes.push(box.new(this.startTime, bTop, rTime, bBot, border_color=na, bgcolor=sliceCol, xloc=xloc.bar_time))
+        
+    this.bgBoxes.push(box.new(this.startTime, this.topPrice, rTime, this.bottomPrice, border_color=cBorder, bgcolor=na, border_width=1, xloc=xloc.bar_time))
+
+method updateBgRight(RangeData this, int rTime, color cBgTop, color cBgBot, color cBorder) =>
+    if not na(this.bgBoxes)
+        for b in this.bgBoxes
+            b.set_right(rTime)
+    else
+        this.drawBg(cBgTop, cBgBot, cBorder, rTime)
+
+method drawProfile(RangeData this, color cBgTop, color cBgBot, color histCol, color histVaCol, color pocCol, color vaCol) =>
+    int rightTime = this.isActive ? time : this.endTime
+    
+    this.drawBg(cBgTop, cBgBot, colorBorder, rightTime)
+    
+    if not na(this.pocLine)
+        this.pocLine.delete()
+    if not na(this.vahLine)
+        this.vahLine.delete()
+    if not na(this.valLine)
+        this.valLine.delete()
+    if not na(this.pocLabel)
+        this.pocLabel.delete()
+    if not na(this.vahLabel)
+        this.vahLabel.delete()
+    if not na(this.valLabel)
+        this.valLabel.delete()
+        
+    if not na(this.histBoxes)
+        for b in this.histBoxes
+            b.delete()
+    
+    this.histBoxes := array.new<box>()
+    
+    if this.isConfirmed
+        float maxVol = this.pocVolume
+        if maxVol > 0
+            int rangeTimeWidth = math.max(rightTime - this.startTime, 1000)
+            int maxTimeWidth = math.round(rangeTimeWidth * 0.35)
+            
+            float rowHeight = this.profile.get(0).priceTop - this.profile.get(0).priceBottom
+            float vPad = rowHeight * 0.1
+            
+            for i = 0 to this.profile.size() - 1
+                ProfileRow row = this.profile.get(i)
+                if row.volumeTotal > 0
+                    float widthRatio = row.volumeTotal / maxVol
+                    int boxTimeWidth = math.round(maxTimeWidth * widthRatio)
+                    int boxLeftTime = rightTime - boxTimeWidth
+                    
+                    bool inVA = (row.priceTop <= this.vah and row.priceBottom >= this.val)
+                    color finalHistCol = inVA ? histVaCol : histCol
+                    
+                    float t = row.priceTop - vPad
+                    float b = row.priceBottom + vPad
+                    
+                    this.histBoxes.push(box.new(boxLeftTime, t, rightTime, b, border_color=na, bgcolor=finalHistCol, xloc=xloc.bar_time))
+        
+        this.pocLine := line.new(this.startTime, this.pocPrice, rightTime, this.pocPrice, color=pocCol, style=line.style_solid, width=2, xloc=xloc.bar_time)
+        this.vahLine := line.new(this.startTime, this.vah, rightTime, this.vah, color=vaCol, style=line.style_dashed, width=1, xloc=xloc.bar_time)
+        this.valLine := line.new(this.startTime, this.val, rightTime, this.val, color=vaCol, style=line.style_dashed, width=1, xloc=xloc.bar_time)
+        
+        this.pocLabel := label.new(rightTime, this.pocPrice, "   POC", style=label.style_none, textcolor=pocCol, size=size.small, textalign=text.align_left, xloc=xloc.bar_time)
+        this.vahLabel := label.new(rightTime, this.vah, "   VAH", style=label.style_none, textcolor=vaCol, size=size.small, textalign=text.align_left, xloc=xloc.bar_time)
+        this.valLabel := label.new(rightTime, this.val, "   VAL", style=label.style_none, textcolor=vaCol, size=size.small, textalign=text.align_left, xloc=xloc.bar_time)
+
+var RangeData activeRange = na
+var int lastClosedRangeEndIndex = 0
+var float recentPH = na
+var int recentPHIndex = na
+var float recentPL = na
+var int recentPLIndex = na
+
+float ph = ta.pivothigh(high, lengthInput, lengthInput)
+float pl = ta.pivotlow(low, lengthInput, lengthInput)
+
+if not na(ph)
+    recentPH := ph
+    recentPHIndex := bar_index[lengthInput]
+
+if not na(pl)
+    recentPL := pl
+    recentPLIndex := bar_index[lengthInput]
+
+bool canCreateRange = na(activeRange) and not na(recentPH) and not na(recentPL)
+
+if canCreateRange
+    float top = math.max(recentPH, recentPL)
+    float bot = math.min(recentPH, recentPL)
+    
+    if top > bot and close <= top and close >= bot
+        int sIndex = math.min(recentPHIndex, recentPLIndex)
+        int barsBack = bar_index - sIndex
+        
+        bool isOverlapping = false
+        if sIndex <= lastClosedRangeEndIndex
+            isOverlapping := true
+            
+        if not isOverlapping
+            bool broken = false
+            if barsBack > 0
+                for i = 0 to barsBack
+                    if close[i] > top or close[i] < bot
+                        broken := true
+                        break
+            
+            if not broken
+                activeRange := RangeData.new(
+                     startIndex = sIndex,
+                     startTime = time[barsBack],
+                     endIndex = bar_index,
+                     endTime = time,
+                     topPrice = top,
+                     bottomPrice = bot,
+                     isActive = true,
+                     isConfirmed = false,
+                     totalVolume = 0.0,
+                     pocPrice = na, pocVolume = 0.0, pocIndex = -1, vah = na, val = na,
+                     bgBoxes = na, histBoxes = na, pocLine = na, vahLine = na, valLine = na, pocLabel = na, vahLabel = na, valLabel = na
+                 )
+                activeRange.initProfile(profileRows)
+                
+                if barsBack >= 0
+                    for i = 0 to barsBack
+                        float bVol = na(volume[i]) ? 1.0 : volume[i]
+                        activeRange.addVolume(high[i], low[i], bVol)
+
+if not na(activeRange) and activeRange.isActive
+    bool justCreated = canCreateRange and not na(activeRange)
+    
+    bool isBroken = close > activeRange.topPrice or close < activeRange.bottomPrice
+    
+    if (bar_index - activeRange.startIndex) >= minRangeLen
+        activeRange.isConfirmed := true
+    
+    if isBroken
+        activeRange.isActive := false
+        activeRange.endIndex := bar_index
+        activeRange.endTime := time
+        
+        if not activeRange.isConfirmed
+            if not na(activeRange.bgBoxes)
+                for b in activeRange.bgBoxes
+                    b.delete()
+        else
+            activeRange.calcValueArea(valAreaPct)
+            activeRange.drawProfile(colorBgTop, colorBgBot, colorProfile, colorProfileVA, colorPOC, colorVA)
+            lastClosedRangeEndIndex := bar_index
+            
+        activeRange := na
+    else
+        if not justCreated
+            float barVol = na(volume) ? 1.0 : volume
+            activeRange.addVolume(high, low, barVol)
+            
+        if activeRange.isConfirmed
+            activeRange.calcValueArea(valAreaPct)
+            activeRange.drawProfile(colorBgTop, colorBgBot, colorProfile, colorProfileVA, colorPOC, colorVA)
+        else
+            activeRange.updateBgRight(time, colorBgTop, colorBgBot, colorBorder)

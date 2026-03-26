@@ -1,0 +1,417 @@
+// This Pine Script™ code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © Combined Trading Levels Indicator (Volume Profile + Psychological Levels)
+
+//@version=6
+indicator("Trading Levels (VP + Psych)", overlay=true, max_lines_count=500, max_boxes_count=500, max_labels_count=500)
+
+// ==================== INPUTS ====================
+
+// === POC Settings ===
+grpPOC = "POC Settings"
+showPOC = input.bool(true, "Show POC", group=grpPOC)
+volDays = input.int(5, "Number of Days", minval=1, maxval=20, group=grpPOC, tooltip="Number of past days to show")
+numRows = input.int(24, "Number of Rows", minval=5, maxval=100, group=grpPOC, tooltip="Number of price rows per day (like TradingView's SVP 'Zeilengröße')")
+volLineColor = input.color(color.orange, "Line Color", group=grpPOC)
+volLineWidth = input.int(2, "Line Width", minval=1, maxval=5, group=grpPOC)
+volLineStyle = input.string("Solid", "Line Style", options=["Solid", "Dashed", "Dotted"], group=grpPOC)
+showPOCBoxes = input.bool(true, "Show Boxes", group=grpPOC)
+volZoneSize = input.float(0.10, "Zone Size", minval=0.0001, step=0.0001, group=grpPOC, tooltip="How far the rectangle extends above and below the POC line")
+volBoxColor = input.color(color.orange, "Zone Color", group=grpPOC)
+volBoxOpacity = input.int(30, "Zone Opacity %", minval=0, maxval=100, group=grpPOC)
+
+// === Daily High/Low Settings ===
+grpDaily = "Daily High/Low (D1)"
+showDailyHL = input.bool(true, "Show Daily High/Low", group=grpDaily)
+dailyDays = input.int(1, "Number of Days", minval=1, maxval=10, group=grpDaily, tooltip="Number of past days to show daily H/L")
+dailyHighColor = input.color(color.lime, "Daily High Color", group=grpDaily)
+dailyLowColor = input.color(color.fuchsia, "Daily Low Color", group=grpDaily)
+dailyLineWidth = input.int(1, "Line Width", minval=1, maxval=5, group=grpDaily)
+dailyLineStyle = input.string("Dotted", "Line Style", options=["Solid", "Dashed", "Dotted"], group=grpDaily)
+extendDailyLines = input.bool(true, "Extend Lines", group=grpDaily)
+showDailyLabels = input.bool(true, "Show Labels", group=grpDaily)
+
+// === Display Settings ===
+grpDisplay = "Display"
+extendLines = input.bool(true, "Extend Lines", group=grpDisplay)
+showDayLabels = input.bool(true, "Show Day Labels", group=grpDisplay)
+showInfoTable = input.bool(true, "Show Info Table", group=grpDisplay)
+
+// ==================== PSYCHOLOGICAL LEVELS INPUTS ====================
+
+grpPsych = "Psychological Levels"
+showPsychLevels = input.bool(true, "Show Psychological Levels", group=grpPsych)
+psychInterval = input.float(1.0, "Level Interval", minval=0.0001, step=0.0001, group=grpPsych, tooltip="The interval between psychological levels (e.g., 1 for 70,71,72 or 5 for 70,75,80 or 0.01 for 1.2000,1.2100)")
+psychZoneSize = input.float(0.10, "Zone Size (above/below line)", minval=0.0001, step=0.0001, group=grpPsych, tooltip="How far the rectangle extends above and below the line")
+psychLineColor = input.color(color.blue, "Line Color", group=grpPsych)
+psychLineWidth = input.int(1, "Line Width", minval=1, maxval=5, group=grpPsych)
+psychLineStyle = input.string("Solid", "Line Style", options=["Solid", "Dashed", "Dotted"], group=grpPsych)
+psychBoxColor = input.color(color.blue, "Zone Color", group=grpPsych)
+psychBoxOpacity = input.int(30, "Zone Opacity %", minval=0, maxval=100, group=grpPsych)
+showPsychLines = input.bool(true, "Show Lines", group=grpPsych)
+showPsychZones = input.bool(true, "Show Zones", group=grpPsych)
+extendPsychLines = input.bool(true, "Extend Lines", group=grpPsych)
+maxPsychLevels = input.int(10, "Max Levels to Display", minval=1, maxval=50, group=grpPsych, tooltip="Maximum number of levels to display above and below current price")
+
+// ==================== FUNCTIONS ====================
+
+// Get line style
+getLineStyle(style) =>
+    switch style
+        "Solid" => line.style_solid
+        "Dashed" => line.style_dashed
+        "Dotted" => line.style_dotted
+        => line.style_solid
+
+// Calculate the nearest lower psychological level
+getNearestLowerLevel(price, interval) =>
+    math.floor(price / interval) * interval
+
+// ==================== LOWER TIMEFRAME DATA ====================
+
+// Get 1-minute data for more accurate volume profile
+[ltfHigh, ltfLow, ltfVolume, ltfTime] = request.security_lower_tf(syminfo.tickerid, "1", [high, low, volume, time])
+
+// ==================== VOLUME PROFILE CALCULATION ====================
+
+// Detect new day
+isNewDay = ta.change(time("D")) != 0
+
+// Store POC values for each completed day
+var float[] dailyPOC = array.new_float(0)
+var string[] dailyPOCDates = array.new_string(0)
+
+// Store Daily High/Low
+var float[] dailyHighs = array.new_float(0)
+var float[] dailyLows = array.new_float(0)
+var string[] dailyHLDates = array.new_string(0)
+
+// Track current day's range and data
+var int currentDayTime = 0
+var float currentDayHigh = na
+var float currentDayLow = na
+var int currentDayBars = 0
+
+// Store 1-minute bar data for the current day
+var float[] dayBarHighs = array.new_float(0)
+var float[] dayBarLows = array.new_float(0)
+var float[] dayBarVolumes = array.new_float(0)
+
+// Function to calculate POC from day data
+calcPOC(float dayHigh, float dayLow, int rows) =>
+    float poc = (dayHigh + dayLow) / 2  // Default to midpoint
+    
+    if dayHigh > dayLow and array.size(dayBarHighs) > 0
+        float rowHeight = (dayHigh - dayLow) / rows
+        
+        // Create volume bins
+        float[] binVolumes = array.new_float(rows, 0.0)
+        
+        // Process each bar's volume
+        for barIdx = 0 to array.size(dayBarHighs) - 1
+            float barH = array.get(dayBarHighs, barIdx)
+            float barL = array.get(dayBarLows, barIdx)
+            float barVol = array.get(dayBarVolumes, barIdx)
+            
+            // Calculate which bins this bar covers
+            int lowBin = math.max(0, math.floor((barL - dayLow) / rowHeight))
+            int highBin = math.min(rows - 1, math.floor((barH - dayLow) / rowHeight))
+            
+            // Distribute volume across bins
+            int numBins = highBin - lowBin + 1
+            float volPerBin = barVol / math.max(numBins, 1)
+            
+            for binIdx = lowBin to highBin
+                if binIdx >= 0 and binIdx < rows
+                    float existing = array.get(binVolumes, binIdx)
+                    array.set(binVolumes, binIdx, existing + volPerBin)
+        
+        // Find the bin with maximum volume (POC)
+        float maxVol = 0.0
+        int pocBinIdx = 0
+        for i = 0 to rows - 1
+            float binVol = array.get(binVolumes, i)
+            if binVol > maxVol
+                maxVol := binVol
+                pocBinIdx := i
+        
+        // Calculate POC price (middle of the max volume bin)
+        poc := dayLow + (pocBinIdx + 0.5) * rowHeight
+    
+    poc
+
+// Initialize on first bar of each day
+if isNewDay or currentDayTime == 0
+    // Calculate POC from previous day if we have data
+    if currentDayBars > 0 and array.size(dayBarHighs) > 0
+        pocPrice = calcPOC(currentDayHigh, currentDayLow, numRows)
+        
+        // Store POC and date - use time[1] to get the previous bar's date
+        string dateStr = str.format("{0,date,dd.MM}", time[1])
+        array.unshift(dailyPOC, pocPrice)
+        array.unshift(dailyPOCDates, dateStr)
+        
+        // Store Daily High/Low
+        array.unshift(dailyHighs, currentDayHigh)
+        array.unshift(dailyLows, currentDayLow)
+        array.unshift(dailyHLDates, dateStr)
+        
+        // Keep only required number of days for POC
+        if array.size(dailyPOC) > volDays
+            array.pop(dailyPOC)
+            array.pop(dailyPOCDates)
+        
+        // Keep only required number of days for Daily H/L
+        if array.size(dailyHighs) > dailyDays
+            array.pop(dailyHighs)
+            array.pop(dailyLows)
+            array.pop(dailyHLDates)
+    
+    // Reset for new day
+    currentDayBars := 0
+    currentDayTime := time
+    currentDayHigh := high
+    currentDayLow := low
+    array.clear(dayBarHighs)
+    array.clear(dayBarLows)
+    array.clear(dayBarVolumes)
+
+// Process lower timeframe data
+if array.size(ltfHigh) > 0
+    for i = 0 to array.size(ltfHigh) - 1
+        float h = array.get(ltfHigh, i)
+        float l = array.get(ltfLow, i)
+        float v = array.get(ltfVolume, i)
+        
+        // Update day's range
+        currentDayHigh := math.max(currentDayHigh, h)
+        currentDayLow := math.min(currentDayLow, l)
+        
+        // Store 1-minute bar data
+        array.push(dayBarHighs, h)
+        array.push(dayBarLows, l)
+        array.push(dayBarVolumes, v)
+        
+        currentDayBars += 1
+
+// Calculate current day's POC for live display
+var float currentDayPOC = na
+if currentDayBars > 0 and array.size(dayBarHighs) > 0
+    currentDayPOC := calcPOC(currentDayHigh, currentDayLow, numRows)
+
+// ==================== MAIN DRAWING LOGIC ====================
+
+if barstate.islast
+    // Delete previous drawings
+    for l in line.all
+        line.delete(l)
+    for b in box.all
+        box.delete(b)
+    for lb in label.all
+        label.delete(lb)
+    
+    // ========== VOLUME PROFILE (POC) ==========
+    if showPOC
+        pocLStyle = getLineStyle(volLineStyle)
+        volBoxColorWithOpacity = color.new(volBoxColor, 100 - volBoxOpacity)
+        extendSetting = extendLines ? extend.both : extend.none
+        
+        // Label position settings
+        lblX = bar_index + 5
+        lblStyle = label.style_label_left
+        
+        todayStr = str.format("{0,date,dd.MM}", time)
+        
+        // ===== CURRENT DAY =====
+        
+        // Draw current day's POC
+        if not na(currentDayPOC)
+            line.new(
+                 x1=bar_index - 100,
+                 y1=currentDayPOC,
+                 x2=bar_index,
+                 y2=currentDayPOC,
+                 color=volLineColor,
+                 width=volLineWidth,
+                 style=pocLStyle,
+                 extend=extendSetting
+                 )
+            
+            if showPOCBoxes
+                box.new(
+                     left=bar_index - 100,
+                     top=currentDayPOC + volZoneSize,
+                     right=bar_index + 100,
+                     bottom=currentDayPOC - volZoneSize,
+                     bgcolor=volBoxColorWithOpacity,
+                     border_color=color.new(volBoxColor, 100),
+                     extend=extendSetting
+                     )
+            
+            if showDayLabels
+                label.new(
+                     x=lblX,
+                     y=currentDayPOC,
+                     text="POC " + todayStr,
+                     color=color.new(color.black, 20),
+                     textcolor=volLineColor,
+                     style=lblStyle,
+                     size=size.normal
+                     )
+        
+        // ===== PREVIOUS DAYS POC =====
+        for i = 0 to array.size(dailyPOC) - 1
+            pocPrice = array.get(dailyPOC, i)
+            pocDate = array.get(dailyPOCDates, i)
+            
+            line.new(
+                 x1=bar_index - 100,
+                 y1=pocPrice,
+                 x2=bar_index,
+                 y2=pocPrice,
+                 color=volLineColor,
+                 width=volLineWidth,
+                 style=pocLStyle,
+                 extend=extendSetting
+                 )
+            
+            if showPOCBoxes
+                box.new(
+                     left=bar_index - 100,
+                     top=pocPrice + volZoneSize,
+                     right=bar_index + 100,
+                     bottom=pocPrice - volZoneSize,
+                     bgcolor=volBoxColorWithOpacity,
+                     border_color=color.new(volBoxColor, 100),
+                     extend=extendSetting
+                     )
+            
+            if showDayLabels
+                label.new(
+                     x=lblX,
+                     y=pocPrice,
+                     text="POC " + pocDate,
+                     color=color.new(color.black, 20),
+                     textcolor=volLineColor,
+                     style=lblStyle,
+                         size=size.normal
+                         )
+    
+    // ========== DAILY HIGH/LOW ==========
+    if showDailyHL
+        dailyLStyle = getLineStyle(dailyLineStyle)
+        dailyExtendSetting = extendDailyLines ? extend.both : extend.none
+        lblX = bar_index + 5
+        lblStyle = label.style_label_left
+        
+        for i = 0 to array.size(dailyHighs) - 1
+            highPrice = array.get(dailyHighs, i)
+            lowPrice = array.get(dailyLows, i)
+            hlDate = array.get(dailyHLDates, i)
+            
+            // Daily High
+            line.new(
+                 x1=bar_index - 100,
+                 y1=highPrice,
+                 x2=bar_index,
+                 y2=highPrice,
+                 color=dailyHighColor,
+                 width=dailyLineWidth,
+                 style=dailyLStyle,
+                 extend=dailyExtendSetting
+                 )
+            
+            if showDailyLabels
+                label.new(
+                     x=lblX,
+                     y=highPrice,
+                     text="D-High " + hlDate,
+                     color=color.new(color.black, 20),
+                     textcolor=dailyHighColor,
+                     style=lblStyle,
+                     size=size.normal
+                     )
+            
+            // Daily Low
+            line.new(
+                 x1=bar_index - 100,
+                 y1=lowPrice,
+                 x2=bar_index,
+                 y2=lowPrice,
+                 color=dailyLowColor,
+                 width=dailyLineWidth,
+                 style=dailyLStyle,
+                 extend=dailyExtendSetting
+                 )
+            
+            if showDailyLabels
+                label.new(
+                     x=lblX,
+                     y=lowPrice,
+                     text="D-Low " + hlDate,
+                     color=color.new(color.black, 20),
+                     textcolor=dailyLowColor,
+                     style=lblStyle,
+                     size=size.normal
+                     )
+    
+    // ========== PSYCHOLOGICAL LEVELS ==========
+    if showPsychLevels
+        currentPrice = close
+        baseLevel = getNearestLowerLevel(currentPrice, psychInterval)
+        psychLStyle = getLineStyle(psychLineStyle)
+        psychBoxColorWithOpacity = color.new(psychBoxColor, 100 - psychBoxOpacity)
+        psychExtendSetting = extendPsychLines ? extend.both : extend.none
+        
+        for i = -maxPsychLevels to maxPsychLevels
+            levelPrice = baseLevel + (i * psychInterval)
+            
+            if levelPrice > 0
+                // Draw the horizontal line
+                if showPsychLines
+                    line.new(
+                         x1=bar_index - 100,
+                         y1=levelPrice,
+                         x2=bar_index,
+                         y2=levelPrice,
+                         color=psychLineColor,
+                         width=psychLineWidth,
+                         style=psychLStyle,
+                         extend=psychExtendSetting
+                         )
+                
+                // Draw the zone rectangle
+                if showPsychZones
+                    boxTop = levelPrice + psychZoneSize
+                    boxBottom = levelPrice - psychZoneSize
+                    
+                    box.new(
+                         left=bar_index - 100,
+                         top=boxTop,
+                         right=bar_index + 100,
+                         bottom=boxBottom,
+                         bgcolor=psychBoxColorWithOpacity,
+                         border_color=color.new(psychBoxColor, 100),
+                         extend=psychExtendSetting
+                         )
+
+// ==================== INFO TABLE ====================
+
+var table infoTable = table.new(position.top_left, 2, 8, bgcolor=color.new(color.black, 80))
+
+if barstate.islast and showInfoTable
+    table.cell(infoTable, 0, 0, "📈 Trading Levels", text_color=color.orange, text_size=size.small)
+    table.cell(infoTable, 1, 0, "", text_color=color.orange, text_size=size.small)
+    table.cell(infoTable, 0, 1, "POC Days:", text_color=color.white, text_size=size.small)
+    table.cell(infoTable, 1, 1, str.tostring(volDays), text_color=color.yellow, text_size=size.small)
+    table.cell(infoTable, 0, 2, "POC Zone:", text_color=color.white, text_size=size.small)
+    table.cell(infoTable, 1, 2, "±" + str.tostring(volZoneSize), text_color=color.yellow, text_size=size.small)
+    table.cell(infoTable, 0, 3, "─────────", text_color=color.gray, text_size=size.small)
+    table.cell(infoTable, 1, 3, "─────────", text_color=color.gray, text_size=size.small)
+    table.cell(infoTable, 0, 4, "D1 H/L Days:", text_color=color.white, text_size=size.small)
+    table.cell(infoTable, 1, 4, str.tostring(dailyDays), text_color=color.lime, text_size=size.small)
+    table.cell(infoTable, 0, 5, "─────────", text_color=color.gray, text_size=size.small)
+    table.cell(infoTable, 1, 5, "─────────", text_color=color.gray, text_size=size.small)
+    table.cell(infoTable, 0, 6, "Psych Interval:", text_color=color.white, text_size=size.small)
+    table.cell(infoTable, 1, 6, str.tostring(psychInterval), text_color=color.aqua, text_size=size.small)
+    table.cell(infoTable, 0, 7, "Psych Zone:", text_color=color.white, text_size=size.small)
+    table.cell(infoTable, 1, 7, "±" + str.tostring(psychZoneSize), text_color=color.aqua, text_size=size.small)

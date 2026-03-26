@@ -1,0 +1,808 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © wirezard
+
+//@version=6
+indicator("Wirezard Wave Rider", overlay=true, max_bars_back=500, max_labels_count=500, max_lines_count=500)
+
+// ============================================================================
+// V14 CHANGELOG (from V13):
+// 1. EXHSELL FALSE SIGNAL FIX — trendExhaustionSell was firing at correction
+//      bottoms (buy zones). Two guards added:
+//      • not bullishDivergence — mirrors the guard already in strongSell; blocks
+//        EXH SELL when price is printing a lower low + higher RSI/MACD (buy setup).
+//      • rsi < rsi[3] — RSI must be DECLINING to confirm true exhaustion; prevents
+//        firing when RSI is recovering from oversold (rising through the ceiling).
+// 2. All V13 signal shapes, inputs, tolerance bands unchanged.
+//
+// V13 CHANGELOG (from V12):
+// 1. DIVERGENCE SIGNALS PROMOTED — bearishDivergence-based sells (divergenceSell,
+//      waveTopSell) now show as red "SELL" (same visual as strongSell).
+//      correctionBuy with strongBullDiv now shows as large green "BUY" (same as
+//      strongBuy). Eliminates confusing purple DIV↓ / teal DIV↑ trigger shapes.
+// 2. SIGNAL SHAPES SIMPLIFIED — 6 plotshape calls reduced to 4:
+//      • Strong BUY  (size.normal) — strongBuy OR correctionBuy + strongBullDiv
+//      • Moderate BUY (size.small) — correctionBuy without strong divergence
+//      • Strong SELL (size.normal) — strongSell OR divergenceSell OR waveTopSell
+//      • Moderate SELL (size.small) — trendExhaustionSell only
+// 3. All V12 inputs, tolerance bands, swing labels, and signal logic unchanged.
+//
+// V12 CHANGELOG (from V11):
+// 1. INPUT SIMPLIFICATION — 41 params reorganised into 3 tiers:
+//      ⚙️ Simple        (7 params)  — display & early-detection toggles
+//      📊 Intermediate  (7 params)  — key ADX / RSI / Volume / Cooldown thresholds
+//      🔬 Advanced      (31 params) — VIDYA, MTF weights, Fib, IMACD fine-tuning
+// 2. SIGNAL TOLERANCE BANDS — ±sigTolPct% price zone drawn after every trigger.
+// 3. SWING LABELS CONVERTED — SH/SL → "Sell"/"Buy" toggle in ⚙️ Simple.
+// 4. LAG REDUCTION — pivotRight default 5→3; dashboard LAG row; EXH text bug fix.
+// ============================================================================
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ⚙️ SIMPLE  — 7 inputs (beginners start here)
+// ─────────────────────────────────────────────────────────────────────────────
+
+bool  autoMTF            = input.bool(true,  "Auto-detect MTF Timeframes",
+     group="⚙️ Simple",
+     tooltip="ON: uses 2×, 4×, 8× chart timeframe automatically.\nOFF: set timeframes manually in 🔬 Advanced → MTF.")
+
+bool  showFibs           = input.bool(true,  "Show Fibonacci Levels",
+     group="⚙️ Simple")
+
+bool  showSwings         = input.bool(true,  "Show Swing Signals",
+     group="⚙️ Simple",
+     tooltip="Draws a label at every confirmed pivot high/low.")
+
+bool  swingAsBuySell     = input.bool(true,  "Swing Labels: Buy / Sell  (OFF = SH / SL)",
+     group="⚙️ Simple",
+     tooltip="ON: swing high → 'Sell', swing low → 'Buy'.\nOFF: classic SH / SL labels.\nNote: these are structural signals, not the same as BUY/SELL trigger shapes.")
+
+bool  showDiverg         = input.bool(true,  "Show Divergence Markers",
+     group="⚙️ Simple")
+
+bool  enableEarlyBottomBuy  = input.bool(true, "Early Bottom Detection",
+     group="⚙️ Simple",
+     tooltip="Relaxes Correction Buy conditions — catches wave 2/4/C bottoms 1-3 bars earlier by allowing VIDYA flattening and RSI crossover instead of full VIDYA reversal.")
+
+bool  enableEarlyWaveTopSell = input.bool(true, "Early Top Detection",
+     group="⚙️ Simple",
+     tooltip="Relaxes Wave Top / Divergence Sell — fires at wave 5 and wave B peaks before VIDYA fully reverses. Pairs with the ±% Tolerance Band below.")
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 📊 INTERMEDIATE  — 7 inputs (key signal thresholds)
+// ─────────────────────────────────────────────────────────────────────────────
+
+int   adxThreshold   = input.int(18,    "ADX Threshold — BUY / EXH signals",
+     group="📊 Intermediate", minval=5, maxval=60,
+     tooltip="Minimum ADX strength required for BUY and EXH sells. Below this ADX the market is ranging — signals are filtered out.")
+
+int   strongAdxInp   = input.int(25,    "ADX Threshold — SELL reversal",
+     group="📊 Intermediate", minval=10, maxval=60,
+     tooltip="Minimum ADX for the strong SELL (tier 1 reversal). Higher = more selective, fewer but cleaner reversal signals.")
+
+float volMult        = input.float(1.2, "Volume Multiplier",
+     group="📊 Intermediate", minval=0.5, maxval=5.0, step=0.1,
+     tooltip="Volume must exceed this multiple of its moving average to confirm a signal. 1.2 = 20% above average.")
+
+float rsiOverbought  = input.float(75.0,"RSI Overbought Guard  (BUY block)",
+     group="📊 Intermediate", minval=60, maxval=95, step=1,
+     tooltip="BUY signals are suppressed when RSI is above this level (price already extended up — risk of buying a wave 5 top).")
+
+float rsiOversold    = input.float(35.0,"RSI Oversold Guard  (SELL block)",
+     group="📊 Intermediate", minval=5, maxval=45, step=1,
+     tooltip="SELL signals are suppressed when RSI is below this level (prevents selling into a wave C capitulation bottom).")
+
+int   sellCooldown   = input.int(15,    "Sell Cooldown Bars",
+     group="📊 Intermediate", minval=1, maxval=50,
+     tooltip="Minimum bars between consecutive SELL triggers. Prevents EXH / DIV / TOP signals clustering when conditions flicker.")
+
+float sigTolPct      = input.float(5.0, "Signal Tolerance ± %",
+     group="📊 Intermediate", minval=1.0, maxval=15.0, step=0.5,
+     tooltip="After a BUY or SELL triggers, a ±% price band is drawn. Entry/exit is considered valid while price stays inside the band.\n\nWhy 5%? Pivot confirmation (pivotRight bars) creates 1-3 bar lag. On typical crypto, that equals 2-6% price movement. The band makes the valid entry zone visible and accounts for bar-close execution delay.\n\nBand expires when the next opposite signal fires.")
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 🔬 ADVANCED  — fine-tuning for experienced users (27 inputs)
+// ─────────────────────────────────────────────────────────────────────────────
+
+// ── Indicator Internals ──────────────────────────────────────────────────────
+int   adxLen       = input.int(14,    "ADX Length",
+     group="🔬 Advanced: Indicator", minval=5, maxval=30)
+int   volLen       = input.int(20,    "Volume MA Length",
+     group="🔬 Advanced: Indicator")
+int   imacdLen     = input.int(34,    "Impulse MACD Length",
+     group="🔬 Advanced: Indicator")
+int   imacdSmth    = input.int(9,     "Impulse MACD Smooth",
+     group="🔬 Advanced: Indicator")
+int   imacdSig     = input.int(9,     "Impulse MACD Signal",
+     group="🔬 Advanced: Indicator")
+int   vidyaSmooth  = input.int(12,    "VIDYA Smoothing",
+     group="🔬 Advanced: Indicator")
+int   pivotLeft    = input.int(10,    "Pivot Lookback Left",
+     group="🔬 Advanced: Indicator", minval=3,
+     tooltip="Bars to the left of a pivot to confirm it is a local high/low.")
+int   pivotRight   = input.int(3,     "Pivot Lookback Right  ← lag control",
+     group="🔬 Advanced: Indicator", minval=1, maxval=10,
+     tooltip="Bars to the right of a pivot before it is confirmed.\n\nLower = earlier swing labels, less lag — but more false pivots.\nHigher = cleaner pivots, more lag.\n\nDefault changed 5 → 3 in V10 to reduce typical 5-bar swing-label delay.\nThe ±% Tolerance Band in 📊 Intermediate absorbs the remaining lag.\n\nSet to 1 for maximum speed; set to 5-7 for maximum confidence.")
+
+// ── MTF Timeframes (manual override when autoMTF = OFF) ─────────────────────
+string manualTf1   = input.timeframe("120", "Short TF  (manual override)",
+     group="🔬 Advanced: MTF",
+     tooltip="Active only when 'Auto-detect MTF' is OFF in ⚙️ Simple.")
+string manualTf2   = input.timeframe("240", "Medium TF (manual override)",
+     group="🔬 Advanced: MTF")
+string manualTf3   = input.timeframe("480", "Long TF   (manual override)",
+     group="🔬 Advanced: MTF")
+
+// ── MTF Weights ──────────────────────────────────────────────────────────────
+float w2h = input.float(3.0, "Short TF Weight",
+     group="🔬 Advanced: MTF", minval=0.5, maxval=5.0, step=0.5,
+     tooltip="Composite score = score2h×w2h + score4h×w4h + score8h×w8h. Range ±30 with default weights 3/2/1.")
+float w4h = input.float(2.0, "Medium TF Weight",
+     group="🔬 Advanced: MTF", minval=0.5, maxval=5.0, step=0.5)
+float w8h = input.float(1.0, "Long TF Weight",
+     group="🔬 Advanced: MTF", minval=0.5, maxval=5.0, step=0.5)
+
+// ── MTF Score Thresholds ─────────────────────────────────────────────────────
+float mtfBullStrongThr   = input.float(16.0, "Bull Confirmed Score",
+     group="🔬 Advanced: MTF", minval=0, maxval=30, step=0.5,
+     tooltip="Composite MTF score needed for STRONG BUY (range ±30 with default weights).")
+float mtfBullModerateThr = input.float( 8.0, "Bull Moderate Score",
+     group="🔬 Advanced: MTF", minval=0, maxval=30, step=0.5,
+     tooltip="Composite score for CORRECTION BUY.")
+float mtfBearStrongThr   = input.float(16.0, "Bear Confirmed Score",
+     group="🔬 Advanced: MTF", minval=0, maxval=30, step=0.5,
+     tooltip="Score needed for SELL reversal (applied as negative).")
+float mtfBearModerateThr = input.float( 8.0, "Bear Moderate Score",
+     group="🔬 Advanced: MTF", minval=0, maxval=30, step=0.5,
+     tooltip="Score for EXH and DIV signals (applied as negative).")
+float mtfBearLocalThr    = input.float( 3.0, "Bear Local 2H Score",
+     group="🔬 Advanced: MTF", minval=0, maxval=5, step=0.5,
+     tooltip="2H individual score threshold for mtfBearLocal (range ±5).")
+
+// ── VIDYA Thresholds ─────────────────────────────────────────────────────────
+int   vidyaTrendLB  = input.int(3,    "Trend Lookback Bars",
+     group="🔬 Advanced: VIDYA", minval=1, maxval=10,
+     tooltip="vidya > vidya[N] — bars back used to determine rising/falling trend.")
+int   vidyaSlopeLB  = input.int(5,    "Slope Lookback Bars",
+     group="🔬 Advanced: VIDYA", minval=2, maxval=20,
+     tooltip="Bars used to compute slope percentage.")
+float vidyaSteepPct = input.float(0.5,"Steep Slope Threshold %",
+     group="🔬 Advanced: VIDYA", minval=0.1, maxval=3.0, step=0.1,
+     tooltip="Minimum slope % to qualify as a steep trend.")
+float vidyaFlatPct  = input.float(0.2,"Flat Threshold %",
+     group="🔬 Advanced: VIDYA", minval=0.0, maxval=1.0, step=0.05,
+     tooltip="Max slope % for VIDYA to be considered flattening (used in divergence confirmation).")
+
+// ── Signal Fine-Tuning ────────────────────────────────────────────────────────
+float corrBuyRsiMin = input.float(30.0,"COR Buy RSI Min",
+     group="🔬 Advanced: Signals", minval=10, maxval=50, step=1,
+     tooltip="Correction Buy: RSI must be above this (not in freefall).")
+float corrBuyRsiMax = input.float(55.0,"COR Buy RSI Max",
+     group="🔬 Advanced: Signals", minval=40, maxval=70, step=1,
+     tooltip="Correction Buy: RSI must be below this (coming from oversold).")
+float exhRsiCeil    = input.float(45.0,"EXH Sell RSI Ceiling",
+     group="🔬 Advanced: Signals", minval=30, maxval=65, step=1,
+     tooltip="EXH signal: RSI must be below this value (mid-trend exhaustion, not at a top).")
+float divRsiFloor   = input.float(55.0,"DIV Sell RSI Floor",
+     group="🔬 Advanced: Signals", minval=40, maxval=70, step=1,
+     tooltip="DIV signal: RSI must be above this (selling near a top, not mid-range).")
+float divRsiCeil    = input.float(75.0,"DIV Sell RSI Ceiling",
+     group="🔬 Advanced: Signals", minval=60, maxval=90, step=1,
+     tooltip="DIV signal: RSI must be below this (not in a blowoff spike — wait for rollover).")
+float fibProxPct    = input.float(1.0, "Fib Proximity %",
+     group="🔬 Advanced: Signals", minval=0.1, maxval=5.0, step=0.1,
+     tooltip="Price must be within this % of a Fibonacci level to qualify as 'at fib zone'.")
+int   localHighBars = input.int(10,   "Local High Lookback",
+     group="🔬 Advanced: Signals", minval=5, maxval=30,
+     tooltip="Bars for 'not at local high' check — blocks correction buy when near recent high.")
+float localHighThr  = input.float(0.99,"Local High Threshold",
+     group="🔬 Advanced: Signals", minval=0.95, maxval=1.01, step=0.01,
+     tooltip="Block when close >= highest×this. 0.99 = within 1% of high. Set 1.01 to disable.")
+
+// =============================================================================
+// 2. CUSTOM FUNCTIONS  (unchanged from V9)
+// =============================================================================
+
+zlema(src, len) =>
+    ema1 = ta.ema(src, len)
+    ema2 = ta.ema(ema1, len)
+    d    = ema1 - ema2
+    ta.ema(ema1 + d, len)
+
+calc_smma(src, len) =>
+    var float smma = na
+    sma_val        = ta.sma(src, len)
+    smma := na(smma[1]) ? sma_val : (nz(smma[1]) * (len - 1) + src) / len
+    smma
+
+get_full_alert_msg(action, tier, price, adx_val, rsi_val, imacd_val, vol_ratio, divInfo) =>
+    '{"ticker": "' + syminfo.tickerid +
+     '", "action": "' + action +
+     '", "tier": "'   + tier +
+     '", "price": '   + str.tostring(price,     "#.##") +
+     ', "adx": '      + str.tostring(adx_val,   "#.#")  +
+     ', "rsi": '      + str.tostring(rsi_val,   "#.#")  +
+     ', "imacd": '    + str.tostring(imacd_val, "#.##") +
+     ', "vol_ratio": ' + str.tostring(vol_ratio, "#.##") +
+     ', "divergence": "' + divInfo + '"}'
+
+// =============================================================================
+// 3. HTF FUNCTIONS  (unchanged from V9)
+// =============================================================================
+
+calc_vidya() =>
+    m    = ta.change(close)
+    sp   = math.sum(math.max(m,  0), 9)
+    sn   = math.sum(math.max(-m, 0), 9)
+    cmo_ = math.abs((sp - sn) / math.max(sp + sn, 1e-6))
+    a    = 2.0 / (12.0 + 1.0)
+    var float v = na
+    v := na(v[1]) ? close : (a * cmo_ * close) + (1.0 - a * cmo_) * nz(v[1])
+    v
+
+calc_md() =>
+    var float smhi  = na
+    var float smlo  = na
+    sma_hi_init     = ta.sma(high, 34)
+    sma_lo_init     = ta.sma(low,  34)
+    smhi := na(smhi[1]) ? sma_hi_init : (nz(smhi[1]) * 33.0 + high) / 34.0
+    smlo := na(smlo[1]) ? sma_lo_init : (nz(smlo[1]) * 33.0 + low)  / 34.0
+    zl   = ta.ema(ta.ema(close, 9) + (ta.ema(close, 9) - ta.ema(ta.ema(close, 9), 9)), 9)
+    zl > smhi ? zl - smhi : zl < smlo ? zl - smlo : 0.0
+
+calc_bias_score() =>
+    vidya_       = calc_vidya()
+    vidyaRising_ = vidya_ > vidya_[vidyaTrendLB]
+    rsi_         = ta.rsi(close, 14)
+    md_          = calc_md()
+    volSma_      = ta.sma(volume, 20)
+    volBull_     = (close > open) and (volume > volSma_)
+    volBear_     = (close < open) and (volume > volSma_)
+    float score  = 0.0
+    score += vidyaRising_   ? 1.0 : -1.0
+    score += close > vidya_ ? 1.0 : -1.0
+    score += rsi_ > 50.0    ? 1.0 : -1.0
+    score += md_ > 0.0      ? 1.0 : -1.0
+    score += volBull_       ? 1.0 : volBear_ ? -1.0 : 0.0
+    score
+
+calc_htf_vidya_rising() =>
+    v = calc_vidya()
+    v > v[vidyaTrendLB]
+
+calc_htf_vidya_above() =>
+    v = calc_vidya()
+    close > v
+
+// =============================================================================
+// 4. MTF BIAS — WEIGHTED SCORING  (unchanged from V9)
+// =============================================================================
+
+// Auto-compute 2×, 4×, 8× the current chart bar duration
+int    chartSecs = timeframe.in_seconds(timeframe.period)
+string autoTf1   = timeframe.from_seconds(chartSecs * 2)
+string autoTf2   = timeframe.from_seconds(chartSecs * 4)
+string autoTf3   = timeframe.from_seconds(chartSecs * 8)
+
+string tf2h = autoMTF ? autoTf1 : manualTf1
+string tf4h = autoMTF ? autoTf2 : manualTf2
+string tf8h = autoMTF ? autoTf3 : manualTf3
+
+float score2h = request.security(syminfo.tickerid, tf2h, calc_bias_score(), lookahead=barmerge.lookahead_off)
+float score4h = request.security(syminfo.tickerid, tf4h, calc_bias_score(), lookahead=barmerge.lookahead_off)
+float score8h = request.security(syminfo.tickerid, tf8h, calc_bias_score(), lookahead=barmerge.lookahead_off)
+
+bool vidya2hRising = request.security(syminfo.tickerid, tf2h, calc_htf_vidya_rising(), lookahead=barmerge.lookahead_off)
+bool vidya4hRising = request.security(syminfo.tickerid, tf4h, calc_htf_vidya_rising(), lookahead=barmerge.lookahead_off)
+bool vidya8hRising = request.security(syminfo.tickerid, tf8h, calc_htf_vidya_rising(), lookahead=barmerge.lookahead_off)
+bool vidya2hAbove  = request.security(syminfo.tickerid, tf2h, calc_htf_vidya_above(), lookahead=barmerge.lookahead_off)
+bool vidya4hAbove  = request.security(syminfo.tickerid, tf4h, calc_htf_vidya_above(), lookahead=barmerge.lookahead_off)
+bool vidya8hAbove  = request.security(syminfo.tickerid, tf8h, calc_htf_vidya_above(), lookahead=barmerge.lookahead_off)
+
+int bias2h = score2h >= 4.0 ? 1 : score2h <= -4.0 ? -1 : 0
+int bias4h = score4h >= 4.0 ? 1 : score4h <= -4.0 ? -1 : 0
+int bias8h = score8h >= 4.0 ? 1 : score8h <= -4.0 ? -1 : 0
+
+float mtfWeighted = score2h * w2h + score4h * w4h + score8h * w8h
+
+int vidyaHTFBullCount = (vidya2hRising and vidya2hAbove ? 1 : 0) + (vidya4hRising and vidya4hAbove ? 1 : 0) + (vidya8hRising and vidya8hAbove ? 1 : 0)
+int vidyaHTFBearCount = (not vidya2hRising and not vidya2hAbove ? 1 : 0) + (not vidya4hRising and not vidya4hAbove ? 1 : 0) + (not vidya8hRising and not vidya8hAbove ? 1 : 0)
+
+bool mtfBullConfirmed = mtfWeighted >= mtfBullStrongThr   and vidyaHTFBullCount >= 2
+bool mtfBullModerate  = mtfWeighted >= mtfBullModerateThr and vidyaHTFBullCount >= 1
+bool mtfBearStrong    = mtfWeighted <= -mtfBearStrongThr  and vidyaHTFBearCount >= 1
+bool mtfBearModerate  = mtfWeighted <= -mtfBearModerateThr and vidyaHTFBearCount >= 1
+bool mtfBearLocal     = score2h <= -mtfBearLocalThr and not vidya2hRising
+
+// =============================================================================
+// 5. BASE TIMEFRAME CALCULATIONS  (unchanged from V9)
+// =============================================================================
+
+float mom    = ta.change(close)
+float sumPos = math.sum(math.max(mom,  0), 9)
+float sumNeg = math.sum(math.max(-mom, 0), 9)
+float cmo    = math.abs((sumPos - sumNeg) / math.max(sumPos + sumNeg, 0.000001))
+float alpha  = 2.0 / (vidyaSmooth + 1.0)
+var float vidya = na
+vidya := na(vidya[1]) ? close : (alpha * cmo * close) + (1.0 - alpha * cmo) * nz(vidya[1])
+
+bool vidyaRising        = vidya > vidya[vidyaTrendLB]
+bool vidyaFalling       = vidya < vidya[vidyaTrendLB]
+bool priceAboveVidya    = close > vidya
+bool priceBelowVidya    = close < vidya
+
+float vidyaSlope        = (vidya - vidya[vidyaSlopeLB]) / math.max(vidya[vidyaSlopeLB], 1e-6) * 100.0
+bool vidyaSteepRise     = vidyaSlope >  vidyaSteepPct
+bool vidyaSteepFall     = vidyaSlope < -vidyaSteepPct
+bool vidyaLostMomentum  = vidyaSlope > -vidyaSteepPct and vidyaSlope < vidyaSteepPct
+bool vidyaFlattening    = vidyaLostMomentum
+bool priceNearVidya     = math.abs(close - vidya) < vidya * (fibProxPct / 100.0)
+bool priceCrossAboveVidya = close > vidya and close[1] <= vidya[1]
+
+float smma_hi = calc_smma(high, imacdLen)
+float smma_lo = calc_smma(low,  imacdLen)
+float mi      = zlema(close, imacdSmth)
+float md      = (mi > smma_hi) ? (mi - smma_hi) : (mi < smma_lo) ? (mi - smma_lo) : 0.0
+float sb      = ta.sma(md, imacdSig)
+float sh      = md - sb
+
+[diplus, diminus, adx] = ta.dmi(adxLen, adxLen)
+float rsi    = ta.rsi(close, 14)
+
+// =============================================================================
+// 6. VOLUME CONDITIONS  (unchanged from V9)
+// =============================================================================
+
+float volSma      = ta.sma(volume, volLen)
+float volRatio    = volume / math.max(volSma, 1)
+bool  volBuyConf  = (close > open) and (volRatio >= volMult)
+bool  volSellConf = (close < open) and (volRatio >= volMult)
+bool  volDivBear  = (high > high[1]) and (volume < volume[1]) and (volume < volSma)
+bool  volDivBull  = (low < low[1])   and (volume < volume[1]) and (volume < volSma)
+bool  volExpanding = volRatio >= volMult
+
+// =============================================================================
+// 7. SWING STRUCTURE  (unchanged from V9 except pivotRight default is now 3)
+// =============================================================================
+
+// LAG NOTE: pivotRight bars must pass after a swing high/low before it is confirmed.
+// With pivotRight=3 (V10 default), labels appear 3 bars after the actual pivot —
+// roughly 2 bars earlier than the V9 default of 5. The ±sigTolPct% band compensates
+// for the remaining entry timing gap.
+
+float pivHi = ta.pivothigh(high, pivotLeft, pivotRight)
+float pivLo = ta.pivotlow(low,   pivotLeft, pivotRight)
+
+var float swingHi1 = na
+var float swingHi2 = na
+var int   swingHi1Bar = na
+var int   swingHi2Bar = na
+var float swingLo1 = na
+var float swingLo2 = na
+var int   swingLo1Bar = na
+var int   swingLo2Bar = na
+
+if not na(pivHi)
+    swingHi2    := swingHi1
+    swingHi2Bar := swingHi1Bar
+    swingHi1    := pivHi
+    swingHi1Bar := bar_index - pivotRight
+
+if not na(pivLo)
+    swingLo2    := swingLo1
+    swingLo2Bar := swingLo1Bar
+    swingLo1    := pivLo
+    swingLo1Bar := bar_index - pivotRight
+
+bool higherHighs = not na(swingHi1) and not na(swingHi2) and (swingHi1 > swingHi2)
+bool lowerHighs  = not na(swingHi1) and not na(swingHi2) and (swingHi1 < swingHi2)
+bool higherLows  = not na(swingLo1) and not na(swingLo2) and (swingLo1 > swingLo2)
+bool lowerLows   = not na(swingLo1) and not na(swingLo2) and (swingLo1 < swingLo2)
+
+bool bullishStructure = higherHighs and higherLows
+bool bearishStructure = lowerHighs  and lowerLows
+
+// =============================================================================
+// 8. FIBONACCI RETRACEMENT LEVELS  (unchanged from V9)
+// =============================================================================
+
+float fibRange   = nz(swingHi1) - nz(swingLo1)
+bool  fibBullish = not na(swingLo1Bar) and not na(swingHi1Bar) and (swingLo1Bar > swingHi1Bar)
+bool  fibBearish = not na(swingHi1Bar) and not na(swingLo1Bar) and (swingHi1Bar > swingLo1Bar)
+
+float fib236 = fibBearish ? swingHi1 - fibRange * 0.236 : fibBullish ? swingLo1 + fibRange * 0.236 : na
+float fib382 = fibBearish ? swingHi1 - fibRange * 0.382 : fibBullish ? swingLo1 + fibRange * 0.382 : na
+float fib500 = fibBearish ? swingHi1 - fibRange * 0.500 : fibBullish ? swingLo1 + fibRange * 0.500 : na
+float fib618 = fibBearish ? swingHi1 - fibRange * 0.618 : fibBullish ? swingLo1 + fibRange * 0.618 : na
+float fib786 = fibBearish ? swingHi1 - fibRange * 0.786 : fibBullish ? swingLo1 + fibRange * 0.786 : na
+
+float fibProximity = close * (fibProxPct / 100.0)
+bool  nearFib382   = not na(fib382) and math.abs(close - fib382) < fibProximity
+bool  nearFib500   = not na(fib500) and math.abs(close - fib500) < fibProximity
+bool  nearFib618   = not na(fib618) and math.abs(close - fib618) < fibProximity
+bool  atFibZone    = nearFib382 or nearFib500 or nearFib618
+
+// =============================================================================
+// 9. DIVERGENCE DETECTION  (unchanged from V9)
+// =============================================================================
+
+var float rsiAtSwingHi1 = na
+var float rsiAtSwingHi2 = na
+var float rsiAtSwingLo1 = na
+var float rsiAtSwingLo2 = na
+var float mdAtSwingHi1  = na
+var float mdAtSwingHi2  = na
+var float mdAtSwingLo1  = na
+var float mdAtSwingLo2  = na
+
+if not na(pivHi)
+    rsiAtSwingHi2 := rsiAtSwingHi1
+    mdAtSwingHi2  := mdAtSwingHi1
+    rsiAtSwingHi1 := rsi[pivotRight]
+    mdAtSwingHi1  := md[pivotRight]
+
+if not na(pivLo)
+    rsiAtSwingLo2 := rsiAtSwingLo1
+    mdAtSwingLo2  := mdAtSwingLo1
+    rsiAtSwingLo1 := rsi[pivotRight]
+    mdAtSwingLo1  := md[pivotRight]
+
+bool rsiBearDiv       = higherHighs and not na(rsiAtSwingHi1) and not na(rsiAtSwingHi2) and (rsiAtSwingHi1 < rsiAtSwingHi2)
+bool mdBearDiv        = higherHighs and not na(mdAtSwingHi1)  and not na(mdAtSwingHi2)  and (mdAtSwingHi1  < mdAtSwingHi2)
+bool bearishDivergence = rsiBearDiv or mdBearDiv
+
+bool rsiBullDiv       = lowerLows and not na(rsiAtSwingLo1) and not na(rsiAtSwingLo2) and (rsiAtSwingLo1 > rsiAtSwingLo2)
+bool mdBullDiv        = lowerLows and not na(mdAtSwingLo1)  and not na(mdAtSwingLo2)  and (mdAtSwingLo1  > mdAtSwingLo2)
+bool bullishDivergence = rsiBullDiv or mdBullDiv
+
+bool vidyaConfirmsBearDiv = bearishDivergence and (vidyaFalling or vidyaSlope <  vidyaFlatPct)
+bool vidyaConfirmsBullDiv = bullishDivergence and (vidyaRising  or vidyaSlope > -vidyaFlatPct)
+
+bool strongBullDiv = rsiBullDiv and mdBullDiv
+bool strongBearDiv = rsiBearDiv and mdBearDiv
+
+// =============================================================================
+// 10. SIGNAL LOGIC  (unchanged from V9)
+// =============================================================================
+
+bool rsiNotOverbought = rsi < rsiOverbought
+bool rsiNotOversold   = rsi > rsiOversold
+
+// ── BUY TIER 1: Strong Trend Buy ──────────────────────────────────────────────
+bool strongBuy =
+     (adx > adxThreshold)      and
+     vidyaRising                and
+     priceAboveVidya            and
+     md > 0.0                   and
+     rsiNotOverbought           and
+     volBuyConf                 and
+     not volDivBear             and
+     not bearishDivergence      and
+     not vidyaLostMomentum      and
+     mtfBullConfirmed
+
+// ── BUY TIER 2: Correction Buy  (wave 2/4/B bottoms) ─────────────────────────
+bool corrBuyVidyaOk    = vidyaRising or (enableEarlyBottomBuy and vidyaFlattening and rsi < 50.0)
+bool corrBuyPriceOk    = (close > vidya or priceNearVidya) or (enableEarlyBottomBuy and priceCrossAboveVidya)
+bool corrBuyRsiOk      = (rsi > corrBuyRsiMin and rsi < corrBuyRsiMax) or (enableEarlyBottomBuy and strongBullDiv and rsi > 20 and rsi < corrBuyRsiMax)
+bool corrBuyMtfOk      = mtfBullModerate or (strongBullDiv and not mtfBearStrong) or (enableEarlyBottomBuy and strongBullDiv and mtfWeighted > -20.0)
+bool corrBuyNotAtTop   = not (bearishDivergence and rsi > 52.0)
+bool corrBuyNotAtLocalHigh = localHighThr >= 1.0 or close < ta.highest(high, localHighBars) * localHighThr
+bool correctionBuy =
+     corrBuyVidyaOk            and
+     corrBuyPriceOk            and
+     corrBuyRsiOk              and
+     bullishDivergence         and
+     (atFibZone or higherLows or lowerLows) and
+     corrBuyMtfOk              and
+     corrBuyNotAtTop           and
+     corrBuyNotAtLocalHigh     and
+     (volBuyConf or volDivBull)
+
+// ── SELL TIER 1: Strong Reversal ──────────────────────────────────────────────
+bool strongSell =
+     (adx > strongAdxInp)  and
+     vidyaFalling           and
+     priceBelowVidya        and
+     md < 0.0               and
+     rsiNotOversold         and
+     volSellConf            and
+     not bullishDivergence  and
+     mtfBearStrong
+
+// ── SELL TIER 2: Exhaustion / Wave B Top ─────────────────────────────────────
+// V14 FIX — two guards added to prevent firing in buy zones:
+//
+// 1. not bullishDivergence
+//    SELL Tier 1 (strongSell) already has this guard; Tier 2 was missing it.
+//    When price makes a lower low while RSI/MACD makes a higher low, the market
+//    is setting up a BUY (wave C bottom / correction buy) — EXH SELL must not fire.
+//    Root cause of the orange SELL appearing at AAPL correction bottoms.
+//
+// 2. rsi < rsi[3]  (RSI must be DECLINING, not just low)
+//    rsi < exhRsiCeil (45) alone is satisfied during a recovery bounce from
+//    oversold (e.g. RSI rising 28 → 40 → 44). True mid-trend exhaustion has
+//    RSI falling toward that ceiling, not climbing up through it from below.
+//    This distinguishes "exhaustion at a lower high" from "recovery from a bottom".
+bool trendExhaustionSell =
+     (adx > adxThreshold)               and
+     (priceBelowVidya or priceNearVidya) and
+     vidyaFalling                        and
+     rsi < exhRsiCeil                    and   // RSI below exhaustion ceiling
+     rsi < rsi[3]                        and   // V14: RSI must be FALLING — not recovering from a low
+     not bullishDivergence               and   // V14: block when market is printing a buy setup
+     sh < 0.0                            and
+     volSellConf                         and
+     (bearishStructure or lowerHighs)    and
+     mtfBearModerate
+
+// ── SELL TIER 3: Early Divergence Sell ───────────────────────────────────────
+bool divSellMtfOk    = mtfBearModerate or (enableEarlyWaveTopSell and strongBearDiv and mtfWeighted <= 0.0)
+bool divSellStructOk = (atFibZone or lowerHighs) or (enableEarlyWaveTopSell and higherHighs)
+bool divergenceSell =
+     rsiBearDiv and mdBearDiv    and
+     vidyaConfirmsBearDiv        and
+     rsi > divRsiFloor           and
+     rsi < divRsiCeil            and
+     sh < 0.0 and md < sb        and
+     divSellStructOk             and
+     divSellMtfOk
+
+// ── SELL TIER 4: Wave Top (Elliott Wave 5 / Wave B peak) ─────────────────────
+bool waveTopVidyaOk  = vidyaLostMomentum or (enableEarlyWaveTopSell and vidyaSlope < vidyaSteepPct and vidyaSlope >= 0.0)
+bool waveTopMomOk    = (sh < 0.0 or md < sb) or (enableEarlyWaveTopSell and (md < md[1] or sh < sh[1]))
+bool waveTopDivOk    = rsiBearDiv or (enableEarlyWaveTopSell and mdBearDiv)
+bool waveTopSell =
+     waveTopDivOk           and
+     waveTopVidyaOk         and
+     not vidyaFalling       and
+     priceAboveVidya        and
+     higherHighs            and
+     rsi > divRsiFloor      and
+     rsi < rsiOverbought    and
+     waveTopMomOk           and
+     not bearishStructure
+
+// ── Composite + edge detection ────────────────────────────────────────────────
+bool buyCondition  = strongBuy or correctionBuy
+bool sellCondition = strongSell or trendExhaustionSell or divergenceSell or waveTopSell
+bool confirmedBuy  = buyCondition
+bool confirmedSell = sellCondition
+
+bool triggerBuy     = confirmedBuy  and not confirmedBuy[1]
+bool rawTriggerSell = confirmedSell and not confirmedSell[1]
+
+var int lastSellBar = na
+bool triggerSell    = rawTriggerSell and (na(lastSellBar) or (bar_index - lastSellBar) >= sellCooldown)
+if triggerSell
+    lastSellBar := bar_index
+
+// Tier labels
+string buyTier  = strongBuy ? "STRONG_TREND" : "CORRECTION_BUY"
+string sellTier = strongSell ? "SELL" : trendExhaustionSell ? "EXHAUSTION" : divergenceSell ? "DIVERGENCE" : "WAVE_TOP"
+string divInfo  = bearishDivergence ? (rsiBearDiv and mdBearDiv ? "RSI+MACD" : rsiBearDiv ? "RSI" : "MACD") :
+                  bullishDivergence ? (rsiBullDiv and mdBullDiv ? "RSI+MACD" : rsiBullDiv ? "RSI" : "MACD") : "NONE"
+
+// =============================================================================
+// 11. ALERTS  (unchanged from V9)
+// =============================================================================
+
+if triggerBuy
+    alert(get_full_alert_msg("BUY",  buyTier,  close, adx, rsi, md, volRatio, divInfo), alert.freq_once_per_bar_close)
+if triggerSell
+    alert(get_full_alert_msg("SELL", sellTier, close, adx, rsi, md, volRatio, divInfo), alert.freq_once_per_bar_close)
+
+// =============================================================================
+// 12. SIGNAL TOLERANCE BANDS  (V10 NEW)
+//
+// PURPOSE: Compensate for inherent lag — signals fire at bar CLOSE, and
+// pivotRight confirmation adds additional delay. The ±sigTolPct% band shows
+// traders the valid execution window around each signal price.
+//
+// MECHANICS:
+//   • A band is drawn from signal_price × (1 − pct) to signal_price × (1 + pct).
+//   • BUY band (green dashed) expires when the next SELL triggers.
+//   • SELL band (red dashed) expires when the next BUY triggers.
+//   • This handles ≈1-5 bar lag at default sigTolPct=5 % on 1D BTC charts.
+// =============================================================================
+
+var float buyTolLow   = na
+var float buyTolHigh  = na
+var float sellTolLow  = na
+var float sellTolHigh = na
+var int   buyTrigBar  = na
+var int   sellTrigBar = na
+
+if triggerBuy
+    buyTolLow   := close * (1.0 - sigTolPct / 100.0)
+    buyTolHigh  := close * (1.0 + sigTolPct / 100.0)
+    buyTrigBar  := bar_index
+    // Expire any open sell band — opposite signal invalidates it
+    sellTolLow  := na
+    sellTolHigh := na
+
+if triggerSell
+    sellTolLow  := close * (1.0 - sigTolPct / 100.0)
+    sellTolHigh := close * (1.0 + sigTolPct / 100.0)
+    sellTrigBar := bar_index
+    // Expire any open buy band
+    buyTolLow   := na
+    buyTolHigh  := na
+
+// Draw tolerance bands (linebr = broken line — gaps on na, continuous when active)
+plot(buyTolLow,   title="Buy Zone Low",   color=color.new(color.green, 40), linewidth=1, style=plot.style_linebr)
+plot(buyTolHigh,  title="Buy Zone High",  color=color.new(color.green, 40), linewidth=1, style=plot.style_linebr)
+plot(sellTolLow,  title="Sell Zone Low",  color=color.new(color.red,   40), linewidth=1, style=plot.style_linebr)
+plot(sellTolHigh, title="Sell Zone High", color=color.new(color.red,   40), linewidth=1, style=plot.style_linebr)
+
+// Shade the active tolerance zone
+bgcolor(not na(buyTolLow)  and close >= buyTolLow  and close <= buyTolHigh  ? color.new(color.green, 92) : na, title="Buy Tolerance Zone")
+bgcolor(not na(sellTolLow) and close >= sellTolLow and close <= sellTolHigh ? color.new(color.red,   92) : na, title="Sell Tolerance Zone")
+
+// =============================================================================
+// 13. VISUALS  (V13: signal shapes simplified + divergence promoted to SELL/BUY)
+// =============================================================================
+
+// VIDYA line + slope background
+color vidyaLineColor = vidyaRising ? color.new(#00C853, 0) : vidyaFalling ? color.new(#FF1744, 0) : color.new(#2962FF, 0)
+plot(vidya, color=vidyaLineColor, linewidth=2, title="VIDYA Trend")
+bgcolor(vidyaRising ? color.new(color.green, 93) : vidyaFalling ? color.new(color.red, 93) : na, title="VIDYA Slope BG")
+
+// Volume candle backgrounds
+bgcolor(volRatio >= volMult and close > open ? color.new(color.green, 92) : na, title="High Bull Vol")
+bgcolor(volRatio >= volMult and close < open ? color.new(color.red,   92) : na, title="High Bear Vol")
+
+// Fibonacci levels
+plot(showFibs ? fib236 : na, color=color.new(color.gray,   60), linewidth=1, style=plot.style_circles, title="Fib 23.6%")
+plot(showFibs ? fib382 : na, color=color.new(color.blue,   50), linewidth=1, style=plot.style_circles, title="Fib 38.2%")
+plot(showFibs ? fib500 : na, color=color.new(color.purple, 40), linewidth=1, style=plot.style_circles, title="Fib 50.0%")
+plot(showFibs ? fib618 : na, color=color.new(color.orange, 40), linewidth=1, style=plot.style_circles, title="Fib 61.8%")
+plot(showFibs ? fib786 : na, color=color.new(color.gray,   60), linewidth=1, style=plot.style_circles, title="Fib 78.6%")
+
+// ── Swing Labels — V10: SH/SL converted to Sell/Buy when swingAsBuySell=true ──
+// WHY: Structural pivot highs are natural sell zones; pivot lows are natural buy zones.
+// These labels appear pivotRight bars AFTER the actual swing, so they are historically
+// accurate but slightly lagged from the real-time perspective.
+if showSwings and not na(pivHi)
+    string shText  = swingAsBuySell ? "Sell" : "SH"
+    color  shColor = swingAsBuySell ? color.new(color.red, 50) : color.new(color.red, 70)
+    label.new(bar_index - pivotRight, pivHi, shText,
+              style=label.style_label_down, color=shColor, textcolor=color.white, size=size.tiny)
+
+if showSwings and not na(pivLo)
+    string slText  = swingAsBuySell ? "Buy" : "SL"
+    color  slColor = swingAsBuySell ? color.new(color.green, 50) : color.new(color.green, 70)
+    label.new(bar_index - pivotRight, pivLo, slText,
+              style=label.style_label_up, color=slColor, textcolor=color.white, size=size.tiny)
+
+// Divergence markers
+if showDiverg and bearishDivergence and not bearishDivergence[1]
+    label.new(bar_index, high + (high * 0.005), vidyaConfirmsBearDiv ? "DIV↓✓" : "DIV↓",
+              style=label.style_label_down, color=color.new(color.purple, 20), textcolor=color.white, size=size.tiny)
+if showDiverg and bullishDivergence and not bullishDivergence[1]
+    label.new(bar_index, low - (low * 0.005), vidyaConfirmsBullDiv ? "DIV↑✓" : "DIV↑",
+              style=label.style_label_up, color=color.new(color.teal, 20), textcolor=color.white, size=size.tiny)
+
+// ── Signal Shapes (V13 — 4 plotshapes, divergence promoted to SELL / BUY) ─────
+//
+// Two visual tiers based on conviction:
+//
+//   STRONG  (size.normal, fully opaque)
+//     BUY  — strongBuy  OR  correctionBuy backed by strongBullDiv
+//     SELL — strongSell OR  divergenceSell OR waveTopSell
+//            (bearishDivergence-based signals are now shown as SELL — not DIV↓)
+//
+//   MODERATE (size.small, semi-transparent)
+//     BUY  — correctionBuy without strong divergence (structural wave 2/4 entries)
+//     SELL — trendExhaustionSell only (mid-trend exhaustion, lower conviction)
+//
+// This collapses 6 plotshape calls into 4, eliminates the purple DIV↓ label noise,
+// and makes all divergence-confirmed signals indistinguishable visually from the
+// primary SELL / BUY triggers — matching user intent.
+
+bool strongBuyShape    = triggerBuy  and (strongBuy or (correctionBuy and strongBullDiv))
+bool moderateBuyShape  = triggerBuy  and not strongBuyShape
+bool strongSellShape   = triggerSell and (strongSell or divergenceSell or waveTopSell)
+bool moderateSellShape = triggerSell and not strongSellShape   // only trendExhaustionSell reaches here
+
+plotshape(strongBuyShape,
+     title="BUY (Strong)",   style=shape.labelup,   location=location.belowbar,
+     color=color.green,      size=size.normal, text="BUY",  textcolor=color.white)
+plotshape(moderateBuyShape,
+     title="BUY",            style=shape.labelup,   location=location.belowbar,
+     color=color.new(color.green, 25), size=size.small, text="BUY", textcolor=color.white)
+
+plotshape(strongSellShape,
+     title="SELL (Strong)",  style=shape.labeldown, location=location.abovebar,
+     color=color.red,        size=size.normal, text="SELL", textcolor=color.white)
+plotshape(moderateSellShape,
+     title="SELL (EXH)",     style=shape.labeldown, location=location.abovebar,
+     color=color.orange,     size=size.small,  text="SELL", textcolor=color.white)
+
+// =============================================================================
+// 14. DASHBOARD  (V10: added SIG AGE row for lag awareness)
+// =============================================================================
+
+var table mtfTable = table.new(position.top_right, 5, 7, bgcolor=color.new(color.black, 70), border_width=1)
+if barstate.islast
+    // Row 0: Headers
+    table.cell(mtfTable, 0, 0, "WWR",  text_color=color.white,  text_size=size.tiny)
+    table.cell(mtfTable, 1, 0, tf2h,   text_color=autoMTF ? color.yellow : color.gray, text_size=size.tiny)
+    table.cell(mtfTable, 2, 0, tf4h,   text_color=autoMTF ? color.yellow : color.gray, text_size=size.tiny)
+    table.cell(mtfTable, 3, 0, tf8h,   text_color=autoMTF ? color.yellow : color.gray, text_size=size.tiny)
+    table.cell(mtfTable, 4, 0, "BASE", text_color=color.gray,   text_size=size.tiny)
+
+    // Row 1: Bias scores
+    table.cell(mtfTable, 0, 1, "Bias", text_color=color.gray, text_size=size.tiny)
+    table.cell(mtfTable, 1, 1, str.tostring(score2h, "#.#"),
+               text_color=score2h > 0 ? color.green : score2h < 0 ? color.red : color.gray, text_size=size.tiny)
+    table.cell(mtfTable, 2, 1, str.tostring(score4h, "#.#"),
+               text_color=score4h > 0 ? color.green : score4h < 0 ? color.red : color.gray, text_size=size.tiny)
+    table.cell(mtfTable, 3, 1, str.tostring(score8h, "#.#"),
+               text_color=score8h > 0 ? color.green : score8h < 0 ? color.red : color.gray, text_size=size.tiny)
+    table.cell(mtfTable, 4, 1, str.tostring(mtfWeighted, "#.#"),
+               text_color=mtfWeighted > 0 ? color.green : mtfWeighted < 0 ? color.red : color.gray, text_size=size.tiny)
+
+    // Row 2: VIDYA HTF status
+    table.cell(mtfTable, 0, 2, "VIDYA", text_color=color.gray, text_size=size.tiny)
+    table.cell(mtfTable, 1, 2, vidya2hRising ? "↑" : "↓",
+               text_color=vidya2hRising ? color.green : color.red, text_size=size.tiny)
+    table.cell(mtfTable, 2, 2, vidya4hRising ? "↑" : "↓",
+               text_color=vidya4hRising ? color.green : color.red, text_size=size.tiny)
+    table.cell(mtfTable, 3, 2, vidya8hRising ? "↑" : "↓",
+               text_color=vidya8hRising ? color.green : color.red, text_size=size.tiny)
+    table.cell(mtfTable, 4, 2,
+               vidyaRising ? "↑" + str.tostring(vidyaSlope, "#.#") + "%" : "↓" + str.tostring(vidyaSlope, "#.#") + "%",
+               text_color=vidyaRising ? color.green : color.red, text_size=size.tiny)
+
+    // Row 3: Volume + Divergence
+    table.cell(mtfTable, 0, 3, "Vol",  text_color=color.gray, text_size=size.tiny)
+    table.cell(mtfTable, 1, 3, str.tostring(volRatio, "#.#") + "x",
+               text_color=volRatio >= volMult ? color.yellow : color.gray, text_size=size.tiny)
+    table.cell(mtfTable, 2, 3, volDivBear ? "DIV↓" : volDivBull ? "DIV↑" : "—",
+               text_color=volDivBear ? color.orange : volDivBull ? color.teal : color.gray, text_size=size.tiny)
+    table.cell(mtfTable, 3, 3, bearishDivergence ? "BEAR" : bullishDivergence ? "BULL" : "—",
+               text_color=bearishDivergence ? color.red : bullishDivergence ? color.green : color.gray, text_size=size.tiny)
+    table.cell(mtfTable, 4, 3, divInfo,
+               text_color=bearishDivergence ? color.red : bullishDivergence ? color.green : color.gray, text_size=size.tiny)
+
+    // Row 4: Structure
+    table.cell(mtfTable, 0, 4, "Struct", text_color=color.gray, text_size=size.tiny)
+    table.cell(mtfTable, 1, 4, bullishStructure ? "HH/HL" : bearishStructure ? "LH/LL" : "MIXED",
+               text_color=bullishStructure ? color.green : bearishStructure ? color.red : color.gray, text_size=size.tiny)
+    table.cell(mtfTable, 2, 4, atFibZone ? "FIB" : "—",
+               text_color=atFibZone ? color.yellow : color.gray, text_size=size.tiny)
+    table.cell(mtfTable, 3, 4, fibBearish ? "RET↓" : fibBullish ? "RET↑" : "—",
+               text_color=fibBearish ? color.red : fibBullish ? color.green : color.gray, text_size=size.tiny)
+    table.cell(mtfTable, 4, 4, "ADX:" + str.tostring(adx, "#.#"),
+               text_color=adx > strongAdxInp ? color.yellow : adx > adxThreshold ? color.white : color.gray, text_size=size.tiny)
+
+    // Row 5: Active signal
+    table.cell(mtfTable, 0, 5, "SIG",  text_color=color.gray, text_size=size.tiny)
+    string sigText = confirmedBuy  ? (strongBuy ? "BUY▲" : "COR▲") :
+                     confirmedSell ? (strongSell ? "SELL▼" : trendExhaustionSell ? "EXH▼" : divergenceSell ? "DIV▼" : "TOP▼") : "—"
+    color  sigColor = confirmedBuy  ? color.green :
+                      confirmedSell ? (strongSell ? color.red : trendExhaustionSell ? color.orange : divergenceSell ? color.purple : color.new(#FF6D00, 0)) : color.gray
+    table.cell(mtfTable, 1, 5, sigText, text_color=sigColor, text_size=size.tiny)
+    table.cell(mtfTable, 2, 5, "RSI:" + str.tostring(rsi, "#.#"),
+               text_color=rsi > 70 ? color.red : rsi < 30 ? color.green : color.white, text_size=size.tiny)
+    table.cell(mtfTable, 3, 5, "MD:" + str.tostring(md, "#.#"),
+               text_color=md > 0 ? color.green : md < 0 ? color.red : color.gray, text_size=size.tiny)
+    table.cell(mtfTable, 4, 5, "SH:" + str.tostring(sh, "#.#"),
+               text_color=sh > 0 ? color.green : sh < 0 ? color.red : color.gray, text_size=size.tiny)
+
+    // Row 6: Signal Age — V10 NEW (lag awareness)
+    // Shows how many bars have passed since the last BUY or SELL trigger.
+    // A large age means you are mid-swing, not at a fresh signal entry.
+    int buyAge  = na(buyTrigBar)  ? -1 : bar_index - buyTrigBar
+    int sellAge = na(sellTrigBar) ? -1 : bar_index - sellTrigBar
+    string buyAgeStr  = buyAge  < 0 ? "—" : str.tostring(buyAge)  + "b"
+    string sellAgeStr = sellAge < 0 ? "—" : str.tostring(sellAge) + "b"
+    string tolStr     = str.tostring(sigTolPct, "#.#") + "%"
+    table.cell(mtfTable, 0, 6, "LAG",  text_color=color.gray, text_size=size.tiny)
+    table.cell(mtfTable, 1, 6, "BUY:"  + buyAgeStr,
+               text_color=not na(buyTolLow) ? color.green : color.gray, text_size=size.tiny)
+    table.cell(mtfTable, 2, 6, "SELL:" + sellAgeStr,
+               text_color=not na(sellTolLow) ? color.red : color.gray, text_size=size.tiny)
+    table.cell(mtfTable, 3, 6, "±" + tolStr,
+               text_color=color.yellow, text_size=size.tiny)
+    table.cell(mtfTable, 4, 6, "pR:" + str.tostring(pivotRight),
+               text_color=pivotRight <= 3 ? color.yellow : color.gray, text_size=size.tiny)

@@ -1,0 +1,355 @@
+// This Pine Script™ code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © forexobroker
+
+//@version=6
+indicator("FX Risk Cockpit [forexobroker]", shorttitle="Risk", overlay=true, max_lines_count=20, max_labels_count=20)
+
+// ─── INPUTS ──────────────────────────────────────────────────────────────────
+
+// Account
+grpAcct = "Account"
+accountSize  = input.float(10000.0, "Account Size", minval=100, step=500, group=grpAcct, tooltip="Your total account balance in account currency")
+riskPercent  = input.float(1.0, "Risk Per Trade %", minval=0.1, maxval=25, step=0.1, group=grpAcct, tooltip="Percentage of account to risk on this trade")
+acctCurrency = input.string("USD", "Account Currency", options=["USD", "EUR", "GBP", "JPY", "AUD", "CAD", "CHF", "NZD"], group=grpAcct, tooltip="Your account denomination currency")
+
+// Trade Setup
+grpTrade = "Trade Setup"
+tradeDir     = input.string("Long", "Direction", options=["Long", "Short"], group=grpTrade, tooltip="Trade direction: Long (buy) or Short (sell)")
+manualEntry  = input.float(0.0, "Entry Price (0 = current)", minval=0, group=grpTrade, tooltip="Set to 0 to use current close as entry, or type a specific price")
+slPipsInput  = input.float(25.0, "Stop Loss (pips)", minval=0.1, maxval=1000, step=5, group=grpTrade, tooltip="Stop loss distance in pips from entry")
+tp1PipsInput = input.float(50.0, "Take Profit 1 (pips)", minval=0.1, maxval=2000, step=5, group=grpTrade, tooltip="TP1 distance in pips from entry")
+showTP2      = input.bool(true, "Show TP2", inline="tp2", group=grpTrade)
+tp2PipsInput = input.float(75.0, "TP2 (pips)", minval=0.1, maxval=2000, step=5, inline="tp2", group=grpTrade, tooltip="TP2 distance in pips from entry")
+showTP3      = input.bool(false, "Show TP3", inline="tp3", group=grpTrade)
+tp3PipsInput = input.float(100.0, "TP3 (pips)", minval=0.1, maxval=2000, step=5, inline="tp3", group=grpTrade, tooltip="TP3 distance in pips from entry")
+
+// Position Sizing
+grpPos = "Position Sizing"
+lotType  = input.string("Standard", "Lot Type", options=["Standard", "Mini", "Micro"], group=grpPos, tooltip="Standard=100K, Mini=10K, Micro=1K units per lot")
+pipValOv = input.float(0.0, "Pip Value Override (0=auto)", minval=0, step=1, group=grpPos, tooltip="Per-pip value for 1 standard lot in account currency. 0 = auto-detect. Use 10 for most USD-quoted pairs")
+
+// Display
+grpDisp = "Display"
+showLines     = input.bool(true, "Show Lines & Labels", group=grpDisp, tooltip="Draw entry, SL, and TP lines with labels on the chart")
+showZones     = input.bool(true, "Show Risk/Reward Zones", group=grpDisp, tooltip="Semi-transparent fill between entry and SL/TP levels")
+showDashboard = input.bool(true, "Show Dashboard", group=grpDisp, tooltip="Show the risk cockpit dashboard table")
+tablePos      = input.string("top_right", "Table Position", options=["top_left", "top_center", "top_right", "middle_left", "middle_right", "bottom_left", "bottom_center", "bottom_right"], group=grpDisp)
+textSz        = input.string("small", "Text Size", options=["tiny", "small", "normal"], group=grpDisp)
+showRiskHeat  = input.bool(true, "Show Risk Heat Gauge", group=grpDisp, tooltip="Color-coded risk level indicator in dashboard")
+
+// Colors
+grpCol = "Colors"
+entryCol = input.color(#2196F3, "Entry", group=grpCol)
+slCol    = input.color(#EF5350, "Stop Loss", group=grpCol)
+tp1Col   = input.color(#26A69A, "TP1", group=grpCol)
+tp2Col   = input.color(#66BB6A, "TP2", group=grpCol)
+tp3Col   = input.color(#00C853, "TP3", group=grpCol)
+
+// ─── THEME-AWARE COLORS ─────────────────────────────────────────────────────
+
+isDark  = chart.bg_color == color.black or color.r(chart.bg_color) < 128
+titleBg = #37474F
+titleFg = color.white
+headerBg = isDark ? #263238 : #ECEFF1
+headerFg = isDark ? #B0BEC5 : #37474F
+cellBg   = isDark ? #1E1E1E : #FAFAFA
+cellFg   = isDark ? #E0E0E0 : #212121
+sectionBg = isDark ? #2C3E50 : #E3F2FD
+sectionFg = isDark ? #81D4FA : #1565C0
+
+// ─── HELPER FUNCTIONS ────────────────────────────────────────────────────────
+
+getTablePos() =>
+    switch tablePos
+        "top_left"      => position.top_left
+        "top_center"    => position.top_center
+        "top_right"     => position.top_right
+        "middle_left"   => position.middle_left
+        "middle_right"  => position.middle_right
+        "bottom_left"   => position.bottom_left
+        "bottom_center" => position.bottom_center
+        => position.top_right
+
+getTextSize() =>
+    switch textSz
+        "tiny"   => size.tiny
+        "small"  => size.small
+        "normal" => size.normal
+        => size.small
+
+getPipSize() =>
+    syminfo.mintick < 0.01 ? 0.0001 : 0.01
+
+getLotUnits() =>
+    switch lotType
+        "Standard" => 100000.0
+        "Mini"     => 10000.0
+        "Micro"    => 1000.0
+        => 100000.0
+
+formatCurr(float val) =>
+    acctCurrency + " " + str.tostring(val, "#,##0.00")
+
+formatPips(float val) =>
+    str.tostring(val, "#,##0.0") + " pips"
+
+// ─── CORE CALCULATIONS ──────────────────────────────────────────────────────
+
+pipSize  = getPipSize()
+isLong   = tradeDir == "Long"
+lotUnits = getLotUnits()
+
+// Entry price — current close if manual is 0, otherwise manual
+entryPrice = manualEntry > 0 ? manualEntry : close
+
+// Calculate absolute SL/TP prices from pip distances
+slPrice  = isLong ? entryPrice - slPipsInput * pipSize : entryPrice + slPipsInput * pipSize
+tp1Price = isLong ? entryPrice + tp1PipsInput * pipSize : entryPrice - tp1PipsInput * pipSize
+tp2Price = isLong ? entryPrice + tp2PipsInput * pipSize : entryPrice - tp2PipsInput * pipSize
+tp3Price = isLong ? entryPrice + tp3PipsInput * pipSize : entryPrice - tp3PipsInput * pipSize
+
+// Risk amount
+riskAmount = accountSize * (riskPercent / 100.0)
+
+// Pip value per unit (auto or override)
+autoPipVal   = syminfo.pointvalue * pipSize / syminfo.mintick
+pipValueUnit = pipValOv > 0 ? pipValOv / lotUnits : autoPipVal
+
+// Position sizing: units first, then convert to lots
+positionUnits = slPipsInput > 0 and pipValueUnit > 0 ? riskAmount / (slPipsInput * pipValueUnit) : 0.0
+positionLots  = positionUnits / lotUnits
+slDollar   = slPipsInput * pipValueUnit * positionUnits
+tp1Dollar  = tp1PipsInput * pipValueUnit * positionUnits
+tp2Dollar  = tp2PipsInput * pipValueUnit * positionUnits
+tp3Dollar  = tp3PipsInput * pipValueUnit * positionUnits
+
+// Risk/Reward ratios
+rr1 = slPipsInput > 0 ? tp1PipsInput / slPipsInput : 0.0
+rr2 = slPipsInput > 0 ? tp2PipsInput / slPipsInput : 0.0
+rr3 = slPipsInput > 0 ? tp3PipsInput / slPipsInput : 0.0
+
+// Risk heat — SL dollar loss as % of account
+riskHeat = accountSize > 0 ? slDollar / accountSize * 100.0 : 0.0
+
+// Pip value for the position
+pipValPosition = pipValueUnit * positionUnits
+
+// ─── SESSION TRACKING ────────────────────────────────────────────────────────
+
+var float sessionHigh = high
+var float sessionLow  = low
+var float sessionOpen = close
+
+if session.isfirstbar
+    sessionHigh := high
+    sessionLow  := low
+    sessionOpen := open
+else
+    sessionHigh := math.max(sessionHigh, high)
+    sessionLow  := math.min(sessionLow, low)
+
+sessionRange    = sessionHigh - sessionLow
+sessionRangePip = sessionRange / pipSize
+drawdownPips    = (sessionHigh - close) / pipSize
+drawdownPct     = sessionHigh > 0 ? (sessionHigh - close) / sessionHigh * 100.0 : 0.0
+sessionPnlPips  = (close - sessionOpen) / pipSize
+
+// ─── ON-CHART VISUALIZATION ─────────────────────────────────────────────────
+
+var line  entryLine = na
+var line  slLine    = na
+var line  tp1Line   = na
+var line  tp2Line   = na
+var line  tp3Line   = na
+var label entryLbl  = na
+var label slLbl     = na
+var label tp1Lbl    = na
+var label tp2Lbl    = na
+var label tp3Lbl    = na
+var linefill slFill  = na
+var linefill tp1Fill = na
+var linefill tp2Fill = na
+var linefill tp3Fill = na
+
+if barstate.islast
+    // Delete previous drawings
+    line.delete(entryLine)
+    line.delete(slLine)
+    line.delete(tp1Line)
+    line.delete(tp2Line)
+    line.delete(tp3Line)
+    label.delete(entryLbl)
+    label.delete(slLbl)
+    label.delete(tp1Lbl)
+    label.delete(tp2Lbl)
+    label.delete(tp3Lbl)
+    linefill.delete(slFill)
+    linefill.delete(tp1Fill)
+    linefill.delete(tp2Fill)
+    linefill.delete(tp3Fill)
+
+    int x1     = bar_index - 20
+    int x2     = bar_index
+    int xLabel = bar_index + 3
+
+    // ── Lines & fills ──
+    if showLines
+        // Entry line (solid)
+        entryLine := line.new(x1, entryPrice, x2, entryPrice, color=entryCol, width=2, style=line.style_solid, extend=extend.right)
+
+        // SL line (dashed)
+        slLine := line.new(x1, slPrice, x2, slPrice, color=slCol, width=2, style=line.style_dashed, extend=extend.right)
+
+        // TP1 line (dashed)
+        tp1Line := line.new(x1, tp1Price, x2, tp1Price, color=tp1Col, width=2, style=line.style_dashed, extend=extend.right)
+
+        // TP2 line
+        if showTP2
+            tp2Line := line.new(x1, tp2Price, x2, tp2Price, color=tp2Col, width=1, style=line.style_dashed, extend=extend.right)
+
+        // TP3 line
+        if showTP3
+            tp3Line := line.new(x1, tp3Price, x2, tp3Price, color=tp3Col, width=1, style=line.style_dashed, extend=extend.right)
+
+    // ── Risk/Reward zone fills ──
+    if showZones and showLines
+        slFill  := linefill.new(entryLine, slLine, color.new(slCol, 88))
+        tp1Fill := linefill.new(entryLine, tp1Line, color.new(tp1Col, 88))
+        if showTP2 and not na(tp2Line)
+            tp2Fill := linefill.new(tp1Line, tp2Line, color.new(tp2Col, 90))
+        if showTP3 and not na(tp3Line) and not na(tp2Line)
+            tp3Fill := linefill.new(tp2Line, tp3Line, color.new(tp3Col, 92))
+
+    // ── Entry direction arrow ──
+    arrowStyle = isLong ? label.style_label_up : label.style_label_down
+    arrowText  = isLong ? "LONG" : "SHORT"
+    entryLbl := label.new(x2, entryPrice, arrowText + " " + str.tostring(entryPrice, format.mintick), color=entryCol, textcolor=color.white, style=arrowStyle, size=size.normal)
+
+    // ── Level labels (to the right) ──
+    slLbl := label.new(xLabel, slPrice, "SL " + formatPips(slPipsInput) + "\n" + formatCurr(slDollar), color=color.new(slCol, 70), textcolor=slCol, style=label.style_label_left, size=size.small)
+
+    tp1Lbl := label.new(xLabel, tp1Price, "TP1 " + formatPips(tp1PipsInput) + "  1:" + str.tostring(rr1, "#.#") + "\n" + formatCurr(tp1Dollar), color=color.new(tp1Col, 70), textcolor=tp1Col, style=label.style_label_left, size=size.small)
+
+    if showTP2
+        tp2Lbl := label.new(xLabel, tp2Price, "TP2 " + formatPips(tp2PipsInput) + "  1:" + str.tostring(rr2, "#.#") + "\n" + formatCurr(tp2Dollar), color=color.new(tp2Col, 70), textcolor=tp2Col, style=label.style_label_left, size=size.small)
+
+    if showTP3
+        tp3Lbl := label.new(xLabel, tp3Price, "TP3 " + formatPips(tp3PipsInput) + "  1:" + str.tostring(rr3, "#.#") + "\n" + formatCurr(tp3Dollar), color=color.new(tp3Col, 70), textcolor=tp3Col, style=label.style_label_left, size=size.small)
+
+// ─── DASHBOARD TABLE ─────────────────────────────────────────────────────────
+
+if showDashboard and barstate.islast
+    var table dash = table.new(getTablePos(), 2, 20, border_width=1, border_color=isDark ? #333333 : #CCCCCC)
+    tSz = getTextSize()
+
+    // Row 0 — Title
+    table.cell(dash, 0, 0, "FX RISK COCKPIT", text_color=titleFg, bgcolor=titleBg, text_size=tSz, text_halign=text.align_left)
+    table.cell(dash, 1, 0, "forexobroker", text_color=#90A4AE, bgcolor=titleBg, text_size=tSz, text_halign=text.align_right)
+
+    // Row 1 — Trade Setup header
+    table.cell(dash, 0, 1, "TRADE SETUP", text_color=sectionFg, bgcolor=sectionBg, text_size=tSz, text_halign=text.align_left)
+    table.cell(dash, 1, 1, "", bgcolor=sectionBg, text_size=tSz)
+
+    // Row 2 — Direction
+    dirColor = isLong ? #26A69A : #EF5350
+    table.cell(dash, 0, 2, "Direction", text_color=headerFg, bgcolor=headerBg, text_size=tSz, text_halign=text.align_left)
+    table.cell(dash, 1, 2, str.upper(tradeDir), text_color=dirColor, bgcolor=cellBg, text_size=tSz, text_halign=text.align_right)
+
+    // Row 3 — Entry
+    table.cell(dash, 0, 3, "Entry", text_color=headerFg, bgcolor=headerBg, text_size=tSz, text_halign=text.align_left)
+    table.cell(dash, 1, 3, str.tostring(entryPrice, format.mintick), text_color=entryCol, bgcolor=cellBg, text_size=tSz, text_halign=text.align_right)
+
+    // Row 4 — Stop Loss
+    table.cell(dash, 0, 4, "Stop Loss", text_color=headerFg, bgcolor=headerBg, text_size=tSz, text_halign=text.align_left)
+    table.cell(dash, 1, 4, formatPips(slPipsInput) + " (" + formatCurr(slDollar) + ")", text_color=slCol, bgcolor=cellBg, text_size=tSz, text_halign=text.align_right)
+
+    // Row 5 — TP1
+    table.cell(dash, 0, 5, "TP1", text_color=headerFg, bgcolor=headerBg, text_size=tSz, text_halign=text.align_left)
+    table.cell(dash, 1, 5, formatPips(tp1PipsInput) + " (" + formatCurr(tp1Dollar) + ") 1:" + str.tostring(rr1, "#.#"), text_color=tp1Col, bgcolor=cellBg, text_size=tSz, text_halign=text.align_right)
+
+    // Row 6 — TP2
+    table.cell(dash, 0, 6, "TP2", text_color=headerFg, bgcolor=headerBg, text_size=tSz, text_halign=text.align_left)
+    tp2Text = showTP2 ? formatPips(tp2PipsInput) + " (" + formatCurr(tp2Dollar) + ") 1:" + str.tostring(rr2, "#.#") : "—"
+    table.cell(dash, 1, 6, tp2Text, text_color=showTP2 ? tp2Col : #666666, bgcolor=cellBg, text_size=tSz, text_halign=text.align_right)
+
+    // Row 7 — TP3
+    table.cell(dash, 0, 7, "TP3", text_color=headerFg, bgcolor=headerBg, text_size=tSz, text_halign=text.align_left)
+    tp3Text = showTP3 ? formatPips(tp3PipsInput) + " (" + formatCurr(tp3Dollar) + ") 1:" + str.tostring(rr3, "#.#") : "—"
+    table.cell(dash, 1, 7, tp3Text, text_color=showTP3 ? tp3Col : #666666, bgcolor=cellBg, text_size=tSz, text_halign=text.align_right)
+
+    // Row 8 — Position Size header
+    table.cell(dash, 0, 8, "POSITION SIZE", text_color=sectionFg, bgcolor=sectionBg, text_size=tSz, text_halign=text.align_left)
+    table.cell(dash, 1, 8, "", bgcolor=sectionBg, text_size=tSz)
+
+    // Row 9 — Risk Amount
+    table.cell(dash, 0, 9, "Risk Amount", text_color=headerFg, bgcolor=headerBg, text_size=tSz, text_halign=text.align_left)
+    table.cell(dash, 1, 9, formatCurr(riskAmount) + " (" + str.tostring(riskPercent, "#.#") + "%)", text_color=cellFg, bgcolor=cellBg, text_size=tSz, text_halign=text.align_right)
+
+    // Row 10 — Lot Size
+    table.cell(dash, 0, 10, "Lot Size", text_color=headerFg, bgcolor=headerBg, text_size=tSz, text_halign=text.align_left)
+    table.cell(dash, 1, 10, str.tostring(positionLots, "#,##0.00") + " " + str.lower(lotType) + " lots", text_color=cellFg, bgcolor=cellBg, text_size=tSz, text_halign=text.align_right)
+
+    // Row 11 — Units
+    table.cell(dash, 0, 11, "Units", text_color=headerFg, bgcolor=headerBg, text_size=tSz, text_halign=text.align_left)
+    table.cell(dash, 1, 11, str.tostring(positionUnits, "#,##0"), text_color=cellFg, bgcolor=cellBg, text_size=tSz, text_halign=text.align_right)
+
+    // Row 12 — Pip Value
+    table.cell(dash, 0, 12, "Pip Value", text_color=headerFg, bgcolor=headerBg, text_size=tSz, text_halign=text.align_left)
+    table.cell(dash, 1, 12, formatCurr(pipValPosition) + "/pip", text_color=cellFg, bgcolor=cellBg, text_size=tSz, text_halign=text.align_right)
+
+    // Row 13 — Pip Size
+    table.cell(dash, 0, 13, "Pip Size", text_color=headerFg, bgcolor=headerBg, text_size=tSz, text_halign=text.align_left)
+    table.cell(dash, 1, 13, str.tostring(pipSize, format.mintick), text_color=cellFg, bgcolor=cellBg, text_size=tSz, text_halign=text.align_right)
+
+    // Row 14 — Session header
+    table.cell(dash, 0, 14, "SESSION", text_color=sectionFg, bgcolor=sectionBg, text_size=tSz, text_halign=text.align_left)
+    table.cell(dash, 1, 14, "", bgcolor=sectionBg, text_size=tSz)
+
+    // Row 15 — Session Range
+    table.cell(dash, 0, 15, "Range", text_color=headerFg, bgcolor=headerBg, text_size=tSz, text_halign=text.align_left)
+    table.cell(dash, 1, 15, formatPips(sessionRangePip), text_color=cellFg, bgcolor=cellBg, text_size=tSz, text_halign=text.align_right)
+
+    // Row 16 — Drawdown
+    table.cell(dash, 0, 16, "Drawdown", text_color=headerFg, bgcolor=headerBg, text_size=tSz, text_halign=text.align_left)
+    ddColor = drawdownPct > 1.0 ? #EF5350 : drawdownPct > 0.5 ? #FFD54F : #26A69A
+    table.cell(dash, 1, 16, formatPips(drawdownPips) + " (" + str.tostring(drawdownPct, "#.##") + "%)", text_color=ddColor, bgcolor=cellBg, text_size=tSz, text_halign=text.align_right)
+
+    // Row 17 — Session P&L
+    table.cell(dash, 0, 17, "Session P&L", text_color=headerFg, bgcolor=headerBg, text_size=tSz, text_halign=text.align_left)
+    pnlColor = sessionPnlPips > 0 ? #26A69A : sessionPnlPips < 0 ? #EF5350 : cellFg
+    pnlSign  = sessionPnlPips > 0 ? "+" : ""
+    table.cell(dash, 1, 17, pnlSign + formatPips(sessionPnlPips), text_color=pnlColor, bgcolor=cellBg, text_size=tSz, text_halign=text.align_right)
+
+    // Risk Heat section
+    if showRiskHeat
+        table.cell(dash, 0, 18, "RISK HEAT", text_color=sectionFg, bgcolor=sectionBg, text_size=tSz, text_halign=text.align_left)
+        table.cell(dash, 1, 18, "", bgcolor=sectionBg, text_size=tSz)
+
+        heatColor = riskHeat > 5.0 ? #EF5350 : riskHeat > 2.0 ? #FFD54F : #26A69A
+        heatLabel = riskHeat > 5.0 ? "HIGH" : riskHeat > 2.0 ? "MEDIUM" : "LOW"
+        table.cell(dash, 0, 19, heatLabel, text_color=heatColor, bgcolor=headerBg, text_size=tSz, text_halign=text.align_left)
+        table.cell(dash, 1, 19, str.tostring(riskHeat, "#.#") + "% of account", text_color=heatColor, bgcolor=cellBg, text_size=tSz, text_halign=text.align_right)
+
+// ─── DATA WINDOW PLOTS ──────────────────────────────────────────────────────
+
+plot(slPipsInput, "SL Pips", display=display.data_window)
+plot(tp1PipsInput, "TP1 Pips", display=display.data_window)
+plot(positionLots, "Position Lots", display=display.data_window)
+plot(riskHeat, "Risk Heat %", display=display.data_window)
+plot(sessionRangePip, "Session Range Pips", display=display.data_window)
+plot(drawdownPips, "Drawdown Pips", display=display.data_window)
+plot(sessionPnlPips, "Session P&L Pips", display=display.data_window)
+
+// ─── ALERT CONDITIONS ────────────────────────────────────────────────────────
+
+atEntry  = math.abs(close - entryPrice) <= pipSize
+atSL     = math.abs(close - slPrice) <= pipSize
+atTP1    = math.abs(close - tp1Price) <= pipSize
+highRisk = riskHeat > 5.0
+highDD   = drawdownPct > 2.0
+
+alertcondition(atEntry, "Price at Entry Level", "Price has reached your entry level")
+alertcondition(atSL, "Price at Stop Loss", "Price has reached your stop loss level")
+alertcondition(atTP1, "Price at TP1", "Price has reached your TP1 target")
+alertcondition(highRisk, "Risk Heat Above 5%", "Risk heat exceeds 5% of account — high exposure")
+alertcondition(highDD, "Session Drawdown Above 2%", "Session drawdown exceeds 2% from session high")

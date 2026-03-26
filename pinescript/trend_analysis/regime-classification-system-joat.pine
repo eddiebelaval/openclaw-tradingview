@@ -1,0 +1,623 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © officialjackofalltrades
+//@version=6
+indicator("Regime Classification System [JOAT]", "RCS [JOAT]", overlay=false, max_labels_count=50)
+// ─────────────────────────────────────────────────────────────────────────
+// INPUTS
+// ─────────────────────────────────────────────────────────────────────────
+
+// Range Filter Settings
+int per = input.int(100, "Sampling Period", minval=1, group="Range Filter")
+float mult = input.float(3.0, "Range Multiplier", minval=0.1, step=0.1, group="Range Filter")
+
+// Regime Detection
+float trendThreshold = input.float(0.6, "Trend Threshold", minval=0.3, maxval=0.9, step=0.05, group="Regime Detection")
+float volThreshold = input.float(1.5, "Volatility Threshold", minval=1.0, maxval=3.0, step=0.1, group="Regime Detection")
+int regimeStrengthLength = input.int(20, "Regime Strength Period", minval=5, maxval=100, group="Regime Detection")
+bool showRegimeSignals = input.bool(true, "Show Regime Signals", group="Regime Detection")
+
+// Chandelier Exit
+int ceLength = input.int(22, "Chandelier ATR Period", minval=1, group="Chandelier Exit")
+float ceMult = input.float(3.0, "Chandelier ATR Multiplier", minval=0.1, step=0.1, group="Chandelier Exit")
+bool ceUseClose = input.bool(true, "Use Close for Extremums", group="Chandelier Exit")
+
+// Impulse Detection
+bool catchFlat = input.bool(true, "Try to Catch Flat", group="Impulse Detection")
+
+// Multi-Timeframe Table
+bool showTable = input.bool(true, "Show MTF Table", group="Multi-Timeframe")
+string tablePosition = input.string("Middle right", "Table Position", 
+     options=["Top right", "Bottom right", "Top left", "Bottom left", "Middle right"], group="Multi-Timeframe")
+bool showRegimeStats = input.bool(true, "Show Regime Statistics", group="Multi-Timeframe")
+
+// Visual Settings - ENHANCED SHOCKING COLORS
+color upColor = input.color(color.new(#00FF88, 0), "Trend Bull", group="Colors", inline="c1")
+color downColor = input.color(color.new(#FF1744, 0), "Trend Bear", group="Colors", inline="c1")
+color midColor = input.color(color.new(#00E5FF, 0), "Mid Trend", group="Colors", inline="c2")
+color rangeColor = input.color(color.new(#FFD600, 0), "Range", group="Colors", inline="c2")
+color highVolColor = input.color(color.new(#FF6D00, 0), "High Volatility", group="Colors", inline="c3")
+color textColor = input.color(color.new(#ECEFF1, 0), "Text", group="Colors", inline="c3")
+color transitionColor = input.color(color.new(#E040FB, 0), "Transition", group="Colors", inline="c4")
+color excellentColor = input.color(color.new(#00E676, 0), "Excellent", group="Colors", inline="c4")
+
+// ─────────────────────────────────────────────────────────────────────────
+// FUNCTIONS
+// ─────────────────────────────────────────────────────────────────────────
+
+// Smooth range calculation (from RealGains)
+smoothrng(x, t, m) =>
+    wper = t * 2 - 1
+    avrng = ta.ema(math.abs(x - x[1]), t)
+    smoothrng = ta.ema(avrng, wper) * m
+    smoothrng
+
+// Range filter (from RealGains)
+rngfilt(x, r) =>
+    rngfilt = x
+    rngfilt := x > nz(rngfilt[1]) ? x - r < nz(rngfilt[1]) ? nz(rngfilt[1]) : x - r : 
+               x + r > nz(rngfilt[1]) ? nz(rngfilt[1]) : x + r
+    rngfilt
+
+// SMMA calculation (from RealGains)
+calc_smma(src, len) =>
+    var float smma = na
+    smma := na(smma) ? ta.sma(src, len) : (smma[1] * (len - 1) + src) / len
+    smma
+
+// ZLEMA calculation (from RealGains)
+calc_zlema(src, len) =>
+    ema1 = ta.ema(src, len)
+    ema2 = ta.ema(ema1, len)
+    d = ema1 - ema2
+    ema1 + d
+
+// Impulse detection (from RealGains)
+check_impulse() =>
+    impulse_length = 34
+    impulse_strength = 9
+    
+    hi = calc_smma(high, impulse_length)
+    lo = calc_smma(low, impulse_length)
+    mi = calc_zlema(hlc3, impulse_length)
+    
+    md = mi > hi ? mi - hi : mi < lo ? mi - lo : 0
+    sb = ta.sma(md, impulse_strength)
+    sh = md - sb
+    
+    is_impulse = sh != 0
+    is_impulse
+
+// Calculate trend strength
+calcTrendStrength(int length) =>
+    float tr = ta.tr
+    float atr = ta.atr(length)
+    
+    float plusDM = high - high[1] > low[1] - low ? math.max(high - high[1], 0) : 0
+    float minusDM = low[1] - low > high - high[1] ? math.max(low[1] - low, 0) : 0
+    
+    // Extract ta.sma calls from ternary for consistency
+    float plusDMSmooth = ta.sma(plusDM, length)
+    float minusDMSmooth = ta.sma(minusDM, length)
+    
+    float plusDI = atr > 0 ? plusDMSmooth / atr * 100 : 0
+    float minusDI = atr > 0 ? minusDMSmooth / atr * 100 : 0
+    
+    float dx = math.abs(plusDI - minusDI) / (plusDI + minusDI) * 100
+    float adx = ta.sma(dx, length)
+    
+    float trendStrength = adx / 100
+    bool bullish = plusDI > minusDI
+    
+    [trendStrength, bullish]
+
+// Calculate volatility regime
+calcVolatilityRegime(int length) =>
+    float atr = ta.atr(length)
+    float atrMA = ta.sma(atr, length)
+    float volRatio = atrMA > 0 ? atr / atrMA : 1.0
+    volRatio
+
+// Classify regime
+classifyRegime(float trendStr, bool isBullish, float volRatio, float threshold, float volThresh, bool impulse) =>
+    string regime = "Range"
+    color regimeColor = rangeColor
+    int regimeValue = 0
+    
+    if not impulse and catchFlat
+        regime := "Flat"
+        regimeColor := color.gray
+        regimeValue := 0
+    else if trendStr >= threshold
+        if volRatio > volThresh
+            regime := isBullish ? "Volatile Bull" : "Volatile Bear"
+            regimeColor := highVolColor
+            regimeValue := isBullish ? 3 : -3
+        else
+            regime := isBullish ? "Trend Bull" : "Trend Bear"
+            regimeColor := isBullish ? upColor : downColor
+            regimeValue := isBullish ? 2 : -2
+    else
+        if volRatio > volThresh
+            regime := "High Vol Range"
+            regimeColor := highVolColor
+            regimeValue := 0
+        else
+            regime := "Low Vol Range"
+            regimeColor := rangeColor
+            regimeValue := 0
+    
+    [regime, regimeColor, regimeValue]
+
+// Get trend status for MTF table - WITH COLORED CIRCLES
+get_trend_status() =>
+    impulse = catchFlat ? check_impulse() : true
+    smrng = smoothrng(close, per, mult)
+    filt = rngfilt(close, smrng)
+    
+    upward = 0.0
+    upward := filt > filt[1] ? nz(upward[1]) + 1 : filt < filt[1] ? 0 : nz(upward[1])
+    downward = 0.0
+    downward := filt < filt[1] ? nz(downward[1]) + 1 : filt > filt[1] ? 0 : nz(downward[1])
+    
+    // Use colored circles with arrows
+    trend_current = not impulse ? "● ●" : upward > 0 ? "● ▲" : downward > 0 ? "● ▼" : "● ●"
+    [filt, trend_current]
+
+// NEW: Calculate regime strength score (0-100)
+calcRegimeStrength(float trendStr, float volRatio, bool impulse, int barsInRegime) =>
+    // Component 1: Trend clarity (40 points)
+    float trendScore = trendStr * 40
+    
+    // Component 2: Volatility consistency (20 points)
+    float volScore = volRatio < volThreshold ? 20 : math.max(0, 20 - (volRatio - volThreshold) * 10)
+    
+    // Component 3: Impulse confirmation (20 points)
+    float impulseScore = impulse ? 20 : 0
+    
+    // Component 4: Regime duration (20 points) - longer = stronger
+    float durationScore = math.min(barsInRegime / 50.0, 1.0) * 20
+    
+    float totalScore = trendScore + volScore + impulseScore + durationScore
+    totalScore
+
+// NEW: Detect regime transition probability
+detectRegimeTransition(float trendStr, float volRatio, bool impulse) =>
+    // Transition signals
+    bool weakTrend = trendStr < trendThreshold * 0.8
+    bool volSpike = volRatio > volThreshold * 1.5
+    bool lostImpulse = not impulse and catchFlat
+    
+    // Transition probability (0-100)
+    float transitionProb = 0.0
+    if weakTrend
+        transitionProb += 40
+    if volSpike
+        transitionProb += 30
+    if lostImpulse
+        transitionProb += 30
+    
+    bool inTransition = transitionProb >= 50
+    [inTransition, transitionProb]
+
+// NEW: Calculate multi-timeframe alignment score
+calcMTFAlignment(string t1m, string t5m, string t15m, string t1h, string t4h, string tD) =>
+    int bullCount = 0
+    int bearCount = 0
+    int neutralCount = 0
+    
+    // Count each timeframe - check for arrow symbols
+    if str.contains(t1m, "▲")
+        bullCount += 1
+    else if str.contains(t1m, "▼")
+        bearCount += 1
+    else
+        neutralCount += 1
+    
+    if str.contains(t5m, "▲")
+        bullCount += 1
+    else if str.contains(t5m, "▼")
+        bearCount += 1
+    else
+        neutralCount += 1
+    
+    if str.contains(t15m, "▲")
+        bullCount += 1
+    else if str.contains(t15m, "▼")
+        bearCount += 1
+    else
+        neutralCount += 1
+    
+    if str.contains(t1h, "▲")
+        bullCount += 2  // Higher weight
+    else if str.contains(t1h, "▼")
+        bearCount += 2
+    else
+        neutralCount += 1
+    
+    if str.contains(t4h, "▲")
+        bullCount += 3  // Even higher weight
+    else if str.contains(t4h, "▼")
+        bearCount += 3
+    else
+        neutralCount += 1
+    
+    if str.contains(tD, "▲")
+        bullCount += 4  // Highest weight
+    else if str.contains(tD, "▼")
+        bearCount += 4
+    else
+        neutralCount += 1
+    
+    // Calculate alignment score (-100 to +100)
+    int totalCount = bullCount + bearCount + neutralCount
+    float alignmentScore = totalCount > 0 ? (bullCount - bearCount) / float(totalCount) * 100 : 0
+    
+    // Determine alignment strength
+    string alignment = alignmentScore > 60 ? "Strong Bull" : 
+                      alignmentScore > 30 ? "Moderate Bull" : 
+                      alignmentScore > -30 ? "Mixed" : 
+                      alignmentScore > -60 ? "Moderate Bear" : "Strong Bear"
+    
+    [alignmentScore, alignment, bullCount, bearCount]
+
+// NEW: Calculate regime confidence
+calcRegimeConfidence(float regimeStrength, float alignmentScore, bool inTransition) =>
+    // Base confidence from regime strength
+    float confidence = regimeStrength
+    
+    // Adjust for alignment
+    float alignmentBonus = math.abs(alignmentScore) / 100 * 20
+    confidence += alignmentBonus
+    
+    // Penalize if in transition
+    if inTransition
+        confidence *= 0.5
+    
+    // Cap at 100
+    confidence := math.min(confidence, 100)
+    confidence
+
+// ─────────────────────────────────────────────────────────────────────────
+// CALCULATIONS
+// ─────────────────────────────────────────────────────────────────────────
+
+// Source
+src = close
+
+// Smooth range and filter
+smrng = smoothrng(src, per, mult)
+filt = rngfilt(src, smrng)
+
+// Filter direction
+upward = 0.0
+upward := filt > filt[1] ? nz(upward[1]) + 1 : filt < filt[1] ? 0 : nz(upward[1])
+downward = 0.0
+downward := filt < filt[1] ? nz(downward[1]) + 1 : filt > filt[1] ? 0 : nz(downward[1])
+
+// Target bands
+hband = filt + smrng
+lband = filt - smrng
+
+// Colors
+filtcolor = upward > 0 ? upColor : downward > 0 ? downColor : midColor
+
+// Impulse check
+impulse = catchFlat ? check_impulse() : true
+
+// Trend Strength
+[trendStrength, isBullish] = calcTrendStrength(50)
+
+// Volatility Regime
+volRatio = calcVolatilityRegime(50)
+
+// Current Timeframe Regime
+[currentRegime, currentColor, currentValue] = classifyRegime(trendStrength, isBullish, volRatio, trendThreshold, volThreshold, impulse)
+
+// NEW: Track regime duration
+var int regimeBarsCount = 0
+var string lastRegime = ""
+if currentRegime != lastRegime
+    regimeBarsCount := 1
+    lastRegime := currentRegime
+else
+    regimeBarsCount += 1
+
+// NEW: Calculate regime strength
+float regimeStrength = calcRegimeStrength(trendStrength, volRatio, impulse, regimeBarsCount)
+
+// NEW: Detect regime transition
+[inTransition, transitionProb] = detectRegimeTransition(trendStrength, volRatio, impulse)
+
+// Chandelier Exit
+atrCE = ceMult * ta.atr(ceLength)
+longStop = (ceUseClose ? ta.highest(close, ceLength) : ta.highest(ceLength)) - atrCE
+longStopPrev = nz(longStop[1], longStop)
+longStop := close[1] > longStopPrev ? math.max(longStop, longStopPrev) : longStop
+
+shortStop = (ceUseClose ? ta.lowest(close, ceLength) : ta.lowest(ceLength)) + atrCE
+shortStopPrev = nz(shortStop[1], shortStop)
+shortStop := close[1] < shortStopPrev ? math.min(shortStop, shortStopPrev) : shortStop
+
+dir = 1
+dir := nz(dir[1], dir)
+dir := dir == -1 and close > shortStopPrev ? 1 : dir == 1 and close < longStopPrev ? -1 : dir
+
+// Multi-Timeframe Data
+[ema_1m, trend_1m] = request.security(syminfo.tickerid, '1', get_trend_status(), barmerge.gaps_off, barmerge.lookahead_off)
+[ema_3m, trend_3m] = request.security(syminfo.tickerid, '3', get_trend_status(), barmerge.gaps_off, barmerge.lookahead_off)
+[ema_5m, trend_5m] = request.security(syminfo.tickerid, '5', get_trend_status(), barmerge.gaps_off, barmerge.lookahead_off)
+[ema_15m, trend_15m] = request.security(syminfo.tickerid, '15', get_trend_status(), barmerge.gaps_off, barmerge.lookahead_off)
+[ema_30m, trend_30m] = request.security(syminfo.tickerid, '30', get_trend_status(), barmerge.gaps_off, barmerge.lookahead_off)
+[ema_1h, trend_1h] = request.security(syminfo.tickerid, '60', get_trend_status(), barmerge.gaps_off, barmerge.lookahead_off)
+[ema_2h, trend_2h] = request.security(syminfo.tickerid, '120', get_trend_status(), barmerge.gaps_off, barmerge.lookahead_off)
+[ema_4h, trend_4h] = request.security(syminfo.tickerid, '240', get_trend_status(), barmerge.gaps_off, barmerge.lookahead_off)
+[ema_D, trend_D] = request.security(syminfo.tickerid, 'D', get_trend_status(), barmerge.gaps_off, barmerge.lookahead_off)
+[ema_W, trend_W] = request.security(syminfo.tickerid, 'W', get_trend_status(), barmerge.gaps_off, barmerge.lookahead_off)
+
+// NEW: Calculate MTF alignment
+[alignmentScore, alignmentText, bullCount, bearCount] = calcMTFAlignment(trend_1m, trend_5m, trend_15m, trend_1h, trend_4h, trend_D)
+
+// NEW: Calculate regime confidence
+float regimeConfidence = calcRegimeConfidence(regimeStrength, alignmentScore, inTransition)
+
+// ─────────────────────────────────────────────────────────────────────────
+// VISUALIZATION
+// ─────────────────────────────────────────────────────────────────────────
+
+// Range Filter
+filtplot = plot(filt, color=filtcolor, linewidth=2, title="Range Filter")
+hbandplot = plot(hband, color=color.new(upColor, 70), title="High Target")
+lbandplot = plot(lband, color=color.new(downColor, 70), title="Low Target")
+
+fill(hbandplot, filtplot, color=color.new(upColor, 90), title="High Target Range")
+fill(lbandplot, filtplot, color=color.new(downColor, 90), title="Low Target Range")
+
+// NEW: Regime strength zones - gradient fills
+float upperZone = filt + (smrng * (regimeStrength / 100))
+float lowerZone = filt - (smrng * (regimeStrength / 100))
+upperZonePlot = plot(upperZone, color=color.new(currentColor, 100), display=display.none)
+lowerZonePlot = plot(lowerZone, color=color.new(currentColor, 100), display=display.none)
+fill(upperZonePlot, lowerZonePlot, color=color.new(currentColor, 85), title="Regime Strength Zone")
+
+// NEW: Volatility expansion zones
+bool highVol = volRatio > volThreshold
+float volUpperBand = hband * (highVol ? 1.2 : 1.0)
+float volLowerBand = lband * (highVol ? 0.8 : 1.0)
+plot(highVol ? volUpperBand : na, color=color.new(highVolColor, 50), linewidth=1, style=plot.style_circles, title="Vol Upper")
+plot(highVol ? volLowerBand : na, color=color.new(highVolColor, 50), linewidth=1, style=plot.style_circles, title="Vol Lower")
+
+// Chandelier Exit
+plot(dir == 1 ? longStop : na, color=upColor, linewidth=2, title="Long Stop", style=plot.style_linebr)
+plot(dir == -1 ? shortStop : na, color=downColor, linewidth=2, title="Short Stop", style=plot.style_linebr)
+
+// NEW: Dynamic regime labels on the lines
+if barstate.islast and showRegimeStats
+    label.new(bar_index, filt, 
+        text=currentRegime + "\n" + str.tostring(regimeStrength, "#") + "%", 
+        style=label.style_label_left, 
+        color=color.new(currentColor, 20), 
+        textcolor=color.new(#000000, 0), 
+        size=size.small)
+    
+    // Confidence label on upper band
+    label.new(bar_index, hband, 
+        text="CONF: " + str.tostring(regimeConfidence, "#") + "%", 
+        style=label.style_label_left, 
+        color=regimeConfidence > 70 ? color.new(excellentColor, 20) : color.new(rangeColor, 20), 
+        textcolor=color.new(#000000, 0), 
+        size=size.tiny)
+
+// Regime Value
+plot(currentValue, "Regime Value", currentColor, 2, plot.style_line, display=display.data_window)
+hline(0, "Neutral", color.new(#808080, 50), hline.style_solid)
+
+// NEW: Regime value histogram with gradient
+plot(currentValue * 10, "Regime Histogram", color.new(currentColor, 60), 3, plot.style_histogram)
+
+// Background coloring - transp parameter removed, use color.new() instead
+bgcolor(color.new(currentColor, 95), title="Regime Background")
+
+// Regime change markers
+bool regimeChanged = currentRegime != currentRegime[1]
+plotshape(regimeChanged and currentValue > 0, "Regime Change Bull", shape.circle, 
+     location.bottom, currentColor, size=size.tiny)
+plotshape(regimeChanged and currentValue < 0, "Regime Change Bear", shape.circle, 
+     location.top, currentColor, size=size.tiny)
+
+// NEW: Regime transition warnings
+plotshape(inTransition and not inTransition[1], "Transition Warning", shape.xcross,
+     location.absolute, transitionColor, size=size.small, offset=0)
+
+// NEW: Regime signals
+bool strongBullRegime = currentValue >= 2 and regimeStrength > 70 and alignmentScore > 50
+bool strongBearRegime = currentValue <= -2 and regimeStrength > 70 and alignmentScore < -50
+
+plotshape(showRegimeSignals and strongBullRegime and not strongBullRegime[1], "Strong Bull Signal", 
+     shape.triangleup, location.bottom, color.new(upColor, 0), text="BULL", textcolor=color.white, size=size.small)
+plotshape(showRegimeSignals and strongBearRegime and not strongBearRegime[1], "Strong Bear Signal", 
+     shape.triangledown, location.top, color.new(downColor, 0), text="BEAR", textcolor=color.white, size=size.small)
+
+// NEW: Regime strength histogram
+plot(regimeStrength, "Regime Strength", color.new(currentColor, 50), 1, plot.style_histogram, display=display.data_window)
+
+// ─────────────────────────────────────────────────────────────────────────
+// TABLE DISPLAY
+// ─────────────────────────────────────────────────────────────────────────
+
+var table_pos = tablePosition == "Top right" ? position.top_right : 
+     tablePosition == "Top left" ? position.top_left : 
+     tablePosition == "Bottom right" ? position.bottom_right : 
+     tablePosition == "Bottom left" ? position.bottom_left : position.middle_right
+
+// Enhanced table with more rows for statistics
+int tableRows = showRegimeStats ? 17 : 12
+var table regimeTable = table.new(table_pos, 2, tableRows, 
+     bgcolor=color.new(#000000, 10), frame_color=color.new(#FFFFFF, 70), 
+     frame_width=1, border_width=1, border_color=color.new(#FFFFFF, 70))
+
+if barstate.islast and showTable
+    int rowIdx = 0
+    
+    // Header
+    table.cell(regimeTable, 0, rowIdx, "Timeframe", bgcolor=color.new(#1E1E1E, 0), 
+         text_color=textColor, text_size=size.small)
+    table.cell(regimeTable, 1, rowIdx, "Trend", bgcolor=color.new(#1E1E1E, 0), 
+         text_color=textColor, text_size=size.small)
+    rowIdx += 1
+    
+    // 1m
+    color trend1mColor = str.contains(trend_1m, "▲") ? color.new(upColor, 0) : str.contains(trend_1m, "▼") ? color.new(downColor, 0) : color.new(#808080, 0)
+    table.cell(regimeTable, 0, rowIdx, "1m", bgcolor=color.new(#000000, 20), 
+         text_color=color.new(#AAAAAA, 0), text_size=size.small)
+    table.cell(regimeTable, 1, rowIdx, trend_1m, bgcolor=color.new(#000000, 20), 
+         text_color=trend1mColor, text_size=size.small)
+    rowIdx += 1
+    
+    // 3m
+    color trend3mColor = str.contains(trend_3m, "▲") ? color.new(upColor, 0) : str.contains(trend_3m, "▼") ? color.new(downColor, 0) : color.new(#808080, 0)
+    table.cell(regimeTable, 0, rowIdx, "3m", bgcolor=color.new(#000000, 20), 
+         text_color=color.new(#AAAAAA, 0), text_size=size.small)
+    table.cell(regimeTable, 1, rowIdx, trend_3m, bgcolor=color.new(#000000, 20), 
+         text_color=trend3mColor, text_size=size.small)
+    rowIdx += 1
+    
+    // 5m
+    color trend5mColor = str.contains(trend_5m, "▲") ? color.new(upColor, 0) : str.contains(trend_5m, "▼") ? color.new(downColor, 0) : color.new(#808080, 0)
+    table.cell(regimeTable, 0, rowIdx, "5m", bgcolor=color.new(#000000, 20), 
+         text_color=color.new(#AAAAAA, 0), text_size=size.small)
+    table.cell(regimeTable, 1, rowIdx, trend_5m, bgcolor=color.new(#000000, 20), 
+         text_color=trend5mColor, text_size=size.small)
+    rowIdx += 1
+    
+    // 15m
+    color trend15mColor = str.contains(trend_15m, "▲") ? color.new(upColor, 0) : str.contains(trend_15m, "▼") ? color.new(downColor, 0) : color.new(#808080, 0)
+    table.cell(regimeTable, 0, rowIdx, "15m", bgcolor=color.new(#000000, 20), 
+         text_color=color.new(#AAAAAA, 0), text_size=size.small)
+    table.cell(regimeTable, 1, rowIdx, trend_15m, bgcolor=color.new(#000000, 20), 
+         text_color=trend15mColor, text_size=size.small)
+    rowIdx += 1
+    
+    // 30m
+    color trend30mColor = str.contains(trend_30m, "▲") ? color.new(upColor, 0) : str.contains(trend_30m, "▼") ? color.new(downColor, 0) : color.new(#808080, 0)
+    table.cell(regimeTable, 0, rowIdx, "30m", bgcolor=color.new(#000000, 20), 
+         text_color=color.new(#AAAAAA, 0), text_size=size.small)
+    table.cell(regimeTable, 1, rowIdx, trend_30m, bgcolor=color.new(#000000, 20), 
+         text_color=trend30mColor, text_size=size.small)
+    rowIdx += 1
+    
+    // 1h
+    color trend1hColor = str.contains(trend_1h, "▲") ? color.new(upColor, 0) : str.contains(trend_1h, "▼") ? color.new(downColor, 0) : color.new(#808080, 0)
+    table.cell(regimeTable, 0, rowIdx, "1h", bgcolor=color.new(#000000, 20), 
+         text_color=color.new(#AAAAAA, 0), text_size=size.small)
+    table.cell(regimeTable, 1, rowIdx, trend_1h, bgcolor=color.new(#000000, 20), 
+         text_color=trend1hColor, text_size=size.small)
+    rowIdx += 1
+    
+    // 2h
+    color trend2hColor = str.contains(trend_2h, "▲") ? color.new(upColor, 0) : str.contains(trend_2h, "▼") ? color.new(downColor, 0) : color.new(#808080, 0)
+    table.cell(regimeTable, 0, rowIdx, "2h", bgcolor=color.new(#000000, 20), 
+         text_color=color.new(#AAAAAA, 0), text_size=size.small)
+    table.cell(regimeTable, 1, rowIdx, trend_2h, bgcolor=color.new(#000000, 20), 
+         text_color=trend2hColor, text_size=size.small)
+    rowIdx += 1
+    
+    // 4h
+    color trend4hColor = str.contains(trend_4h, "▲") ? color.new(upColor, 0) : str.contains(trend_4h, "▼") ? color.new(downColor, 0) : color.new(#808080, 0)
+    table.cell(regimeTable, 0, rowIdx, "4h", bgcolor=color.new(#000000, 20), 
+         text_color=color.new(#AAAAAA, 0), text_size=size.small)
+    table.cell(regimeTable, 1, rowIdx, trend_4h, bgcolor=color.new(#000000, 20), 
+         text_color=trend4hColor, text_size=size.small)
+    rowIdx += 1
+    
+    // D
+    color trendDColor = str.contains(trend_D, "▲") ? color.new(upColor, 0) : str.contains(trend_D, "▼") ? color.new(downColor, 0) : color.new(#808080, 0)
+    table.cell(regimeTable, 0, rowIdx, "D", bgcolor=color.new(#000000, 20), 
+         text_color=color.new(#AAAAAA, 0), text_size=size.small)
+    table.cell(regimeTable, 1, rowIdx, trend_D, bgcolor=color.new(#000000, 20), 
+         text_color=trendDColor, text_size=size.small)
+    rowIdx += 1
+    
+    // W
+    color trendWColor = str.contains(trend_W, "▲") ? color.new(upColor, 0) : str.contains(trend_W, "▼") ? color.new(downColor, 0) : color.new(#808080, 0)
+    table.cell(regimeTable, 0, rowIdx, "W", bgcolor=color.new(#000000, 20), 
+         text_color=color.new(#AAAAAA, 0), text_size=size.small)
+    table.cell(regimeTable, 1, rowIdx, trend_W, bgcolor=color.new(#000000, 20), 
+         text_color=trendWColor, text_size=size.small)
+    rowIdx += 1
+    
+    // Current Regime
+    table.cell(regimeTable, 0, rowIdx, "Current", bgcolor=color.new(#1E1E1E, 0), 
+         text_color=textColor, text_size=size.small)
+    table.cell(regimeTable, 1, rowIdx, currentRegime, bgcolor=color.new(#1E1E1E, 0), 
+         text_color=currentColor, text_size=size.small)
+    rowIdx += 1
+    
+    // NEW: Additional statistics if enabled
+    if showRegimeStats
+        // Regime Strength - ENHANCED COLORS
+        color strengthColor = regimeStrength > 70 ? color.new(#00E676, 20) : 
+                             regimeStrength > 40 ? color.new(#FFEA00, 20) : color.new(#FF1744, 20)
+        table.cell(regimeTable, 0, rowIdx, "Strength", bgcolor=color.new(#1E1E1E, 0), 
+             text_color=textColor, text_size=size.small)
+        table.cell(regimeTable, 1, rowIdx, str.tostring(regimeStrength, "#") + "%", 
+             bgcolor=strengthColor, text_color=color.new(#000000, 0), text_size=size.small)
+        rowIdx += 1
+        
+        // Regime Duration
+        table.cell(regimeTable, 0, rowIdx, "Duration", bgcolor=color.new(#000000, 20), 
+             text_color=textColor, text_size=size.small)
+        table.cell(regimeTable, 1, rowIdx, str.tostring(regimeBarsCount) + " bars", 
+             bgcolor=color.new(#000000, 20), text_color=textColor, text_size=size.small)
+        rowIdx += 1
+        
+        // MTF Alignment - ENHANCED COLORS
+        color alignColor = alignmentScore > 50 ? color.new(#00E676, 20) : 
+                          alignmentScore > 0 ? color.new(#69F0AE, 40) : 
+                          alignmentScore > -50 ? color.new(#FF6E40, 40) : color.new(#FF1744, 20)
+        table.cell(regimeTable, 0, rowIdx, "Alignment", bgcolor=color.new(#1E1E1E, 0), 
+             text_color=textColor, text_size=size.small)
+        table.cell(regimeTable, 1, rowIdx, alignmentText, bgcolor=alignColor, 
+             text_color=color.new(#000000, 0), text_size=size.small)
+        rowIdx += 1
+        
+        // Confidence - ENHANCED COLORS
+        color confColor = regimeConfidence > 70 ? color.new(#00E676, 20) : 
+                         regimeConfidence > 40 ? color.new(#FFEA00, 20) : color.new(#FF1744, 20)
+        table.cell(regimeTable, 0, rowIdx, "Confidence", bgcolor=color.new(#000000, 20), 
+             text_color=textColor, text_size=size.small)
+        table.cell(regimeTable, 1, rowIdx, str.tostring(regimeConfidence, "#") + "%", 
+             bgcolor=confColor, text_color=color.new(#000000, 0), text_size=size.small)
+        rowIdx += 1
+        
+        // Transition Status - ENHANCED COLORS
+        color transColor = inTransition ? color.new(#E040FB, 20) : color.new(#00E676, 40)
+        string transText = inTransition ? "WARNING " + str.tostring(transitionProb, "#") + "%" : "STABLE"
+        table.cell(regimeTable, 0, rowIdx, "Transition", bgcolor=color.new(#1E1E1E, 0), 
+             text_color=textColor, text_size=size.small)
+        table.cell(regimeTable, 1, rowIdx, transText, bgcolor=transColor, 
+             text_color=color.new(#000000, 0), text_size=size.small)
+
+// ─────────────────────────────────────────────────────────────────────────
+// ALERTS - COMPREHENSIVE
+// ─────────────────────────────────────────────────────────────────────────
+
+alertcondition(regimeChanged and currentValue > 0, "Bullish Regime", 
+     "Bullish regime detected: {{ticker}}")
+alertcondition(regimeChanged and currentValue < 0, "Bearish Regime", 
+     "Bearish regime detected: {{ticker}}")
+alertcondition(dir == 1 and dir[1] == -1, "Long Chandelier", 
+     "Chandelier Exit long signal: {{ticker}}")
+alertcondition(dir == -1 and dir[1] == 1, "Short Chandelier", 
+     "Chandelier Exit short signal: {{ticker}}")
+
+// NEW: Enhanced alerts - using const strings only
+alertcondition(strongBullRegime and not strongBullRegime[1], "Strong Bull Regime", 
+     "Strong bullish regime with high confidence detected on {{ticker}}")
+alertcondition(strongBearRegime and not strongBearRegime[1], "Strong Bear Regime", 
+     "Strong bearish regime with high confidence detected on {{ticker}}")
+alertcondition(inTransition and not inTransition[1], "Regime Transition Warning", 
+     "Regime transition detected on {{ticker}} - Market may be changing character")
+alertcondition(regimeConfidence > 80, "High Confidence Regime", 
+     "High confidence regime detected on {{ticker}}")
+alertcondition(alignmentScore > 70 or alignmentScore < -70, "Strong MTF Alignment", 
+     "Strong multi-timeframe alignment detected on {{ticker}}")

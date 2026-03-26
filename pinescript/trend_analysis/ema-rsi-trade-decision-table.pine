@@ -1,0 +1,639 @@
+//@version=6
+indicator("EMA + RSI Trade Decision Table", overlay=true)
+
+//==================================================
+// INPUTS: LOGIC
+//==================================================
+rsiLen      = input.int(14, "RSI Length", minval=1)
+ema50Len    = input.int(50,  "EMA 50",  minval=1)
+ema100Len   = input.int(100, "EMA 100", minval=1)
+ema200Len   = input.int(200, "EMA 200", minval=1)
+
+emaTolPct   = input.float(0.15, "EMA Touch Tolerance (%)", step=0.05, minval=0.0)
+alertsClose = input.bool(true, "Alerts only on candle close")
+
+//==================================================
+// EMA DISTANCE BLOCKER
+//==================================================
+grpB = "EMA Distance Blocker"
+minEMADistPct = input.float(0.50, "Min EMA50–EMA100 Distance (%)", step=0.05, minval=0.0, group=grpB)
+
+//==================================================
+// PRICE–EMA50 DISTANCE BLOCKER (Late entry filter)
+//==================================================
+grpP = "Price Distance Blocker"
+maxPriceEma50DistPct = input.float(0.40, "Max Price–EMA50 Distance (%)", step=0.05, minval=0.0, group=grpP)
+
+//==================================================
+// Dynamic RSI zones
+//==================================================
+grpZ = "Dynamic RSI Zones"
+bullRSILow  = input.int(40, "Bull RSI Low",  minval=1, maxval=99, group=grpZ)
+bullRSIHigh = input.int(80, "Bull RSI High", minval=1, maxval=99, group=grpZ)
+bearRSILow  = input.int(20, "Bear RSI Low",  minval=1, maxval=99, group=grpZ)
+bearRSIHigh = input.int(60, "Bear RSI High", minval=1, maxval=99, group=grpZ)
+useEMA200Regime = input.bool(false, "Regime also requires price vs EMA200", group=grpZ)
+
+//==================================================
+// A/B grading by score
+//==================================================
+grpG = "Grade (A/B)"
+gradeA_min = input.int(75, "Grade A if Score >=", minval=1, maxval=100, group=grpG)
+gradeB_min = input.int(60, "Grade B if Score >=", minval=1, maxval=100, group=grpG)
+
+//==================================================
+// INPUTS: TABLE LAYOUT / POSITION + SIZE + MODE
+//==================================================
+grpL = "Table Layout"
+posMode    = input.string("Bottom Right", "Position", options=["Bottom Right","Bottom Left","Top Right"], group=grpL)
+sizeMode   = input.string("Normal", "Text Size", options=["Small","Normal"], group=grpL)
+
+// ✅ Modes
+tableMode  = input.string("Compact+Checks", "Mode", options=["Compact","Compact+Checks","Full"], group=grpL)
+
+//==================================================
+// INPUTS: TRADE DECISION THRESHOLD
+//==================================================
+grpD = "Trade Decision"
+tradeDecisionMinScore = input.int(92, "Min Score for TRADE DECISION", minval=0, maxval=100, group=grpD)
+
+//==================================================
+// CLEAN FILTERS (1H)
+//==================================================
+grpCL = "Clean Filters"
+rsiLongMin  = input.int(55, "RSI min for LONG",  minval=1, maxval=99, group=grpCL)
+rsiShortMax = input.int(45, "RSI max for SHORT", minval=1, maxval=99, group=grpCL)
+cooldownBars = input.int(15, "Cooldown bars after EMA50/100 cross", minval=0, maxval=200, group=grpCL)
+requireRejection = input.bool(true, "Require pullback rejection candle", group=grpCL)
+
+//==================================================
+// INPUTS: TABLE COLORS
+//==================================================
+grpC = "Table Colors"
+cLabelBG    = input.color(color.new(color.black, 70), "Label BG", group=grpC)
+cLabelText  = input.color(color.white,               "Label Text", group=grpC)
+
+cValueBG    = input.color(color.new(color.black, 80), "Value BG (base)", group=grpC)
+cValueText  = input.color(color.white,               "Value Text (base)", group=grpC)
+
+cScoreHighBG   = input.color(color.new(color.green, 0),  "Score High BG (>=A)", group=grpC)
+cScoreMidBG    = input.color(color.new(color.orange, 0), "Score Mid BG (>=B)", group=grpC)
+cScoreLowBG    = input.color(color.new(color.red, 0),    "Score Low BG (<B)",  group=grpC)
+cScoreText     = input.color(color.black,                "Score Text", group=grpC)
+
+cDecisionYesBG = input.color(color.new(color.black, 0),  "Decision BG (YES)", group=grpC)
+cDecisionNoBG  = input.color(color.new(color.gray, 80),  "Decision BG (NO)",  group=grpC)
+cDecisionText  = input.color(color.white,                "Decision Text", group=grpC)
+
+// Section header
+cHdrBG      = input.color(color.new(color.silver, 75), "Section Header BG", group=grpC)
+cHdrText    = input.color(color.white,                 "Section Header Text", group=grpC)
+
+// OK/NO badge colors
+cOK_BG      = input.color(color.new(color.lime, 0), "OK BG", group=grpC)
+cNO_BG      = input.color(color.new(color.red,  0), "NO BG", group=grpC)
+cOK_TX      = input.color(color.black,               "OK Text", group=grpC)
+cNO_TX      = input.color(color.white,               "NO Text", group=grpC)
+
+//==================================================
+// INDICATORS
+//==================================================
+ema50  = ta.ema(close, ema50Len)
+ema100 = ta.ema(close, ema100Len)
+ema200 = ta.ema(close, ema200Len)
+rsiVal = ta.rsi(close, rsiLen)
+
+// Distances
+priceToEma50Pct = math.abs(close - ema50) / ema50 * 100.0
+emaDistPct      = math.abs(ema50 - ema100) / ema100 * 100.0
+
+priceTooFar     = priceToEma50Pct > maxPriceEma50DistPct
+emaTooClose     = emaDistPct < minEMADistPct
+
+//==================================================
+// HELPERS
+//==================================================
+touchEMA(float ema) =>
+    math.abs(close - ema) / ema * 100.0 <= emaTolPct
+
+clamp100(float x) =>
+    math.max(0.0, math.min(100.0, x))
+
+scoreBG(float val) =>
+    color bg = cScoreLowBG
+    if val >= gradeA_min
+        bg := cScoreHighBG
+    else if val >= gradeB_min
+        bg := cScoreMidBG
+    else
+        bg := cScoreLowBG
+    bg
+
+gradeFromScore(float s) =>
+    string g = "C"
+    if s >= gradeA_min
+        g := "A"
+    else if s >= gradeB_min
+        g := "B"
+    else
+        g := "C"
+    g
+
+f_txtSize() =>
+    sizeMode == "Small" ? size.small : size.normal
+
+f_pos() =>
+    posMode == "Bottom Left" ? position.bottom_left :
+     posMode == "Top Right"  ? position.top_right  :
+                               position.bottom_right
+
+fmtPct(float x) => str.tostring(x, "#.##") + "%"
+fmt1(float x)   => str.tostring(x, "#.0")
+
+//==================================================
+// REGIME + DYNAMIC RSI ZONE
+//==================================================
+emaBull = ema50 > ema100
+emaBear = ema50 < ema100
+
+bool bullRegime = emaBull
+bool bearRegime = emaBear
+
+if useEMA200Regime
+    bullRegime := emaBull and close > ema200
+    bearRegime := emaBear and close < ema200
+
+int rsiLow  = 40
+int rsiHigh = 60
+string regimeName = "NEUTRAL"
+
+if bullRegime and not bearRegime
+    rsiLow := bullRSILow
+    rsiHigh := bullRSIHigh
+    regimeName := "BULL"
+else if bearRegime and not bullRegime
+    rsiLow := bearRSILow
+    rsiHigh := bearRSIHigh
+    regimeName := "BEAR"
+else
+    rsiLow := 40
+    rsiHigh := 60
+    regimeName := "NEUTRAL"
+
+bool rsiInZone = (rsiVal >= rsiLow and rsiVal <= rsiHigh)
+
+// Directional RSI confirmation (clean)
+rsiLongOk  = rsiVal >= rsiLongMin
+rsiShortOk = rsiVal <= rsiShortMax
+
+//==================================================
+// EMA CROSS + BLOCKERS (+ COOLDOWN)
+//==================================================
+bullCrossUpNow = ta.crossover(ema50, ema100)   // blocks short
+bearCrossDnNow = ta.crossunder(ema50, ema100)  // blocks long
+
+barsSinceBullCross = ta.barssince(bullCrossUpNow)
+barsSinceBearCross = ta.barssince(bearCrossDnNow)
+
+cooldownShort = cooldownBars > 0 and (barsSinceBullCross >= 0) and (barsSinceBullCross < cooldownBars)
+cooldownLong  = cooldownBars > 0 and (barsSinceBearCross >= 0) and (barsSinceBearCross < cooldownBars)
+
+bool shortBlocked = bullCrossUpNow or emaTooClose or priceTooFar or cooldownShort
+bool longBlocked  = bearCrossDnNow or emaTooClose or priceTooFar or cooldownLong
+
+float cdRemShort = cooldownShort ? (cooldownBars - barsSinceBullCross) : 0.0
+float cdRemLong  = cooldownLong  ? (cooldownBars - barsSinceBearCross) : 0.0
+
+//==================================================
+// TRADE LOGIC (CLEAN PULLBACK + REJECTION)
+//==================================================
+touchZone = touchEMA(ema50) or touchEMA(ema100)
+
+longRejection  = touchZone and close > ema50 and (not requireRejection or close > open)
+shortRejection = touchZone and close < ema50 and (not requireRejection or close < open)
+
+emaPullbackLong  = longRejection
+emaPullbackShort = shortRejection
+
+shortAllowed = (rsiInZone and rsiShortOk and emaPullbackShort and emaBear and not shortBlocked)
+longAllowed  = (rsiInZone and rsiLongOk  and emaPullbackLong  and emaBull and not longBlocked)
+
+//==================================================
+// CONFIDENCE SCORE (0–100)
+//==================================================
+float shortScore = 0.0
+if rsiInZone and rsiShortOk
+    shortScore += 30
+if emaPullbackShort
+    shortScore += 30
+if emaBear
+    shortScore += 25
+if close < ema200
+    shortScore += 15
+else
+    shortScore += 5
+if emaTooClose
+    shortScore -= 15
+if bullCrossUpNow
+    shortScore -= 10
+if cooldownShort
+    shortScore -= 10
+if priceTooFar
+    shortScore -= 20
+shortScore := clamp100(shortScore)
+
+float longScore = 0.0
+if rsiInZone and rsiLongOk
+    longScore += 30
+if emaPullbackLong
+    longScore += 30
+if emaBull
+    longScore += 25
+if close > ema200
+    longScore += 15
+else
+    longScore += 5
+if emaTooClose
+    longScore -= 15
+if bearCrossDnNow
+    longScore -= 10
+if cooldownLong
+    longScore -= 10
+if priceTooFar
+    longScore -= 20
+longScore := clamp100(longScore)
+
+shortGrade = gradeFromScore(shortScore)
+longGrade  = gradeFromScore(longScore)
+
+//==================================================
+// DECISION GATE (Entry-ready)
+//==================================================
+bool shortYes = shortAllowed and shortScore >= tradeDecisionMinScore
+bool longYes  = longAllowed  and longScore  >= tradeDecisionMinScore
+
+//==================================================
+// STATUS
+//==================================================
+float bestScore = math.max(shortScore, longScore)
+
+string statusTxt = "NO SETUP"
+color  statusBG  = cDecisionNoBG
+color  statusTX  = cDecisionText
+
+if (shortYes or longYes)
+    statusTxt := (shortYes and longYes) ? "EXECUTE (SHORT & LONG)" : shortYes ? "EXECUTE (SHORT)" : "EXECUTE (LONG)"
+    statusBG  := cDecisionYesBG
+    statusTX  := cDecisionText
+else
+    if bestScore >= 75
+        statusTxt := "WATCH"
+        statusBG  := cScoreHighBG
+        statusTX  := cScoreText
+    else if bestScore >= 60
+        statusTxt := "PREPARE"
+        statusBG  := cScoreMidBG
+        statusTX  := cScoreText
+    else
+        statusTxt := "NO SETUP"
+        statusBG  := cDecisionNoBG
+        statusTX  := cDecisionText
+
+//==================================================
+// ALERTS (status flips)
+//==================================================
+int STATUS_NONE    = 0
+int STATUS_PREPARE = 1
+int STATUS_WATCH   = 2
+int STATUS_LONG    = 3
+int STATUS_SHORT   = 4
+
+int statusCode = STATUS_NONE
+if (shortYes or longYes)
+    statusCode := shortYes ? STATUS_SHORT : STATUS_LONG
+else
+    if bestScore >= 75
+        statusCode := STATUS_WATCH
+    else if bestScore >= 60
+        statusCode := STATUS_PREPARE
+    else
+        statusCode := STATUS_NONE
+
+confirmed = alertsClose ? barstate.isconfirmed : true
+longEntryTrigger  = confirmed and (statusCode == STATUS_LONG)  and (statusCode[1] != STATUS_LONG)
+shortEntryTrigger = confirmed and (statusCode == STATUS_SHORT) and (statusCode[1] != STATUS_SHORT)
+
+alertcondition(longEntryTrigger,  title="LONG ENTRY",  message="LONG ENTRY (status flip).")
+alertcondition(shortEntryTrigger, title="SHORT ENTRY", message="SHORT ENTRY (status flip).")
+
+if longEntryTrigger
+    alert("🚀 LONG ENTRY | " + syminfo.ticker + " | TF=" + timeframe.period, alert.freq_once_per_bar_close)
+if shortEntryTrigger
+    alert("🔻 SHORT ENTRY | " + syminfo.ticker + " | TF=" + timeframe.period, alert.freq_once_per_bar_close)
+
+//==================================================
+// "TO GO" values (for checks display)
+//==================================================
+float longRsiToGo  = math.max(0.0, rsiLongMin - rsiVal)
+float shortRsiToGo = math.max(0.0, rsiVal - rsiShortMax)
+
+float priceTooFarBy = math.max(0.0, priceToEma50Pct - maxPriceEma50DistPct)
+float emaDistToGo   = math.max(0.0, minEMADistPct - emaDistPct)
+
+float longScoreToGo  = math.max(0.0, tradeDecisionMinScore - longScore)
+float shortScoreToGo = math.max(0.0, tradeDecisionMinScore - shortScore)
+
+//==================================================
+// COMPACT TABLE LABELS/VALUES
+//==================================================
+f_comp_label(int i) =>
+    string s = ""
+    if i == 0
+        s := "MARKET TREND"
+    else if i == 1
+        s := "RSI Value"
+    else if i == 2
+        s := "Dist Price–EMA50 (%)"
+    else if i == 3
+        s := "Dist EMA50–EMA100 (%)"
+    else if i == 4
+        s := "TRADE DECISION"
+    else
+        s := "STATUS"
+    s
+
+f_comp_value(int i) =>
+    string v = ""
+    if i == 0
+        v := regimeName
+    else if i == 1
+        v := fmt1(rsiVal)
+    else if i == 2
+        v := fmtPct(priceToEma50Pct)
+    else if i == 3
+        v := fmtPct(emaDistPct)
+    else if i == 4
+        string d = "NO TRADE"
+        if shortYes and longYes
+            d := "SHORT & LONG = YES"
+        else if shortYes
+            d := "SHORT = YES"
+        else if longYes
+            d := "LONG = YES"
+        v := d
+    else
+        v := statusTxt
+    v
+
+//==================================================
+// TABLE CREATE (Full = always checks layout)
+//==================================================
+var table t = na
+var string lastMode = ""
+var string lastPosMode = ""
+var int lastCols = na
+var int lastRows = na
+
+bool isComp   = tableMode == "Compact"
+bool isChecks = tableMode == "Compact+Checks"
+bool isFull   = tableMode == "Full"
+
+int compCols = 2, compRows = 6
+int chkCols  = 4, chkRows  = 30
+
+int colsNow = isComp ? compCols : chkCols
+int rowsNow = isComp ? compRows : chkRows
+
+bool needRecreate = na(t) or (lastMode != tableMode) or (lastPosMode != posMode) or (lastCols != colsNow) or (lastRows != rowsNow)
+if needRecreate
+    t := table.new(f_pos(), colsNow, rowsNow, border_width=1)
+    lastMode := tableMode
+    lastPosMode := posMode
+    lastCols := colsNow
+    lastRows := rowsNow
+
+//==================================================
+// CELL HELPERS
+//==================================================
+f_cell(int col, int row, string txt, color bg, color tx, hal) =>
+    table.cell(t, col, row, txt, bgcolor=bg, text_color=tx, text_halign=hal, text_size=f_txtSize())
+
+f_badge(int col, int row, bool ok, string extra) =>
+    string base = ok ? "OK" : "NO"
+    string txt  = extra == "" ? base : base + " " + extra
+    f_cell(col, row, txt, ok ? cOK_BG : cNO_BG, ok ? cOK_TX : cNO_TX, text.align_center)
+
+//==================================================
+// RENDER
+//==================================================
+if barstate.islast
+    table.clear(t, 0, 0, colsNow - 1, rowsNow - 1)
+
+    // ---------------- COMPACT ONLY ----------------
+    if isComp
+        for i = 0 to 5
+            string lbl = f_comp_label(i)
+            string val = f_comp_value(i)
+
+            color valBG = cValueBG
+            color valTX = cValueText
+
+            if i == 4
+                bool anyYes = shortYes or longYes
+                valBG := anyYes ? cDecisionYesBG : cDecisionNoBG
+                valTX := cDecisionText
+            if i == 5
+                valBG := statusBG
+                valTX := statusTX
+
+            f_cell(0, i, lbl, cLabelBG, cLabelText, text.align_left)
+            f_cell(1, i, val, valBG, valTX, text.align_left)
+
+    // ---------------- COMPACT+CHECKS or FULL ----------------
+    if isChecks or isFull
+        // ============================
+        // TOP AREA
+        // - Checks: show full compact (rows 0..5) as before
+        // - Full  : show only Trend / Status / Trade (rows 0..2)
+        // ============================
+        int topRows = isFull ? 3 : 6
+
+        if isChecks
+            // Compact always in top rows (0..5)
+            for i = 0 to 5
+                string lbl = f_comp_label(i)
+                string val = f_comp_value(i)
+
+                color valBG = cValueBG
+                color valTX = cValueText
+
+                if i == 4
+                    bool anyYes = shortYes or longYes
+                    valBG := anyYes ? cDecisionYesBG : cDecisionNoBG
+                    valTX := cDecisionText
+                if i == 5
+                    valBG := statusBG
+                    valTX := statusTX
+
+                f_cell(0, i, lbl, cLabelBG, cLabelText, text.align_left)
+                f_cell(1, i, val, valBG, valTX, text.align_left)
+                f_cell(2, i, "", cValueBG, cValueText, text.align_left)
+                f_cell(3, i, "", cValueBG, cValueText, text.align_left)
+
+        if isFull
+            // Row 0: TREND
+            f_cell(0, 0, "TREND",  cLabelBG, cLabelText, text.align_left)
+            f_cell(1, 0, regimeName, cValueBG, cValueText, text.align_left)
+            f_cell(2, 0, "", cValueBG, cValueText, text.align_left)
+            f_cell(3, 0, "", cValueBG, cValueText, text.align_left)
+
+            // Row 1: STATUS
+            f_cell(0, 1, "STATUS", cLabelBG, cLabelText, text.align_left)
+            f_cell(1, 1, statusTxt, statusBG, statusTX, text.align_left)
+            f_cell(2, 1, "", cValueBG, cValueText, text.align_left)
+            f_cell(3, 1, "", cValueBG, cValueText, text.align_left)
+
+            // Row 2: TRADE
+            string d = "NO TRADE"
+            if shortYes and longYes
+                d := "SHORT & LONG = YES"
+            else if shortYes
+                d := "SHORT = YES"
+            else if longYes
+                d := "LONG = YES"
+
+            bool anyYes = shortYes or longYes
+            color dBG = anyYes ? cDecisionYesBG : cDecisionNoBG
+            color dTX = cDecisionText
+
+            f_cell(0, 2, "TRADE", cLabelBG, cLabelText, text.align_left)
+            f_cell(1, 2, d, dBG, dTX, text.align_left)
+            f_cell(2, 2, "", cValueBG, cValueText, text.align_left)
+            f_cell(3, 2, "", cValueBG, cValueText, text.align_left)
+
+        int r = topRows
+
+        // spacer
+        for c = 0 to 3
+            f_cell(c, r, "", cValueBG, cValueText, text.align_left)
+        r += 1
+
+        // show blocks:
+        bool showLongBlock  = isFull ? true : longYes
+        bool showShortBlock = isFull ? true : shortYes
+
+        // -------- LONG BLOCK --------
+        if showLongBlock
+            f_cell(0, r, isFull ? "LONG CHECK (ALL)" : "LONG CHECK (ENTRY READY)", cHdrBG, cHdrText, text.align_left)
+            f_cell(1, r, "", cHdrBG, cHdrText, text.align_left)
+            f_cell(2, r, "", cHdrBG, cHdrText, text.align_left)
+            f_cell(3, r, "", cHdrBG, cHdrText, text.align_left)
+            r += 1
+
+            f_cell(0, r, "Regime", cLabelBG, cLabelText, text.align_left)
+            f_cell(1, r, emaBull ? "EMA50 > EMA100" : "EMA50 ≤ EMA100", cValueBG, cValueText, text.align_left)
+            f_cell(2, r, "required", cValueBG, cValueText, text.align_left)
+            f_badge(3, r, emaBull, "")
+            r += 1
+
+            f_cell(0, r, "RSI Value", cLabelBG, cLabelText, text.align_left)
+            f_cell(1, r, fmt1(rsiVal), cValueBG, cValueText, text.align_left)
+            f_cell(2, r, "≥ " + str.tostring(rsiLongMin), cValueBG, cValueText, text.align_left)
+            f_badge(3, r, rsiLongOk, longRsiToGo > 0 ? "(+" + fmt1(longRsiToGo) + ")" : "")
+            r += 1
+
+            f_cell(0, r, "RSI Zone", cLabelBG, cLabelText, text.align_left)
+            f_cell(1, r, str.tostring(rsiLow) + "–" + str.tostring(rsiHigh), cValueBG, cValueText, text.align_left)
+            f_cell(2, r, "inside", cValueBG, cValueText, text.align_left)
+            f_badge(3, r, rsiInZone, "")
+            r += 1
+
+            f_cell(0, r, "Pullback / Rejection", cLabelBG, cLabelText, text.align_left)
+            f_cell(1, r, emaPullbackLong ? "confirmed" : "not confirmed", cValueBG, cValueText, text.align_left)
+            f_cell(2, r, "required", cValueBG, cValueText, text.align_left)
+            f_badge(3, r, emaPullbackLong, "")
+            r += 1
+
+            f_cell(0, r, "Price ↔ EMA50", cLabelBG, cLabelText, text.align_left)
+            f_cell(1, r, fmtPct(priceToEma50Pct), cValueBG, cValueText, text.align_left)
+            f_cell(2, r, "≤ " + fmtPct(maxPriceEma50DistPct), cValueBG, cValueText, text.align_left)
+            f_badge(3, r, not priceTooFar, priceTooFar ? "(+" + fmtPct(priceTooFarBy) + ")" : "")
+            r += 1
+
+            f_cell(0, r, "EMA50 ↔ EMA100", cLabelBG, cLabelText, text.align_left)
+            f_cell(1, r, fmtPct(emaDistPct), cValueBG, cValueText, text.align_left)
+            f_cell(2, r, "≥ " + fmtPct(minEMADistPct), cValueBG, cValueText, text.align_left)
+            f_badge(3, r, not emaTooClose, emaTooClose ? "(+" + fmtPct(emaDistToGo) + ")" : "")
+            r += 1
+
+            f_cell(0, r, "Cooldown", cLabelBG, cLabelText, text.align_left)
+            f_cell(1, r, cooldownLong ? ("active (" + str.tostring(math.round(cdRemLong)) + " bars)") : "inactive", cValueBG, cValueText, text.align_left)
+            f_cell(2, r, "none", cValueBG, cValueText, text.align_left)
+            f_badge(3, r, not cooldownLong, cooldownLong ? "(+" + str.tostring(math.round(cdRemLong)) + " bars)" : "")
+            r += 1
+
+            f_cell(0, r, "Score", cLabelBG, cLabelText, text.align_left)
+            f_cell(1, r, str.tostring(math.round(longScore)) + " / 100 (" + longGrade + ")", scoreBG(longScore), cScoreText, text.align_left)
+            f_cell(2, r, "≥ " + str.tostring(tradeDecisionMinScore), cValueBG, cValueText, text.align_left)
+            f_badge(3, r, longScore >= tradeDecisionMinScore, longScoreToGo > 0 ? "(+" + str.tostring(math.round(longScoreToGo)) + ")" : "")
+            r += 1
+
+            for c = 0 to 3
+                f_cell(c, r, "", cValueBG, cValueText, text.align_left)
+            r += 1
+
+        // -------- SHORT BLOCK --------
+        if showShortBlock
+            f_cell(0, r, isFull ? "SHORT CHECK (ALL)" : "SHORT CHECK (ENTRY READY)", cHdrBG, cHdrText, text.align_left)
+            f_cell(1, r, "", cHdrBG, cHdrText, text.align_left)
+            f_cell(2, r, "", cHdrBG, cHdrText, text.align_left)
+            f_cell(3, r, "", cHdrBG, cHdrText, text.align_left)
+            r += 1
+
+            f_cell(0, r, "Regime", cLabelBG, cLabelText, text.align_left)
+            f_cell(1, r, emaBear ? "EMA50 < EMA100" : "EMA50 ≥ EMA100", cValueBG, cValueText, text.align_left)
+            f_cell(2, r, "required", cValueBG, cValueText, text.align_left)
+            f_badge(3, r, emaBear, "")
+            r += 1
+
+            f_cell(0, r, "RSI Value", cLabelBG, cLabelText, text.align_left)
+            f_cell(1, r, fmt1(rsiVal), cValueBG, cValueText, text.align_left)
+            f_cell(2, r, "≤ " + str.tostring(rsiShortMax), cValueBG, cValueText, text.align_left)
+            f_badge(3, r, rsiShortOk, shortRsiToGo > 0 ? "(+" + fmt1(shortRsiToGo) + ")" : "")
+            r += 1
+
+            f_cell(0, r, "RSI Zone", cLabelBG, cLabelText, text.align_left)
+            f_cell(1, r, str.tostring(rsiLow) + "–" + str.tostring(rsiHigh), cValueBG, cValueText, text.align_left)
+            f_cell(2, r, "inside", cValueBG, cValueText, text.align_left)
+            f_badge(3, r, rsiInZone, "")
+            r += 1
+
+            f_cell(0, r, "Pullback / Rejection", cLabelBG, cLabelText, text.align_left)
+            f_cell(1, r, emaPullbackShort ? "confirmed" : "not confirmed", cValueBG, cValueText, text.align_left)
+            f_cell(2, r, "required", cValueBG, cValueText, text.align_left)
+            f_badge(3, r, emaPullbackShort, "")
+            r += 1
+
+            f_cell(0, r, "Price ↔ EMA50", cLabelBG, cLabelText, text.align_left)
+            f_cell(1, r, fmtPct(priceToEma50Pct), cValueBG, cValueText, text.align_left)
+            f_cell(2, r, "≤ " + fmtPct(maxPriceEma50DistPct), cValueBG, cValueText, text.align_left)
+            f_badge(3, r, not priceTooFar, priceTooFar ? "(+" + fmtPct(priceTooFarBy) + ")" : "")
+            r += 1
+
+            f_cell(0, r, "EMA50 ↔ EMA100", cLabelBG, cLabelText, text.align_left)
+            f_cell(1, r, fmtPct(emaDistPct), cValueBG, cValueText, text.align_left)
+            f_cell(2, r, "≥ " + fmtPct(minEMADistPct), cValueBG, cValueText, text.align_left)
+            f_badge(3, r, not emaTooClose, emaTooClose ? "(+" + fmtPct(emaDistToGo) + ")" : "")
+            r += 1
+
+            f_cell(0, r, "Cooldown", cLabelBG, cLabelText, text.align_left)
+            f_cell(1, r, cooldownShort ? ("active (" + str.tostring(math.round(cdRemShort)) + " bars)") : "inactive", cValueBG, cValueText, text.align_left)
+            f_cell(2, r, "none", cValueBG, cValueText, text.align_left)
+            f_badge(3, r, not cooldownShort, cooldownShort ? "(+" + str.tostring(math.round(cdRemShort)) + " bars)" : "")
+            r += 1
+
+            f_cell(0, r, "Score", cLabelBG, cLabelText, text.align_left)
+            f_cell(1, r, str.tostring(math.round(shortScore)) + " / 100 (" + shortGrade + ")", scoreBG(shortScore), cScoreText, text.align_left)
+            f_cell(2, r, "≥ " + str.tostring(tradeDecisionMinScore), cValueBG, cValueText, text.align_left)
+            f_badge(3, r, shortScore >= tradeDecisionMinScore, shortScoreToGo > 0 ? "(+" + str.tostring(math.round(shortScoreToGo)) + ")" : "")
+            r += 1

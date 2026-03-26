@@ -1,0 +1,332 @@
+//@version=6
+indicator("AG Pro Market Regime Meter v1.4", "AGP MRM", overlay=true, max_labels_count=500, max_lines_count=50)
+
+//──────────────────────────────────────────────────────────────────────────────
+// Inputs
+groupCore = "Regime Core"
+lenER     = input.int(20,  "Trend Persistence Length", minval=5,  group=groupCore)
+lenADX    = input.int(14,  "DMI/ADX Length",           minval=5,  group=groupCore)
+lenCHOP   = input.int(14,  "Chop Length",              minval=5,  group=groupCore)
+lenATR    = input.int(14,  "ATR Length",               minval=5,  group=groupCore)
+volLook   = input.int(100, "Volatility Normalize Lookback", minval=20, group=groupCore)
+
+groupUI   = "HUD"
+modeOpt   = input.string("PRO", "Display Mode", options=["PRO","MINIMAL"], group=groupUI)
+hudPosOpt = input.string("Top Right", "HUD Position", options=["Top Right","Top Left","Bottom Right","Bottom Left"], group=groupUI)
+txtSizeOpt= input.string("Normal", "Text Size", options=["Tiny","Small","Normal","Large","Huge"], group=groupUI)
+
+bgAlpha   = input.int(10, "HUD Background Transparency (0=solid, 90=transparent)", minval=0, maxval=90, group=groupUI)
+hdrAlpha  = input.int(4,  "Header Transparency (0=solid, 90=transparent)", minval=0, maxval=90, group=groupUI)
+bandAlpha = input.int(14, "Status Cell Transparency (0=solid, 90=transparent)", minval=0, maxval=90, group=groupUI)
+
+showPct     = input.bool(true,  "Show Numeric %", group=groupUI)
+showBar     = input.bool(true,  "Show Mini Bar Gauge", group=groupUI)
+barLen      = input.int(10, "Bar Length", minval=6, maxval=16, group=groupUI)
+showSymbol  = input.bool(true, "Show Ticker + TF in Header", group=groupUI)
+
+showSummary = input.bool(true, "Show Summary Row (PRO)", group=groupUI)
+showConfPro = input.bool(true,"Show Confidence Row (PRO)", group=groupUI)
+showHint    = input.bool(true, "Show Hint Row (PRO)", group=groupUI)
+
+showAgeInSummary = input.bool(true, "Summary: Show Regime Age (bars)", group=groupUI)
+showStarsHeader  = input.bool(true,  "Header: Show Playability Stars", group=groupUI)
+
+groupFrem = "Add-ons"
+showShiftMarkers     = input.bool(true, "Regime Shift Markers", group=groupFrem)
+shiftOnlyConfirmed   = input.bool(true, "Shift Markers: Confirmed Bars Only", group=groupFrem)
+shiftLocOpt          = input.string("Top", "Shift Marker Location", options=["Top","Bottom"], group=groupFrem)
+maxShiftLabels       = input.int(50, "Max Shift Labels (older deleted)", minval=0, maxval=300, group=groupFrem)
+
+// Label readability + anti-clutter
+shiftLabelSizeOpt    = input.string("Small", "Shift Label Text Size", options=["Tiny","Small","Normal","Large","Huge"], group=groupFrem)
+shiftMinBars         = input.int(8, "Shift Label Min Bars Apart (cooldown)", minval=0, maxval=500, group=groupFrem)
+shiftYOffsetATR      = input.float(0.35, "Shift Label Y-Offset (x ATR)", minval=0.0, maxval=3.0, step=0.05, group=groupFrem)
+shiftStagger         = input.bool(true, "Shift Label Stagger (reduces overlap)", group=groupFrem)
+shiftStaggerLevels   = input.int(2, "Stagger Levels", minval=2, maxval=4, group=groupFrem)
+
+showTint   = input.bool(true, "Chart Regime Tint (bg)", group=groupFrem)
+tintAlpha  = input.int(92, "Tint Transparency (80 subtle → 95 very subtle)", minval=80, maxval=99, group=groupFrem)
+
+showHTF    = input.bool(true, "Show HTF Peek Row", group=groupFrem)
+htfTf      = input.timeframe("D", "HTF Timeframe", group=groupFrem) // default 1D
+
+groupStyle = "HUD • Style"
+frameAlpha = input.int(0,  "Frame Transparency", minval=0, maxval=90, group=groupStyle)
+borderAlpha= input.int(0,  "Border Transparency", minval=0, maxval=90, group=groupStyle)
+
+//──────────────────────────────────────────────────────────────────────────────
+// Helpers
+posFromOpt(opt) =>
+    opt == "Top Right" ? position.top_right :
+     opt == "Top Left" ? position.top_left :
+     opt == "Bottom Right" ? position.bottom_right :
+     position.bottom_left
+
+textSizeFromOpt(opt) =>
+    opt == "Tiny" ? size.tiny :
+     opt == "Small" ? size.small :
+     opt == "Normal" ? size.normal :
+     opt == "Large" ? size.large :
+     size.huge
+
+clamp01(x) =>
+    math.max(0.0, math.min(1.0, x))
+
+toBand(x) =>
+    x < 0.33 ? "LOW" : x < 0.66 ? "MID" : "HIGH"
+
+rollSum(src, n) =>
+    ta.sma(src, n) * n
+
+mkBar(score, n) =>
+    filled = int(math.round(clamp01(score) * n))
+    empty  = n - filled
+    str.repeat("▮", filled) + str.repeat("▯", empty)
+
+mkPct(score) =>
+    str.tostring(int(math.round(clamp01(score) * 100.0))) + "%"
+
+mkCompact3(tBand, cBand, vBand) =>
+    "T:" + tBand + "  C:" + cBand + "  V:" + vBand
+
+mkConf(t, c, v) =>
+    clamp01((math.abs(t - 0.5) + math.abs(c - 0.5) + math.abs(v - 0.5)) / 1.5)
+
+mkConfText(conf) =>
+    "CONF " + mkPct(conf) + (showBar ? ("  " + mkBar(conf, barLen)) : "")
+
+mkStars(play) =>
+    // Map 0..1 to 1..5 stars
+    _n = int(math.round(clamp01(play) * 4.0)) + 1
+    _n := math.max(1, math.min(5, _n))
+    str.repeat("★", _n) + str.repeat("☆", 5 - _n)
+
+trendBandColor(band) =>
+    band == "HIGH" ? color.lime : band == "MID" ? color.orange : color.red
+
+chopBandColor(band) =>
+    band == "HIGH" ? color.red : band == "MID" ? color.orange : color.lime
+
+volBandColor(band) =>
+    band == "HIGH" ? color.aqua : band == "MID" ? color.blue : color.gray
+
+summaryColor(sum) =>
+    sum == "TREND" ? color.lime : sum == "RANGE / CHOP" ? color.red : color.orange
+
+fmtTf(tf) =>
+    tf == "D" ? "1D" : tf
+
+//──────────────────────────────────────────────────────────────────────────────
+// Regime Engine (current timeframe)
+netMove  = math.abs(close - close[lenER])
+denMove  = rollSum(math.abs(close - close[1]), lenER)
+erRaw    = denMove == 0.0 ? 0.0 : (netMove / denMove)
+
+[_, _, adxRaw] = ta.dmi(lenADX, lenADX)
+adxNorm  = clamp01(adxRaw / 40.0)
+trendScore = clamp01(0.65 * erRaw + 0.35 * adxNorm)
+trendBand  = toBand(trendScore)
+
+// Chop / whipsaw
+tr      = ta.tr(true)
+sumTR   = rollSum(tr, lenCHOP)
+hh      = ta.highest(high, lenCHOP)
+ll      = ta.lowest(low,  lenCHOP)
+rangeHL = math.max(hh - ll, syminfo.mintick)
+chop    = 100.0 * math.log10(sumTR / rangeHL) / math.log10(lenCHOP)
+
+chopNorm  = clamp01((chop - 38.0) / (62.0 - 38.0))
+chopScore = clamp01(0.70 * chopNorm + 0.30 * (1.0 - trendScore))
+chopBand  = toBand(chopScore)
+
+// Volatility
+atr     = ta.atr(lenATR)
+atrPct  = close == 0.0 ? 0.0 : (100.0 * atr / close)
+
+atrMin  = ta.lowest(atrPct, volLook)
+atrMax  = ta.highest(atrPct, volLook)
+atrSpan = math.max(atrMax - atrMin, 1e-10)
+volScore = clamp01((atrPct - atrMin) / atrSpan)
+volBand  = toBand(volScore)
+
+// Summary + hint
+summary =
+     chopScore >= 0.66 ? "RANGE / CHOP" :
+     (trendScore >= 0.66 and chopScore <= 0.33) ? "TREND" :
+     "MIXED"
+
+hint =
+     summary == "TREND" ? "Trend bias. Prefer pullbacks; let winners run." :
+     summary == "RANGE / CHOP" ? "Whipsaw risk high. Reduce size; mean-revert or wait." :
+     "Mixed regime. Lower aggression; wait for confirmation."
+
+confScore = mkConf(trendScore, chopScore, volScore)
+
+// Playability (quick quality cue): high trend + low chop + some vol
+playScore = clamp01(0.60 * trendScore + 0.30 * (1.0 - chopScore) + 0.10 * volScore)
+starsTxt  = mkStars(playScore)
+
+//──────────────────────────────────────────────────────────────────────────────
+// HTF Peek
+[trendHTF, chopHTF, volHTF] = request.security(syminfo.tickerid, htfTf, [trendScore, chopScore, volScore])
+trendBandHTF = toBand(trendHTF)
+chopBandHTF  = toBand(chopHTF)
+volBandHTF   = toBand(volHTF)
+summaryHTF =
+     chopHTF >= 0.66 ? "RANGE / CHOP" :
+     (trendHTF >= 0.66 and chopHTF <= 0.33) ? "TREND" :
+     "MIXED"
+
+//──────────────────────────────────────────────────────────────────────────────
+// Tint (global-scope)
+sumCol = summaryColor(summary)
+sumColHtf = summaryColor(summaryHTF)
+
+_tint = showTint ? color.new(sumCol, tintAlpha) : na
+bgcolor(_tint)
+
+//──────────────────────────────────────────────────────────────────────────────
+// Regime age (bars since last change) — for optional Summary suffix
+shiftNow = summary != summary[1]
+var int regimeAge = 0
+if shiftNow
+    regimeAge := 0
+else
+    regimeAge += 1
+
+ageSuffix = showAgeInSummary ? ("  ·  AGE " + str.tostring(regimeAge) + "b") : ""
+
+//──────────────────────────────────────────────────────────────────────────────
+// Shift labels + cap + anti-clutter
+shiftOK  = shiftOnlyConfirmed ? barstate.isconfirmed : true
+doShiftRaw  = showShiftMarkers and shiftNow and shiftOK
+
+shiftTxtSize = textSizeFromOpt(shiftLabelSizeOpt)
+
+var int _lastShiftBar = na
+cooldownOK = shiftMinBars == 0 ? true : (na(_lastShiftBar) ? true : (bar_index - _lastShiftBar >= shiftMinBars))
+
+_levels = math.max(2, math.min(4, shiftStaggerLevels))
+var int _stag = 0
+
+var label[] _shiftLabels = array.new<label>()
+
+if doShiftRaw and cooldownOK and maxShiftLabels > 0
+    _yloc = shiftLocOpt == "Top" ? yloc.abovebar : yloc.belowbar
+    _st   = shiftLocOpt == "Top" ? label.style_label_down : label.style_label_up
+
+    _base = shiftLocOpt == "Top" ? (high + atr * shiftYOffsetATR) : (low - atr * shiftYOffsetATR)
+    _extra = shiftStagger ? (atr * shiftYOffsetATR * 0.85 * _stag) : 0.0
+    _y = shiftLocOpt == "Top" ? (_base + _extra) : (_base - _extra)
+
+    _lab = label.new(x=bar_index, y=_y, text="→ " + summary, xloc=xloc.bar_index, yloc=_yloc,
+        style=_st, textcolor=color.new(color.white, 0), color=color.new(sumCol, 0), size=shiftTxtSize)
+    array.push(_shiftLabels, _lab)
+
+    _lastShiftBar := bar_index
+    _stag := (_stag + 1) % _levels
+
+    while array.size(_shiftLabels) > maxShiftLabels
+        _old = array.shift(_shiftLabels)
+        label.delete(_old)
+
+if maxShiftLabels == 0 and array.size(_shiftLabels) > 0 and barstate.islast
+    for i = 0 to array.size(_shiftLabels) - 1
+        label.delete(array.get(_shiftLabels, i))
+    array.clear(_shiftLabels)
+
+if barstate.islast and maxShiftLabels > 0
+    while array.size(_shiftLabels) > maxShiftLabels
+        _old = array.shift(_shiftLabels)
+        label.delete(_old)
+
+//──────────────────────────────────────────────────────────────────────────────
+// HUD (table) — dynamic row count (no blank rows)
+isPro = modeOpt == "PRO"
+
+// PRO rows: header + 3 axes + optional summary + optional conf + optional hint + optional HTF
+rowsPro = 1 + 3 + (showSummary ? 1 : 0) + (showConfPro ? 1 : 0) + (showHint ? 1 : 0) + (showHTF ? 1 : 0)
+// MIN rows: header + regime + axes + confidence + optional HTF
+rowsMin = 1 + 3 + (showHTF ? 1 : 0)
+rows    = isPro ? rowsPro : rowsMin
+
+var table hud = table.new(posFromOpt(hudPosOpt), 2, rows,
+     frame_width=2, frame_color=color.new(color.white, frameAlpha),
+     border_width=1, border_color=color.new(color.white, borderAlpha))
+
+txtSize = textSizeFromOpt(txtSizeOpt)
+hudBg = color.new(color.black, bgAlpha)
+hdrBg = color.new(color.black, hdrAlpha)
+
+// Icons
+iconTrend = trendBand == "HIGH" ? "▲" : trendBand == "MID" ? "↗" : "·"
+iconChop  = chopBand  == "HIGH" ? "≈" : chopBand  == "MID" ? "∿" : "·"
+iconVol   = volBand   == "HIGH" ? "⚡" : volBand   == "MID" ? "•" : "·"
+
+mkValue(icon, band, score) =>
+    pct = showPct ? ("  " + mkPct(score)) : ""
+    bar = showBar ? ("  " + mkBar(score, barLen)) : ""
+    icon + " " + band + pct + bar
+
+renderRow(r, title, icon, band, score, bandBgColor) =>
+    table.cell(hud, 0, r, "  " + title, text_color=color.new(color.white, 0), bgcolor=hudBg, text_size=txtSize)
+    table.cell(hud, 1, r, "  " + mkValue(icon, band, score), text_color=color.new(color.white, 0), bgcolor=color.new(bandBgColor, bandAlpha), text_size=txtSize)
+
+if barstate.islast
+    // Clear visible rows
+    for i = 0 to rows - 1
+        table.cell(hud, 0, i, "", bgcolor=color.new(color.black, 100), text_color=color.new(color.white, 100), text_size=txtSize)
+        table.cell(hud, 1, i, "", bgcolor=color.new(color.black, 100), text_color=color.new(color.white, 100), text_size=txtSize)
+
+    headerBase = showSymbol ? (syminfo.ticker + " · " + timeframe.period) : "REGIME"
+    headerRight = showStarsHeader ? (headerBase + "  " + starsTxt) : headerBase
+
+    table.cell(hud, 0, 0, "  AG Pro Market Regime Meter", text_color=color.new(color.white, 0), bgcolor=hdrBg, text_size=txtSize)
+    table.cell(hud, 1, 0, "  " + headerRight,             text_color=color.new(color.white, 0), bgcolor=hdrBg, text_size=txtSize)
+
+    int r = 1
+
+    if isPro
+        renderRow(r, "Trend Strength", iconTrend, trendBand, trendScore, trendBandColor(trendBand)), r += 1
+        renderRow(r, "Chop Risk",      iconChop,  chopBand,  chopScore,  chopBandColor(chopBand)),   r += 1
+        renderRow(r, "Volatility",     iconVol,   volBand,   volScore,   volBandColor(volBand)),     r += 1
+
+        if showSummary
+            table.cell(hud, 0, r, "  Summary", text_color=color.new(color.white, 0), bgcolor=hudBg, text_size=txtSize)
+            table.cell(hud, 1, r, "  " + summary + ageSuffix, text_color=color.new(color.white, 0), bgcolor=color.new(sumCol, bandAlpha), text_size=txtSize)
+            r += 1
+
+        if showConfPro
+            table.cell(hud, 0, r, "  Confidence", text_color=color.new(color.white, 0), bgcolor=hudBg, text_size=txtSize)
+            table.cell(hud, 1, r, "  " + mkConfText(confScore), text_color=color.new(color.white, 0), bgcolor=color.new(color.black, bgAlpha), text_size=txtSize)
+            r += 1
+
+        if showHint
+            table.cell(hud, 0, r, "  Hint", text_color=color.new(color.white, 0), bgcolor=hudBg, text_size=txtSize)
+            table.cell(hud, 1, r, "  " + hint, text_color=color.new(color.white, 0), bgcolor=color.new(color.black, bgAlpha), text_size=txtSize)
+            r += 1
+
+        if showHTF
+            table.cell(hud, 0, r, "  HTF " + fmtTf(htfTf), text_color=color.new(color.white, 0), bgcolor=hudBg, text_size=txtSize)
+            table.cell(hud, 1, r, "  " + summaryHTF + "  (" + mkCompact3(trendBandHTF, chopBandHTF, volBandHTF) + ")",
+                 text_color=color.new(color.white, 0), bgcolor=color.new(sumColHtf, bandAlpha), text_size=txtSize)
+            r += 1
+    else
+        // MINIMAL
+        table.cell(hud, 0, r, "  Regime", text_color=color.new(color.white, 0), bgcolor=hudBg, text_size=txtSize)
+        table.cell(hud, 1, r, "  " + summary, text_color=color.new(color.white, 0), bgcolor=color.new(sumCol, bandAlpha), text_size=txtSize)
+        r += 1
+
+        compact = mkCompact3(trendBand, chopBand, volBand)
+        table.cell(hud, 0, r, "  Axes", text_color=color.new(color.white, 0), bgcolor=hudBg, text_size=txtSize)
+        table.cell(hud, 1, r, "  " + compact, text_color=color.new(color.white, 0), bgcolor=color.new(color.black, bgAlpha), text_size=txtSize)
+        r += 1
+
+        table.cell(hud, 0, r, "  Confidence", text_color=color.new(color.white, 0), bgcolor=hudBg, text_size=txtSize)
+        table.cell(hud, 1, r, "  " + mkConfText(confScore), text_color=color.new(color.white, 0), bgcolor=color.new(color.black, bgAlpha), text_size=txtSize)
+        r += 1
+
+        if showHTF
+            table.cell(hud, 0, r, "  HTF " + fmtTf(htfTf), text_color=color.new(color.white, 0), bgcolor=hudBg, text_size=txtSize)
+            table.cell(hud, 1, r, "  " + summaryHTF, text_color=color.new(color.white, 0), bgcolor=color.new(sumColHtf, bandAlpha), text_size=txtSize)
+            r += 1

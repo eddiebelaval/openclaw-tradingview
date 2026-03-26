@@ -1,0 +1,187 @@
+// This source code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+
+//@version=6
+indicator("Zig Zag Liquidity Pools & Sweeps by Capitan-Trading", overlay = true, max_lines_count = 500, max_labels_count = 500)
+
+import TradingView/ZigZag/7 as ZigZagLib
+
+// ====================================================================
+// UI HELPER FUNCTIONS
+// ====================================================================
+f_get_line_style(_s) =>
+    _s == "Solid" ? line.style_solid : _s == "Dotted" ? line.style_dotted : line.style_dashed
+
+f_get_label_size(_s) =>
+    _s == "Tiny" ? size.tiny : _s == "Small" ? size.small : _s == "Normal" ? size.normal : size.large
+
+// ====================================================================
+// MEMORY GARBAGE COLLECTOR (Fix for the Line Cemetery)
+// ====================================================================
+var mitigated_lines = array.new_line()
+f_manage_mitigated(_l) =>
+    array.push(mitigated_lines, _l)
+    if array.size(mitigated_lines) > 400
+        line.delete(array.shift(mitigated_lines))
+
+// ====================================================================
+// 1) ZIG ZAG ENGINE & VOLUMETRIC DATA
+// ====================================================================
+grp_zz = "Visual Engine (Zig Zag Line)"
+deviationInput = input.float(0.00001, "Deviation (%)", minval=0.00001, group=grp_zz)
+depthInput     = input.int(3, "Pivot Legs (Depth)", minval=1, group=grp_zz) 
+lineColorInput = input.color(#2962FF, "Line Color", group=grp_zz)
+
+extendInput    = input.bool(true, "Extend to Last Bar", group=grp_zz)
+showPriceInput = input.bool(false, "Show Reversal Price", group=grp_zz)
+showVolInput   = input.bool(false, "Show Cumulative Wave Volume", group=grp_zz) 
+showChgInput   = input.bool(false, "Show Price Change", inline = "priceRev", group=grp_zz)
+priceDiffInput = input.string("Absolute", "", options=["Absolute", "Percent"], inline = "priceRev", group=grp_zz)
+
+var zigZag = ZigZagLib.newInstance(
+    ZigZagLib.Settings.new(deviationInput, depthInput, lineColorInput, extendInput, showPriceInput, showVolInput, showChgInput, priceDiffInput, true)
+)
+zigZag.update()
+
+// ====================================================================
+// 2) SMC LIQUIDITY ENGINE
+// ====================================================================
+grp_liq = "Liquidity Levels (Macro)"
+show_liq       = input.bool(true, "Show Liquidity Lines", group=grp_liq)
+leftBars       = input.int(6, "Pivot Strength (Left)",  minval=1, group=grp_liq)   
+rightBars      = input.int(4, "Pivot Confirmation (Right)", minval=1, group=grp_liq) 
+displayLimit   = input.int(5, "Max Lines on Screen", minval=1, maxval=200, group=grp_liq) 
+
+grp_sweep = "Sweep / Mitigation"
+candleType      = input.string("Wick", "Invalidate Level On:", options=["Close", "Wick"], group=grp_sweep) 
+waitConfirm     = input.bool(false, "Wait for Candle Close to Confirm Sweep", group=grp_sweep, tooltip="If false, X prints immediately on touch (Reacts faster but may repaint intrabar).")
+mitiOptions     = input.string("Show", "Mitigated Levels:", options=["Remove", "Show"], group=grp_sweep) 
+show_x          = input.bool(true, "Print 'X' on Liquidity Sweeps", group=grp_sweep)
+x_size_str      = input.string("Tiny", "Size of 'X'", options=["Tiny", "Small", "Normal", "Large"], group=grp_sweep) 
+
+grp_liq_style = "Lines & Signals Style"
+highLiqColor = input.color(color.new(color.red, 0), "Resistances (Highs)", group=grp_liq_style)  
+lowLiqColor  = input.color(color.new(color.green, 0), "Supports (Lows)",  group=grp_liq_style)      
+liq_width    = input.int(2, "Line Width", minval=1, maxval=4, group=grp_liq_style)     
+liq_style    = input.string("Dashed", "Line Style", options=["Solid", "Dashed", "Dotted"], group=grp_liq_style) 
+
+// ====================================================================
+// LEVEL CREATION LOGIC (With Blind Spot Fix)
+// ====================================================================
+var high_lines = array.new_line()
+var low_lines  = array.new_line()
+
+ph = ta.pivothigh(high, leftBars, rightBars)
+pl = ta.pivotlow(low,  leftBars, rightBars)
+
+if not na(ph)
+    bool levelExists = false
+    if array.size(high_lines) > 0
+        for i = 0 to array.size(high_lines) - 1
+            if math.abs(line.get_y1(array.get(high_lines, i)) - ph) <= syminfo.mintick
+                levelExists := true
+                break
+    
+    if not levelExists
+        // Retroactive Check (Blind Spot Fix)
+        int sweepIndexOffset = -1
+        for j = rightBars - 1 to 0 
+            float checkHigh = (candleType == "Close") ? close[j] : high[j]
+            if checkHigh > ph
+                sweepIndexOffset := j
+                break
+                
+        if sweepIndexOffset != -1
+            // Level was swept during confirmation delay. Draw it already mitigated.
+            line new_ln = line.new(bar_index[rightBars], ph, bar_index[sweepIndexOffset], ph, color=show_liq ? color.new(highLiqColor, 80) : na, width=liq_width, style=f_get_line_style(liq_style))
+            if show_x
+                label.new(bar_index[sweepIndexOffset], ph, text="✖", color=color.new(color.white, 100), textcolor=highLiqColor, style=label.style_label_center, size=f_get_label_size(x_size_str))
+            if mitiOptions == "Show"
+                f_manage_mitigated(new_ln)
+            else
+                line.delete(new_ln)
+        else
+            // Normal active level creation
+            if array.size(high_lines) >= displayLimit
+                line.delete(array.shift(high_lines))
+            line new_ln = line.new(bar_index[rightBars], ph, bar_index, ph, color=show_liq ? highLiqColor : na, width=liq_width, style=f_get_line_style(liq_style), extend=extend.right)
+            array.push(high_lines, new_ln)
+
+if not na(pl)
+    bool levelExists = false
+    if array.size(low_lines) > 0
+        for i = 0 to array.size(low_lines) - 1
+            if math.abs(line.get_y1(array.get(low_lines, i)) - pl) <= syminfo.mintick
+                levelExists := true
+                break
+
+    if not levelExists
+        // Retroactive Check (Blind Spot Fix)
+        int sweepIndexOffset = -1
+        for j = rightBars - 1 to 0 
+            float checkLow = (candleType == "Close") ? close[j] : low[j]
+            if checkLow < pl
+                sweepIndexOffset := j
+                break
+                
+        if sweepIndexOffset != -1
+            // Level was swept during confirmation delay. Draw it already mitigated.
+            line new_ln = line.new(bar_index[rightBars], pl, bar_index[sweepIndexOffset], pl, color=show_liq ? color.new(lowLiqColor, 80) : na, width=liq_width, style=f_get_line_style(liq_style))
+            if show_x
+                label.new(bar_index[sweepIndexOffset], pl, text="✖", color=color.new(color.white, 100), textcolor=lowLiqColor, style=label.style_label_center, size=f_get_label_size(x_size_str))
+            if mitiOptions == "Show"
+                f_manage_mitigated(new_ln)
+            else
+                line.delete(new_ln)
+        else
+            // Normal active level creation
+            if array.size(low_lines) >= displayLimit
+                line.delete(array.shift(low_lines))
+            line new_ln = line.new(bar_index[rightBars], pl, bar_index, pl, color=show_liq ? lowLiqColor : na, width=liq_width, style=f_get_line_style(liq_style), extend=extend.right)
+            array.push(low_lines, new_ln)
+
+// ====================================================================
+// MITIGATION & 'X' PRINT LOGIC (PURE & DIRECT)
+// ====================================================================
+if array.size(high_lines) > 0
+    for i = array.size(high_lines) - 1 to 0
+        l = array.get(high_lines, i)
+        v = line.get_y1(l)
+        
+        bool isHitHigh = (candleType == "Close") ? (close > v) : (high > v)
+        swept = waitConfirm ? (barstate.isconfirmed and isHitHigh) : isHitHigh
+        
+        if swept
+            if show_x
+                label.new(bar_index, v, text="✖", color=color.new(color.white, 100), textcolor=highLiqColor, style=label.style_label_center, size=f_get_label_size(x_size_str))
+                
+            if mitiOptions == "Remove"
+                line.delete(l)
+            else
+                line.set_extend(l, extend.none)
+                line.set_x2(l, bar_index)
+                line.set_color(l, show_liq ? color.new(highLiqColor, 80) : na)
+                f_manage_mitigated(l) // Add to garbage collector
+                
+            array.remove(high_lines, i)
+
+if array.size(low_lines) > 0
+    for i = array.size(low_lines) - 1 to 0
+        l = array.get(low_lines, i)
+        v = line.get_y1(l)
+        
+        bool isHitLow = (candleType == "Close") ? (close < v) : (low < v)
+        swept = waitConfirm ? (barstate.isconfirmed and isHitLow) : isHitLow
+        
+        if swept
+            if show_x
+                label.new(bar_index, v, text="✖", color=color.new(color.white, 100), textcolor=lowLiqColor, style=label.style_label_center, size=f_get_label_size(x_size_str))
+                
+            if mitiOptions == "Remove"
+                line.delete(l)
+            else
+                line.set_extend(l, extend.none)
+                line.set_x2(l, bar_index)
+                line.set_color(l, show_liq ? color.new(lowLiqColor, 80) : na)
+                f_manage_mitigated(l) // Add to garbage collector
+                
+            array.remove(low_lines, i)
