@@ -1,0 +1,500 @@
+// Liquidation HeatMap Pro
+// Fixes: NaN delta, zone overlap, thinner zones, better gradient, cleaner VP
+// Educational purposes only
+
+//@version=6
+indicator("Liquidation HeatMap Pro v2", overlay = true, max_boxes_count = 500, max_labels_count = 200, max_bars_back = 500)
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// INPUTS
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+// — Heat Colors (5-step gradient)
+color col_heat_1  = input.color(#004d40, "Cold",     inline = "H", group = "Heat Gradient")
+color col_heat_2  = input.color(#26a69a, "Cool",     inline = "H", group = "Heat Gradient")
+color col_heat_3  = input.color(#ffee58, "Warm",     inline = "H", group = " Heat Gradient")
+color col_heat_4  = input.color(#ff6d00, "Hot",      inline = "H", group = " Heat Gradient")
+color col_heat_5  = input.color(#d50000, "Max",      inline = "H", group = " Heat Gradient")
+color col_bull    = input.color(#00e676, "Bull",     inline = "D", group = "Delta Colors")
+color col_bear    = input.color(#ff1744, "Bear",     inline = "D", group = "Delta Colors")
+color col_absorb  = input.color(#aa00ff, "Absorbed", inline = "D", group = "Delta Colors")
+
+// — Zone Settings
+int   lookback    = input.int(300, "Lookback",               minval = 50,   maxval = 500,  group = "Zones")
+int   piv_left    = input.int(3, "Pivot Left",               minval = 1,    maxval = 15,   group = "Zones")
+int   piv_right   = input.int(2, "Pivot Right",              minval = 1,    maxval = 15,   group = " Zones")
+float zone_width  = input.float(0.15, "Zone Width (ATR×)",   minval = 0.02, maxval = 0.5,  step = 0.01, group = "Zones")
+int   max_touches = input.int(1, "Touches to Remove",         minval = 1,    maxval = 5,    group = "Zones")
+float merge_dist  = input.float(0.5, "Merge Distance (ATR×)", minval = 0.1, maxval = 2.0,  step = 0.1,  group = "Zones")
+
+// — Delta
+bool  show_delta_bars = input.bool(true, "Color Bars by Delta",            group = "Delta")
+bool  show_cum_line   = input.bool(false, "Cum Delta Overlay Line",        group = "Delta")
+int   delta_smooth    = input.int(8, "Delta Smoothing",       minval = 1,   maxval = 50,   group = "Delta")
+
+// — Features
+bool  show_absorb     = input.bool(true, "Absorption Markers",             group = "Features")
+bool  show_divergence = input.bool(true, "Delta Divergence Signals",       group = "Features")
+bool  show_vp         = input.bool(true, "Volume Profile (Right)",         group = "Features")
+int   vp_levels       = input.int(20, "VP Resolution",        minval = 8,   maxval = 40,   group = "Features")
+bool  show_info       = input.bool(true, "Info Panel",                     group = "Features")
+bool  show_scale      = input.bool(true, "Heat Scale",                     group = "Features")
+
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// HELPERS
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+// Volume fallback
+f_vol() =>
+    nz(volume) > 0 ? volume : (high - low) * 100000
+
+// 5-step heat gradient
+f_heat(float val, float lo, float hi) =>
+    float pct = hi > lo ? (val - lo) / (hi - lo) : 0.5
+    pct := math.max(0.0, math.min(1.0, pct))
+    color c = na
+    if pct < 0.25
+        c := color.from_gradient(pct, 0.0, 0.25, col_heat_1, col_heat_2)
+    else if pct < 0.5
+        c := color.from_gradient(pct, 0.25, 0.5, col_heat_2, col_heat_3)
+    else if pct < 0.75
+        c := color.from_gradient(pct, 0.5, 0.75, col_heat_3, col_heat_4)
+    else
+        c := color.from_gradient(pct, 0.75, 1.0, col_heat_4, col_heat_5)
+    c
+
+// Bulk Volume Classification delta
+f_delta() =>
+    float v   = f_vol()
+    float rng = high - low
+    float pct = rng > 0 ? (close - low) / rng : 0.5
+    v * (2.0 * pct - 1.0)
+
+// Enhanced delta weighted by volume intensity
+f_enh_delta() =>
+    float d      = f_delta()
+    float avg_v  = ta.sma(f_vol(), 20)
+    float ratio  = avg_v > 0 ? math.min(f_vol() / avg_v, 3.0) : 1.0
+    d * ratio
+
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// VOLUME TRACKING
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+var array<float> vol_hist = array.new<float>()
+float cv = f_vol()
+vol_hist.push(cv)
+if vol_hist.size() > lookback
+    vol_hist.shift()
+
+float v_lo  = vol_hist.min()
+float v_hi  = vol_hist.max()
+float v_avg = vol_hist.avg()
+
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// DELTA
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+float d_raw    = f_enh_delta()
+float d_ema    = ta.ema(d_raw, delta_smooth)
+var float cd   = 0.0
+cd            += nz(d_raw)
+
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// LIQUIDITY ZONES
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+var array<box>   zones   = array.new<box>()
+var array<float> z_vols  = array.new<float>()
+var array<int>   z_touch = array.new<int>()
+var array<float> z_mids  = array.new<float>()
+
+float atr = ta.atr(200)
+float zw  = atr * zone_width
+
+float ph = ta.pivothigh(high, piv_left, piv_right)
+float pl = ta.pivotlow(low, piv_left, piv_right)
+
+// Volume at the pivot bar
+float pv_vol = nz(vol_hist.size() > piv_right ? vol_hist.get(vol_hist.size() - 1 - piv_right) : cv)
+
+bool in_range = (last_bar_index - bar_index) < lookback
+
+// Check if a new zone would overlap/merge with existing
+f_find_nearby(float mid) =>
+    int result = -1
+    if zones.size() > 0
+        for i = 0 to zones.size() - 1
+            float existing_mid = z_mids.get(i)
+            if math.abs(mid - existing_mid) < atr * merge_dist
+                result := i
+                break
+    result
+
+if in_range
+    // HIGH PIVOTS — resistance / short liquidation above
+    if not na(ph)
+        float top = high[piv_right] + zw
+        float bot = high[piv_right]
+        float mid = (top + bot) / 2.0
+        
+        int nearby = f_find_nearby(mid)
+        
+        if nearby >= 0
+            // Merge: update volume (take max for hotter color)
+            float old_v = z_vols.get(nearby)
+            float new_v = math.max(old_v, pv_vol) * 1.15  // Boost merged zones
+            z_vols.set(nearby, new_v)
+            
+            color mc = f_heat(new_v, v_lo, v_hi)
+            zones.get(nearby).set_bgcolor(color.new(mc, 25))
+        else
+            color hc = f_heat(pv_vol, v_lo, v_hi)
+            box b = box.new(bar_index[piv_right], top, bar_index, bot,
+                             border_color = color.new(hc, 60), border_width = 1,
+                             bgcolor = color.new(hc, 40))
+            zones.push(b)
+            z_vols.push(pv_vol)
+            z_touch.push(0)
+            z_mids.push(mid)
+
+    // LOW PIVOTS — support / long liquidation below
+    if not na(pl)
+        float top = low[piv_right]
+        float bot = low[piv_right] - zw
+        float mid = (top + bot) / 2.0
+        
+        int nearby = f_find_nearby(mid)
+        
+        if nearby >= 0
+            float old_v = z_vols.get(nearby)
+            float new_v = math.max(old_v, pv_vol) * 1.15
+            z_vols.set(nearby, new_v)
+            
+            color mc = f_heat(new_v, v_lo, v_hi)
+            zones.get(nearby).set_bgcolor(color.new(mc, 25))
+        else
+            color hc = f_heat(pv_vol, v_lo, v_hi)
+            box b = box.new(bar_index[piv_right], top, bar_index, bot,
+                             border_color = color.new(hc, 60), border_width = 1,
+                             bgcolor = color.new(hc, 40))
+            zones.push(b)
+            z_vols.push(pv_vol)
+            z_touch.push(0)
+            z_mids.push(mid)
+
+// ——— Extend & sweep detection
+if zones.size() > 0
+    int i = zones.size() - 1
+    while i >= 0 and i < zones.size()
+        box   b   = zones.get(i)
+        float top = b.get_top()
+        float bot = b.get_bottom()
+        float mid = z_mids.get(i)
+        int   tc  = z_touch.get(i)
+        
+        b.set_right(bar_index + 3)
+        
+        // Swept = price penetrates into the zone (any overlap with candle range)
+        bool price_enters_zone = high >= bot and low <= top
+        // Strong sweep = price passes through midpoint
+        bool strong_sweep = high > mid and low < mid
+        // Full sweep = price goes completely through the zone
+        bool full_sweep = (high > top and low < bot)
+        
+        if full_sweep
+            // Immediately remove on full sweep
+            b.set_bgcolor(color.new(col_absorb, 85))
+            b.set_border_color(color.new(col_absorb, 85))
+            b.set_right(bar_index)
+            
+            zones.remove(i)
+            z_vols.remove(i)
+            z_touch.remove(i)
+            z_mids.remove(i)
+        else if strong_sweep or price_enters_zone
+            z_touch.set(i, tc + 1)
+            
+            if tc + 1 >= max_touches
+                // Fade out consumed zone
+                b.set_bgcolor(color.new(col_absorb, 85))
+                b.set_border_color(color.new(col_absorb, 85))
+                b.set_right(bar_index)
+                
+                zones.remove(i)
+                z_vols.remove(i)
+                z_touch.remove(i)
+                z_mids.remove(i)
+            else
+                // Dim after touch
+                float tv = z_vols.get(i) * 0.7
+                z_vols.set(i, tv)
+                color tc_col = f_heat(tv, v_lo, v_hi)
+                b.set_bgcolor(color.new(tc_col, 55))
+        
+        i -= 1
+
+// Cap zones
+while zones.size() > 350
+    zones.shift().delete()
+    z_vols.shift()
+    z_touch.shift()
+    z_mids.shift()
+
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// VOLUME PROFILE (RIGHT SIDE)
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+var array<box> vp_boxes = array.new<box>()
+
+// Pre-compute at global scope (Pine requires ta.highest/ta.lowest called every bar)
+simple int vp_lb = math.min(lookback, 250)
+float vp_rh = ta.highest(high, vp_lb)
+float vp_rl = ta.lowest(low, vp_lb)
+
+if show_vp and barstate.islast
+    for b in vp_boxes
+        b.delete()
+    vp_boxes.clear()
+    
+    int lb = vp_lb
+    float rh = vp_rh
+    float rl = vp_rl
+    float step = (rh - rl) / vp_levels
+    
+    if step > 0
+        array<float> lv = array.new<float>(vp_levels, 0.0)
+        array<float> lv_buy  = array.new<float>(vp_levels, 0.0)
+        array<float> lv_sell = array.new<float>(vp_levels, 0.0)
+        
+        for j = 0 to lb - 1
+            float hj = high[j]
+            float lj = low[j]
+            float vj = nz(volume[j]) > 0 ? volume[j] : (high[j] - low[j]) * 100000
+            float cj = close[j]
+            float oj = open[j]
+            
+            for idx = 0 to vp_levels - 1
+                float lb_price = rl + step * idx
+                float lt_price = lb_price + step
+                
+                if hj >= lb_price and lj <= lt_price
+                    float overlap = math.min(hj, lt_price) - math.max(lj, lb_price)
+                    float brng    = hj - lj
+                    float pct     = brng > 0 ? overlap / brng : 1.0 / vp_levels
+                    float alloc   = vj * pct
+                    
+                    lv.set(idx, lv.get(idx) + alloc)
+                    if cj >= oj
+                        lv_buy.set(idx, lv_buy.get(idx) + alloc)
+                    else
+                        lv_sell.set(idx, lv_sell.get(idx) + alloc)
+        
+        float mx = lv.max()
+        
+        // Find POC (Point of Control)
+        int poc_idx = 0
+        float poc_val = 0.0
+        for idx = 0 to vp_levels - 1
+            if lv.get(idx) > poc_val
+                poc_val := lv.get(idx)
+                poc_idx := idx
+        
+        int vp_max_w = 20
+        int max_future = 490  // safe margin under 500 limit
+        int vp_start = last_bar_index + 5
+        
+        for idx = 0 to vp_levels - 1
+            float lb_price = rl + step * idx
+            float lt_price = lb_price + step
+            float tv       = lv.get(idx)
+            float bv       = lv_buy.get(idx)
+            float sv       = lv_sell.get(idx)
+            float ratio    = mx > 0 ? tv / mx : 0
+            int   w        = math.max(1, math.round(vp_max_w * ratio))
+            
+            bool is_poc = idx == poc_idx
+            
+            // Buy side
+            float buy_ratio = tv > 0 ? bv / tv : 0.5
+            int   buy_w     = math.max(0, math.round(w * buy_ratio))
+            int   sell_w    = math.max(0, w - buy_w)
+            
+            int left_x     = math.min(vp_start, last_bar_index + max_future)
+            int buy_right   = math.min(vp_start + buy_w, last_bar_index + max_future)
+            int sell_left   = buy_right
+            int sell_right  = math.min(vp_start + buy_w + sell_w, last_bar_index + max_future)
+            
+            if buy_w > 0 and buy_right > left_x
+                box bb = box.new(left_x, lt_price, buy_right, lb_price,
+                                  border_color = is_poc ? color.white : na,
+                                  border_width = is_poc ? 1 : 0,
+                                  bgcolor = color.new(col_bull, is_poc ? 20 : 45))
+                vp_boxes.push(bb)
+            
+            if sell_w > 0 and sell_right > sell_left
+                box sb = box.new(sell_left, lt_price, sell_right, lb_price,
+                                  border_color = is_poc ? color.white : na,
+                                  border_width = is_poc ? 1 : 0,
+                                  bgcolor = color.new(col_bear, is_poc ? 20 : 45))
+                vp_boxes.push(sb)
+        
+        // POC line
+        float poc_price = rl + step * poc_idx + step / 2.0
+        int poc_left  = math.max(bar_index - lb, 0)
+        int poc_right = math.min(vp_start + vp_max_w, last_bar_index + max_future)
+        box poc_line = box.new(poc_left, poc_price + step * 0.05, poc_right, poc_price - step * 0.05,
+                                border_color = na, bgcolor = color.new(color.white, 80))
+        vp_boxes.push(poc_line)
+
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// ABSORPTION DETECTION
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+f_absorb() =>
+    float v    = f_vol()
+    float av   = ta.sma(v, 20)
+    float body = math.abs(close - open)
+    float rng  = high - low
+    float bp   = rng > 0 ? body / rng : 0.5
+    
+    bool hvol  = v > av * 2.0
+    bool smlbd = bp < 0.3
+    bool wicks = rng > 0 and (high - math.max(close, open)) > body * 0.8 and (math.min(close, open) - low) > body * 0.8
+    
+    hvol and smlbd and wicks
+
+bool is_abs = f_absorb()
+
+plotshape(show_absorb and is_abs and close >= open ? low - atr * 0.2 : na,
+             title = "Buy Absorb", style = shape.diamond, location = location.absolute,
+             color = col_bull, size = size.tiny)
+plotshape(show_absorb and is_abs and close < open ? high + atr * 0.2 : na,
+             title = "Sell Absorb", style = shape.diamond, location = location.absolute,
+             color = col_bear, size = size.tiny)
+
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// DELTA BAR COLORING
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+float d_abs    = math.abs(d_ema)
+float d_avg_a  = ta.sma(math.abs(d_raw), 50)
+float d_str    = d_avg_a > 0 ? math.min(d_abs / d_avg_a, 2.0) / 2.0 : 0.5
+int   d_transp = math.round(70 * (1.0 - d_str))
+
+color bar_col = show_delta_bars ? 
+                 (d_ema > 0 ? color.new(col_bull, d_transp) : color.new(col_bear, d_transp)) : na
+barcolor(bar_col)
+
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// CUMULATIVE DELTA LINE (normalized to price)
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+float p_mid = (ta.highest(high, 50) + ta.lowest(low, 50)) / 2.0
+float p_rng = ta.highest(high, 50) - ta.lowest(low, 50)
+float cd_hi = ta.highest(cd, 50)
+float cd_lo = ta.lowest(cd, 50)
+float cd_rn = cd_hi - cd_lo
+
+float cd_norm = cd_rn > 0 ? p_mid + (cd - (cd_hi + cd_lo) / 2.0) / cd_rn * p_rng * 0.4 : p_mid
+
+plot(show_cum_line ? cd_norm : na, "Cum Delta",
+     color = cd > nz(cd[1]) ? color.new(col_bull, 30) : color.new(col_bear, 30),
+     linewidth = 2)
+
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// DIVERGENCE SIGNALS
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+float p_roc = ta.roc(close, 12)
+float d_roc = ta.roc(cd, 12)
+
+// Only signal on significant moves
+float p_thresh = ta.stdev(p_roc, 20) * 0.8
+float d_thresh = ta.stdev(d_roc, 20) * 0.8
+
+bool bull_div = show_divergence and p_roc < -p_thresh and d_roc > d_thresh
+bool bear_div = show_divergence and p_roc > p_thresh  and d_roc < -d_thresh
+
+plotshape(bull_div ? low - atr * 0.4 : na, title = "Bull Div",
+             style = shape.triangleup, location = location.absolute,
+             color = col_bull, size = size.tiny, text = "δ↑", textcolor = col_bull)
+plotshape(bear_div ? high + atr * 0.4 : na, title = "Bear Div",
+             style = shape.triangledown, location = location.absolute,
+             color = col_bear, size = size.tiny, text = "δ↓", textcolor = col_bear)
+
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// HEAT SCALE
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+if show_scale and barstate.islast
+    var table stbl = table.new(position.bottom_right, 1, 14)
+    
+    table.cell(stbl, 0, 0, "HEAT", text_color = chart.fg_color, text_size = size.tiny, bgcolor = color.new(chart.bg_color, 40))
+    
+    for i = 1 to 12
+        float pct_val = v_hi - (v_hi - v_lo) * (i - 1) / 11.0
+        color gc = f_heat(pct_val, v_lo, v_hi)
+        string lbl = i == 1 ? "MAX" : i == 12 ? "MIN" : ""
+        table.cell(stbl, 0, i, lbl, bgcolor = gc, text_color = chart.fg_color, text_size = size.tiny, width = 3)
+    
+    table.cell(stbl, 0, 13, "VOL", text_color = chart.fg_color, text_size = size.tiny, bgcolor = color.new(chart.bg_color, 40))
+
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// INFO PANEL
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+if show_info and barstate.islast
+    var table info = table.new(position.top_right, 2, 6)
+    
+    color panel_bg = color.new(chart.bg_color, 20)
+    
+    // Delta
+    table.cell(info, 0, 0, "Δ Smooth", text_color = color.gray, text_size = size.tiny, bgcolor = panel_bg)
+    table.cell(info, 1, 0, str.tostring(math.round(d_ema)),
+                 text_color = d_ema > 0 ? col_bull : col_bear, text_size = size.small, bgcolor = panel_bg)
+    
+    // Cum Delta
+    table.cell(info, 0, 1, "Cum Δ", text_color = color.gray, text_size = size.tiny, bgcolor = panel_bg)
+    table.cell(info, 1, 1, str.tostring(math.round(cd)),
+                 text_color = cd > nz(cd[1]) ? col_bull : col_bear, text_size = size.small, bgcolor = panel_bg)
+    
+    // Volume
+    float vol_pct = v_avg > 0 ? cv / v_avg : 1.0
+    string vol_str = str.tostring(cv, format.volume)
+    table.cell(info, 0, 2, "Vol", text_color = color.gray, text_size = size.tiny, bgcolor = panel_bg)
+    table.cell(info, 1, 2, vol_str + (vol_pct > 1.5 ? " 🔥" : ""),
+                 text_color = vol_pct > 2 ? col_heat_5 : vol_pct > 1.5 ? col_heat_4 : chart.fg_color, 
+                 text_size = size.small, bgcolor = panel_bg)
+    
+    // Active zones
+    table.cell(info, 0, 3, "Zones", text_color = color.gray, text_size = size.tiny, bgcolor = panel_bg)
+    table.cell(info, 1, 3, str.tostring(zones.size()), text_color = chart.fg_color, text_size = size.small, bgcolor = panel_bg)
+    
+    // Buy/Sell pressure
+    float buy_pct  = (high - low) > 0 ? (close - low) / (high - low) * 100 : 50
+    table.cell(info, 0, 4, "Buy %", text_color = color.gray, text_size = size.tiny, bgcolor = panel_bg)
+    table.cell(info, 1, 4, str.tostring(math.round(buy_pct)) + "%",
+                 text_color = buy_pct > 60 ? col_bull : buy_pct < 40 ? col_bear : color.gray, 
+                 text_size = size.small, bgcolor = panel_bg)
+    
+    // Bias
+    bool  cd_rising = cd > nz(cd[5])
+    bool  d_pos     = d_ema > 0
+    string bias     = d_pos and cd_rising ? "BUYERS ▲" : not d_pos and not cd_rising ? "SELLERS ▼" : "NEUTRAL ―"
+    color  bias_col = d_pos and cd_rising ? col_bull : not d_pos and not cd_rising ? col_bear : color.gray
+    table.cell(info, 0, 5, "Bias", text_color = color.gray, text_size = size.tiny, bgcolor = panel_bg)
+    table.cell(info, 1, 5, bias, text_color = bias_col, text_size = size.small, bgcolor = panel_bg)
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━

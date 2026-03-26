@@ -1,0 +1,105 @@
+//@version=6
+indicator("Delta Imbalance", overlay = true, max_bars_back = 5000)
+
+// --- INPUTS ---
+atrLength    = input.int(2, "ATR Period (Days)", group = "Strategy")
+atrMult      = input.float(0.5, "ATR Multiplier", group = "Strategy")
+bufferTicks  = input.int(10, "Buffer Area (Ticks)", group = "Strategy")
+volPctTarget = input.float(90.0, "Volume Threshold %", group = "Volume")
+imbRatio     = input.float(3.0, "Delta Imbalance Ratio", group = "Footprint")
+
+// --- DATA FETCHING ---
+footprint reqFootprint = request.footprint(100, 70)
+float currentDelta     = not na(reqFootprint) ? reqFootprint.delta() : 0.0
+float daily_atr_val    = request.security(syminfo.tickerid, "D", ta.atr(atrLength)[1], gaps = barmerge.gaps_off)
+float srcLow           = request.security(syminfo.tickerid, "2", low)
+
+// --- VOLUME LOGIC ---
+float volChangePct = ta.change(volume) / volume[1] * 100
+float maxVol       = ta.highest(volume, 20)
+float volPct       = (volume / maxVol) * 100
+bool is_90vol      = volPct >= volPctTarget
+
+// --- STATE MANAGEMENT ---
+var float opening_low = na
+var int trade_state   = 0 // 0=Flat, 1=Long, -1=Short
+var float cumDelta    = 0.0
+
+is_new_day = ta.change(time("D")) != 0
+if is_new_day
+    opening_low := srcLow
+    trade_state := 0
+    cumDelta    := currentDelta
+else
+    opening_low := opening_low[1]
+    cumDelta    += currentDelta
+
+// --- LEVELS & BUFFER ---
+upper_exit = opening_low + (daily_atr_val * atrMult)
+lower_exit = opening_low - (daily_atr_val * atrMult)
+float buffer = bufferTicks * syminfo.mintick
+in_buffer = math.abs(close - opening_low) <= buffer or math.abs(close - upper_exit) <= buffer or math.abs(close - lower_exit) <= buffer
+
+// --- ALGO-SAFE SIGNALS (GLOBAL SCOPE) ---
+buy_trigger  = ta.crossover(close, opening_low) and (trade_state == 0 or trade_state == -1)
+sell_trigger = ta.crossunder(close, opening_low) and (trade_state == 0 or trade_state == 1)
+exit_plus    = ta.crossover(high, upper_exit) and trade_state == 1
+exit_minus   = ta.crossunder(low, lower_exit) and trade_state == -1
+
+if buy_trigger
+    trade_state := 1
+else if sell_trigger
+    trade_state := -1
+else if exit_plus or exit_minus
+    trade_state := 0
+
+// --- ABSORPTION / IMBALANCE LOGIC ---
+bool bull_abs = in_buffer and close > open and currentDelta < 0
+bool bear_abs = in_buffer and close < open and currentDelta > 0
+
+// --- VISUALS: CANDLES & BG ---
+color candleCol = na
+if bull_abs
+    candleCol := color.new(#00ffbb, 0)
+else if bear_abs
+    candleCol := color.new(#ff1100, 0)
+
+// 90% Volume Yellow Highlight (Priority)
+if is_90vol
+    candleCol := color.yellow
+
+barcolor(candleCol)
+bgcolor(is_90vol ? color.new(color.yellow, 90) : na)
+bgcolor(bull_abs ? color.new(color.green, 95) : bear_abs ? color.new(color.red, 95) : na)
+
+// --- PLOTS ---
+plot(opening_low, "Baseline", color=color.white, linewidth=2, style=plot.style_linebr)
+plot(upper_exit, "ATR Target (+)", color=color.lime, style=plot.style_linebr)
+plot(lower_exit, "ATR Target (-)", color=color.red, style=plot.style_linebr)
+
+// Strategy Shapes
+plotshape(buy_trigger, "BUY", shape.labelup, location.belowbar, color.green, text="BUY")
+plotshape(sell_trigger, "SELL", shape.labeldown, location.abovebar, color.red, text="SELL")
+plotshape(exit_plus or exit_minus, "EXIT", shape.xcross, location.belowbar, color.gray, text="EXIT")
+plotshape(bull_abs or bear_abs, "ABS", shape.circle, location.top, bull_abs ? color.green : color.red, size=size.tiny)
+
+// --- DATA AUDIT TABLE (BOTTOM RIGHT) ---
+var table stats = table.new(position.bottom_right, 2, 3, border_width = 1, border_color = color.gray)
+if barstate.islast
+    // Volume Change %
+    table.cell(stats, 0, 0, "Volume change, %", bgcolor=color.black, text_color=color.white)
+    table.cell(stats, 1, 0, str.tostring(volChangePct, "#.##"), bgcolor=volChangePct >= 0 ? color.teal : color.maroon, text_color=color.white)
+    
+    // Delta
+    table.cell(stats, 0, 1, "Delta", bgcolor=color.black, text_color=color.white)
+    table.cell(stats, 1, 1, str.tostring(currentDelta, format.volume), bgcolor=currentDelta >= 0 ? color.teal : color.maroon, text_color=color.white)
+    
+    // Session CVD
+    table.cell(stats, 0, 2, "Session CVD", bgcolor=color.black, text_color=color.white)
+    table.cell(stats, 1, 2, str.tostring(cumDelta, format.volume), bgcolor=cumDelta >= 0 ? color.teal : color.maroon, text_color=color.white)
+
+// --- ALERTS ---
+alertcondition(buy_trigger, "Buy Alert", "Price closed above Baseline")
+alertcondition(sell_trigger, "Sell Alert", "Price closed below Baseline")
+alertcondition(is_90vol, "Volume Spike", "90% Volume Threshold Hit")
+alertcondition(bull_abs or bear_abs, "Absorption", "Absorption/Imbalance at Level")

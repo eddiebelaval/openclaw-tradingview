@@ -1,0 +1,936 @@
+//@version=6
+indicator("Flux Pulse ORB", overlay = true, max_labels_count = 200)
+
+// ---------- Time Settings ----------
+groupTime = "Time Settings"
+// Session Template does not apply time values by itself; enable "Lock Time Settings To Session Template" to apply template schedule.
+sessionTemplate = input.string("New York (RTH)", "Session Template", options = ["Custom", "New York (RTH)", "Tokyo"], group = groupTime, tooltip = "Session template selector. Time values from this template are used only when template time lock is enabled.")
+tzInput = input.string("America/New_York", "Timezone String", group = groupTime, tooltip = "Manual timezone.")
+orStartHour = input.int(9, "OR Start Hour", minval = 0, maxval = 23, group = groupTime, tooltip = "Manual OR start hour.")
+orStartMinute = input.int(30, "OR Start Minute", minval = 0, maxval = 59, group = groupTime, tooltip = "Manual OR start minute.")
+orDurationMins = input.int(5, "OR Duration Minutes", minval = 1, maxval = 240, group = groupTime, tooltip = "Manual OR duration in minutes.")
+nyOpenHour = input.int(9, "Session Open Hour", minval = 0, maxval = 23, group = groupTime, tooltip = "Manual session open hour.")
+nyOpenMinute = input.int(30, "Session Open Minute", minval = 0, maxval = 59, group = groupTime, tooltip = "Manual session open minute.")
+displayEndMinsAfterOpen = input.int(30, "Display End Minutes After Open", minval = 1, maxval = 600, group = groupTime, tooltip = "Manual display end minutes after open.")
+firstMinutesShadedAfterOpen = input.int(5, "First Minutes Shaded After Open", minval = 0, maxval = 120, group = groupTime, tooltip = "Manual shaded minutes after open.")
+triggerDelayMinsAfterOpen = input.int(6, "Trigger/Entry Delay Minutes After Open", minval = 0, maxval = 120, group = groupTime, tooltip = "Manual delay before triggers/entries.")
+lockTemplateTimeSettings = input.bool(false, "Lock Time Settings To Session Template", group = groupTime, tooltip = "When enabled, template schedule values are always used for New York/Tokyo. When disabled, manual time inputs are always used.")
+
+// ---------- Toggles ----------
+groupToggles = "Toggles"
+showPreOrbHighLow = input.bool(true, "Show Pre-ORB High/Low", group = groupToggles, tooltip = "Show Pre-ORB high and low lines.")
+showMidline = input.bool(true, "Show Midline", group = groupToggles, tooltip = "Show midpoint of Pre-ORB range.")
+showRangeFill = input.bool(true, "Show Range Fill", group = groupToggles, tooltip = "Fill between Pre-ORB high and low.")
+showTargets = input.bool(true, "Show Targets 1x/2x/3x", group = groupToggles, tooltip = "Show 3 targets above high and 3 below low.")
+showRthShade = input.bool(true, "Show Session First-Minutes Vertical Shade", group = groupToggles, tooltip = "Shade first minutes after the selected session open.")
+breakoutConfirmMode = input.string("Wick", "Breakout Confirmation Mode", options = ["Wick", "Close"], group = groupToggles, tooltip = "Wick = use high/low crossing. Close = require candle close beyond ORB boundary. Used only when Global Preset = Custom.")
+breakoutTouchMode = input.string("Break (>/<)", "Breakout Boundary Mode", options = ["Break (>/<)", "Touch (>=/<=)"], group = groupToggles, tooltip = "Break = strict crossing only. Touch = boundary touch counts as breakout. Used only when Global Preset = Custom.")
+ambiguousBreakoutPolicy = input.string("Ignore", "Ambiguous Breakout Bar Policy", options = ["Ignore", "Use Close Direction"], group = groupToggles, tooltip = "When a bar breaches both ORB sides: Ignore = no breakout trigger. Use Close Direction = choose side by close beyond ORB.")
+
+// ---------- Entry Engine ----------
+groupEntry = "Entry Engine"
+globalPreset = input.string("MNQ", "Global Preset", options = ["Custom", "ES", "NQ", "MNQ", "Tokyo"], group = groupEntry, tooltip = "Custom = use manual values below.\n\nES applies: Confirm=Close, Boundary=Break, Entry=Retest Limit, Buffers=1/2/1, MaxEntry=45m, InvalidateBars=3, InvalidateMode=Midline/Opposite, ATR=14, OR/ATR=0.35-1.20, Re-entry=3m, Breakout-after-Reentry=12m.\n\nNQ applies: Confirm=Close, Boundary=Break, Entry=Retest Limit, Buffers=2/4/2, MaxEntry=60m, InvalidateBars=4, InvalidateMode=Midline/Opposite, ATR=14, OR/ATR=0.45-1.60, Re-entry=5m, Breakout-after-Reentry=20m.\n\nMNQ applies same as NQ.\n\nTokyo applies: Confirm=Close, Boundary=Break, Entry=Retest Limit, Buffers=1/2/1, MaxEntry=45m, InvalidateBars=3, InvalidateMode=Midline/Opposite, ATR=14, OR/ATR=0.35-1.20, Re-entry=3m, Breakout-after-Reentry=12m.\n\nWhen preset is not Custom, related manual inputs are ignored.\n\nTrigger/Entry Delay Minutes After Open and Volume Context settings stay manual.")
+useEntryEngine = input.bool(true, "Enable Entry Engine", group = groupEntry, tooltip = "Builds a trade setup state machine from ORB trigger signals.")
+enforceTightEntryProfile = input.bool(true, "Tight Entry Profile (Require Close + Retest)", group = groupEntry, tooltip = "When enabled, setup arming requires Breakout Confirmation Mode=Close and Entry Mode=Retest Limit. No hidden overrides are applied.")
+entryMode = input.string("Retest Limit", "Entry Mode", options = ["Breakout Stop", "Retest Limit"], group = groupEntry, tooltip = "Breakout Stop = continuation entry. Retest Limit = wait for retest, then continuation. Used only when Global Preset = Custom.")
+entryBufferTicks = input.int(1, "Entry Buffer (Ticks)", minval = 0, maxval = 20, group = groupEntry, tooltip = "Offset from ORB boundary for entry. Used only when Global Preset = Custom.")
+retestToleranceTicks = input.int(2, "Retest Tolerance (Ticks)", minval = 0, maxval = 50, group = groupEntry, tooltip = "How close price must return to ORB boundary to arm retest entries. Used only when Global Preset = Custom.")
+stopBufferTicks = input.int(1, "Stop Buffer (Ticks)", minval = 0, maxval = 50, group = groupEntry, tooltip = "Offset beyond opposite ORB boundary for stop. Used only when Global Preset = Custom.")
+maxEntryMinsAfterOpen = input.int(30, "Max Entry Minutes After Open", minval = 1, maxval = 240, group = groupEntry, tooltip = "No new setups after this many minutes from open. Used only when Global Preset = Custom.")
+oneTradePerDay = input.bool(true, "One Directional Trade Per Day", group = groupEntry, tooltip = "At most one filled long and one filled short per day.")
+useCloseBackInvalidation = input.bool(true, "Invalidate On Close Back Inside ORB", group = groupEntry, tooltip = "If enabled, invalidate entered trade when price closes back inside/through ORB within N bars.")
+closeBackInvalidateBars = input.int(3, "Invalidate Window (Bars)", minval = 1, maxval = 30, group = groupEntry, tooltip = "Bars after entry where close-back-inside invalidation is active. Used only when Global Preset = Custom.")
+closeBackInvalidateMode = input.string("Midline/Opposite", "Close-Back Invalidation Mode", options = ["Inside ORB", "Midline/Opposite"], group = groupEntry, tooltip = "Inside ORB = aggressive invalidation. Midline/Opposite = tighter confirmation and fewer false cancels. Used only when Global Preset = Custom.")
+useAtrRegimeFilter = input.bool(true, "Use ATR Regime Filter", group = groupEntry, tooltip = "Require OR range / ATR to be inside bounds before arming entries.")
+atrLength = input.int(14, "ATR Length", minval = 1, maxval = 200, group = groupEntry, tooltip = "ATR length for OR-range normalization. Used only when Global Preset = Custom.")
+minOrbAtrRatio = input.float(0.35, "Min OR/ATR Ratio", minval = 0.0, step = 0.01, group = groupEntry, tooltip = "Minimum OR range to ATR ratio required. Used only when Global Preset = Custom.")
+maxOrbAtrRatio = input.float(1.20, "Max OR/ATR Ratio", minval = 0.0, step = 0.01, group = groupEntry, tooltip = "Maximum OR range to ATR ratio allowed. Used only when Global Preset = Custom.")
+reentryWindowMinsAfterOpen = input.int(3, "Re-entry Window Minutes After Open", minval = 1, maxval = 60, group = groupEntry, tooltip = "Window to detect outside -> re-entry sequence. Used only when Global Preset = Custom.")
+breakoutAfterReentryMinsAfterOpen = input.int(10, "Breakout-After-Reentry Window Minutes After Open", minval = 1, maxval = 180, group = groupEntry, tooltip = "Window to confirm breakout after re-entry. Used only when Global Preset = Custom.")
+pendingConfirmWindowBars = input.int(3, "Delay-Start Pending Confirm Window (Bars)", minval = 1, maxval = 20, group = groupEntry, tooltip = "If price is already outside ORB at trigger-start, allow this many bars to confirm pending breakout direction.")
+pendingCloseConfirmBars = input.int(2, "Delay-Start Required Closes (Close Mode)", minval = 1, maxval = 2, group = groupEntry, tooltip = "In Close mode, pending direction confirms after this many closes still outside ORB on the same side.")
+yellowLineFilterMode = input.string("Breakout Only", "Yellow Line Filter Mode", options = ["Breakout Only", "Use Volume + ATR"], group = groupEntry, tooltip = "Breakout Only highlights ORB lines on confirmed breakout structure only. Use Volume + ATR requires both filters for yellow highlight.")
+showEntryOrderLine = input.bool(true, "Show Entry/Stop Guide Lines", group = groupEntry, tooltip = "Show state-machine entry and stop guide lines.")
+entryLineColor = input.color(color.lime, "Entry Guide Line Color", group = groupEntry, tooltip = "Color for planned entry level.")
+stopLineColor = input.color(color.red, "Stop Guide Line Color", group = groupEntry, tooltip = "Color for planned stop level.")
+entryGuideLineWidth = input.int(1, "Entry/Stop Guide Width", minval = 1, maxval = 4, group = groupEntry, tooltip = "Line width for entry/stop guide levels.")
+showEntryStatusLabel = input.bool(true, "Show Entry Status Label", group = groupEntry, tooltip = "Shows setup state text near current bar.")
+entryStatusLabelOffsetBars = input.int(1, "Entry Status Label Offset (Bars)", minval = 0, maxval = 50, group = groupEntry, tooltip = "Move entry status label right of current bar by this many bars.")
+engineVisibilityMode = input.string("Follow Display Window", "Engine Visibility Mode", options = ["Follow Display Window", "Follow Entry Window"], group = groupEntry, tooltip = "Controls entry guide/status visibility only. Logic remains unchanged.")
+
+// ---------- Volume Context ----------
+groupVolume = "Volume Context"
+useVolumeContext = input.bool(true, "Use Volume Context Filter", group = groupVolume, tooltip = "Require breakout trigger bar volume context to pass.")
+volumeMaLength = input.int(20, "Volume MA Length", minval = 1, maxval = 500, group = groupVolume, tooltip = "Length for baseline volume average.")
+volumeContextBasis = input.string("Time-of-Day", "Volume Context Basis", options = ["Time-of-Day", "Simple SMA"], group = groupVolume, tooltip = "Time-of-Day compares against average volume at the same minutes-after-open slot. Simple SMA uses volume / SMA(volume, length).")
+todMinSamples = input.int(5, "Time-of-Day Min Samples", minval = 1, maxval = 100, group = groupVolume, tooltip = "Minimum historical samples required for a time-of-day slot before volume context can pass.")
+todWarmupBehavior = input.string("Fallback To SMA", "Time-of-Day Warm-up Behavior", options = ["Fallback To SMA", "Block Until Ready"], group = groupVolume, tooltip = "Fallback To SMA avoids trigger blocking while ToD samples build and after reload.")
+todSeedFromSmaOnReset = input.bool(true, "Seed ToD Slots From SMA On Reset", group = groupVolume, tooltip = "When enabled, empty time-of-day slots are seeded from SMA baseline on first sample. This reduces reload/reset cold-start impact.")
+minRelativeVolume = input.float(1.10, "Min Relative Volume", minval = 0.10, step = 0.05, group = groupVolume, tooltip = "Trigger requires relative volume to be at least this value, based on selected Volume Context Basis.")
+volumeContextMode = input.string("Close Confirmed", "Volume Context Mode", options = ["Close Confirmed", "Realtime"], group = groupVolume, tooltip = "Close Confirmed = evaluate volume filter only on closed bars to avoid intrabar flips.")
+
+// ---------- Pre-ORB Style ----------
+groupRangeStyle = "Pre-ORB Style"
+highLineColor = input.color(color.rgb(128, 0, 128), "High Line Color", group = groupRangeStyle, tooltip = "Color of Pre-ORB high line.")
+highLineWidth = input.int(2, "High Line Width", minval = 1, maxval = 6, group = groupRangeStyle, tooltip = "Width of Pre-ORB high line.")
+lowLineColor = input.color(color.rgb(128, 0, 128), "Low Line Color", group = groupRangeStyle, tooltip = "Color of Pre-ORB low line.")
+lowLineWidth = input.int(2, "Low Line Width", minval = 1, maxval = 6, group = groupRangeStyle, tooltip = "Width of Pre-ORB low line.")
+midLineColor = input.color(color.rgb(128, 0, 128), "Midline Color", group = groupRangeStyle, tooltip = "Default color of Pre-ORB midline.")
+triggeredOrbLineColor = input.color(color.yellow, "Triggered ORB Line Color", group = groupRangeStyle, tooltip = "Color used when High/Low ORB line is triggered by breakout rule.")
+armedOrbLineColor = input.color(color.rgb(255, 191, 0), "Armed ORB Line Color", group = groupRangeStyle, tooltip = "Color used during arm stage before breakout confirmation (amber).")
+midLineWidth = input.int(2, "Midline Width", minval = 1, maxval = 6, group = groupRangeStyle, tooltip = "Width of Pre-ORB midline.")
+showOrbLevelLabels = input.bool(true, "Show ORB High/Low Labels", group = groupRangeStyle, tooltip = "Show ORB High and ORB Low text labels to the right of their lines.")
+orbLevelLabelTextColor = input.color(color.white, "ORB Label Text Color", group = groupRangeStyle, tooltip = "Text color for ORB High/Low labels.")
+orbLevelLabelBgColor = input.color(color.new(color.black, 20), "ORB Label Background Color", group = groupRangeStyle, tooltip = "Background color for ORB High/Low labels.")
+orbLevelLabelSizeInput = input.string("Small", "ORB Label Size", options = ["Tiny", "Small", "Normal", "Large", "Huge"], group = groupRangeStyle, tooltip = "Size for ORB High/Low labels.")
+orbLevelLabelOffsetBars = input.int(4, "ORB Label Offset (Bars)", minval = 0, maxval = 50, group = groupRangeStyle, tooltip = "Move ORB High/Low labels right of current bar by this many bars (use as right-side padding).")
+rangeFillColor = input.color(color.white, "Range Fill Color", group = groupRangeStyle, tooltip = "Color used for range fill.")
+rangeFillTransp = input.int(92, "Range Fill Transparency", minval = 0, maxval = 100, group = groupRangeStyle, tooltip = "0 = solid, 100 = fully transparent.")
+
+// ---------- Target Values ----------
+groupTargetVals = "Target Values"
+target1Mult = input.float(1.0, "Target 1 Multiplier", minval = 0.01, step = 0.01, group = groupTargetVals, tooltip = "Multiplier for first target.")
+target2Mult = input.float(2.0, "Target 2 Multiplier", minval = 0.01, step = 0.01, group = groupTargetVals, tooltip = "Multiplier for second target.")
+target3Mult = input.float(3.0, "Target 3 Multiplier", minval = 0.01, step = 0.01, group = groupTargetVals, tooltip = "Multiplier for third target.")
+tpTargetChoice = input.string("1x", "TP Target", options = ["1x", "2x", "3x"], group = groupTargetVals, tooltip = "Select which target multiple is used as the trade TP level in the entry engine.")
+targetDurationMinsAfterOpen = input.int(455, "Target Duration Minutes After Open", minval = 1, maxval = 1440, group = groupTargetVals, tooltip = "How long 1x/2x/3x target lines stay visible after session open. Default 455 minutes (09:30 to 17:05).")
+
+// ---------- Target Style ----------
+groupTargetStyle = "Target Style"
+targetLineColor = input.color(color.rgb(30, 144, 255), "Target Line Color", group = groupTargetStyle, tooltip = "Color for all target lines.")
+targetLineWidth = input.int(1, "Target Line Width", minval = 1, maxval = 6, group = groupTargetStyle, tooltip = "Width for all target lines.")
+enableTargetRetouchColorShift = input.bool(true, "Enable Target Retouch Color Shift", group = groupTargetStyle, tooltip = "After a target line is crossed a second time (retouch), color shifts by role: support=green, resistance=red.")
+targetSupportColor = input.color(color.lime, "Retouch Support Color", group = groupTargetStyle, tooltip = "Color when a retouched target acts as support.")
+targetResistanceColor = input.color(color.red, "Retouch Resistance Color", group = groupTargetStyle, tooltip = "Color when a retouched target acts as resistance.")
+showTargetPriceLabels = input.bool(true, "Show Multiplier Price Labels", group = groupTargetStyle, tooltip = "Shows (1X/2X/3X) and live price under each multiplier target line.")
+targetPriceLabelTextColor = input.color(color.white, "Multiplier Label Text Color", group = groupTargetStyle, tooltip = "Text color for multiplier price labels.")
+targetPriceLabelBgColor = input.color(color.new(color.black, 20), "Multiplier Label Background Color", group = groupTargetStyle, tooltip = "Background color for multiplier price labels.")
+targetPriceLabelSizeInput = input.string("Small", "Multiplier Label Size", options = ["Tiny", "Small", "Normal", "Large", "Huge"], group = groupTargetStyle, tooltip = "Size for multiplier price labels.")
+targetPriceLabelOffsetBars = input.int(4, "Multiplier Label Offset (Bars)", minval = 0, maxval = 50, group = groupTargetStyle, tooltip = "Move multiplier price labels right of current bar by this many bars (left pointer targets the line).")
+
+// ---------- Vertical Shade Style ----------
+groupShadeStyle = "Vertical Shade Style"
+verticalShadeColor = input.color(color.rgb(255, 165, 0), "Vertical Shade Color", group = groupShadeStyle, tooltip = "Color for first-minutes vertical shading.")
+verticalShadeTransp = input.int(88, "Vertical Shade Transparency", minval = 0, maxval = 100, group = groupShadeStyle, tooltip = "0 = solid, 100 = fully transparent.")
+
+// ---------- Effective Config Display ----------
+groupEffectiveCfg = "Effective Config Display"
+showEffectiveCfgDataWindow = input.bool(true, "Show Effective Config In Data Window", group = groupEffectiveCfg, tooltip = "Adds effective template/TZ/OR values to Data Window using plotchar.")
+showEffectiveCfgOverlay = input.bool(true, "Show Effective Config Overlay", group = groupEffectiveCfg, tooltip = "Shows compact high-contrast effective config text on chart.")
+effectiveCfgOverlayPosition = input.string("Top Center", "Effective Config Overlay Position", options = ["Top Left", "Top Left Center", "Top Center", "Top Right Center", "Top Right", "Middle Left", "Middle Center", "Middle Right", "Bottom Left", "Bottom Center", "Bottom Right"], group = groupEffectiveCfg, tooltip = "Position of compact effective config text.")
+effectiveCfgTopCenterPadRows = input.int(15, "Top-Center Extra Top Padding (Rows)", minval = 0, maxval = 20, group = groupEffectiveCfg, tooltip = "When position is Top Center, this adds blank rows above the text to push it lower.")
+effectiveCfgTopSideCenterPadCols = input.int(6, "Top Side-Center Horizontal Padding (Cols)", minval = 0, maxval = 40, group = groupEffectiveCfg, tooltip = "When position is Top Left Center / Top Right Center, this shifts text inward from the chart edge.")
+effectiveCfgTextSizeInput = input.string("Small", "Effective Config Text Size", options = ["Tiny", "Small", "Normal", "Large", "Huge"], group = groupEffectiveCfg, tooltip = "Text size for effective config overlay.")
+effectiveCfgTextColor = input.color(color.white, "Effective Config Text Color", group = groupEffectiveCfg, tooltip = "Text color for effective config overlay.")
+effectiveCfgBgColor = input.color(color.black, "Effective Config Background Color", group = groupEffectiveCfg, tooltip = "Background color for effective config overlay.")
+effectiveCfgBgTransp = input.int(10, "Effective Config Background Transparency", minval = 0, maxval = 100, group = groupEffectiveCfg, tooltip = "0 = solid, 100 = fully transparent.")
+
+// ---------- Effective Session Schedule (Templates) ----------
+isSessionCustom = sessionTemplate == "Custom"
+isSessionTokyo = sessionTemplate == "Tokyo"
+presetTzInput = isSessionTokyo ? "Asia/Tokyo" : "America/New_York"
+presetOrStartHour = 9
+presetOrStartMinute = isSessionTokyo ? 0 : 30
+presetOrDurationMins = 5
+presetSessionOpenHour = 9
+presetSessionOpenMinute = isSessionTokyo ? 0 : 30
+presetDisplayEndMinsAfterOpen = 30
+presetFirstMinutesShadedAfterOpen = 5
+presetTriggerDelayMinsAfterOpen = 6
+
+useTemplateTimeDefaults = not isSessionCustom and lockTemplateTimeSettings
+effTzInput = useTemplateTimeDefaults ? presetTzInput : tzInput
+effOrStartHour = useTemplateTimeDefaults ? presetOrStartHour : orStartHour
+effOrStartMinute = useTemplateTimeDefaults ? presetOrStartMinute : orStartMinute
+effOrDurationMins = useTemplateTimeDefaults ? presetOrDurationMins : orDurationMins
+effSessionOpenHour = useTemplateTimeDefaults ? presetSessionOpenHour : nyOpenHour
+effSessionOpenMinute = useTemplateTimeDefaults ? presetSessionOpenMinute : nyOpenMinute
+effDisplayEndMinsAfterOpen = useTemplateTimeDefaults ? presetDisplayEndMinsAfterOpen : displayEndMinsAfterOpen
+effFirstMinutesShadedAfterOpen = useTemplateTimeDefaults ? presetFirstMinutesShadedAfterOpen : firstMinutesShadedAfterOpen
+effTriggerDelayMinsAfterOpen = useTemplateTimeDefaults ? presetTriggerDelayMinsAfterOpen : triggerDelayMinsAfterOpen
+
+// ---------- Helpers ----------
+f_label_size(_size) =>
+    switch _size
+        "Tiny" => size.tiny
+        "Small" => size.small
+        "Normal" => size.normal
+        "Large" => size.large
+        "Huge" => size.huge
+        => size.small
+
+f_pad2(_n) =>
+    _n < 10 ? "0" + str.tostring(_n) : str.tostring(_n)
+
+f_mult_text(_m) =>
+    _mRounded = math.round(_m)
+    math.abs(_m - _mRounded) < 0.000001 ? str.tostring(int(_mRounded)) : str.tostring(_m)
+
+f_delete_label(label _lbl) =>
+    if not na(_lbl)
+        label.delete(_lbl)
+
+f_broke_above(_h, _c, _rangeHigh, _useCloseMode, _useTouchMode) =>
+    _ref = _useCloseMode ? _c : _h
+    _useTouchMode ? _ref >= _rangeHigh : _ref > _rangeHigh
+
+f_broke_below(_l, _c, _rangeLow, _useCloseMode, _useTouchMode) =>
+    _ref = _useCloseMode ? _c : _l
+    _useTouchMode ? _ref <= _rangeLow : _ref < _rangeLow
+
+// Target retouch crossing detector that follows breakout confirm + boundary mode.
+f_crossed_level_by_mode(_lvl, _useCloseMode, _useTouchMode) =>
+    if na(_lvl) or na(close[1]) or na(high[1]) or na(low[1])
+        false
+    else
+        _currUpRef = _useCloseMode ? close : high
+        _currDnRef = _useCloseMode ? close : low
+        _prevUpRef = _useCloseMode ? close[1] : high[1]
+        _prevDnRef = _useCloseMode ? close[1] : low[1]
+        _upCross = _useTouchMode ? (_currUpRef >= _lvl and _prevUpRef < _lvl) : (_currUpRef > _lvl and _prevUpRef <= _lvl)
+        _dnCross = _useTouchMode ? (_currDnRef <= _lvl and _prevDnRef > _lvl) : (_currDnRef < _lvl and _prevDnRef >= _lvl)
+        _upCross or _dnCross
+
+// Returns role for target recolor: 1=support, -1=resistance, 0=ambiguous (hold previous role).
+f_level_role_by_mode(_lvl, _useCloseMode, _useTouchMode) =>
+    if na(_lvl)
+        0
+    else
+        _above = _useCloseMode ? (_useTouchMode ? close >= _lvl : close > _lvl) : (_useTouchMode ? low >= _lvl : low > _lvl)
+        _below = _useCloseMode ? (_useTouchMode ? close <= _lvl : close < _lvl) : (_useTouchMode ? high <= _lvl : high < _lvl)
+        _above and not _below ? 1 : _below and not _above ? -1 : 0
+
+f_breakout_dir(_h, _l, _c, _rangeHigh, _rangeLow, _useCloseMode, _useTouchMode, _ambiguousPolicy) =>
+    _up = f_broke_above(_h, _c, _rangeHigh, _useCloseMode, _useTouchMode)
+    _dn = f_broke_below(_l, _c, _rangeLow, _useCloseMode, _useTouchMode)
+    int _dir = 0
+    if _up and not _dn
+        _dir := 1
+    else if _dn and not _up
+        _dir := -1
+    else if _up and _dn and _ambiguousPolicy == "Use Close Direction"
+        if _c > _rangeHigh
+            _dir := 1
+        else if _c < _rangeLow
+            _dir := -1
+    _dir
+
+// ---------- Effective settings (global presets) ----------
+// Use the selected global preset directly (no template-based remapping).
+effectivePreset = globalPreset
+
+isPresetCustom = effectivePreset == "Custom"
+isPresetES = effectivePreset == "ES"
+isPresetNQ = effectivePreset == "NQ"
+isPresetMNQ = effectivePreset == "MNQ"
+isPresetTokyo = effectivePreset == "Tokyo"
+
+presetBreakoutConfirmMode = "Close"
+presetBreakoutTouchMode = "Break (>/<)"
+presetAmbiguousBreakoutPolicy = "Ignore"
+presetEntryMode = "Retest Limit"
+presetCloseBackInvalidateMode = "Midline/Opposite"
+presetAtrLength = 14
+presetEntryBufferTicks = isPresetES ? 1 : isPresetNQ ? 2 : isPresetMNQ ? 2 : isPresetTokyo ? 1 : entryBufferTicks
+presetRetestToleranceTicks = isPresetES ? 2 : isPresetNQ ? 4 : isPresetMNQ ? 4 : isPresetTokyo ? 2 : retestToleranceTicks
+presetStopBufferTicks = isPresetES ? 1 : isPresetNQ ? 2 : isPresetMNQ ? 2 : isPresetTokyo ? 1 : stopBufferTicks
+presetMaxEntryMinsAfterOpen = isPresetES ? 45 : isPresetNQ ? 60 : isPresetMNQ ? 60 : isPresetTokyo ? 45 : maxEntryMinsAfterOpen
+presetCloseBackInvalidateBars = isPresetES ? 3 : isPresetNQ ? 4 : isPresetMNQ ? 4 : isPresetTokyo ? 3 : closeBackInvalidateBars
+presetMinOrbAtrRatio = isPresetES ? 0.35 : isPresetNQ ? 0.45 : isPresetMNQ ? 0.45 : isPresetTokyo ? 0.35 : minOrbAtrRatio
+presetMaxOrbAtrRatio = isPresetES ? 1.20 : isPresetNQ ? 1.60 : isPresetMNQ ? 1.60 : isPresetTokyo ? 1.20 : maxOrbAtrRatio
+presetReentryWindowMinsAfterOpen = isPresetES ? 3 : isPresetNQ ? 5 : isPresetMNQ ? 5 : isPresetTokyo ? 3 : reentryWindowMinsAfterOpen
+presetBreakoutAfterReentryMinsAfterOpen = isPresetES ? 12 : isPresetNQ ? 20 : isPresetMNQ ? 20 : isPresetTokyo ? 12 : breakoutAfterReentryMinsAfterOpen
+
+effBreakoutConfirmMode = isPresetCustom ? breakoutConfirmMode : presetBreakoutConfirmMode
+effBreakoutTouchMode = isPresetCustom ? breakoutTouchMode : presetBreakoutTouchMode
+effAmbiguousBreakoutPolicy = isPresetCustom ? ambiguousBreakoutPolicy : presetAmbiguousBreakoutPolicy
+effEntryMode = isPresetCustom ? entryMode : presetEntryMode
+effEntryBufferTicks = isPresetCustom ? entryBufferTicks : presetEntryBufferTicks
+effRetestToleranceTicks = isPresetCustom ? retestToleranceTicks : presetRetestToleranceTicks
+effStopBufferTicks = isPresetCustom ? stopBufferTicks : presetStopBufferTicks
+effMaxEntryMinsAfterOpen = isPresetCustom ? maxEntryMinsAfterOpen : presetMaxEntryMinsAfterOpen
+effCloseBackInvalidateBars = isPresetCustom ? closeBackInvalidateBars : presetCloseBackInvalidateBars
+effCloseBackInvalidateMode = isPresetCustom ? closeBackInvalidateMode : presetCloseBackInvalidateMode
+effAtrLength = isPresetCustom ? atrLength : presetAtrLength
+effMinOrbAtrRatio = isPresetCustom ? minOrbAtrRatio : presetMinOrbAtrRatio
+effMaxOrbAtrRatio = isPresetCustom ? maxOrbAtrRatio : presetMaxOrbAtrRatio
+effReentryWindowMinsAfterOpenRaw = isPresetCustom ? reentryWindowMinsAfterOpen : presetReentryWindowMinsAfterOpen
+effBreakoutAfterReentryMinsAfterOpenRaw = isPresetCustom ? breakoutAfterReentryMinsAfterOpen : presetBreakoutAfterReentryMinsAfterOpen
+// Soft guardrails: clamp invalid relationships instead of hard-stopping the script.
+effReentryWindowMinsAfterOpenSafe = math.max(effReentryWindowMinsAfterOpenRaw, effTriggerDelayMinsAfterOpen + 1)
+effBreakoutAfterReentryMinsAfterOpenSafe = math.max(effBreakoutAfterReentryMinsAfterOpenRaw, effReentryWindowMinsAfterOpenSafe + 1)
+effMaxEntryMinsAfterOpenSafe = math.max(effMaxEntryMinsAfterOpen, effTriggerDelayMinsAfterOpen + 1)
+
+STATE_IDLE = 0
+STATE_WAIT_RETEST = 1
+STATE_WAIT_CONTINUATION = 2
+STATE_ENTERED = 3
+STATE_TP_HIT = 4
+STATE_STOP_HIT = 5
+STATE_CANCELLED = 6
+
+f_entry_state_text(_dir, _state) =>
+    _side = _dir == 1 ? "Long" : "Short"
+    switch _state
+        STATE_WAIT_RETEST => _side + " Setup: Wait Retest"
+        STATE_WAIT_CONTINUATION => _side + " Setup: Entry Armed"
+        STATE_ENTERED => _side + " Entered"
+        STATE_TP_HIT => _side + " TP Hit"
+        STATE_STOP_HIT => _side + " Stop Hit"
+        STATE_CANCELLED => _side + " Cancelled"
+        => "Idle"
+
+// ---------- Persistent State ----------
+var float rangeHigh = na
+var float rangeLow = na
+var bool rangeLocked = false
+var float nyOpenPrice = na
+var bool nyOpenCaptured = false
+var bool openInsideRange = false
+var bool openInsideEvaluated = false
+var int highlightedLineDir = 0
+var int entryState = STATE_IDLE
+var int entryDir = 0
+var float plannedEntry = na
+var float plannedStop = na
+var float plannedTp = na
+var int entryFillBar = na
+var bool setupAtrQualified = false
+var bool longTradeLocked = false
+var bool shortTradeLocked = false
+var label entryStatusLabel = na
+var bool reentryOutsideSeen = false
+var bool reentrySeen = false
+var int reentrySeenBarIndex = na
+var bool rule1Triggered = false
+var int armedLineDir = 0
+var int pendingDir = 0
+var int pendingStartBar = na
+var int pendingCloseOutsideCount = 0
+var int entryTerminalBar = na
+var int u1CrossCount = 0
+var int u2CrossCount = 0
+var int u3CrossCount = 0
+var int l1CrossCount = 0
+var int l2CrossCount = 0
+var int l3CrossCount = 0
+var int u1RoleState = 0
+var int u2RoleState = 0
+var int u3RoleState = 0
+var int l1RoleState = 0
+var int l2RoleState = 0
+var int l3RoleState = 0
+var label orbHighLabel = na
+var label orbLowLabel = na
+var label u1InfoLabel = na
+var label u2InfoLabel = na
+var label u3InfoLabel = na
+var label l1InfoLabel = na
+var label l2InfoLabel = na
+var label l3InfoLabel = na
+var float[] todAvgVolByOffset = array.new_float(1440, na)
+var int[] todVolCountByOffset = array.new_int(1440, 0)
+var table effectiveCfgTable = na
+var string effectiveCfgPosState = ""
+var int effectiveCfgRowsState = na
+var int effectiveCfgColsState = na
+
+// ---------- Time window detection ----------
+nyYear = year(time, effTzInput)
+nyMonth = month(time, effTzInput)
+nyDay = dayofmonth(time, effTzInput)
+nyDayKey = nyYear * 10000 + nyMonth * 100 + nyDay
+isNewNyDay = na(nyDayKey[1]) or nyDayKey != nyDayKey[1]
+
+orStartTs = timestamp(effTzInput, nyYear, nyMonth, nyDay, effOrStartHour, effOrStartMinute)
+orEndTs = orStartTs + effOrDurationMins * 60 * 1000
+openTs = timestamp(effTzInput, nyYear, nyMonth, nyDay, effSessionOpenHour, effSessionOpenMinute)
+triggerStartTs = openTs + effTriggerDelayMinsAfterOpen * 60 * 1000
+displayEndTs = openTs + effDisplayEndMinsAfterOpen * 60 * 1000
+shadeEndTs = openTs + effFirstMinutesShadedAfterOpen * 60 * 1000
+targetEndTs = openTs + targetDurationMinsAfterOpen * 60 * 1000
+maxEntryTs = openTs + effMaxEntryMinsAfterOpenSafe * 60 * 1000
+reentryEndTs = openTs + effReentryWindowMinsAfterOpenSafe * 60 * 1000
+breakoutAfterReentryEndTs = openTs + effBreakoutAfterReentryMinsAfterOpenSafe * 60 * 1000
+
+inOrWindow = time >= orStartTs and time < orEndTs
+inDisplayWindow = time >= orStartTs and time < displayEndTs
+inRthShadeWindow = time >= openTs and time < shadeEndTs
+// Re-entry tracking begins at trigger-delay start (not at session open).
+inReentryWindow = time >= triggerStartTs and time < reentryEndTs
+// Breakout-after-reentry phase starts only after re-entry window has ended.
+inBreakoutAfterReentryWindow = time >= reentryEndTs and time < breakoutAfterReentryEndTs
+
+// ---------- Daily reset / OR lock ----------
+if isNewNyDay
+    rangeHigh := na
+    rangeLow := na
+    rangeLocked := false
+    nyOpenPrice := na
+    nyOpenCaptured := false
+    openInsideRange := false
+    openInsideEvaluated := false
+    highlightedLineDir := 0
+    entryState := STATE_IDLE
+    entryDir := 0
+    plannedEntry := na
+    plannedStop := na
+    plannedTp := na
+    entryFillBar := na
+    setupAtrQualified := false
+    longTradeLocked := false
+    shortTradeLocked := false
+    f_delete_label(entryStatusLabel)
+    entryStatusLabel := na
+    reentryOutsideSeen := false
+    reentrySeen := false
+    reentrySeenBarIndex := na
+    rule1Triggered := false
+    armedLineDir := 0
+    pendingDir := 0
+    pendingStartBar := na
+    pendingCloseOutsideCount := 0
+    entryTerminalBar := na
+    u1CrossCount := 0
+    u2CrossCount := 0
+    u3CrossCount := 0
+    l1CrossCount := 0
+    l2CrossCount := 0
+    l3CrossCount := 0
+    u1RoleState := 0
+    u2RoleState := 0
+    u3RoleState := 0
+    l1RoleState := 0
+    l2RoleState := 0
+    l3RoleState := 0
+    f_delete_label(orbHighLabel)
+    f_delete_label(orbLowLabel)
+    orbHighLabel := na
+    orbLowLabel := na
+    f_delete_label(u1InfoLabel)
+    f_delete_label(u2InfoLabel)
+    f_delete_label(u3InfoLabel)
+    f_delete_label(l1InfoLabel)
+    f_delete_label(l2InfoLabel)
+    f_delete_label(l3InfoLabel)
+    u1InfoLabel := na
+    u2InfoLabel := na
+    u3InfoLabel := na
+    l1InfoLabel := na
+    l2InfoLabel := na
+    l3InfoLabel := na
+
+// Limitation: on timeframes larger than OR duration, levels use only available bars in the OR window.
+if inOrWindow and not rangeLocked
+    rangeHigh := na(rangeHigh) ? high : math.max(rangeHigh, high)
+    rangeLow := na(rangeLow) ? low : math.min(rangeLow, low)
+
+if not rangeLocked and time >= orEndTs and not na(rangeHigh) and not na(rangeLow)
+    rangeLocked := true
+
+// Capture session-open bar open first, then evaluate "inside ORB" only after OR is locked.
+isExactOpenBar = hour(time, effTzInput) == effSessionOpenHour and minute(time, effTzInput) == effSessionOpenMinute
+isFirstBarAfterOpen = time >= openTs and (na(time[1]) or time[1] < openTs)
+if not nyOpenCaptured and (isExactOpenBar or isFirstBarAfterOpen)
+    nyOpenPrice := open
+    nyOpenCaptured := true
+
+if not openInsideEvaluated and nyOpenCaptured and rangeLocked and not na(rangeHigh) and not na(rangeLow)
+    openInsideRange := nyOpenPrice >= rangeLow and nyOpenPrice <= rangeHigh
+    openInsideEvaluated := true
+
+tpTargetMult = tpTargetChoice == "1x" ? target1Mult : tpTargetChoice == "2x" ? target2Mult : target3Mult
+mid = not na(rangeHigh) and not na(rangeLow) ? (rangeHigh + rangeLow) * 0.5 : na
+rng = not na(rangeHigh) and not na(rangeLow) ? (rangeHigh - rangeLow) : na
+atrValue = ta.atr(effAtrLength)
+orbAtrRatio = not na(rng) and atrValue > 0 ? rng / atrValue : na
+useTodBasis = volumeContextBasis == "Time-of-Day"
+useTodWarmupFallback = todWarmupBehavior == "Fallback To SMA"
+volOffsetMin = int(math.floor((time - openTs) / 60000.0))
+volSlotActive = time >= openTs and time <= maxEntryTs and volOffsetMin >= 0 and volOffsetMin < 1440
+todAvgVol = volSlotActive ? array.get(todAvgVolByOffset, volOffsetMin) : na
+todSamples = volSlotActive ? array.get(todVolCountByOffset, volOffsetMin) : 0
+volumeMa = ta.sma(volume, volumeMaLength)
+relativeVolumeSma = not na(volumeMa) and volumeMa > 0 ? volume / volumeMa : na
+relativeVolumeTod = volSlotActive and not na(todAvgVol) and todAvgVol > 0 ? volume / todAvgVol : na
+todReady = volSlotActive and todSamples >= todMinSamples and not na(relativeVolumeTod)
+todWarmup = useTodBasis and not todReady
+todUsingSmaFallback = todWarmup and useTodWarmupFallback and not na(relativeVolumeSma)
+relativeVolume = useTodBasis ? (todReady ? relativeVolumeTod : todUsingSmaFallback ? relativeVolumeSma : na) : relativeVolumeSma
+volumeContextDataReady = useTodBasis ? (todReady or todUsingSmaFallback) : not na(relativeVolumeSma)
+volumeContextPassRaw = volumeContextDataReady and not na(relativeVolume) and relativeVolume >= minRelativeVolume
+volumeContextPass = not useVolumeContext or (volumeContextMode == "Close Confirmed" ? (barstate.isconfirmed and volumeContextPassRaw) : volumeContextPassRaw)
+atrRegimePass = not useAtrRegimeFilter or (not na(orbAtrRatio) and orbAtrRatio >= effMinOrbAtrRatio and orbAtrRatio <= effMaxOrbAtrRatio)
+preOrbVisible = inDisplayWindow and not na(rangeHigh) and not na(rangeLow)
+// ORB lines/fill extend to the same duration window used by target multiplier lines.
+orbLinesVisible = time >= orStartTs and time < targetEndTs and not na(rangeHigh) and not na(rangeLow)
+levelsReadyLogic = rangeLocked and not na(rangeHigh) and not na(rangeLow) and not na(rng) and rng > 0
+tightProfileReady = not enforceTightEntryProfile or (effBreakoutConfirmMode == "Close" and effEntryMode == "Retest Limit")
+useCloseMode = effBreakoutConfirmMode == "Close"
+useTouchMode = effBreakoutTouchMode == "Touch (>=/<=)"
+rawBrokeAbove = levelsReadyLogic and f_broke_above(high, close, rangeHigh, useCloseMode, useTouchMode)
+rawBrokeBelow = levelsReadyLogic and f_broke_below(low, close, rangeLow, useCloseMode, useTouchMode)
+breakDir = levelsReadyLogic ? f_breakout_dir(high, low, close, rangeHigh, rangeLow, useCloseMode, useTouchMode, effAmbiguousBreakoutPolicy) : 0
+prevBreakDir = levelsReadyLogic and not na(high[1]) and not na(low[1]) and not na(close[1]) ? f_breakout_dir(high[1], low[1], close[1], rangeHigh, rangeLow, useCloseMode, useTouchMode, effAmbiguousBreakoutPolicy) : 0
+newBreakDir = breakDir != 0 and breakDir != prevBreakDir ? breakDir : 0
+outsideByMode = levelsReadyLogic and (rawBrokeAbove or rawBrokeBelow)
+insideByMode = levelsReadyLogic and not outsideByMode
+entryInFlight = useEntryEngine and (entryState == STATE_WAIT_RETEST or entryState == STATE_WAIT_CONTINUATION or entryState == STATE_ENTERED)
+isTriggerStartCrossBar = time >= triggerStartTs and (na(time[1]) or time[1] < triggerStartTs)
+strictFiltersPass = volumeContextPass and atrRegimePass
+yellowFiltersPass = yellowLineFilterMode == "Use Volume + ATR" ? strictFiltersPass : true
+terminalState = entryState == STATE_TP_HIT or entryState == STATE_STOP_HIT or entryState == STATE_CANCELLED
+if useEntryEngine and terminalState and (na(entryTerminalBar) or bar_index > entryTerminalBar)
+    // Terminal states are shown for one bar, then state resets so new setups can arm.
+    entryState := STATE_IDLE
+    entryDir := 0
+    plannedEntry := na
+    plannedStop := na
+    plannedTp := na
+    entryFillBar := na
+    setupAtrQualified := false
+    entryTerminalBar := na
+
+signalDir = 0
+// Delay-start bridge: if already outside ORB at trigger-start, set pending side and confirm within N bars.
+if levelsReadyLogic and not entryInFlight and openInsideRange and not rule1Triggered and isTriggerStartCrossBar and pendingDir == 0 and breakDir != 0 and newBreakDir == 0
+    pendingDir := breakDir
+    armedLineDir := breakDir
+    pendingStartBar := bar_index
+    pendingCloseOutsideCount := 0
+
+if signalDir == 0 and levelsReadyLogic and pendingDir != 0
+    pendingAge = na(pendingStartBar) ? na : bar_index - pendingStartBar
+    pendingWindowOpen = not na(pendingAge) and pendingAge <= pendingConfirmWindowBars
+    pendingReenteredRange = useCloseMode ? (close <= rangeHigh and close >= rangeLow) : (pendingDir == 1 ? (useTouchMode ? low <= rangeHigh : low < rangeHigh) : (useTouchMode ? high >= rangeLow : high > rangeLow))
+    pendingOppositeOutside = useCloseMode ? (pendingDir == 1 ? (useTouchMode ? close <= rangeLow : close < rangeLow) : (useTouchMode ? close >= rangeHigh : close > rangeHigh)) : (pendingDir == 1 ? (useTouchMode ? low <= rangeLow : low < rangeLow) : (useTouchMode ? high >= rangeHigh : high > rangeHigh))
+    pendingCloseOutside = pendingDir == 1 ? (useTouchMode ? close >= rangeHigh : close > rangeHigh) : (useTouchMode ? close <= rangeLow : close < rangeLow)
+    pendingWickOutside = pendingDir == 1 ? (useTouchMode ? high >= rangeHigh : high > rangeHigh) : (useTouchMode ? low <= rangeLow : low < rangeLow)
+
+    if not pendingWindowOpen or entryInFlight or rule1Triggered
+        pendingDir := 0
+        pendingStartBar := na
+        pendingCloseOutsideCount := 0
+    else if bar_index > pendingStartBar
+        if pendingReenteredRange or pendingOppositeOutside
+            pendingDir := 0
+            pendingStartBar := na
+            pendingCloseOutsideCount := 0
+        else if useCloseMode
+            if pendingCloseOutside
+                pendingCloseOutsideCount += 1
+            if pendingCloseOutsideCount >= pendingCloseConfirmBars and yellowFiltersPass
+                signalDir := pendingDir
+                rule1Triggered := true
+                pendingDir := 0
+                pendingStartBar := na
+                pendingCloseOutsideCount := 0
+            else if pendingCloseOutsideCount >= pendingCloseConfirmBars and not yellowFiltersPass
+                armedLineDir := pendingDir
+        else
+            if pendingWickOutside and not pendingReenteredRange and yellowFiltersPass
+                signalDir := pendingDir
+                rule1Triggered := true
+                pendingDir := 0
+                pendingStartBar := na
+                pendingCloseOutsideCount := 0
+            else if pendingWickOutside and not pendingReenteredRange and not yellowFiltersPass
+                armedLineDir := pendingDir
+
+// Rule 1 (strict): if session-open candle opened inside ORB, first unambiguous breakout sets trigger direction.
+if signalDir == 0 and levelsReadyLogic and not entryInFlight and time >= triggerStartTs and openInsideRange and not rule1Triggered and newBreakDir != 0 and yellowFiltersPass
+    signalDir := newBreakDir
+    rule1Triggered := true
+else if signalDir == 0 and levelsReadyLogic and not entryInFlight and time >= triggerStartTs and openInsideRange and not rule1Triggered and newBreakDir != 0 and not yellowFiltersPass
+    armedLineDir := newBreakDir
+
+// Rule 2 (strict): outside in re-entry window -> later re-entry in that window -> later breakout in confirmation window.
+if levelsReadyLogic and not entryInFlight
+    if inReentryWindow
+        if not reentryOutsideSeen and outsideByMode
+            reentryOutsideSeen := true
+        else if reentryOutsideSeen and not reentrySeen and insideByMode
+            reentrySeen := true
+            reentrySeenBarIndex := bar_index
+    if signalDir == 0 and time >= triggerStartTs and reentrySeen and inBreakoutAfterReentryWindow and not na(reentrySeenBarIndex) and bar_index > reentrySeenBarIndex and newBreakDir != 0 and yellowFiltersPass
+        signalDir := newBreakDir
+    else if signalDir == 0 and time >= triggerStartTs and reentrySeen and inBreakoutAfterReentryWindow and not na(reentrySeenBarIndex) and bar_index > reentrySeenBarIndex and newBreakDir != 0 and not yellowFiltersPass
+        armedLineDir := newBreakDir
+
+// Opposite-direction rearm path: after one direction is filled, allow the opposite side on a new breakout event.
+if signalDir == 0 and useEntryEngine and oneTradePerDay and entryState == STATE_IDLE and time >= triggerStartTs and time <= maxEntryTs and levelsReadyLogic
+    if longTradeLocked and not shortTradeLocked and newBreakDir == -1 and yellowFiltersPass
+        signalDir := -1
+    else if longTradeLocked and not shortTradeLocked and newBreakDir == -1 and not yellowFiltersPass
+        armedLineDir := -1
+    else if shortTradeLocked and not longTradeLocked and newBreakDir == 1 and yellowFiltersPass
+        signalDir := 1
+    else if shortTradeLocked and not longTradeLocked and newBreakDir == 1 and not yellowFiltersPass
+        armedLineDir := 1
+
+if signalDir != 0 and not entryInFlight
+    highlightedLineDir := signalDir
+    armedLineDir := 0
+
+if armedLineDir != 0
+    armedSideStillOutside = armedLineDir == 1 ? f_broke_above(high, close, rangeHigh, useCloseMode, useTouchMode) : f_broke_below(low, close, rangeLow, useCloseMode, useTouchMode)
+    armedStillValid = levelsReadyLogic and not entryInFlight and time >= triggerStartTs and time <= maxEntryTs and armedSideStillOutside
+    if not armedStillValid
+        armedLineDir := 0
+
+// ---------- Entry engine state machine ----------
+tickSize = syminfo.mintick
+entryWindowOpen = time >= triggerStartTs and time <= maxEntryTs
+entryModeActive = effEntryMode
+directionLockPass = not oneTradePerDay or (signalDir == 1 ? not longTradeLocked : signalDir == -1 ? not shortTradeLocked : false)
+engineVisualWindow = engineVisibilityMode == "Follow Entry Window" ? entryWindowOpen : preOrbVisible
+
+if useEntryEngine and levelsReadyLogic and strictFiltersPass and tightProfileReady and signalDir != 0 and entryState == STATE_IDLE and entryWindowOpen and directionLockPass
+    entryDir := signalDir
+    plannedEntry := entryDir == 1 ? rangeHigh + effEntryBufferTicks * tickSize : rangeLow - effEntryBufferTicks * tickSize
+    plannedStop := entryDir == 1 ? rangeLow - effStopBufferTicks * tickSize : rangeHigh + effStopBufferTicks * tickSize
+    plannedTp := entryDir == 1 ? rangeHigh + tpTargetMult * rng : rangeLow - tpTargetMult * rng
+    entryState := entryModeActive == "Retest Limit" ? STATE_WAIT_RETEST : STATE_WAIT_CONTINUATION
+    entryFillBar := na
+    setupAtrQualified := atrRegimePass
+
+entryPending = entryState == STATE_WAIT_RETEST or entryState == STATE_WAIT_CONTINUATION
+if useEntryEngine and entryPending
+    invalidPreEntry = entryDir == 1 ? (useTouchMode ? close <= rangeLow : close < rangeLow) : (useTouchMode ? close >= rangeHigh : close > rangeHigh)
+    if invalidPreEntry or not levelsReadyLogic or time > maxEntryTs or (useAtrRegimeFilter and not setupAtrQualified)
+        entryState := STATE_CANCELLED
+        entryTerminalBar := bar_index
+    else if entryState == STATE_WAIT_RETEST
+        retestBand = effRetestToleranceTicks * tickSize
+        retested = entryDir == 1 ? low <= rangeHigh + retestBand : high >= rangeLow - retestBand
+        if retested
+            entryState := STATE_WAIT_CONTINUATION
+    else if entryState == STATE_WAIT_CONTINUATION
+        filled = entryDir == 1 ? f_broke_above(high, close, plannedEntry, useCloseMode, useTouchMode) : f_broke_below(low, close, plannedEntry, useCloseMode, useTouchMode)
+        if filled
+            entryState := STATE_ENTERED
+            entryFillBar := bar_index
+            if oneTradePerDay
+                if entryDir == 1
+                    longTradeLocked := true
+                else if entryDir == -1
+                    shortTradeLocked := true
+
+if useEntryEngine and entryState == STATE_ENTERED
+    hitTp = entryDir == 1 ? f_broke_above(high, close, plannedTp, useCloseMode, useTouchMode) : f_broke_below(low, close, plannedTp, useCloseMode, useTouchMode)
+    hitStop = entryDir == 1 ? f_broke_below(low, close, plannedStop, useCloseMode, useTouchMode) : f_broke_above(high, close, plannedStop, useCloseMode, useTouchMode)
+    barsSinceEntry = na(entryFillBar) ? na : bar_index - entryFillBar
+    backInsideOrb = entryDir == 1 ? (useTouchMode ? close <= rangeHigh : close < rangeHigh) : (useTouchMode ? close >= rangeLow : close > rangeLow)
+    throughMidline = entryDir == 1 ? (useTouchMode ? close <= mid : close < mid) : (useTouchMode ? close >= mid : close > mid)
+    throughOppBoundary = entryDir == 1 ? (useTouchMode ? close <= rangeLow : close < rangeLow) : (useTouchMode ? close >= rangeHigh : close > rangeHigh)
+    invalidateByMode = effCloseBackInvalidateMode == "Inside ORB" ? backInsideOrb : (throughMidline or throughOppBoundary)
+    invalidateCloseBack = useCloseBackInvalidation and not na(barsSinceEntry) and barsSinceEntry > 0 and barsSinceEntry <= effCloseBackInvalidateBars and invalidateByMode
+    if hitStop
+        entryState := STATE_STOP_HIT
+        entryTerminalBar := bar_index
+    else if hitTp
+        entryState := STATE_TP_HIT
+        entryTerminalBar := bar_index
+    else if invalidateCloseBack
+        entryState := STATE_CANCELLED
+        entryTerminalBar := bar_index
+
+// ---------- Plotting / fill ----------
+highLineColorActive = highlightedLineDir == 1 ? triggeredOrbLineColor : armedLineDir == 1 ? armedOrbLineColor : highLineColor
+lowLineColorActive = highlightedLineDir == -1 ? triggeredOrbLineColor : armedLineDir == -1 ? armedOrbLineColor : lowLineColor
+
+preHigh = showPreOrbHighLow and orbLinesVisible ? rangeHigh : na
+preLow = showPreOrbHighLow and orbLinesVisible ? rangeLow : na
+preMid = showMidline and orbLinesVisible ? mid : na
+
+plot(preHigh, "Pre-ORB High", color = highLineColorActive, linewidth = highLineWidth, style = plot.style_linebr)
+plot(preLow, "Pre-ORB Low", color = lowLineColorActive, linewidth = lowLineWidth, style = plot.style_linebr)
+// Dotted-like midline visual.
+plot(preMid, "Pre-ORB Mid", color = midLineColor, linewidth = midLineWidth, style = plot.style_circles)
+
+// ORB boundary labels on the right side of the chart.
+showOrbLabelsNow = showPreOrbHighLow and showOrbLevelLabels and orbLinesVisible
+if showOrbLabelsNow
+    orbLblX = bar_index + orbLevelLabelOffsetBars
+    orbLblSize = f_label_size(orbLevelLabelSizeInput)
+    if na(orbHighLabel)
+        orbHighLabel := label.new(orbLblX, rangeHigh, "ORB High", xloc = xloc.bar_index, style = label.style_label_left, textcolor = orbLevelLabelTextColor, color = orbLevelLabelBgColor, size = orbLblSize)
+    else
+        label.set_x(orbHighLabel, orbLblX)
+        label.set_y(orbHighLabel, rangeHigh)
+        label.set_text(orbHighLabel, "ORB High")
+        label.set_style(orbHighLabel, label.style_label_left)
+        label.set_textcolor(orbHighLabel, orbLevelLabelTextColor)
+        label.set_color(orbHighLabel, orbLevelLabelBgColor)
+        label.set_size(orbHighLabel, orbLblSize)
+
+    if na(orbLowLabel)
+        orbLowLabel := label.new(orbLblX, rangeLow, "ORB Low", xloc = xloc.bar_index, style = label.style_label_left, textcolor = orbLevelLabelTextColor, color = orbLevelLabelBgColor, size = orbLblSize)
+    else
+        label.set_x(orbLowLabel, orbLblX)
+        label.set_y(orbLowLabel, rangeLow)
+        label.set_text(orbLowLabel, "ORB Low")
+        label.set_style(orbLowLabel, label.style_label_left)
+        label.set_textcolor(orbLowLabel, orbLevelLabelTextColor)
+        label.set_color(orbLowLabel, orbLevelLabelBgColor)
+        label.set_size(orbLowLabel, orbLblSize)
+else
+    f_delete_label(orbHighLabel)
+    f_delete_label(orbLowLabel)
+    orbHighLabel := na
+    orbLowLabel := na
+
+fillTop = plot(showRangeFill and orbLinesVisible ? rangeHigh : na, "Fill Top", display = display.none)
+fillBot = plot(showRangeFill and orbLinesVisible ? rangeLow : na, "Fill Bottom", display = display.none)
+fill(fillTop, fillBot, title = "Pre-ORB Fill", color = color.new(rangeFillColor, rangeFillTransp))
+
+// ---------- Targets ----------
+// 1x/2x/3x are multiples of FULL range from ORB High (up) and ORB Low (down).
+targetsWindowActive = time >= orStartTs and time < targetEndTs and rangeLocked and not na(rng) and rng > 0
+
+u1Raw = targetsWindowActive ? rangeHigh + target1Mult * rng : na
+u2Raw = targetsWindowActive ? rangeHigh + target2Mult * rng : na
+u3Raw = targetsWindowActive ? rangeHigh + target3Mult * rng : na
+l1Raw = targetsWindowActive ? rangeLow - target1Mult * rng : na
+l2Raw = targetsWindowActive ? rangeLow - target2Mult * rng : na
+l3Raw = targetsWindowActive ? rangeLow - target3Mult * rng : na
+
+if targetsWindowActive
+    if f_crossed_level_by_mode(u1Raw, useCloseMode, useTouchMode)
+        u1CrossCount += 1
+    if f_crossed_level_by_mode(u2Raw, useCloseMode, useTouchMode)
+        u2CrossCount += 1
+    if f_crossed_level_by_mode(u3Raw, useCloseMode, useTouchMode)
+        u3CrossCount += 1
+    if f_crossed_level_by_mode(l1Raw, useCloseMode, useTouchMode)
+        l1CrossCount += 1
+    if f_crossed_level_by_mode(l2Raw, useCloseMode, useTouchMode)
+        l2CrossCount += 1
+    if f_crossed_level_by_mode(l3Raw, useCloseMode, useTouchMode)
+        l3CrossCount += 1
+
+if enableTargetRetouchColorShift and targetsWindowActive
+    if u1CrossCount >= 2 and not na(u1Raw)
+        u1RoleNow = f_level_role_by_mode(u1Raw, useCloseMode, useTouchMode)
+        if u1RoleNow != 0
+            u1RoleState := u1RoleNow
+    if u2CrossCount >= 2 and not na(u2Raw)
+        u2RoleNow = f_level_role_by_mode(u2Raw, useCloseMode, useTouchMode)
+        if u2RoleNow != 0
+            u2RoleState := u2RoleNow
+    if u3CrossCount >= 2 and not na(u3Raw)
+        u3RoleNow = f_level_role_by_mode(u3Raw, useCloseMode, useTouchMode)
+        if u3RoleNow != 0
+            u3RoleState := u3RoleNow
+    if l1CrossCount >= 2 and not na(l1Raw)
+        l1RoleNow = f_level_role_by_mode(l1Raw, useCloseMode, useTouchMode)
+        if l1RoleNow != 0
+            l1RoleState := l1RoleNow
+    if l2CrossCount >= 2 and not na(l2Raw)
+        l2RoleNow = f_level_role_by_mode(l2Raw, useCloseMode, useTouchMode)
+        if l2RoleNow != 0
+            l2RoleState := l2RoleNow
+    if l3CrossCount >= 2 and not na(l3Raw)
+        l3RoleNow = f_level_role_by_mode(l3Raw, useCloseMode, useTouchMode)
+        if l3RoleNow != 0
+            l3RoleState := l3RoleNow
+
+u1Color = enableTargetRetouchColorShift and u1CrossCount >= 2 and not na(u1Raw) ? (u1RoleState == 1 ? targetSupportColor : u1RoleState == -1 ? targetResistanceColor : targetLineColor) : targetLineColor
+u2Color = enableTargetRetouchColorShift and u2CrossCount >= 2 and not na(u2Raw) ? (u2RoleState == 1 ? targetSupportColor : u2RoleState == -1 ? targetResistanceColor : targetLineColor) : targetLineColor
+u3Color = enableTargetRetouchColorShift and u3CrossCount >= 2 and not na(u3Raw) ? (u3RoleState == 1 ? targetSupportColor : u3RoleState == -1 ? targetResistanceColor : targetLineColor) : targetLineColor
+l1Color = enableTargetRetouchColorShift and l1CrossCount >= 2 and not na(l1Raw) ? (l1RoleState == 1 ? targetSupportColor : l1RoleState == -1 ? targetResistanceColor : targetLineColor) : targetLineColor
+l2Color = enableTargetRetouchColorShift and l2CrossCount >= 2 and not na(l2Raw) ? (l2RoleState == 1 ? targetSupportColor : l2RoleState == -1 ? targetResistanceColor : targetLineColor) : targetLineColor
+l3Color = enableTargetRetouchColorShift and l3CrossCount >= 2 and not na(l3Raw) ? (l3RoleState == 1 ? targetSupportColor : l3RoleState == -1 ? targetResistanceColor : targetLineColor) : targetLineColor
+
+targetsVisible = showTargets and targetsWindowActive
+u1 = targetsVisible ? u1Raw : na
+u2 = targetsVisible ? u2Raw : na
+u3 = targetsVisible ? u3Raw : na
+l1 = targetsVisible ? l1Raw : na
+l2 = targetsVisible ? l2Raw : na
+l3 = targetsVisible ? l3Raw : na
+
+plot(u1, "Target Upper 1x", color = u1Color, linewidth = targetLineWidth, style = plot.style_linebr)
+plot(u2, "Target Upper 2x", color = u2Color, linewidth = targetLineWidth, style = plot.style_linebr)
+plot(u3, "Target Upper 3x", color = u3Color, linewidth = targetLineWidth, style = plot.style_linebr)
+plot(l1, "Target Lower 1x", color = l1Color, linewidth = targetLineWidth, style = plot.style_linebr)
+plot(l2, "Target Lower 2x", color = l2Color, linewidth = targetLineWidth, style = plot.style_linebr)
+plot(l3, "Target Lower 3x", color = l3Color, linewidth = targetLineWidth, style = plot.style_linebr)
+
+// Multiplier labels: show "(1X/2X/3X) <price>" on the right with a left pointer to each target line.
+showTargetLabelsNow = targetsVisible and showTargetPriceLabels
+if showTargetLabelsNow
+    targetLblX = bar_index + targetPriceLabelOffsetBars
+    targetLblSize = f_label_size(targetPriceLabelSizeInput)
+    u1Txt = "(" + f_mult_text(target1Mult) + "X) " + str.tostring(u1, format.mintick)
+    u2Txt = "(" + f_mult_text(target2Mult) + "X) " + str.tostring(u2, format.mintick)
+    u3Txt = "(" + f_mult_text(target3Mult) + "X) " + str.tostring(u3, format.mintick)
+    l1Txt = "(" + f_mult_text(target1Mult) + "X) " + str.tostring(l1, format.mintick)
+    l2Txt = "(" + f_mult_text(target2Mult) + "X) " + str.tostring(l2, format.mintick)
+    l3Txt = "(" + f_mult_text(target3Mult) + "X) " + str.tostring(l3, format.mintick)
+
+    if na(u1InfoLabel)
+        u1InfoLabel := label.new(targetLblX, u1, u1Txt, xloc = xloc.bar_index, style = label.style_label_left, textcolor = targetPriceLabelTextColor, color = targetPriceLabelBgColor, size = targetLblSize)
+    else
+        label.set_x(u1InfoLabel, targetLblX)
+        label.set_y(u1InfoLabel, u1)
+        label.set_text(u1InfoLabel, u1Txt)
+        label.set_style(u1InfoLabel, label.style_label_left)
+        label.set_textcolor(u1InfoLabel, targetPriceLabelTextColor)
+        label.set_color(u1InfoLabel, targetPriceLabelBgColor)
+        label.set_size(u1InfoLabel, targetLblSize)
+
+    if na(u2InfoLabel)
+        u2InfoLabel := label.new(targetLblX, u2, u2Txt, xloc = xloc.bar_index, style = label.style_label_left, textcolor = targetPriceLabelTextColor, color = targetPriceLabelBgColor, size = targetLblSize)
+    else
+        label.set_x(u2InfoLabel, targetLblX)
+        label.set_y(u2InfoLabel, u2)
+        label.set_text(u2InfoLabel, u2Txt)
+        label.set_style(u2InfoLabel, label.style_label_left)
+        label.set_textcolor(u2InfoLabel, targetPriceLabelTextColor)
+        label.set_color(u2InfoLabel, targetPriceLabelBgColor)
+        label.set_size(u2InfoLabel, targetLblSize)
+
+    if na(u3InfoLabel)
+        u3InfoLabel := label.new(targetLblX, u3, u3Txt, xloc = xloc.bar_index, style = label.style_label_left, textcolor = targetPriceLabelTextColor, color = targetPriceLabelBgColor, size = targetLblSize)
+    else
+        label.set_x(u3InfoLabel, targetLblX)
+        label.set_y(u3InfoLabel, u3)
+        label.set_text(u3InfoLabel, u3Txt)
+        label.set_style(u3InfoLabel, label.style_label_left)
+        label.set_textcolor(u3InfoLabel, targetPriceLabelTextColor)
+        label.set_color(u3InfoLabel, targetPriceLabelBgColor)
+        label.set_size(u3InfoLabel, targetLblSize)
+
+    if na(l1InfoLabel)
+        l1InfoLabel := label.new(targetLblX, l1, l1Txt, xloc = xloc.bar_index, style = label.style_label_left, textcolor = targetPriceLabelTextColor, color = targetPriceLabelBgColor, size = targetLblSize)
+    else
+        label.set_x(l1InfoLabel, targetLblX)
+        label.set_y(l1InfoLabel, l1)
+        label.set_text(l1InfoLabel, l1Txt)
+        label.set_style(l1InfoLabel, label.style_label_left)
+        label.set_textcolor(l1InfoLabel, targetPriceLabelTextColor)
+        label.set_color(l1InfoLabel, targetPriceLabelBgColor)
+        label.set_size(l1InfoLabel, targetLblSize)
+
+    if na(l2InfoLabel)
+        l2InfoLabel := label.new(targetLblX, l2, l2Txt, xloc = xloc.bar_index, style = label.style_label_left, textcolor = targetPriceLabelTextColor, color = targetPriceLabelBgColor, size = targetLblSize)
+    else
+        label.set_x(l2InfoLabel, targetLblX)
+        label.set_y(l2InfoLabel, l2)
+        label.set_text(l2InfoLabel, l2Txt)
+        label.set_style(l2InfoLabel, label.style_label_left)
+        label.set_textcolor(l2InfoLabel, targetPriceLabelTextColor)
+        label.set_color(l2InfoLabel, targetPriceLabelBgColor)
+        label.set_size(l2InfoLabel, targetLblSize)
+
+    if na(l3InfoLabel)
+        l3InfoLabel := label.new(targetLblX, l3, l3Txt, xloc = xloc.bar_index, style = label.style_label_left, textcolor = targetPriceLabelTextColor, color = targetPriceLabelBgColor, size = targetLblSize)
+    else
+        label.set_x(l3InfoLabel, targetLblX)
+        label.set_y(l3InfoLabel, l3)
+        label.set_text(l3InfoLabel, l3Txt)
+        label.set_style(l3InfoLabel, label.style_label_left)
+        label.set_textcolor(l3InfoLabel, targetPriceLabelTextColor)
+        label.set_color(l3InfoLabel, targetPriceLabelBgColor)
+        label.set_size(l3InfoLabel, targetLblSize)
+else
+    f_delete_label(u1InfoLabel)
+    f_delete_label(u2InfoLabel)
+    f_delete_label(u3InfoLabel)
+    f_delete_label(l1InfoLabel)
+    f_delete_label(l2InfoLabel)
+    f_delete_label(l3InfoLabel)
+    u1InfoLabel := na
+    u2InfoLabel := na
+    u3InfoLabel := na
+    l1InfoLabel := na
+    l2InfoLabel := na
+    l3InfoLabel := na
+
+// Entry guide levels from the state machine.
+entryGuideVisible = useEntryEngine and showEntryOrderLine and engineVisualWindow and levelsReadyLogic and entryState != STATE_IDLE and entryState != STATE_CANCELLED
+plot(entryGuideVisible ? plannedEntry : na, "Entry Guide", color = entryLineColor, linewidth = entryGuideLineWidth, style = plot.style_linebr)
+plot(entryGuideVisible ? plannedStop : na, "Stop Guide", color = stopLineColor, linewidth = entryGuideLineWidth, style = plot.style_linebr)
+
+// Entry status label (single label, updated each bar).
+showEntryLabelNow = useEntryEngine and showEntryStatusLabel and engineVisualWindow and levelsReadyLogic and entryState != STATE_IDLE
+if showEntryLabelNow
+    entryLblX = bar_index + entryStatusLabelOffsetBars
+    entryLblY = na(plannedEntry) ? close : plannedEntry
+    entryStateText = f_entry_state_text(entryDir, entryState)
+    entryPriceText = na(plannedEntry) ? "" : " @ " + str.tostring(plannedEntry, format.mintick)
+    entryLblText = entryStateText + entryPriceText
+    entryLblBg = entryState == STATE_TP_HIT ? color.new(color.green, 0) : entryState == STATE_STOP_HIT or entryState == STATE_CANCELLED ? color.new(color.red, 0) : color.new(color.black, 0)
+    if na(entryStatusLabel)
+        entryStatusLabel := label.new(entryLblX, entryLblY, entryLblText, xloc = xloc.bar_index, style = label.style_label_left, textcolor = color.white, color = entryLblBg, size = size.small)
+    else
+        label.set_x(entryStatusLabel, entryLblX)
+        label.set_y(entryStatusLabel, entryLblY)
+        label.set_text(entryStatusLabel, entryLblText)
+        label.set_textcolor(entryStatusLabel, color.white)
+        label.set_color(entryStatusLabel, entryLblBg)
+        label.set_style(entryStatusLabel, label.style_label_left)
+        label.set_size(entryStatusLabel, size.small)
+else
+    f_delete_label(entryStatusLabel)
+    entryStatusLabel := na
+
+// Update time-of-day volume baseline after calculations, using closed bars only.
+if barstate.isconfirmed and volSlotActive
+    _sampleCount = array.get(todVolCountByOffset, volOffsetMin)
+    _prevAvg = array.get(todAvgVolByOffset, volOffsetMin)
+    if useTodBasis and useTodWarmupFallback and todSeedFromSmaOnReset and _sampleCount == 0 and not na(volumeMa)
+        _sampleCount := math.max(todMinSamples - 1, 0)
+        _prevAvg := volumeMa
+    _newAvg = na(_prevAvg) ? volume : (_prevAvg * _sampleCount + volume) / (_sampleCount + 1)
+    array.set(todAvgVolByOffset, volOffsetMin, _newAvg)
+    array.set(todVolCountByOffset, volOffsetMin, _sampleCount + 1)
+
+// ---------- Effective config signal ----------
+effTzCode = effTzInput == "America/New_York" ? 1 : effTzInput == "Asia/Tokyo" ? 2 : 0
+plotchar(showEffectiveCfgDataWindow ? (useTemplateTimeDefaults ? 1 : 0) : na, title = "Cfg: Template Active (1/0)", char = "*", location = location.top, display = display.data_window)
+plotchar(showEffectiveCfgDataWindow ? effTzCode : na, title = "Cfg: Effective TZ Code (1=NY,2=Tokyo,0=Other)", char = "*", location = location.top, display = display.data_window)
+plotchar(showEffectiveCfgDataWindow ? effOrStartHour : na, title = "Cfg: Effective OR Start Hour", char = "*", location = location.top, display = display.data_window)
+plotchar(showEffectiveCfgDataWindow ? effOrStartMinute : na, title = "Cfg: Effective OR Start Minute", char = "*", location = location.top, display = display.data_window)
+plotchar(showEffectiveCfgDataWindow ? effOrDurationMins : na, title = "Cfg: Effective OR Duration (Min)", char = "*", location = location.top, display = display.data_window)
+
+isTopLeftCenterPos = effectiveCfgOverlayPosition == "Top Left Center"
+isTopRightCenterPos = effectiveCfgOverlayPosition == "Top Right Center"
+cfgPos = switch effectiveCfgOverlayPosition
+    "Top Left" => position.top_left
+    "Top Left Center" => position.top_left
+    "Top Center" => position.top_center
+    "Top Right Center" => position.top_right
+    "Top Right" => position.top_right
+    "Middle Left" => position.middle_left
+    "Middle Center" => position.middle_center
+    "Middle Right" => position.middle_right
+    "Bottom Left" => position.bottom_left
+    "Bottom Center" => position.bottom_center
+    => position.bottom_right
+cfgPadRows = effectiveCfgOverlayPosition == "Top Center" ? effectiveCfgTopCenterPadRows : 0
+cfgPadCols = (isTopLeftCenterPos or isTopRightCenterPos) ? effectiveCfgTopSideCenterPadCols : 0
+cfgRows = cfgPadRows + 1
+cfgCols = cfgPadCols + 1
+cfgTextCol = isTopRightCenterPos ? 0 : cfgPadCols
+cfgPosKey = effectiveCfgOverlayPosition + "|" + str.tostring(cfgPadRows) + "|" + str.tostring(cfgPadCols)
+cfgTextSize = f_label_size(effectiveCfgTextSizeInput)
+if na(effectiveCfgTable) or effectiveCfgPosState != cfgPosKey or effectiveCfgRowsState != cfgRows or effectiveCfgColsState != cfgCols
+    if not na(effectiveCfgTable)
+        table.delete(effectiveCfgTable)
+    effectiveCfgTable := table.new(cfgPos, cfgCols, cfgRows)
+    effectiveCfgPosState := cfgPosKey
+    effectiveCfgRowsState := cfgRows
+    effectiveCfgColsState := cfgCols
+
+if showEffectiveCfgOverlay
+    cfgModeText = useTemplateTimeDefaults ? "TEMPLATE" : "MANUAL"
+    cfgText = "CFG " + cfgModeText + " | TZ " + effTzInput + " | OR " + f_pad2(effOrStartHour) + ":" + f_pad2(effOrStartMinute) + " +" + str.tostring(effOrDurationMins) + "m"
+    table.clear(effectiveCfgTable, 0, 0, cfgCols - 1, cfgRows - 1)
+    table.cell(effectiveCfgTable, cfgTextCol, cfgPadRows, cfgText, text_color = effectiveCfgTextColor, text_size = cfgTextSize, bgcolor = color.new(effectiveCfgBgColor, effectiveCfgBgTransp))
+else
+    table.clear(effectiveCfgTable, 0, 0, cfgCols - 1, cfgRows - 1)
+
+// ---------- Vertical shading ----------
+bgcolor(showRthShade and inRthShadeWindow ? color.new(verticalShadeColor, verticalShadeTransp) : na, title = "Session First-Minutes Shade")

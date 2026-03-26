@@ -1,0 +1,727 @@
+//@version=6
+indicator("Confirmed Liquidity Matrix [CodaPro]", overlay=true, max_boxes_count=500, max_lines_count=500, max_labels_count=500)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  CODAPRO TRADING SYSTEMS — LIQUIDITY MATRIX [Confirmed]
+//  Institutional Volume Towers + Order Blocks + Round Numbers + S/R Grid
+//  Version 1.0 | ArisCodes | CodaPro.ai Engine
+//  Copyright (c) 2026 CodaPro.ai LLC — All Rights Reserved
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// ─── COLOR PALETTE ────────────────────────────────────────────────────────────
+color C_TEAL     = color.new(#00F5D4, 0)
+color C_TEAL_DIM = color.new(#00F5D4, 60)
+color C_GOLD     = color.new(#FFD700, 0)
+color C_GOLD_DIM = color.new(#FFD700, 60)
+color C_BULL     = color.new(#00FF88, 0)
+color C_BEAR     = color.new(#FF4466, 0)
+color C_BG       = color.new(#0a0a14, 10)
+color C_MUTED    = color.new(color.white, 30)
+color C_GRAY     = color.new(#555555, 0)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  SETTINGS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+string GRP_VT = "VOLUME TOWERS"
+bool   i_vt_show = input.bool(true,  "Show Volume Towers",           group=GRP_VT)
+int    i_vt_lb   = input.int(100,    "Lookback Bars",   minval=20,   group=GRP_VT)
+int    i_vt_bins = input.int(20,     "Bin Count",       minval=10, maxval=40, group=GRP_VT)
+
+string GRP_OB = "ORDER BLOCKS"
+bool   i_ob_show = input.bool(true,  "Show Order Blocks",            group=GRP_OB)
+float  i_ob_atr  = input.float(1.5,  "OB Impulse Strength (ATR x)", step=0.1, minval=0.5, group=GRP_OB)
+int    i_ob_max  = input.int(5,      "Max Active OBs Per Side",     minval=1, maxval=10,   group=GRP_OB)
+
+string GRP_IL = "INSTITUTIONAL LEVELS"
+bool   i_il_show  = input.bool(true, "Show Institutional Levels",   group=GRP_IL)
+float  i_il_step  = input.float(100.0, "Round Number Step",         group=GRP_IL, minval=1.0)
+int    i_il_count = input.int(5,     "Levels Above / Below",        group=GRP_IL, minval=1, maxval=10)
+
+string GRP_SR = "PIVOT S/R ZONES"
+bool   i_sr_show  = input.bool(true, "Show S/R Zones",              group=GRP_SR)
+int    i_sr_left  = input.int(10,    "Pivot Left Bars",             group=GRP_SR, minval=3, maxval=50)
+int    i_sr_right = input.int(5,     "Pivot Right Bars",            group=GRP_SR, minval=1, maxval=20)
+float  i_sr_atr   = input.float(0.5, "Zone ATR Tolerance",          group=GRP_SR, minval=0.1, maxval=2.0, step=0.1)
+
+string GRP_SIG = "SIGNALS"
+int    i_sig_min = input.int(3,  "Min Confluence Score (1-4)", minval=1, maxval=4, group=GRP_SIG)
+int    i_sig_cd  = input.int(5,  "Cooldown Bars",              minval=0, maxval=50, group=GRP_SIG)
+
+string GRP_TM = "TRADE MANAGEMENT"
+bool   i_tm_show = input.bool(true,  "Enable Trade Management",     group=GRP_TM)
+float  i_tm_tp   = input.float(2.0,  "TP Multiplier (ATR x)",       group=GRP_TM, step=0.1, minval=0.5)
+float  i_tm_sl   = input.float(1.0,  "SL Multiplier (ATR x)",       group=GRP_TM, step=0.1, minval=0.2)
+int    i_tm_max  = input.int(30,     "Max Bars in Trade",           group=GRP_TM, minval=5, maxval=200)
+
+// ─── GHOST CANDLES ────────────────────────────────────────────────────────────
+barcolor(color.new(color.gray, 80))
+
+// ─── BASE CALCULATIONS ────────────────────────────────────────────────────────
+float atr14 = ta.atr(14)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  UTILITY: GAUGE BAR BUILDER
+// ═══════════════════════════════════════════════════════════════════════════════
+f_gauge(float pct, int barLen) =>
+    int    filled = math.round(math.max(pct, 0) / 100.0 * barLen)
+    int    empty  = barLen - filled
+    string bar    = ""
+    for i = 0 to filled - 1
+        bar += "█"
+    for i = 0 to empty - 1
+        bar += "░"
+    bar
+
+f_dotRow(int active, int total) =>
+    string dots = ""
+    for i = 1 to total
+        dots += i <= active ? "●" : "○"
+    dots
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  ENGINE 1 — 3D VOLUME LIQUIDITY TOWERS
+//  Three stacked box layers per bin create depth/perspective illusion
+// ═══════════════════════════════════════════════════════════════════════════════
+
+var box[] vt_back  = array.new<box>()
+var box[] vt_mid   = array.new<box>()
+var box[] vt_front = array.new<box>()
+
+if barstate.islast and i_vt_show
+    // Purge previous drawings
+    for b in vt_back
+        box.delete(b)
+    for b in vt_mid
+        box.delete(b)
+    for b in vt_front
+        box.delete(b)
+    array.clear(vt_back)
+    array.clear(vt_mid)
+    array.clear(vt_front)
+
+    // Establish price range over lookback
+    float rangeHigh = high
+    float rangeLow  = low
+    for i = 0 to i_vt_lb - 1
+        rangeHigh := math.max(rangeHigh, high[i])
+        rangeLow  := math.min(rangeLow,  low[i])
+
+    float binSize = (rangeHigh - rangeLow) / i_vt_bins
+
+    if binSize > 0
+        float[] volBins = array.new<float>(i_vt_bins, 0.0)
+
+        // Accumulate volume per price bin
+        for i = 0 to i_vt_lb - 1
+            float midPx = (high[i] + low[i]) / 2.0
+            int   idx   = math.floor((midPx - rangeLow) / binSize)
+            idx := math.max(0, math.min(i_vt_bins - 1, idx))
+            array.set(volBins, idx, array.get(volBins, idx) + volume[i])
+
+        float maxVol = array.max(volBins)
+
+        // Towers project RIGHT from current bar (doesn't obscure price history)
+        int maxWidth = math.round(i_vt_lb * 0.5)
+
+        for idx = 0 to i_vt_bins - 1
+            float rawVol  = array.get(volBins, idx)
+            float volPct  = maxVol > 0 ? rawVol / maxVol * 100.0 : 0.0
+            float binLow  = rangeLow + idx * binSize
+            float binHigh = binLow + binSize
+
+            // Dynamic color: gray → gold → teal by density
+            color cFront = volPct < 30 ? color.new(#555555, 25) :
+                           volPct < 65 ? color.new(#FFD700, 20) :
+                                         color.new(#00F5D4, 15)
+            color cMid   = volPct < 30 ? color.new(#555555, 60) :
+                           volPct < 65 ? color.new(#FFD700, 55) :
+                                         color.new(#00F5D4, 50)
+            color cBack  = volPct < 30 ? color.new(#555555, 82) :
+                           volPct < 65 ? color.new(#FFD700, 80) :
+                                         color.new(#00F5D4, 78)
+
+            // Width scales with volume percentage
+            int wFront = math.max(1, math.round(maxWidth * volPct / 100.0 * 0.55))
+            int wMid   = math.max(1, math.round(maxWidth * volPct / 100.0 * 0.75))
+            int wBack  = math.max(1, math.round(maxWidth * volPct / 100.0))
+
+            // BACK (widest shadow layer — farthest back in Z depth)
+            box bk = box.new(bar_index + 1, binHigh, bar_index + 1 + wBack, binLow,
+                             bgcolor=cBack,
+                             border_color=color.new(cBack, 90),
+                             border_width=1)
+            array.push(vt_back, bk)
+
+            // MID (middle depth)
+            box md = box.new(bar_index + 1, binHigh, bar_index + 1 + wMid, binLow,
+                             bgcolor=cMid,
+                             border_color=color.new(cMid, 80),
+                             border_width=1)
+            array.push(vt_mid, md)
+
+            // FRONT (bright face — closest in Z depth)
+            box ft = box.new(bar_index + 1, binHigh, bar_index + 1 + wFront, binLow,
+                             bgcolor=cFront,
+                             border_color=cFront,
+                             border_width=1)
+            array.push(vt_front, ft)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  ENGINE 2 — ORDER BLOCK DETECTION + GLOW BOXES
+//  Bullish OB: last bearish candle before a strong bullish impulse
+//  Bearish OB: last bullish candle before a strong bearish impulse
+// ═══════════════════════════════════════════════════════════════════════════════
+
+var box[] bull_ob_boxes = array.new<box>()
+var box[] bear_ob_boxes = array.new<box>()
+
+float obThresh = i_ob_atr * atr14
+
+// Impulse detection (confirmed bars only — non-repainting)
+bool bullImpulse = barstate.isconfirmed and (close - close[3]) > obThresh and close > open
+bool bearImpulse = barstate.isconfirmed and (close[3] - close) > obThresh and close < open
+
+if i_ob_show and bullImpulse
+    for lookback = 1 to 5
+        if close[lookback] < open[lookback]
+            float obTop    = math.max(open[lookback], close[lookback - 1])
+            float obBottom = close[lookback]
+
+            // Trim if at max capacity
+            if array.size(bull_ob_boxes) >= i_ob_max
+                box.delete(array.shift(bull_ob_boxes))
+
+            // GLOW: outer halo box
+            box halo = box.new(bar_index - lookback - 2, obTop, bar_index + 50, obBottom,
+                               bgcolor=color.new(#00FF88, 93),
+                               border_color=color.new(#00FF88, 70),
+                               border_width=3)
+            // CORE: inner solid box
+            box core = box.new(bar_index - lookback - 2, obTop, bar_index + 50, obBottom,
+                               bgcolor=color.new(#00FF88, 88),
+                               border_color=color.new(#00FF88, 0),
+                               border_width=1)
+            array.push(bull_ob_boxes, halo)
+            array.push(bull_ob_boxes, core)
+            break
+
+if i_ob_show and bearImpulse
+    for lookback = 1 to 5
+        if close[lookback] > open[lookback]
+            float obTop    = close[lookback]
+            float obBottom = math.min(open[lookback], close[lookback - 1])
+
+            if array.size(bear_ob_boxes) >= i_ob_max
+                box.delete(array.shift(bear_ob_boxes))
+
+            box halo = box.new(bar_index - lookback - 2, obTop, bar_index + 50, obBottom,
+                               bgcolor=color.new(#FF4466, 93),
+                               border_color=color.new(#FF4466, 70),
+                               border_width=3)
+            box core = box.new(bar_index - lookback - 2, obTop, bar_index + 50, obBottom,
+                               bgcolor=color.new(#FF4466, 88),
+                               border_color=color.new(#FF4466, 0),
+                               border_width=1)
+            array.push(bear_ob_boxes, halo)
+            array.push(bear_ob_boxes, core)
+            break
+
+// Invalidate OBs when price closes THROUGH them
+if i_ob_show and barstate.isconfirmed
+    if array.size(bull_ob_boxes) > 0
+        for i = array.size(bull_ob_boxes) - 1 to 0
+            box b = array.get(bull_ob_boxes, i)
+            if close < box.get_bottom(b)
+                box.delete(b)
+                array.remove(bull_ob_boxes, i)
+
+    if array.size(bear_ob_boxes) > 0
+        for i = array.size(bear_ob_boxes) - 1 to 0
+            box b = array.get(bear_ob_boxes, i)
+            if close > box.get_top(b)
+                box.delete(b)
+                array.remove(bear_ob_boxes, i)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  ENGINE 3 — INSTITUTIONAL ROUND NUMBERS (Triple-Glow Lines)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+var line[] inst_lines  = array.new<line>()
+var label[] inst_lbls  = array.new<label>()
+
+if barstate.islast and i_il_show
+    for l in inst_lines
+        line.delete(l)
+    for lb in inst_lbls
+        label.delete(lb)
+    array.clear(inst_lines)
+    array.clear(inst_lbls)
+
+    float baseLevel = math.floor(close / i_il_step) * i_il_step
+
+    for i = -i_il_count to i_il_count
+        float lvl = baseLevel + i * i_il_step
+        if lvl <= 0
+            continue
+
+        bool  isAbove    = lvl >= close
+        color cCore      = isAbove ? C_TEAL     : C_GOLD
+        color cGlow1     = isAbove ? color.new(#00F5D4, 65) : color.new(#FFD700, 65)
+        color cGlow2     = isAbove ? color.new(#00F5D4, 82) : color.new(#FFD700, 82)
+
+        // Three-layer glow lines: wide+dim → medium → thin+bright
+        line lg2 = line.new(bar_index - 10, lvl, bar_index + 5, lvl,
+                            color=cGlow2, width=8, extend=extend.right)
+        line lg1 = line.new(bar_index - 10, lvl, bar_index + 5, lvl,
+                            color=cGlow1, width=3, extend=extend.right)
+        line lc  = line.new(bar_index - 10, lvl, bar_index + 5, lvl,
+                            color=cCore,  width=1, extend=extend.right)
+
+        array.push(inst_lines, lg2)
+        array.push(inst_lines, lg1)
+        array.push(inst_lines, lc)
+
+        // Label
+        string lvlStr = str.tostring(lvl, "#.##")
+        label lbl = label.new(bar_index + 6, lvl,
+                              " " + lvlStr + " ",
+                              color=color.new(#0a0a14, 10),
+                              textcolor=cCore,
+                              style=label.style_label_left,
+                              size=size.tiny,
+                              text_font_family=font.family_monospace)
+        array.push(inst_lbls, lbl)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  ENGINE 4 — PIVOT S/R ZONES (Filled Boxes with Glow Borders)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+var box[]   sr_boxes  = array.new<box>()
+var label[] sr_labels = array.new<label>()
+var float[] sr_levels = array.new<float>()
+var int[]   sr_touch  = array.new<int>()
+
+float srTol    = i_sr_atr * atr14
+float pivHigh  = ta.pivothigh(high, i_sr_left, i_sr_right)
+float pivLow   = ta.pivotlow(low,   i_sr_left, i_sr_right)
+
+if i_sr_show and not na(pivHigh)
+    bool exists = false
+    int srSizeH = array.size(sr_levels)
+    if srSizeH > 0
+        for i = 0 to srSizeH - 1
+            if math.abs(array.get(sr_levels, i) - pivHigh) < srTol
+                array.set(sr_touch, i, array.get(sr_touch, i) + 1)
+                exists := true
+                break
+    if not exists
+        array.push(sr_levels, pivHigh)
+        array.push(sr_touch, 1)
+
+        // Resistance zone — teal
+        int zLeft = bar_index - i_sr_left - i_sr_right
+        box zOuter = box.new(zLeft, pivHigh + srTol * 0.4,
+                             bar_index + 60, pivHigh - srTol * 0.4,
+                             bgcolor=color.new(#00F5D4, 93),
+                             border_color=color.new(#00F5D4, 50),
+                             border_width=2)
+        box zInner = box.new(zLeft, pivHigh + srTol * 0.4,
+                             bar_index + 60, pivHigh - srTol * 0.4,
+                             bgcolor=color.new(#00F5D4, 90),
+                             border_color=color.new(#00F5D4, 0),
+                             border_width=1)
+        label zLbl = label.new(bar_index + 62, pivHigh,
+                               " RES ",
+                               color=color.new(#00F5D4, 40),
+                               textcolor=color.white,
+                               style=label.style_label_left,
+                               size=size.tiny,
+                               text_font_family=font.family_monospace)
+        array.push(sr_boxes, zOuter)
+        array.push(sr_boxes, zInner)
+        array.push(sr_labels, zLbl)
+
+if i_sr_show and not na(pivLow)
+    bool exists = false
+    int srSizeL = array.size(sr_levels)
+    if srSizeL > 0
+        for i = 0 to srSizeL - 1
+            if math.abs(array.get(sr_levels, i) - pivLow) < srTol
+                array.set(sr_touch, i, array.get(sr_touch, i) + 1)
+                exists := true
+                break
+    if not exists
+        array.push(sr_levels, pivLow)
+        array.push(sr_touch, 1)
+
+        // Support zone — gold
+        int zLeft = bar_index - i_sr_left - i_sr_right
+        box zOuter = box.new(zLeft, pivLow + srTol * 0.4,
+                             bar_index + 60, pivLow - srTol * 0.4,
+                             bgcolor=color.new(#FFD700, 93),
+                             border_color=color.new(#FFD700, 50),
+                             border_width=2)
+        box zInner = box.new(zLeft, pivLow + srTol * 0.4,
+                             bar_index + 60, pivLow - srTol * 0.4,
+                             bgcolor=color.new(#FFD700, 90),
+                             border_color=color.new(#FFD700, 0),
+                             border_width=1)
+        label zLbl = label.new(bar_index + 62, pivLow,
+                               " SUP ",
+                               color=color.new(#FFD700, 40),
+                               textcolor=color.white,
+                               style=label.style_label_left,
+                               size=size.tiny,
+                               text_font_family=font.family_monospace)
+        array.push(sr_boxes, zOuter)
+        array.push(sr_boxes, zInner)
+        array.push(sr_labels, zLbl)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  ENGINE 5 — CONFLUENCE SIGNAL ENGINE
+//  Scores 4 conditions, fires when threshold met, non-repainting
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// Condition 1: Inside an Order Block
+bool inBullOB = false
+bool inBearOB = false
+
+if array.size(bull_ob_boxes) > 0
+    for b in bull_ob_boxes
+        if close >= box.get_bottom(b) and close <= box.get_top(b)
+            inBullOB := true
+
+if array.size(bear_ob_boxes) > 0
+    for b in bear_ob_boxes
+        if close >= box.get_bottom(b) and close <= box.get_top(b)
+            inBearOB := true
+
+// Condition 2: Near institutional round number
+float nearestInst = math.round(close / i_il_step) * i_il_step
+bool  nearInst    = math.abs(close - nearestInst) < atr14 * 0.75
+
+// Condition 3: Near pivot S/R zone
+bool nearSupport    = false
+bool nearResistance = false
+if array.size(sr_levels) > 0
+    for i = 0 to array.size(sr_levels) - 1
+        float lvl = array.get(sr_levels, i)
+        if math.abs(close - lvl) < atr14
+            if lvl < close
+                nearSupport    := true
+            else
+                nearResistance := true
+
+// Condition 4: RSI directional momentum (not extreme, trending)
+float rsi14       = ta.rsi(close, 14)
+bool  bullMoment  = rsi14 > 45 and rsi14 < 70
+bool  bearMoment  = rsi14 < 55 and rsi14 > 30
+
+// Aggregate scores
+int bullScore = (inBullOB ? 1 : 0) + (nearInst ? 1 : 0) + (nearSupport ? 1 : 0) + (bullMoment ? 1 : 0)
+int bearScore = (inBearOB ? 1 : 0) + (nearInst ? 1 : 0) + (nearResistance ? 1 : 0) + (bearMoment ? 1 : 0)
+
+// Signal grade
+string sigGrade = bullScore == 4 or bearScore == 4 ? "A+" :
+                  bullScore == 3 or bearScore == 3 ? "A"  :
+                  bullScore == 2 or bearScore == 2 ? "B"  :
+                  bullScore == 1 or bearScore == 1 ? "C"  : "D"
+
+// Cooldown gate
+var int lastSigBar = 0
+bool    cdOk       = (bar_index - lastSigBar) >= i_sig_cd
+
+// Final signal gate: confirmed close + cooldown + score threshold
+bool longSig  = barstate.isconfirmed and cdOk and bullScore >= i_sig_min
+bool shortSig = barstate.isconfirmed and cdOk and bearScore >= i_sig_min and not longSig
+
+if longSig or shortSig
+    lastSigBar := bar_index
+
+// Signal shapes
+plotshape(longSig,  "Long Signal",  shape.triangleup,   location.belowbar, C_BULL, size=size.normal)
+plotshape(shortSig, "Short Signal", shape.triangledown, location.abovebar, C_BEAR, size=size.normal)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  ENGINE 6 — TRADE MANAGEMENT OVERLAY
+//  State machine: FLAT → ARMED → EXIT. TP/SL/MaxBars exits.
+// ═══════════════════════════════════════════════════════════════════════════════
+
+var int   tradeDir      = 0    // 0=flat, 1=long, -1=short
+var float tradeEntry    = na
+var float tradeTP       = na
+var float tradeSL       = na
+var int   tradeBars     = 0
+var line  tp_line       = na
+var line  sl_line       = na
+
+if i_tm_show
+    // Increment hold counter
+    if tradeDir != 0
+        tradeBars += 1
+
+    // ── EXIT LOGIC ────────────────────────────────────────────────
+    if tradeDir == 1 and barstate.isconfirmed
+        if close >= tradeTP
+            label.new(bar_index, high, "  TP HIT  ",
+                      color=color.new(#00BCD4, 0), textcolor=color.white,
+                      style=label.style_label_down, size=size.normal,
+                      text_font_family=font.family_monospace)
+            if not na(tp_line)
+                line.delete(tp_line)
+            if not na(sl_line)
+                line.delete(sl_line)
+            tradeDir := 0
+        else if close <= tradeSL
+            // SL HIT — silent
+            if not na(tp_line)
+                line.delete(tp_line)
+            if not na(sl_line)
+                line.delete(sl_line)
+            tradeDir := 0
+        else if tradeBars >= i_tm_max
+            label.new(bar_index, high, " MAX BARS ",
+                      color=color.new(#555555, 40), textcolor=color.new(color.white, 40),
+                      style=label.style_label_down, size=size.tiny,
+                      text_font_family=font.family_monospace)
+            if not na(tp_line)
+                line.delete(tp_line)
+            if not na(sl_line)
+                line.delete(sl_line)
+            tradeDir := 0
+
+    if tradeDir == -1 and barstate.isconfirmed
+        if close <= tradeTP
+            label.new(bar_index, low, "  TP HIT  ",
+                      color=color.new(#00BCD4, 0), textcolor=color.white,
+                      style=label.style_label_up, size=size.normal,
+                      text_font_family=font.family_monospace)
+            if not na(tp_line)
+                line.delete(tp_line)
+            if not na(sl_line)
+                line.delete(sl_line)
+            tradeDir := 0
+        else if close >= tradeSL
+            // SL HIT — silent
+            if not na(tp_line)
+                line.delete(tp_line)
+            if not na(sl_line)
+                line.delete(sl_line)
+            tradeDir := 0
+        else if tradeBars >= i_tm_max
+            label.new(bar_index, low, " MAX BARS ",
+                      color=color.new(#555555, 40), textcolor=color.new(color.white, 40),
+                      style=label.style_label_up, size=size.tiny,
+                      text_font_family=font.family_monospace)
+            if not na(tp_line)
+                line.delete(tp_line)
+            if not na(sl_line)
+                line.delete(sl_line)
+            tradeDir := 0
+
+    // ── ENTRY LOGIC ───────────────────────────────────────────────
+    if tradeDir == 0
+        if longSig
+            tradeDir   := 1
+            tradeEntry := close
+            tradeTP    := close + i_tm_tp * atr14
+            tradeSL    := close - i_tm_sl * atr14
+            tradeBars  := 0
+
+            if not na(tp_line)
+                line.delete(tp_line)
+            if not na(sl_line)
+                line.delete(sl_line)
+
+            tp_line := line.new(bar_index, tradeTP, bar_index + i_tm_max, tradeTP,
+                                color=color.new(#00BCD4, 0), width=1,
+                                style=line.style_dashed)
+            sl_line := line.new(bar_index, tradeSL, bar_index + i_tm_max, tradeSL,
+                                color=color.new(#FF4466, 30), width=1,
+                                style=line.style_dashed)
+
+        if shortSig
+            tradeDir   := -1
+            tradeEntry := close
+            tradeTP    := close - i_tm_tp * atr14
+            tradeSL    := close + i_tm_sl * atr14
+            tradeBars  := 0
+
+            if not na(tp_line)
+                line.delete(tp_line)
+            if not na(sl_line)
+                line.delete(sl_line)
+
+            tp_line := line.new(bar_index, tradeTP, bar_index + i_tm_max, tradeTP,
+                                color=color.new(#00BCD4, 0), width=1,
+                                style=line.style_dashed)
+            sl_line := line.new(bar_index, tradeSL, bar_index + i_tm_max, tradeSL,
+                                color=color.new(#FF4466, 30), width=1,
+                                style=line.style_dashed)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  ENGINE 7 — CODAPRO GAUGE-BAR DASHBOARD
+// ═══════════════════════════════════════════════════════════════════════════════
+
+var table dash = table.new(position.top_right, 1, 21,
+                           bgcolor=color.new(#0a0a14, 10),
+                           border_width=1,
+                           border_color=color.new(#1a1a2e, 0),
+                           frame_width=1,
+                           frame_color=color.new(#00F5D4, 60))
+
+if barstate.islast
+    float bullPct       = bullScore / 4.0 * 100.0
+    float bearPct       = bearScore / 4.0 * 100.0
+    int   activeBullOBs = math.round(array.size(bull_ob_boxes) / 2)  // 2 boxes per OB (halo+core)
+    int   activeBearOBs = math.round(array.size(bear_ob_boxes) / 2)
+    float instDist      = math.abs(close - nearestInst)
+    string instDistStr  = str.tostring(math.round(instDist, 1), "#.##")
+    string instLvlStr   = str.tostring(nearestInst, "#.##")
+
+    string tradeStatus  = tradeDir == 1  ? "LONG    ●" :
+                          tradeDir == -1 ? "SHORT   ●" : "FLAT    ○"
+    color  tradeColor   = tradeDir == 1  ? C_BULL :
+                          tradeDir == -1 ? C_BEAR  : C_MUTED
+
+    color  gradeColor   = sigGrade == "A+" ? C_TEAL :
+                          sigGrade == "A"  ? C_BULL :
+                          sigGrade == "B"  ? C_GOLD : C_MUTED
+
+    color  bullGColor   = bullScore >= 3 ? C_TEAL :
+                          bullScore >= 2 ? C_GOLD : C_GRAY
+    color  bearGColor   = bearScore >= 3 ? C_BEAR :
+                          bearScore >= 2 ? C_GOLD : C_GRAY
+
+    string SEP = " ────────────────────── "
+
+    // Row 0 — Header
+    table.cell(dash, 0, 0, "  LIQUIDITY MATRIX v1.0  ",
+               text_color=C_TEAL, text_size=size.small,
+               text_font_family=font.family_monospace, bgcolor=color.new(#0a0a14, 10))
+
+    // Row 1 — Brand
+    table.cell(dash, 0, 1, "        ArisCodes        ",
+               text_color=C_MUTED, text_size=size.small,
+               text_font_family=font.family_monospace, bgcolor=color.new(#0a0a14, 10))
+
+    // Row 2 — Sep
+    table.cell(dash, 0, 2, SEP,
+               text_color=C_TEAL_DIM, text_size=size.small,
+               text_font_family=font.family_monospace, bgcolor=color.new(#0a0a14, 10))
+
+    // Row 3 — Bull gauge label
+    table.cell(dash, 0, 3, " BULL PRESSURE",
+               text_color=C_MUTED, text_size=size.small,
+               text_font_family=font.family_monospace, bgcolor=color.new(#0a0a14, 10))
+
+    // Row 4 — Bull gauge bar
+    table.cell(dash, 0, 4, " [" + f_gauge(bullPct, 10) + "] " + str.tostring(math.round(bullPct)) + "%",
+               text_color=bullGColor, text_size=size.small,
+               text_font_family=font.family_monospace, bgcolor=color.new(#0a0a14, 10))
+
+    // Row 5 — Bear gauge label
+    table.cell(dash, 0, 5, " BEAR PRESSURE",
+               text_color=C_MUTED, text_size=size.small,
+               text_font_family=font.family_monospace, bgcolor=color.new(#0a0a14, 10))
+
+    // Row 6 — Bear gauge bar
+    table.cell(dash, 0, 6, " [" + f_gauge(bearPct, 10) + "] " + str.tostring(math.round(bearPct)) + "%",
+               text_color=bearGColor, text_size=size.small,
+               text_font_family=font.family_monospace, bgcolor=color.new(#0a0a14, 10))
+
+    // Row 7 — Sep
+    table.cell(dash, 0, 7, SEP,
+               text_color=C_TEAL_DIM, text_size=size.small,
+               text_font_family=font.family_monospace, bgcolor=color.new(#0a0a14, 10))
+
+    // Row 8 — Bull OB dots
+    table.cell(dash, 0, 8, " BULL OB  " + f_dotRow(activeBullOBs, i_ob_max) + "  " + str.tostring(activeBullOBs),
+               text_color=C_BULL, text_size=size.small,
+               text_font_family=font.family_monospace, bgcolor=color.new(#0a0a14, 10))
+
+    // Row 9 — Bear OB dots
+    table.cell(dash, 0, 9, " BEAR OB  " + f_dotRow(activeBearOBs, i_ob_max) + "  " + str.tostring(activeBearOBs),
+               text_color=C_BEAR, text_size=size.small,
+               text_font_family=font.family_monospace, bgcolor=color.new(#0a0a14, 10))
+
+    // Row 10 — Sep
+    table.cell(dash, 0, 10, SEP,
+               text_color=C_TEAL_DIM, text_size=size.small,
+               text_font_family=font.family_monospace, bgcolor=color.new(#0a0a14, 10))
+
+    // Row 11 — Nearest institutional level
+    table.cell(dash, 0, 11, " INST  " + instLvlStr + "  |  " + instDistStr + " pts",
+               text_color=C_GOLD, text_size=size.small,
+               text_font_family=font.family_monospace, bgcolor=color.new(#0a0a14, 10))
+
+    // Row 12 — S/R proximity
+    table.cell(dash, 0, 12,
+               " SUPP " + (nearSupport ? "●" : "○") + "  RES " + (nearResistance ? "●" : "○") + "  INST " + (nearInst ? "●" : "○"),
+               text_color=C_TEAL, text_size=size.small,
+               text_font_family=font.family_monospace, bgcolor=color.new(#0a0a14, 10))
+
+    // Row 13 — Sep
+    table.cell(dash, 0, 13, SEP,
+               text_color=C_TEAL_DIM, text_size=size.small,
+               text_font_family=font.family_monospace, bgcolor=color.new(#0a0a14, 10))
+
+    // Row 14 — Signal grade
+    table.cell(dash, 0, 14, " SIGNAL GRADE    [  " + sigGrade + "  ]",
+               text_color=gradeColor, text_size=size.small,
+               text_font_family=font.family_monospace, bgcolor=color.new(#0a0a14, 10))
+
+    // Row 15 — Trade status
+    table.cell(dash, 0, 15, " TRADE  " + tradeStatus,
+               text_color=tradeColor, text_size=size.small,
+               text_font_family=font.family_monospace, bgcolor=color.new(#0a0a14, 10))
+
+    // Row 16 — Sep
+    table.cell(dash, 0, 16, SEP,
+               text_color=C_TEAL_DIM, text_size=size.small,
+               text_font_family=font.family_monospace, bgcolor=color.new(#0a0a14, 10))
+
+    // Row 17 — Footer brand
+    table.cell(dash, 0, 17, "  CodaPro Trading Systems  ",
+               text_color=color.new(#00F5D4, 55), text_size=size.small,
+               text_font_family=font.family_monospace, bgcolor=color.new(#0a0a14, 10))
+
+    // Row 18 — Copyright
+    table.cell(dash, 0, 18, " (c) 2026 CodaPro.ai LLC ",
+               text_color=color.new(color.white, 60), text_size=size.small,
+               text_font_family=font.family_monospace, bgcolor=color.new(#0a0a14, 10))
+
+// ─── STATUS LINE ─────────────────────────────────────────────────────────────
+plot(bullScore, "Bull Score", display=display.status_line, color=C_BULL,  editable=false)
+plot(bearScore, "Bear Score", display=display.status_line, color=C_BEAR,  editable=false)
+plot(tradeDir,  "Trade Dir",  display=display.status_line, color=C_TEAL,  editable=false)
+
+// ─── ALERTS ──────────────────────────────────────────────────────────────────
+alertcondition(longSig,  "LM Long Signal",  "Liquidity Matrix: Long signal fired — check confluence score")
+alertcondition(shortSig, "LM Short Signal", "Liquidity Matrix: Short signal fired — check confluence score")
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  DISCLAIMER
+//  This tool was created using the CodaPro Pine Script AI engine — designed to
+//  produce robust trading overlays, educational visuals, and automation-ready
+//  alerts. It is provided strictly for educational and informational purposes
+//  and does not constitute financial advice. Past performance does not guarantee
+//  future results. Always backtest and demo before applying to real capital.
+//  Use at your own risk. Created by ArisCodes | CodaPro Engine
+// ═══════════════════════════════════════════════════════════════════════════════
+
+//─────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+//─██████████████───██████████████───██████████████───██████████████───██████████████───██████████████───██████████████─
+//─██░░░░░░░░░░██───██░░░░░░░░░░██───██░░░░░░░░░░██───██░░░░░░░░░░██───██░░░░░░░░░░██───██░░░░░░░░░░██───██░░░░░░░░░░██─
+//─██░░██████████───██░░██████░░██───██░░██████░░██───██░░██████░░██───██░░██████░░██───██░░██████░░██───██░░██████░░██─
+//─██░░██───────────██░░██──██░░██───██░░██──██░░██───██░░██──██░░██───██░░██──██░░██───██░░██──██░░██───██░░██──██░░██─
+//─██░░██───────────██░░██──██░░██───██░░██──██░░██───██░░████████░░██─██░░██████░░██───██░░████████░░██─██░░██──██░░██─
+//─██░░██───────────██░░██──██░░██───██░░██──██░░██───██░░░░░░░░░░░░██─██░░░░░░░░░░██───██░░░░░░░░░░░░██─██░░██──██░░██─
+//─██░░██───────────██░░██──██░░██───██░░██──██░░██───██░░██████░░████─██░░██████████───██░░██████░░████─██░░██──██░░██─
+//─██░░██───────────██░░██──██░░██───██░░██──██░░██───██░░██──██░░██───██░░██───────────██░░██──██░░██───██░░██──██░░██─
+//─██░░██████████───██░░██████░░██───██░░██████░░██───██░░██──██░░██───██░░██───────────██░░██──██░░██───██░░██████░░██─
+//─██░░░░░░░░░░██───██░░░░░░░░░░██───██░░░░░░░░░░██───██░░██──██░░██───██░░██───────────██░░██──██░░██───██░░░░░░░░░░██─
+//─██████████████───██████████████───██████████████───██████──██████───██████───────────██████──██████───██████████████─
+//─────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+//                                              CodaPro Trading Systems

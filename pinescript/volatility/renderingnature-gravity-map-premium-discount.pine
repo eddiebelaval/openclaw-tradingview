@@ -1,0 +1,624 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © renderingnature1
+
+//@version=6
+indicator("RenderingNature Gravity Map | Premium Discount", overlay=true, max_lines_count=500, max_labels_count=500)
+
+// === INPUT GROUPS ===
+htfGroup          = "Higher Timeframe Sync"
+gravityGroup      = "Gravity Map"
+incomeGroup       = "Income Layer"
+incomeTuningGroup = "Income Layer — Tuning"
+psychGroup        = "Psych Zones"
+
+// ============================================================
+// HIGHER TIMEFRAME SYNC
+// ============================================================
+
+// Master HTF used across the system unless overridden
+masterHTF = input.timeframe("D", "Master Higher Timeframe", group=htfGroup)
+
+// Gravity sync controls
+syncGravityToMaster = input.bool(true, "Sync Gravity To Master HTF", group=htfGroup)
+useCustomGravityTF  = input.bool(false, "Use Custom Gravity HTF (Advanced)", group=htfGroup)
+customGravityTF     = input.timeframe("D", "Custom Gravity HTF", group=htfGroup)
+
+// Final Gravity timeframe
+gtf = syncGravityToMaster and not useCustomGravityTF ? masterHTF : customGravityTF
+
+// ============================================================
+// GRAVITY MAP
+// ============================================================
+
+// Core settings
+gEMALen = input.int(200, "Gravity EMA Length", minval=50, group=gravityGroup)
+gATRLen = input.int(14, "Gravity ATR Length", minval=7, group=gravityGroup)
+useVWAPHybrid = input.bool(true, "Use VWAP / EMA Hybrid Anchor", group=gravityGroup)
+
+// Intermarket + psychology
+intermarketSym = input.string("DXY", "Intermarket Symbol", group=gravityGroup)
+roundNumThresh = input.float(1000, "Round Number Threshold", group=gravityGroup)
+
+// Visuals
+showGravityGrades = input.bool(true, "Show Structure Grades", group=gravityGroup)
+showGravityNarrative = input.bool(true, "Show Gravity Dashboard", group=gravityGroup)
+labelOffset = input.int(3, "Label Offset", minval=0, group=gravityGroup)
+labelDistMult = input.int(3, "Label Distance Multiplier", minval=1, group=gravityGroup)
+labelSlope = input.float(0.0, "Label Line Slope", step=0.1, group=gravityGroup)
+autoSlope = input.bool(false, "Auto Label Slope (ATR-Based)", group=gravityGroup)
+showCHoCHLabels = input.bool(true, "Show CHoCH Labels", group=gravityGroup)
+showBOSLabels = input.bool(true, "Show BOS Labels", group=gravityGroup)
+
+// Swing / confidence
+pivotLeft = input.int(5, "Pivot Left Bars", minval=1, group=gravityGroup)
+pivotRight = input.int(5, "Pivot Right Bars", minval=1, group=gravityGroup)
+volBoost = input.bool(true, "Use Volume Boost In Confidence", group=gravityGroup)
+
+// Optional OB visuals
+showOBs = input.bool(true, "Show Structure Zones", group=gravityGroup)
+obTTL = input.int(200, "Structure Zone Lifespan (bars)", minval=50, group=gravityGroup)
+
+// Dashboard position
+tablePos = input.string(
+    "Top Right",
+    "Gravity Table Position",
+    options=["Top Left", "Top Center", "Top Right", "Bottom Left", "Bottom Center", "Bottom Right"],
+    group=gravityGroup
+)
+
+// ============================================================
+// INCOME LAYER
+// ============================================================
+
+showIncomeLayer = input.bool(true, "Show Income Layer (Covered Calls)", group=incomeGroup)
+alertLowRiskRocking = input.bool(false, "Alert: Low Risk + Rocking Premium", group=incomeGroup)
+
+// Advanced tuning
+riskSensitivity = input.float(1.00, "Risk Sensitivity", step=0.05, minval=0.70, maxval=1.40, group=incomeTuningGroup)
+enableExhaustionRelief = input.bool(true, "Reduce Risk When Stretched + Cooling Off", group=incomeTuningGroup)
+exhaustZ = input.float(2.2, "Exhaustion Z Threshold", step=0.1, minval=1.5, maxval=3.5, group=incomeTuningGroup)
+exhaustDecay = input.float(0.10, "Cooling Threshold (Velocity Decay)", step=0.01, minval=0.00, maxval=0.50, group=incomeTuningGroup)
+
+protectUpsideInStrongTrend = input.bool(true, "Protect Upside In Strong Trend", group=incomeTuningGroup)
+trendStrengthPct = input.float(1.0, "Strong Trend Threshold (EMA Spread %)", step=0.1, minval=0.2, maxval=5.0, group=incomeTuningGroup)
+
+// ============================================================
+// PSYCH ZONES
+// ============================================================
+
+showPsychLevels = input.bool(true, "Show Psych Rays", group=psychGroup)
+psychTTL = input.int(100, "Psych Line Lifespan (bars)", minval=10, maxval=500, group=psychGroup)
+fadeOldPsychLines = input.bool(true, "Fade Old Psych Lines", group=psychGroup)
+showPsychLabels = input.bool(false, "Show Psych Price Labels", group=psychGroup)
+
+// === CORE COMPUTATIONS ===
+gEMA = request.security(syminfo.tickerid, gtf, ta.ema(close, gEMALen))
+gATR = request.security(syminfo.tickerid, gtf, ta.atr(gATRLen))
+gVWAP = request.security(syminfo.tickerid, gtf, ta.vwap(hl2))
+gAnchor = useVWAPHybrid ? (gEMA + gVWAP) / 2 : gEMA
+zScore = (close - gAnchor) / gATR
+
+// === DYNAMICS & CONFIDENCE ENGINE ===
+atrCurr = ta.atr(gATRLen)
+atrSMA = ta.sma(atrCurr, 50)
+velocityDecay = atrCurr[1] != 0 ? math.max(0, (atrCurr[1] - atrCurr) / atrCurr[1]) : 0
+clustering = atrCurr > atrSMA[3] and atrCurr[1] > atrSMA[3] and atrCurr[2] > atrSMA[3]
+
+// Volume Boost
+volSMA = ta.sma(volume, 50)
+highVol = volume > volSMA * 1.5
+
+// Psych Modifiers
+nearestPsych = math.round(close / roundNumThresh) * roundNumThresh
+nearRoundNum = math.abs(close - nearestPsych) < (roundNumThresh * 0.01)
+psychBoost = nearRoundNum ? 1.2 : 1.0
+
+// Intermarket Logic
+interZScore = request.security(intermarketSym, gtf, (close - ta.ema(close, gEMALen)) / ta.atr(gATRLen))
+interPull = interZScore > 1.5 ? "Bearish (Strong " + intermarketSym + ")" :interZScore < -1.5 ? "Bullish (Weak " + intermarketSym + ")" : "Neutral"
+
+// === Final Gravity State (Improved Regime Logic) ===
+adjZScore  = zScore * psychBoost * (clustering ? 0.8 : 1.0)
+
+inDiscount = adjZScore < -1.5
+inPremium  = adjZScore > 1.5
+inNeutral  = not inDiscount and not inPremium
+
+emaFast = ta.ema(close, 50)
+emaSlow = ta.ema(close, 200)
+
+isBullTrend = emaFast > emaSlow
+isBearTrend = emaFast < emaSlow
+isTrend     = isBullTrend or isBearTrend
+
+isExpandingVol  = atrCurr > atrSMA
+isContractingVol = atrCurr < atrSMA
+
+state =
+     inDiscount ? "🟢 Discount Zone" :
+     inPremium ? "🔴 Premium Zone" :
+     "🟡 Neutral Zone"
+
+revertProb = 100 / (1 + math.exp(-(-adjZScore + 1)))
+
+// Confidence Score
+confScore = (inDiscount or inPremium ? 0.4 : 0.2) +
+             (velocityDecay > 0.1 ? 0.2 : 0) +
+             (clustering ? 0.1 : 0) +
+             (psychBoost > 1 ? 0.1 : 0) +
+             (interZScore < -1.5 or interZScore > 1.5 ? 0.1 : 0) +
+             (volBoost and highVol ? 0.1 : 0)
+confScore := math.min(confScore, 1)
+
+// === EXPORT GLOBALS ===
+gravityZScore = adjZScore
+gravityState = state
+confidence = confScore
+bias = confScore > 0.6 and inDiscount ? "Bullish" :
+       confScore > 0.6 and inPremium ? "Bearish" : "Neutral"
+
+// ------------------------------------------------------------
+// STRETCH RISK CLASSIFICATION
+// ------------------------------------------------------------
+
+stretchRisk =
+     adjZScore >= 2.0 ? "Extreme Premium" :
+     adjZScore >= 1.5 ? "Premium Stretch" :
+     adjZScore <= -2.0 ? "Extreme Discount" :
+     adjZScore <= -1.5 ? "Discount Stretch" :
+     "Normal"
+
+// === SMC AGREEMENT CONTEXT ===
+bullGravityAgreement = (inDiscount or inNeutral) and bias != "Bearish"
+bearGravityAgreement = (inPremium or inNeutral) and bias != "Bullish"
+
+bullIdealReversal = inDiscount and str.contains(state, "Reversion")
+bearIdealReversal = inPremium and str.contains(state, "Reversion")
+
+bullTrendAssist = isBullTrend and str.contains(state, "Expansion")
+bearTrendAssist = isBearTrend and str.contains(state, "Expansion")
+
+gravityHeadwindBull = inPremium and bias == "Bearish"
+gravityHeadwindBear = inDiscount and bias == "Bullish"
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// 💰 COVERED CALL INCOME LAYER LOGIC
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+isReversion = str.contains(state, "Reversion")
+isExpansion = str.contains(state, "Expansion")
+isChop      = str.contains(state, "Chop")
+
+// --- Premium Environment
+string premiumEnv =
+     inPremium and confScore >= 0.70 and adjZScore > 2.0 and velocityDecay < 0.70 ? "Rocking" :
+     inPremium and confScore >= 0.55 ? "Solid" :
+     inNeutral ? "Moderate" :
+     "Risky"
+
+// --- Assignment Risk
+float fastness        = 1.0 - math.min(math.max(velocityDecay, 0.0), 1.0)
+float zPressure       = math.min(math.abs(adjZScore) / 3.0, 1.0)
+float biasPressure    = bias == "Neutral" ? 0.3 : 0.8
+float interPressure   = interPull == "Neutral" ? 0.3 : 0.8
+float clusterPressure = clustering ? 0.35 : 0.75
+
+float riskScoreRaw =
+     0.30 * fastness +
+     0.25 * (isExpansion ? 1.0 : isChop ? 0.60 : 0.40) +
+     0.15 * (1.0 - confScore) +
+     0.15 * zPressure +
+     0.10 * biasPressure +
+     0.05 * interPressure +
+     0.05 * clusterPressure
+
+float riskScore = math.min(math.max(riskScoreRaw * riskSensitivity, 0.0), 1.0)
+
+string assignRisk =
+     riskScore < 0.40 ? "Low" :
+     riskScore < 0.60 ? "Moderate" :
+     riskScore < 0.78 ? "High" :
+     "Extreme"
+
+   // --- Exhaustion relief: stretched + cooling → step risk down one tier (optional)
+bool exhaustionRelief = enableExhaustionRelief and (math.abs(adjZScore) >= exhaustZ) and (velocityDecay >= exhaustDecay) and (not clustering)
+
+if exhaustionRelief
+    assignRisk := assignRisk == "Extreme" ? "High" :
+                  assignRisk == "High"    ? "Moderate" :
+                  assignRisk == "Moderate"? "Low" :
+                  assignRisk 
+
+// --- Recommended DTE
+string recDTE =
+     premiumEnv == "Risky" and (assignRisk == "High" or assignRisk == "Extreme") ? "Avoid" :
+     assignRisk == "Low" and (premiumEnv == "Rocking" or premiumEnv == "Solid")  ? (isReversion ? "10–21" : "21–45") :
+     assignRisk == "Moderate" ? (isExpansion ? "30–60+" : "21–45") :
+     assignRisk == "High" ? "30–60+" :
+     "Avoid"
+
+// --- Internal Structural Awareness (Gravity-only, Tunable)
+
+// Trend strength proxy (adjustable via inputs)
+emaSpread = math.abs(emaFast - emaSlow) / close * 100
+strongTrend = emaSpread >= trendStrengthPct
+
+gravStrongBull = protectUpsideInStrongTrend and isBullTrend and strongTrend
+gravStrongBear = isBearTrend and strongTrend
+
+// Reversal pressure (kept intact)
+gravReversalPressure =
+     (isBullTrend and inPremium and velocityDecay < 0.05) or
+     (isBearTrend and inDiscount and velocityDecay < 0.05)
+
+
+// --- Delta Band (Gravity-adjusted, Tunable)
+string recDelta =
+     recDTE == "Avoid" ? "Skip" :
+
+     // Strong bull trend → safer deltas (protected upside)
+     gravStrongBull and assignRisk != "Low" ? "0.05–0.12" :
+
+     gravStrongBull and assignRisk == "Low" ? "0.10–0.18" :
+
+     // Strong bear trend → slightly more aggressive allowed
+     gravStrongBear and assignRisk == "Low" ? "0.20–0.30" :
+
+     // Reversal pressure detected
+     gravReversalPressure ? "0.05–0.12" :
+
+     // Default logic
+     assignRisk == "Low" and premiumEnv == "Rocking" ? "0.15–0.25" :
+     assignRisk == "Low" ? "0.10–0.20" :
+     assignRisk == "Moderate" ? "0.10–0.18" :
+     assignRisk == "High" ? "0.05–0.12" :
+     "Skip"
+
+// --- One-line Guide
+string incomeHeadline =
+     "Regime: " + (isExpansion ? "Expansion" : isReversion ? "Reversion" : "Chop") +
+     " → premium " + (premiumEnv == "Rocking" or premiumEnv == "Solid" ? "good" :
+                      premiumEnv == "Moderate" ? "okay" : "bad") +
+     " but assignment risk " + str.lower(assignRisk) +
+     ". Use " + recDTE + " DTE, " + recDelta + " delta" +
+     (recDTE == "Avoid" ? ", or skip." : ".") 
+
+// ================================
+// === AGREEMENT MODE: SMC STRUCTURE
+// ================================
+structureGroup = "Structure Sync (SMC Agreement)"
+
+syncWithSMC    = input.bool(true, "Sync Structure Logic with SMC?", group=structureGroup)
+syncSMCToMaster = input.bool(true, "Sync SMC To Master HTF?", group=htfGroup)
+customSMCHTF = input.timeframe("60", "Custom SMC HTF", group=htfGroup)
+
+smcHTF = syncSMCToMaster ? masterHTF : customSMCHTF
+useAutoFractal = input.bool(true, "Auto Fractal Sensitivity", group=structureGroup)
+manualSens     = input.int(3, "Manual Sensitivity (Auto OFF)", minval=1, group=structureGroup)
+useIDMFilter   = input.bool(true, "Require Inducement (IDM) Before CHoCH?", group=structureGroup)
+
+// --- Outputs Gravity uses everywhere below ---
+var bool bullBOS   = false
+var bool bearBOS   = false
+var bool bullCHoCH = false
+var bool bearCHoCH = false
+
+if syncWithSMC
+    // Same mapping style you used in SMC
+    fractalSensitivity = useAutoFractal ? (
+         smcHTF == "1"   ? 1 :
+         smcHTF == "5"   ? 2 :
+         smcHTF == "15"  ? 3 :
+         smcHTF == "30"  ? 4 :
+         smcHTF == "60"  ? 5 :
+         smcHTF == "120" ? 6 :
+         smcHTF == "240" ? 7 :
+         smcHTF == "D"   ? 8 :
+         smcHTF == "W"   ? 10 : 12
+    ) : manualSens
+    fractalSensitivity := math.max(2, fractalSensitivity)
+
+    // Swings (same style as SMC)
+    pivotHigh = ta.pivothigh(high, fractalSensitivity, fractalSensitivity)
+    pivotLow  = ta.pivotlow(low,  fractalSensitivity, fractalSensitivity)
+
+    // IDM tracking (pre-break swings)
+    var float preBreakHigh = na
+    var float preBreakLow  = na
+    if not na(pivotHigh)
+        preBreakHigh := high
+    if not na(pivotLow)
+        preBreakLow := low
+
+    // Track last confirmed swing high/low + trend direction
+    var float lastSwingHigh = na
+    var float lastSwingLow  = na
+    var string trendDir     = "Neutral"
+
+    if not na(pivotHigh)
+        lastSwingHigh := high
+    if not na(pivotLow)
+        lastSwingLow := low
+
+    // CHoCH/BOS to match your SMC behavior
+    bullishCHoCH = not na(pivotHigh) and pivotHigh > nz(lastSwingHigh[1]) and trendDir == "Bearish"
+    bearishCHoCH = not na(pivotLow)  and pivotLow  < nz(lastSwingLow[1])  and trendDir == "Bullish"
+
+    validBullCHoCH = bullishCHoCH and (not useIDMFilter or high > preBreakHigh)
+    validBearCHoCH = bearishCHoCH and (not useIDMFilter or low < preBreakLow)
+
+    bullishBOS = not na(pivotLow)  and pivotLow > nz(lastSwingLow[1])
+    bearishBOS = not na(pivotHigh) and pivotHigh < nz(lastSwingHigh[1])
+
+    trendDir := (validBullCHoCH or bullishBOS) ? "Bullish" :(validBearCHoCH or bearishBOS) ? "Bearish" : trendDir
+
+    // Expose names Gravity already uses
+    bullBOS   := bullishBOS
+    bearBOS   := bearishBOS
+    bullCHoCH := validBullCHoCH
+    bearCHoCH := validBearCHoCH
+
+else
+    // ==========================
+    // Original Gravity Structure
+    // ==========================
+    swingHigh = ta.pivothigh(high, pivotLeft, pivotRight)
+    swingLow  = ta.pivotlow(low,  pivotLeft, pivotRight)
+
+    var float prevSwingHigh = na
+    var float prevSwingLow  = na
+
+    if not na(swingHigh)
+        prevSwingHigh := swingHigh
+    if not na(swingLow)
+        prevSwingLow := swingLow
+
+    bullBOS   := not na(swingHigh) and high > nz(prevSwingHigh[1])
+    bearBOS   := not na(swingLow)  and low  < nz(prevSwingLow[1])
+
+    // Keep your original “weird” CHoCH if you liked it (it’s conservative)
+    bullCHoCH := ta.crossover(close, nz(prevSwingHigh[1])) and high < nz(prevSwingHigh[1])
+    bearCHoCH := ta.crossunder(close, nz(prevSwingLow[1]))  and low  > nz(prevSwingLow[1])
+
+// === LABELS ===
+var float lastLabelPriceBull = na
+var float lastLabelPriceBear = na
+
+// Grading Text Builder
+gravityGrade(_bullish, _conf) =>
+    // Directional quality: best when structure aligns with extreme zone
+    dirGrade =
+         _bullish and inDiscount ? "A+" :
+         _bullish and inNeutral  ? "B"  :
+         _bullish and inPremium  ? "C-" :
+         (not _bullish) and inPremium ? "A+" :
+         (not _bullish) and inNeutral ? "B"  :
+         "C-"
+
+    // Context boost: reversion state boosts reversal-style reads
+    ctxBoost = str.contains(state, "Reversion") ? " (MeanRev)" :
+               str.contains(state, "Expansion") ? " (Trend)" : " (Chop)"
+
+    "[" + dirGrade + "]" + ctxBoost +
+      "\nConf: " + str.tostring(_conf * 100, "#") + "%" +
+      "\nZ: " + str.tostring(adjZScore, "#.##") + "σ" +
+      "\nRevert: " + str.tostring(revertProb, "#.##") + "%" +
+      "\nInter: " + interPull
+
+// Text Colors
+confTextColorBull = confScore > 0.7 ? color.green : confScore > 0.5 ? color.lime : color.gray
+confTextColorBear = confScore > 0.7 ? color.red : confScore > 0.5 ? color.maroon : color.gray
+
+// === LABEL DRAW FUNCTION (SAFE - NO GLOBAL MODIFICATION) ===
+drawLabel(_txt, _y, _textColor, _offset, _slope, _bullish) =>
+    _label_x = bar_index + _offset * labelDistMult
+    _end_y   = _y + _offset * _slope * labelDistMult
+    _last    = _bullish ? lastLabelPriceBull : lastLabelPriceBear
+    _shouldDraw = na(_last) or math.abs(_y - _last) > syminfo.mintick * 50
+    var float _returnY = na
+
+    if _shouldDraw
+        label.new(
+            x=_label_x,
+            y=_end_y,
+            text=_txt,
+            yloc=yloc.price,
+            style=label.style_label_left,
+            color=color.new(color.black, 90),
+            textcolor=_textColor,
+            size=size.small
+        )
+        line.new(
+            x1=bar_index,
+            y1=_y,
+            x2=_label_x,
+            y2=_end_y,
+            color=color.new(_textColor, 50),
+            style=line.style_dotted,
+            width=1
+        )
+        _returnY := _y
+
+    _returnY
+
+// === APPLY GRADING LABELS ===
+float newY = na  // ✅ explicitly declared as float
+
+if showGravityGrades and showCHoCHLabels and bullCHoCH
+    newY := drawLabel(gravityGrade(true, confScore), low, confTextColorBull, labelOffset, labelSlope, true)
+    if not na(newY)
+        lastLabelPriceBull := newY
+
+if showGravityGrades and showCHoCHLabels and bearCHoCH
+    newY := drawLabel(gravityGrade(false, confScore), high, confTextColorBear, labelOffset, -labelSlope, false)
+    if not na(newY)
+        lastLabelPriceBear := newY
+
+if showGravityGrades and showBOSLabels and bullBOS
+    newY := drawLabel(gravityGrade(true, confScore), high, confTextColorBull, labelOffset, labelSlope, true)
+    if not na(newY)
+        lastLabelPriceBull := newY
+
+if showGravityGrades and showBOSLabels and bearBOS
+    newY := drawLabel(gravityGrade(false, confScore), low, confTextColorBear, labelOffset, -labelSlope, false)
+    if not na(newY)
+        lastLabelPriceBear := newY
+
+// === PSYCH RAYS ===
+var line[] psychLines = array.new_line()
+var color[] psychColors = array.new_color()
+
+if showPsychLevels and nearRoundNum
+    psychColor = inPremium ? color.red : inDiscount ? color.green : color.gray
+    psychLine = line.new(
+        bar_index, nearestPsych,
+        bar_index, nearestPsych,
+        xloc.bar_index, extend=extend.right,
+        color=psychColor, width=inNeutral ? 1 : 2
+    )
+    array.push(psychLines, psychLine)
+    array.push(psychColors, psychColor)
+
+    if showPsychLabels
+        label.new(
+            bar_index + 5, nearestPsych,
+            str.tostring(nearestPsych),
+            style=label.style_label_left,
+            color=color.new(color.black, 100),
+            textcolor=psychColor
+        )
+
+if array.size(psychLines) > 0 and array.size(psychColors) > 0
+    for i = array.size(psychLines) - 1 to 0
+        l = array.get(psychLines, i)
+        c = array.get(psychColors, i)
+        age = bar_index - line.get_x1(l)
+
+        if age > psychTTL
+            line.delete(l)
+            array.remove(psychLines, i)
+            array.remove(psychColors, i)
+        else if fadeOldPsychLines
+            op = math.max(0, 100 - (age * 100 / psychTTL))
+            line.set_color(l, color.new(c, op))
+
+// === VISUAL ZONES (±2σ Deviation Bands) — persistent ===
+var line upBand = na
+var line dnBand = na
+
+if showGravityGrades and barstate.islast
+    float up = gAnchor + (2 * gATR)
+    float dn = gAnchor - (2 * gATR)
+
+    if na(upBand)
+        upBand := line.new(bar_index, up, bar_index + 50, up, extend=extend.right, style=line.style_dashed, color=color.new(color.red, 70))
+        dnBand := line.new(bar_index, dn, bar_index + 50, dn, extend=extend.right, style=line.style_dashed, color=color.new(color.green, 70))
+    else
+        line.set_xy1(upBand, bar_index, up)
+        line.set_xy2(upBand, bar_index + 50, up)
+        line.set_xy1(dnBand, bar_index, dn)
+        line.set_xy2(dnBand, bar_index + 50, dn)
+
+// === GRAVITY DASHBOARD PANEL ===
+var table dash = table.new(
+    tablePos == "Top Left"     ? position.top_left :
+    tablePos == "Top Center"   ? position.top_center :
+    tablePos == "Top Right"    ? position.top_right :
+    tablePos == "Bottom Left"  ? position.bottom_left :
+    tablePos == "Bottom Center"? position.bottom_center :
+                                 position.bottom_right,
+    columns=2, rows=17, border_width=1
+)
+
+if showGravityNarrative and barstate.islast
+    table.cell(dash, 0, 0, "State:", text_color=color.white)
+    table.cell(dash, 1, 0, state, text_color=inNeutral ? color.gray : inDiscount ? color.green : color.red)
+
+    table.cell(dash, 0, 1, "Z-Score:", text_color=color.white)
+    table.cell(dash, 1, 1, str.tostring(adjZScore, "#.##") + "σ",
+        text_color=inNeutral ? color.gray : inDiscount ? color.green : color.red)
+
+    // --- Stretch Risk (NEW) ---
+    table.cell(dash, 0, 2, "Stretch Risk:", text_color=color.white)
+    table.cell(dash, 1, 2, stretchRisk,
+        text_color=
+            str.contains(stretchRisk, "Extreme") ? color.red :
+            str.contains(stretchRisk, "Stretch") ? color.orange :
+            color.gray)
+
+    table.cell(dash, 0, 3, "Revert Prob:", text_color=color.white)
+    table.cell(dash, 1, 3, str.tostring(revertProb, "#.##") + "%", text_color=color.yellow)
+
+    table.cell(dash, 0, 4, "Conf Score:", text_color=color.white)
+    table.cell(dash, 1, 4, str.tostring(confScore * 100, "#.##") + "%", text_color=color.orange)
+
+    table.cell(dash, 0, 5, "Decay:", text_color=color.white)
+    table.cell(dash, 1, 5, str.tostring(velocityDecay * 100, "#.##") + "%", text_color=color.fuchsia)
+
+    table.cell(dash, 0, 6, "Clustering:", text_color=color.white)
+    table.cell(dash, 1, 6, clustering ? "High" : "Low",
+        text_color=clustering ? color.green : color.gray)
+
+    table.cell(dash, 0, 7, "Psych Level:", text_color=color.white)
+    table.cell(dash, 1, 7, nearestPsych != 0 ? str.tostring(nearestPsych) : "-", text_color=color.teal)
+
+    table.cell(dash, 0, 8, "Intermarket:", text_color=color.white)
+    table.cell(dash, 1, 8, interPull, text_color=color.silver)
+
+    table.cell(dash, 0, 9, "Bias:", text_color=color.white)
+    table.cell(dash, 1, 9, bias,
+        text_color=bias == "Bullish" ? color.green :
+                   bias == "Bearish" ? color.red :
+                   color.gray)
+
+    // === 💰 INCOME LAYER (Covered Calls) ===
+    if showIncomeLayer
+        table.cell(dash, 0, 10, "Income:", text_color=color.white)
+        table.cell(dash, 1, 10, "Covered Calls", text_color=color.white)
+
+        table.cell(dash, 0, 11, "Premium:", text_color=color.white)
+        table.cell(dash, 1, 11, premiumEnv,
+            text_color=premiumEnv == "Rocking" ? color.lime :
+                       premiumEnv == "Solid"   ? color.new(color.lime, 25) :
+                       premiumEnv == "Moderate"? color.yellow :
+                       color.red)
+
+        table.cell(dash, 0, 12, "Risk:", text_color=color.white)
+        table.cell(dash, 1, 12, assignRisk,
+            text_color=assignRisk == "Low"      ? color.lime :
+                       assignRisk == "Moderate" ? color.yellow :
+                       assignRisk == "High"     ? color.orange :
+                       color.red)
+
+        table.cell(dash, 0, 13, "DTE / Δ:", text_color=color.white)
+        table.cell(dash, 1, 13, recDTE + " | " + recDelta, text_color=color.silver)
+
+        table.cell(dash, 0, 14, "Mode:", text_color=color.white)
+        table.cell(dash, 1, 14, premiumEnv + " / " + assignRisk, text_color=color.silver)
+
+// === STRUCTURE CONTEXT FLAGS ===
+// Gravity no longer defines true Order Blocks.
+// Your upgraded SMC script owns OB / Breaker / Mitigation logic.
+bullStructHint = bullCHoCH or bullBOS
+bearStructHint = bearCHoCH or bearBOS
+
+// === ALERT HOOKS ===
+alertcondition(bullBOS and confScore > 0.7, title="High Conf Bull BOS", message="Bullish BOS with confidence > 70%")
+alertcondition(bearBOS and confScore > 0.7, title="High Conf Bear BOS", message="Bearish BOS with confidence > 70%")
+alertcondition(bullCHoCH and confScore > 0.5, title="Bull CHoCH Alert", message="Bullish CHoCH with conf > 50%")
+alertcondition(bearCHoCH and confScore > 0.5, title="Bear CHoCH Alert", message="Bearish CHoCH with conf > 50%")
+alertcondition(bullStructHint and confScore > 0.6, title="Bullish Gravity Context", message="Bullish structure context with strong gravity confidence")
+alertcondition(bearStructHint and confScore > 0.6, title="Bearish Gravity Context", message="Bearish structure context with strong gravity confidence")
+alertcondition(bullCHoCH and bullIdealReversal, title="Bull CHoCH + Gravity Reversal Assist",
+    message="Bullish CHoCH occurred from discount/reversion gravity context")
+
+alertcondition(bearCHoCH and bearIdealReversal, title="Bear CHoCH + Gravity Reversal Assist",
+    message="Bearish CHoCH occurred from premium/reversion gravity context")
+
+alertcondition(bullBOS and bullTrendAssist, title="Bull BOS + Gravity Trend Assist",
+    message="Bullish BOS aligned with bullish gravity expansion context")
+
+alertcondition(bearBOS and bearTrendAssist, title="Bear BOS + Gravity Trend Assist",
+    message="Bearish BOS aligned with bearish gravity expansion context")
+
+// === END ===

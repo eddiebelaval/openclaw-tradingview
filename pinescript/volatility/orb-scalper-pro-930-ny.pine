@@ -1,0 +1,395 @@
+//@version=5
+indicator("ORB Scalper Pro (9:30 NY)", overlay=true, max_labels_count=500, max_lines_count=200, max_boxes_count=50)
+
+// ─── Input Groups ─────────────────────────────────────────────────────────────
+G1 = "ORB Settings"
+G2 = "Signal Settings"
+G3 = "Risk / Levels"
+G4 = "Style"
+G5 = "VWAP / EMAs / Levels"
+G6 = "Setup Grading"
+
+// ─── ORB Settings ─────────────────────────────────────────────────────────────
+tz      = input.string("America/New_York", "Timezone", group=G1)
+orbMins = input.int(5, "ORB Window (minutes from 9:30)", minval=1, maxval=60, group=G1,
+          tooltip="5 = 9:30–9:35 (most common). Use a chart TF ≤ this value for best accuracy.")
+showBox = input.bool(true, "Show ORB Formation Box",   group=G1)
+showMid = input.bool(true, "Show ORB Midline",         group=G1)
+showExt = input.bool(true, "Show 1× / 2× Extensions", group=G1)
+
+// ─── Signal Settings ──────────────────────────────────────────────────────────
+showSigs   = input.bool(true,  "Show Signals on Chart",            group=G2)
+onePerDay  = input.bool(true,  "One Breakout Signal per Side/Day", group=G2)
+showRetest = input.bool(true,  "Show Retest Signals",              group=G2)
+showFailed = input.bool(true,  "Show Failed ORB (Fade) Signals",   group=G2)
+useVol     = input.bool(false, "Volume Filter on Break Bars",      group=G2)
+volLen     = input.int(20,     "Volume Avg Length", minval=5,      group=G2)
+tradeSess  = input.session("0935-1030", "Signal Window (NY time)", group=G2)
+
+// ─── Risk / Levels ────────────────────────────────────────────────────────────
+showLvls = input.bool(true,  "Show SL / TP on Signals",          group=G3)
+tpMult   = input.float(2.0,  "TP Multiple (× ORB range)", step=0.5,  minval=0.5,  group=G3)
+slMult   = input.float(0.5,  "SL Multiple (× ORB range)", step=0.25, minval=0.1,  group=G3)
+
+// ─── Style ────────────────────────────────────────────────────────────────────
+highCol = input.color(#00e676, "ORB High Color", group=G4)
+lowCol  = input.color(#f44336, "ORB Low Color",  group=G4)
+midCol  = input.color(#ffeb3b, "ORB Mid Color",  group=G4)
+boxCol  = input.color(color.new(#2962ff, 88), "ORB Box Fill", group=G4)
+
+// ─── VWAP / EMAs / Levels ─────────────────────────────────────────────────────
+showVWAP = input.bool(true,  "Show VWAP",               group=G5)
+showEMAs = input.bool(true,  "Show EMA 9 / EMA 21",     group=G5)
+showPDHL = input.bool(true,  "Show Prior Day High / Low", group=G5)
+vwapCol  = input.color(#ff9800,                    "VWAP Color",          group=G5)
+ema9Col  = input.color(#00bcd4,                    "EMA 9 Color",         group=G5)
+ema21Col = input.color(#e91e63,                    "EMA 21 Color",        group=G5)
+pdhCol   = input.color(color.new(#ffeb3b, 30),     "Prior Day High Color", group=G5)
+pdlCol   = input.color(color.new(#ff5722, 30),     "Prior Day Low Color",  group=G5)
+
+// ─── Setup Grading ────────────────────────────────────────────────────────────
+showGrade      = input.bool(true, "Show Grade on Signal Labels",  group=G6)
+showScorecard  = input.bool(true, "Show Live Scorecard Table",    group=G6)
+tablePos       = input.string("Bottom Left", "Table Position",
+                 options=["Bottom Left", "Bottom Right", "Top Left", "Top Right"], group=G6)
+volBoostMult   = input.float(1.5, "Vol Boost Threshold (× avg)",  step=0.25, minval=1.0, group=G6,
+                 tooltip="Volume must be this many times the avg to earn the +1 volume point")
+earlyBreakHHMM = input.int(1000,  "Early Break Cutoff (HHMM)",   group=G6,
+                 tooltip="Breaks before this time earn +1 pt. Default 1000 = before 10:00 AM")
+
+// ─── Helpers ──────────────────────────────────────────────────────────────────
+inSession(sess) => not na(time(timeframe.period, sess, tz))
+newDay = ta.change(time("D", "0000-2359", tz)) != 0
+
+// ORB end time as HHMM integer
+_endMins   = 30 + orbMins
+_endHour   = 9  + _endMins / 60
+_endMin    = _endMins % 60
+orbEndHHMM = _endHour * 100 + _endMin
+
+t_bar = time(timeframe.period, "0000-2359", tz)
+hhmm  = not na(t_bar) ? hour(t_bar, tz) * 100 + minute(t_bar, tz) : na
+inOrb = not na(hhmm) and hhmm >= 930 and hhmm < orbEndHHMM
+
+// ─── ORB Range Tracking ───────────────────────────────────────────────────────
+var float orbHigh      = na
+var float orbLow       = na
+var int   orbLeft      = na
+var int   orbRight     = na
+var bool  orbCapturing = false
+
+if newDay
+    orbHigh      := na
+    orbLow       := na
+    orbLeft      := na
+    orbRight     := na
+    orbCapturing := false
+
+if inOrb
+    orbHigh  := na(orbHigh) ? high : math.max(orbHigh, high)
+    orbLow   := na(orbLow)  ? low  : math.min(orbLow,  low)
+    if not orbCapturing
+        orbLeft      := bar_index
+        orbCapturing := true
+    orbRight := bar_index
+
+orbReady = not inOrb and not na(orbHigh) and not na(orbLow)
+
+// ─── Derived Levels ───────────────────────────────────────────────────────────
+orbMid = orbReady ? (orbHigh + orbLow) / 2 : na
+orbRng = orbReady ? orbHigh - orbLow        : na
+
+ext1Up = orbReady ? orbHigh + orbRng       : na
+ext2Up = orbReady ? orbHigh + orbRng * 2.0 : na
+ext1Dn = orbReady ? orbLow  - orbRng       : na
+ext2Dn = orbReady ? orbLow  - orbRng * 2.0 : na
+
+// ─── RTH VWAP (resets at 9:30 AM every day — correct for futures) ────────────
+// ta.vwap resets at the exchange session open (6 PM for CME futures) which is wrong.
+// This custom VWAP resets exactly at the 9:30 AM RTH open and only counts RTH bars.
+inRTH    = not na(hhmm) and hhmm >= 930 and hhmm < 1600
+rthOpen  = inRTH and (na(hhmm[1]) or hhmm[1] < 930)   // first bar of RTH each day
+
+var float _vwapTP  = 0.0
+var float _vwapVol = 0.0
+
+if rthOpen
+    _vwapTP  := hlc3 * volume
+    _vwapVol := volume
+else if inRTH
+    _vwapTP  += hlc3 * volume
+    _vwapVol += volume
+
+vwap = _vwapVol > 0 ? _vwapTP / _vwapVol : na
+
+// ─── EMAs ─────────────────────────────────────────────────────────────────────
+ema9  = ta.ema(close, 9)
+ema21 = ta.ema(close, 21)
+
+// ─── Prior Day High / Low ─────────────────────────────────────────────────────
+pdHigh = request.security(syminfo.tickerid, "D", high[1], barmerge.gaps_off, barmerge.lookahead_on)
+pdLow  = request.security(syminfo.tickerid, "D", low[1],  barmerge.gaps_off, barmerge.lookahead_on)
+
+// ─── Gap Detection (futures-accurate) ────────────────────────────────────────
+// Compare the ORB range to where price was just before the 9:30 open.
+// preMarketRef = last price before RTH — the true pre-market reference for futures.
+var float preMarketRef = na
+if newDay
+    preMarketRef := na
+if not na(hhmm) and hhmm < 930
+    preMarketRef := close   // keeps updating up to the last pre-market bar
+
+gapUp   = orbReady and not na(preMarketRef) and orbLow  > preMarketRef
+gapDown = orbReady and not na(preMarketRef) and orbHigh < preMarketRef
+
+// ─── Setup Scoring (computed every bar at global scope) ───────────────────────
+// Max 7 points per side. VWAP worth 2 pts (most important for futures).
+//   +2  VWAP aligned with trade direction
+//   +1  Volume ≥ boost threshold × average
+//   +1  Early break (before earlyBreakHHMM)
+//   +1  Gap direction matches trade direction
+//   +1  EMA 9 / 21 trend aligned
+//   +1  ORB range is "normal" (not a micro or blowout range)
+
+atr5      = ta.atr(5)
+volMA     = ta.sma(volume, volLen)
+normalRng = not na(orbRng) and orbRng >= atr5 * 0.05 and orbRng <= atr5 * 4.0
+earlyBar  = not na(hhmm) and hhmm < earlyBreakHHMM
+volBoosted = volume >= volMA * volBoostMult
+
+longScore = ((close > vwap  ? 2 : 0) +
+             (volBoosted    ? 1 : 0) +
+             (earlyBar      ? 1 : 0) +
+             (gapUp         ? 1 : 0) +
+             (ema9 > ema21  ? 1 : 0) +
+             (normalRng     ? 1 : 0))
+
+shortScore = ((close < vwap ? 2 : 0) +
+              (volBoosted   ? 1 : 0) +
+              (earlyBar     ? 1 : 0) +
+              (gapDown      ? 1 : 0) +
+              (ema9 < ema21 ? 1 : 0) +
+              (normalRng    ? 1 : 0))
+
+getGrade(s) =>
+    s >= 6 ? "A+" : s >= 4 ? "A" : s >= 2 ? "B" : "C"
+
+getGradeCol(g) =>
+    g == "A+" ? color.lime : g == "A" ? color.teal : g == "B" ? #f0b90b : color.red
+
+gradeLong  = getGrade(longScore)
+gradeShort = getGrade(shortScore)
+gcolLong   = getGradeCol(gradeLong)
+gcolShort  = getGradeCol(gradeShort)
+
+// ─── Plots ────────────────────────────────────────────────────────────────────
+plot(orbHigh, "ORB High", color=highCol, linewidth=2)
+plot(orbLow,  "ORB Low",  color=lowCol,  linewidth=2)
+plot(showMid ? orbMid  : na, "ORB Mid",  color=color.new(midCol, 40),   linewidth=1, style=plot.style_circles)
+plot(showExt ? ext1Up  : na, "Ext +1×",  color=color.new(highCol, 55),  linewidth=1, style=plot.style_stepline)
+plot(showExt ? ext2Up  : na, "Ext +2×",  color=color.new(highCol, 25),  linewidth=1, style=plot.style_stepline)
+plot(showExt ? ext1Dn  : na, "Ext -1×",  color=color.new(lowCol,  55),  linewidth=1, style=plot.style_stepline)
+plot(showExt ? ext2Dn  : na, "Ext -2×",  color=color.new(lowCol,  25),  linewidth=1, style=plot.style_stepline)
+plot(showVWAP ? vwap   : na, "VWAP",     color=vwapCol,                 linewidth=2)
+plot(showEMAs ? ema9   : na, "EMA 9",    color=ema9Col,                 linewidth=1)
+plot(showEMAs ? ema21  : na, "EMA 21",   color=ema21Col,                linewidth=1)
+plot(showPDHL ? pdHigh : na, "PDH",      color=pdhCol,                  linewidth=1, style=plot.style_stepline)
+plot(showPDHL ? pdLow  : na, "PDL",      color=pdlCol,                  linewidth=1, style=plot.style_stepline)
+
+// ─── ORB Formation Box + Range Label ─────────────────────────────────────────
+var box   orbBox    = na
+var label orbRngLbl = na
+
+if showBox and barstate.islast and not na(orbLeft) and not na(orbHigh) and not na(orbRng)
+    box.delete(orbBox)
+    label.delete(orbRngLbl)
+    orbBox := box.new(orbLeft, orbHigh, orbRight, orbLow,
+      border_color = color.new(#2962ff, 30),
+      border_width  = 1,
+      bgcolor       = boxCol)
+    orbRngLbl := label.new(orbRight + 1, orbHigh,
+      "ORB  " + str.tostring(orbRng, format.mintick),
+      style     = label.style_label_right,
+      color     = color.new(#2962ff, 20),
+      textcolor = color.white,
+      size      = size.small)
+
+// ─── ORB Window Background Highlight ─────────────────────────────────────────
+bgcolor(inOrb ? color.new(#2962ff, 90) : na, title="ORB Formation Window")
+
+// ─── Volume Filter ────────────────────────────────────────────────────────────
+volOk = not useVol or volume >= volMA
+
+// ─── Signal State ─────────────────────────────────────────────────────────────
+inWindow = inSession(tradeSess)
+
+var bool buyDone   = false
+var bool sellDone  = false
+var bool bullBreak = false
+var bool bearBreak = false
+
+if newDay
+    buyDone   := false
+    sellDone  := false
+    bullBreak := false
+    bearBreak := false
+
+// ─── Primary Break Signals ────────────────────────────────────────────────────
+buyBreak  = orbReady and inWindow and volOk and ta.crossover(close,  orbHigh)
+sellBreak = orbReady and inWindow and volOk and ta.crossunder(close, orbLow)
+
+if buyBreak
+    bullBreak := true
+if sellBreak
+    bearBreak := true
+
+buySignal  = buyBreak  and (not onePerDay or not buyDone)
+sellSignal = sellBreak and (not onePerDay or not sellDone)
+
+if buySignal
+    buyDone := true
+if sellSignal
+    sellDone := true
+
+// ─── Last Signal Tracker (persists across bars for table display) ─────────────
+var string lastSigTxt = "—"
+var color  lastSigCol = color.gray
+
+if newDay
+    lastSigTxt := "—"
+    lastSigCol := color.gray
+
+// ─── Retest Signals ───────────────────────────────────────────────────────────
+retestBuy  = (showRetest and bullBreak and not buySignal and inWindow and
+              low <= orbHigh and close > orbHigh and close[1] > orbHigh)
+
+retestSell = (showRetest and bearBreak and not sellSignal and inWindow and
+              high >= orbLow and close < orbLow and close[1] < orbLow)
+
+// ─── Failed ORB / Fade Signals ────────────────────────────────────────────────
+failedBull = showFailed and bullBreak and inWindow and ta.crossunder(close, orbHigh)
+failedBear = showFailed and bearBreak and inWindow and ta.crossover(close,  orbLow)
+
+// Update last signal tracker (priority: failed > retest > break)
+if buySignal
+    lastSigTxt := "▲ BUY ORB"
+    lastSigCol := highCol
+if sellSignal
+    lastSigTxt := "▼ SELL ORB"
+    lastSigCol := lowCol
+if retestBuy
+    lastSigTxt := "↩ RETEST LONG"
+    lastSigCol := #00bcd4
+if retestSell
+    lastSigTxt := "↩ RETEST SHORT"
+    lastSigCol := #ff9800
+if failedBull
+    lastSigTxt := "✗ FADE SHORT"
+    lastSigCol := color.purple
+if failedBear
+    lastSigTxt := "✗ FADE LONG"
+    lastSigCol := color.purple
+
+// ─── SL / TP Levels ───────────────────────────────────────────────────────────
+sl_buy        = orbReady ? orbHigh - orbRng * slMult : na
+tp_buy        = orbReady ? orbHigh + orbRng * tpMult : na
+sl_sell       = orbReady ? orbLow  + orbRng * slMult : na
+tp_sell       = orbReady ? orbLow  - orbRng * tpMult : na
+sl_fadeShort  = orbReady ? orbHigh + orbRng * slMult : na
+tp_fadeShort  = orbReady ? orbLow                   : na
+sl_fadeLong   = orbReady ? orbLow  - orbRng * slMult : na
+tp_fadeLong   = orbReady ? orbHigh                  : na
+
+// ─── Label Builder Helper ─────────────────────────────────────────────────────
+buildLbl(grade, txt, showGr) =>
+    showGr ? "[" + grade + "] " + txt : txt
+
+addLevels(base, sl, tp, show) =>
+    show and not na(sl) ? base + "\nSL " + str.tostring(sl, format.mintick) + "   TP " + str.tostring(tp, format.mintick) : base
+
+// ─── Labels & Shapes ─────────────────────────────────────────────────────────
+if showSigs
+    if buySignal
+        lbl = addLevels(buildLbl(gradeLong, "▲ BUY ORB", showGrade), sl_buy, tp_buy, showLvls)
+        label.new(bar_index, low, lbl,
+          style=label.style_label_up, color=color.new(gcolLong, 10), textcolor=color.white, size=size.small)
+
+    if sellSignal
+        lbl = addLevels(buildLbl(gradeShort, "▼ SELL ORB", showGrade), sl_sell, tp_sell, showLvls)
+        label.new(bar_index, high, lbl,
+          style=label.style_label_down, color=color.new(gcolShort, 10), textcolor=color.white, size=size.small)
+
+    if retestBuy
+        lbl = buildLbl(gradeLong, "↩ RETEST LONG", showGrade)
+        lbl := addLevels(lbl, sl_buy, tp_buy, showLvls)
+        label.new(bar_index, low, lbl,
+          style=label.style_label_up, color=color.new(gcolLong, 10), textcolor=color.white, size=size.small)
+
+    if retestSell
+        lbl = buildLbl(gradeShort, "↩ RETEST SHORT", showGrade)
+        lbl := addLevels(lbl, sl_sell, tp_sell, showLvls)
+        label.new(bar_index, high, lbl,
+          style=label.style_label_down, color=color.new(gcolShort, 10), textcolor=color.white, size=size.small)
+
+    if failedBull
+        // Fade short — score using short criteria
+        fadeGrade = getGrade(shortScore)
+        fadeCol   = getGradeCol(fadeGrade)
+        lbl = addLevels(buildLbl(fadeGrade, "✗ FAILED — FADE SHORT", showGrade), sl_fadeShort, tp_fadeShort, showLvls)
+        label.new(bar_index, high, lbl,
+          style=label.style_label_down, color=color.new(fadeCol, 10), textcolor=color.white, size=size.small)
+
+    if failedBear
+        // Fade long — score using long criteria
+        fadeGrade = getGrade(longScore)
+        fadeCol   = getGradeCol(fadeGrade)
+        lbl = addLevels(buildLbl(fadeGrade, "✗ FAILED — FADE LONG", showGrade), sl_fadeLong, tp_fadeLong, showLvls)
+        label.new(bar_index, low, lbl,
+          style=label.style_label_up, color=color.new(fadeCol, 10), textcolor=color.white, size=size.small)
+
+// Shapes for quick scanning
+plotshape(showSigs and buySignal,   "BUY Break",    shape.triangleup,   location.belowbar, highCol,       size=size.small)
+plotshape(showSigs and sellSignal,  "SELL Break",   shape.triangledown, location.abovebar, lowCol,        size=size.small)
+plotshape(showSigs and retestBuy,   "Retest Long",  shape.diamond,      location.belowbar, #00bcd4,       size=size.tiny)
+plotshape(showSigs and retestSell,  "Retest Short", shape.diamond,      location.abovebar, #ff9800,       size=size.tiny)
+plotshape(showSigs and failedBull,  "Fade Short",   shape.xcross,       location.abovebar, color.purple,  size=size.tiny)
+plotshape(showSigs and failedBear,  "Fade Long",    shape.xcross,       location.belowbar, color.purple,  size=size.tiny)
+
+// ─── Live Scorecard Table (bottom right, compact) ────────────────────────────
+_tblPos = (tablePos == "Bottom Left"  ? position.bottom_left  :
+           tablePos == "Top Left"     ? position.top_left     :
+           tablePos == "Top Right"    ? position.top_right    :
+           position.bottom_right)
+
+var table sc = na
+if showScorecard
+    sc := table.new(_tblPos, 3, 3,
+      bgcolor      = #1e222d,
+      border_color = #373a46,
+      border_width = 1,
+      frame_color  = #373a46,
+      frame_width  = 1)
+
+if showScorecard and barstate.islast
+    // Signal row (spans all 3 columns)
+    sc.cell(0, 0, "SIGNAL",      text_color=color.gray,   bgcolor=#2a2e39, text_size=size.small)
+    sc.cell(1, 0, lastSigTxt,    text_color=lastSigCol,   bgcolor=#2a2e39, text_size=size.small)
+    sc.merge_cells(1, 0, 2, 0)
+
+    // Total row
+    sc.cell(0, 1, "TOTAL / 7",                       text_color=color.gray,  bgcolor=#2a2e39, text_size=size.small)
+    sc.cell(1, 1, str.tostring(longScore)  + " pts", text_color=gcolLong,   bgcolor=#2a2e39, text_size=size.small)
+    sc.cell(2, 1, str.tostring(shortScore) + " pts", text_color=gcolShort,  bgcolor=#2a2e39, text_size=size.small)
+
+    // Grade row
+    sc.cell(0, 2, "GRADE",    text_color=color.gray,  bgcolor=#2a2e39,                   text_size=size.small)
+    sc.cell(1, 2, gradeLong,  text_color=gcolLong,    bgcolor=color.new(gcolLong,  80),   text_size=size.small)
+    sc.cell(2, 2, gradeShort, text_color=gcolShort,   bgcolor=color.new(gcolShort, 80),   text_size=size.small)
+
+// ─── Alerts ───────────────────────────────────────────────────────────────────
+alertcondition(buySignal,   "ORB Buy Break",      "ORB BUY: Close broke above ORB High!")
+alertcondition(sellSignal,  "ORB Sell Break",     "ORB SELL: Close broke below ORB Low!")
+alertcondition(retestBuy,   "ORB Retest Long",    "ORB RETEST LONG: ORB High holding as support")
+alertcondition(retestSell,  "ORB Retest Short",   "ORB RETEST SHORT: ORB Low holding as resistance")
+alertcondition(failedBull,  "Failed ORB — Short", "FAILED BULL ORB: Reversal — fade short")
+alertcondition(failedBear,  "Failed ORB — Long",  "FAILED BEAR ORB: Reversal — fade long")

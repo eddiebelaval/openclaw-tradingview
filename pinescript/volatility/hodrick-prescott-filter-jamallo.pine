@@ -1,0 +1,154 @@
+//@version=5
+indicator("Hodrick-Prescott filter [Jamallo]", overlay = true, max_bars_back = 500)
+
+// ══════════════════════════════════════════════════════════════════════════════
+// INPUTS
+// ══════════════════════════════════════════════════════════════════════════════
+
+// HP Filter Settings
+fastper = input.int(33, 'HP Filter Period', minval=4, group = "HP Filter Settings", 
+     tooltip="Lookback period for Hodrick-Prescott trend calculation. Higher = smoother trend.")
+
+// Adaptive Filter Settings
+adaptivePercentileThreshold = input.int(1, "Adaptive Filter - Range Percentile Threshold", group="Adaptive Filter", tooltip="Percentile of True Range for adaptive filter")
+adaptiveLookbackPeriod = input.int(1, "Adaptive Filter - Percentile Lookback Period", group="Adaptive Filter")
+adaptiveRangeMultiplier = input.float(1.0, "Adaptive Filter - Range Multiplier", group="Adaptive Filter", tooltip="Multiplier for adaptive filter range")
+smoothRange = input.bool(false, "Smooth Range", group="Adaptive Filter")
+smoothPeriod = input.int(14, "Smoothing Period", group="Adaptive Filter")
+
+// Trend Detection Settings
+slopeThreshold = input.float(0.1, "Slope Threshold Multiplier", minval=0.01, maxval=1.0, step=0.01, group="Trend Detection", 
+     tooltip="Multiplied by range for minimum slope for trend change. Higher = fewer trend flips")
+
+// Display Options
+colorCodeBaseline = input.bool(true, "Color Code HP Baseline", group="Display")
+bullColor = input.color(color.teal, "Bullish Color", inline="colors", group="Display")
+bearColor = input.color(color.maroon, "Bearish Color", inline="colors", group="Display")
+neutralColor = input.color(color.gray, "Neutral Color", inline="colors", group="Display")
+
+// ══════════════════════════════════════════════════════════════════════════════
+// HODRICK-PRESCOTT FILTER
+// ══════════════════════════════════════════════════════════════════════════════
+
+_HPFilter(src, lamb, per) =>
+    H1 = 0., H2 = 0., H3 = 0., H4 = 0., H5 = 0.
+    HH1 = 0., HH2 = 0., HH3 = 0., HH5 = 0.
+    HB = 0., HC = 0., Z = 0.
+    
+    a = array.new<float>(per, 0.)
+    b = array.new<float>(per, 0.)
+    c = array.new<float>(per, 0.)
+    out = array.new<float>(per, 0.)
+    
+    for i = 0 to per - 1
+        array.set(out, i, nz(src[i]))
+    
+    array.set(a, 0, 1.0 + lamb)
+    array.set(b, 0, -2.0 * lamb)
+    array.set(c, 0, lamb)
+    
+    for i = 1 to per - 3
+        array.set(a, i, 6.0 * lamb + 1.0)
+        array.set(b, i, -4.0 * lamb)
+        array.set(c, i, lamb)
+    
+    array.set(a, 1, 5.0 * lamb + 1)
+    array.set(a, per - 1, 1.0 + lamb)
+    array.set(a, per - 2, 5.0 * lamb + 1.0)
+    array.set(b, per - 2, -2.0 * lamb)
+    array.set(b, per - 1, 0.)
+    array.set(c, per - 2, 0.)
+    array.set(c, per - 1, 0.)
+    
+    for i = 0 to per - 1 
+        Z := array.get(a, i) - H4 * H1 - HH5 * HH2
+        if Z == 0
+            break
+        
+        HB := array.get(b, i)
+        HH1 := H1
+        H1 := (HB - H4 * H2) / Z
+        array.set(b, i, H1)
+        
+        HC := array.get(c, i)
+        HH2 := H2
+        H2 := HC / Z
+        array.set(c, i, H2)
+        
+        array.set(a, i, (array.get(out, i) - HH3 * HH5 - H3 * H4) / Z)
+        HH3 := H3
+        H3 := array.get(a, i)
+        H4 := HB - H5 * HH1
+        HH5 := H5
+        H5 := HC
+    
+    H2 := 0
+    H1 := array.get(a, per - 1)
+    array.set(out, per - 1, H1)
+    
+    for i = per - 2 to 0
+        array.set(out, i, array.get(a, i) - array.get(b, i) * H1 - array.get(c, i) * H2)
+        H2 := H1
+        H1 := array.get(out, i)
+    
+    out
+
+// ══════════════════════════════════════════════════════════════════════════════
+// CALCULATE HP FILTER
+// ══════════════════════════════════════════════════════════════════════════════
+
+lambfast = 0.0625 / math.pow(math.sin(math.pi / fastper), 4) 
+hp_trend_array = _HPFilter(close, lambfast, fastper)
+hp_baseline = array.get(hp_trend_array, 0)
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ADAPTIVE FILTER FOR HP BASELINE
+// ══════════════════════════════════════════════════════════════════════════════
+
+// Calculate True Range
+tr = ta.tr
+
+// Get the percentile of True Range for adaptive range
+adaptiveRange = ta.percentile_linear_interpolation(tr, adaptiveLookbackPeriod, adaptivePercentileThreshold)
+
+// Optional smoothing and apply multiplier
+r_adaptive = smoothRange ? ta.sma(adaptiveRange, smoothPeriod) * adaptiveRangeMultiplier : adaptiveRange * adaptiveRangeMultiplier
+
+// Range filter function
+rngfilt(x, r) =>
+    var float rng = x
+    rng := x > nz(rng[1]) ? x - r < nz(rng[1]) ? nz(rng[1]) : x - r : 
+           x + r > nz(rng[1]) ? nz(rng[1]) : x + r
+    rng
+
+// ══════════════════════════════════════════════════════════════════════════════
+// APPLY ADAPTIVE FILTER TO HP BASELINE
+// ══════════════════════════════════════════════════════════════════════════════
+
+// Apply range filter to HP baseline using adaptive range
+hp_filtered = rngfilt(hp_baseline, r_adaptive)
+
+// ══════════════════════════════════════════════════════════════════════════════
+// STATE-BASED TREND DETECTION FOR HP
+// ══════════════════════════════════════════════════════════════════════════════
+
+var int trendState = 0
+
+float baselineSlope = hp_filtered - hp_filtered[1]
+
+// Simplified trend detection based on price position relative to HP line
+if close > hp_filtered and baselineSlope > 0
+    trendState := 1
+else if close < hp_filtered and baselineSlope < 0
+    trendState := -1
+
+color baselineColor = colorCodeBaseline ? 
+     (trendState == 1 ? bullColor : trendState == -1 ? bearColor : neutralColor) : 
+     color.white
+
+// ══════════════════════════════════════════════════════════════════════════════
+// PLOTTING
+// ══════════════════════════════════════════════════════════════════════════════
+
+// HP Filtered line
+plot(hp_filtered, "HP Baseline", color=baselineColor, linewidth=1)

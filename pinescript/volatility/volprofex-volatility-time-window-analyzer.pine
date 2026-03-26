@@ -1,0 +1,591 @@
+//@version=6
+//@description VolProfex Volatility Time Window Analyzer
+//@license This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+
+// =====================================================
+// DISCLAIMER: This software is provided "AS IS" without warranty.
+// Not financial advice. Use at your own risk. Past performance ≠ future results.
+// For educational/demo purposes only. 
+// =====================================================
+
+indicator("VolProfex Volatility Time Window Analyzer", shorttitle="VPX VTWA", overlay=true)
+//Version v1.0
+
+// ══════════════════════════════════════════════════════════════════════════════
+// § 1 ─ INPUTS
+// ══════════════════════════════════════════════════════════════════════════════
+string G_SESS = " ══ SESSION ══ "
+string G_CALC = " ══ CALCULATION ══ "
+string G_FILT = " ══ TREND QUALITY FILTER ══ "
+string G_CONS = " ══ CONSOLIDATION ══ "
+string G_DISP = " ══ DISPLAY ══ "
+
+i_sessStr   = input.session("0930-1600", "Session (HHMM-HHMM)", group=G_SESS,
+                tooltip="Trading session in exchange local time.\nExamples: 0930-1600 for NYSE/NASDAQ · 0800-1630 for LSE · 0900-1530 for TSX")
+i_sessTZ    = input.string("America/New_York", "Session Timezone",
+                options=["UTC","UTC-5","UTC+1","UTC+2","UTC+3","UTC+8",
+                         "America/New_York","America/Chicago",
+                         "Europe/London","Europe/Berlin",
+                         "Asia/Tokyo","Asia/Singapore","Australia/Sydney"],
+                group=G_SESS,
+                tooltip="Named timezones handle daylight saving time automatically.")
+
+// Analysis window and intrabar resolution are now independent.
+// Example: 30-min windows analysed with 5-min candles gives 6 intrabar bars
+// per window, enabling an accurate efficiency ratio for the trend filter.
+i_windowMin  = input.int(30, "Analysis Window (min)", options=[5,10,15,30,60,120,240],
+                group=G_CALC,
+                tooltip="Size of each time slot displayed in the table.\nMust be ≥ Intrabar Resolution.")
+i_intrabarMin = input.int(10, "Intrabar Resolution (min)", options=[1,2,3,5,10,15,30],
+                group=G_CALC,
+                tooltip="Timeframe used to fetch intrabar data via request.security_lower_tf.\nSmaller values give a more accurate Trend Quality score but increase load time.\nMust be ≤ Analysis Window.")
+i_lookback   = input.int(1000, "Lookback Days", minval=1, maxval=5000, group=G_CALC,
+                tooltip="Number of recent trading days to include. 252 ≈ 1 trading year.")
+i_method     = input.string("High-Low Range", "Move Method",
+                options=["High-Low Range","Open-to-Close"], group=G_CALC,
+                tooltip="High-Low Range: intra-window high minus low (absolute range).\nOpen-to-Close: first intrabar open to last intrabar close (directional).")
+
+// ── ATR Normalisation ─────────────────────────────────────────────────────────
+// Expresses each window's move as a multiple of ATR rather than % of price.
+// This removes the effect of absolute price level and session volatility regime,
+// making NY open directly comparable to Asia or London sessions.
+// ATR is computed at the intrabar resolution on the intrabar feed.
+i_normalize  = input.bool(false, "ATR Normalisation", group=G_CALC,
+                tooltip="When ON: move values are shown as multiples of ATR (e.g. 1.4×).\n" +
+                        "Allows cross-session comparison — a 0.3% Asia move and a 0.8% NY move\n" +
+                        "may both be ~1.2× ATR, meaning equal relative significance.")
+i_atrLen     = input.int(14, "ATR Period", minval=1, maxval=200, group=G_CALC,
+                tooltip="Lookback period for ATR calculation on the intrabar feed.\n14 is standard. The ATR at each slot's first intrabar bar is used as the divisor.")
+
+// ── Trend Quality Filter ──────────────────────────────────────────────────────
+// Uses the Directional Efficiency Ratio (Kaufman ER):
+//   Efficiency = |window close − window open| / Σ(intrabar high − intrabar low)
+// A value near 1.0 = perfectly directional; near 0 = all wicks, no trend.
+// Days below the threshold are excluded from avg/median; the Days column shows
+// qualifying/total so you can see how selective the filter is.
+i_trendFilter   = input.bool(false, "Enable Trend Quality Filter", group=G_FILT,
+                    tooltip="Exclude choppy windows from the statistics.\nKeeps only days where the intrabar move was directionally efficient.")
+i_minEfficiency = input.float(30.0, "Min Trend Quality (%)", minval=0.0, maxval=100.0, step=5.0,
+                    group=G_FILT,
+                    tooltip="Minimum Directional Efficiency Ratio (0–100%).\n" +
+                            "20–30% = remove only the most chaotic sessions\n" +
+                            "40–55% = moderate filter — reasonably clean moves\n" +
+                            "60%+   = strict — only near-straight-line moves pass")
+
+i_consolidate    = input.bool(true, "Enable Consolidation", group=G_CONS,
+                    tooltip="Show only the top N windows individually; group the rest into larger time blocks.")
+i_topIndividual  = input.int(10, "Show Top N Individually", minval=1, maxval=100, group=G_CONS,
+                    tooltip="Number of highest-volatility windows to show at full granularity.")
+i_consolidateMin = input.int(60, "Group Remaining Into (min)", options=[5,10,15,30,60,120], group=G_CONS,
+                    tooltip="Granularity for consolidated rows. Remaining windows are averaged into blocks of this size.")
+
+i_topN      = input.int(3, "Highlight Top N Rows", minval=1, maxval=10, group=G_DISP,
+                tooltip="Number of rows to highlight in green.")
+i_tblPos    = input.string("Bottom Right", "Table Position",
+                options=["Top Right","Top Left","Bottom Right","Bottom Left"], group=G_DISP)
+i_tblSize   = input.string("Small", "Text Size",
+                options=["Tiny","Small","Normal","Large"], group=G_DISP)
+
+// ══════════════════════════════════════════════════════════════════════════════
+// § 2 ─ TYPES
+// ══════════════════════════════════════════════════════════════════════════════
+// Stores per-day data for one slot. Both arrays grow in parallel (index i = day i).
+//   moves : % price move for that day's window
+//   effs  : directional efficiency ratio (0–1) for that day's window
+type SlotHistory
+    array<float> moves
+    array<float> effs
+
+// One display row — covers either a single slot or a consolidated group.
+type DisplayRow
+    string label
+    float  avg
+    float  med
+    int    cnt      // days that passed the trend filter (or all days if filter off)
+    int    total    // total days with data for this slot/group
+    bool   isGroup  // true = consolidated time block
+
+// ══════════════════════════════════════════════════════════════════════════════
+// § 3 ─ PURE HELPERS
+// ══════════════════════════════════════════════════════════════════════════════
+f_pad2(int n) =>
+    n < 10 ? "0" + str.tostring(n) : str.tostring(n)
+
+f_parseHHMM(string hhmm) =>
+    int h = int(str.tonumber(str.substring(hhmm, 0, 2)))
+    int m = int(str.tonumber(str.substring(hhmm, 2, 4)))
+    h * 60 + m
+
+f_sessionParams(string sessStr, int winMin) =>
+    int startMin = f_parseHHMM(str.substring(sessStr, 0, 4))
+    int endMin   = f_parseHHMM(str.substring(sessStr, 5, 9))
+    if endMin <= startMin
+        endMin := endMin + 1440
+    int nSlots = int(math.ceil((endMin - startMin) / winMin))
+    [startMin, endMin, nSlots]
+
+f_rangeLabel(int startTotalMin, int endTotalMin) =>
+    int s  = startTotalMin % 1440
+    int e  = endTotalMin   % 1440
+    int sm = s % 60
+    int sh = (s - sm) / 60
+    int em = e % 60
+    int eh = (e - em) / 60
+    f_pad2(sh) + ":" + f_pad2(sm) + "–" + f_pad2(eh) + ":" + f_pad2(em)
+
+f_slotLabel(int sessStartMin, int slotIdx, int winMin) =>
+    f_rangeLabel(sessStartMin + slotIdx * winMin, sessStartMin + (slotIdx + 1) * winMin)
+
+f_groupLabel(int sessStartMin, int startSlot, int endSlot, int winMin) =>
+    f_rangeLabel(sessStartMin + startSlot * winMin, sessStartMin + (endSlot + 1) * winMin)
+
+f_median(array<float> arr) =>
+    int n = array.size(arr)
+    float result = na
+    if n > 0
+        float[] s = array.copy(arr)
+        array.sort(s)
+        int mid = int(math.floor(n / 2))
+        result := n % 2 == 1
+                  ? array.get(s, mid)
+                  : (array.get(s, mid - 1) + array.get(s, mid)) / 2.0
+    result
+
+f_barStr(int blocks) =>
+    string r = ""
+    if blocks > 0
+        for i = 0 to blocks - 1
+            r := r + "█"
+    r
+
+f_tblPos(string p) =>
+    switch p
+        "Top Right"   => position.top_right
+        "Top Left"    => position.top_left
+        "Bottom Left" => position.bottom_left
+        =>               position.bottom_right
+
+f_tblSz(string s) =>
+    switch s
+        "Small"  => size.small
+        "Normal" => size.normal
+        "Large"  => size.large
+        =>          size.tiny
+
+// ══════════════════════════════════════════════════════════════════════════════
+// § 4 ─ SESSION PARAMETERS  (computed once on the very first bar)
+// ══════════════════════════════════════════════════════════════════════════════
+var int _sessStartMin = 0
+var int _sessEndMin   = 0
+var int _maxSlots     = 1
+
+if barstate.isfirst
+    [s, e, n]     = f_sessionParams(i_sessStr, i_windowMin)
+    _sessStartMin := s
+    _sessEndMin   := e
+    _maxSlots     := n
+    // Warn if intrabar resolution is coarser than the analysis window
+    if i_intrabarMin > i_windowMin
+        label.new(bar_index, close,
+                  "⚠ VTWA: Intrabar Resolution (" + str.tostring(i_intrabarMin) +
+                  "min) > Analysis Window (" + str.tostring(i_windowMin) +
+                  "min). Set Intrabar Resolution ≤ Analysis Window.",
+                  style=label.style_label_right, color=color.new(color.red, 10),
+                  textcolor=color.white, size=size.normal)
+
+// ══════════════════════════════════════════════════════════════════════════════
+// § 5 ─ PERSISTENT STATE
+// ══════════════════════════════════════════════════════════════════════════════
+// Per-slot history: key = slot index, value = SlotHistory (moves + efficiencies).
+var map<int, SlotHistory> slotData = map.new<int, SlotHistory>()
+
+// Per-day running accumulators for each slot (reset at each new trading day).
+// Maps are used instead of fixed-size arrays so _maxSlots has no upper bound —
+// any session/window combination is supported without a slot count cap.
+var map<int, float> curOpen      = map.new<int, float>()  // open of slot's first intrabar
+var map<int, float> curHigh      = map.new<int, float>()  // running high within slot
+var map<int, float> curLow       = map.new<int, float>()  // running low within slot
+var map<int, float> slotRangeSum = map.new<int, float>()  // Σ(intrabar high−low) for efficiency
+var map<int, float> curSlotATR   = map.new<int, float>()  // ATR at slot's first intrabar bar
+var map<int, bool>  slotSeen     = map.new<int, bool>()   // entered this slot today?
+
+// Transition-detection state (previous intrabar)
+var int   prevWinIdx     = -1
+var bool  prevInSess     = false
+var bool  prevInLookback = false
+var float curDayOpen     = na    // session open price (% denominator)
+var float prevIbClose    = na    // close of previous intrabar
+var int   prevDate       = -1
+
+// ══════════════════════════════════════════════════════════════════════════════
+// § 6 ─ FINALIZATION HELPER
+// Called when a slot ends (day boundary, slot transition, or session exit).
+// Computes the efficiency ratio, then appends move+efficiency to slotData.
+// Always clears the running trackers for the slot.
+// ══════════════════════════════════════════════════════════════════════════════
+f_finalize(int idx, float refPrice, float closePrice, bool accumulate) =>
+    if idx >= 0
+        if accumulate and not na(refPrice) and refPrice > 0.0
+            float h  = map.get(curHigh,      idx)
+            float l  = map.get(curLow,       idx)
+            float o  = map.get(curOpen,      idx)
+            float rs = nz(map.get(slotRangeSum, idx), 0.0)
+            if not na(h) and not na(l) and not na(o)
+                float rawDisp = i_method == "High-Low Range" ? (h - l) : math.abs(closePrice - o)
+                // ATR-normalised mode: express move as a multiple of ATR at slot entry.
+                // Price-% mode: express move as % of session open.
+                float slotAtr = map.get(curSlotATR, idx)
+                float move    = na
+                if i_normalize
+                    if not na(slotAtr) and slotAtr > 0.0
+                        move := rawDisp / slotAtr
+                else
+                    move := rawDisp / refPrice * 100.0
+                // Directional Efficiency Ratio (always price-based, dimensionless):
+                //   |net displacement| / Σ(intrabar range)
+                // → 1.0 = perfectly directional, 0.0 = pure noise / all wicks
+                float eff = rs > 0.0 ? math.abs(closePrice - o) / rs : 0.0
+                if not na(move)
+                    SlotHistory hist = map.get(slotData, idx)
+                    if na(hist)
+                        hist := SlotHistory.new(array.new_float(0), array.new_float(0))
+                        map.put(slotData, idx, hist)
+                    array.push(hist.moves, move)
+                    array.push(hist.effs,  eff)
+        // Always clear trackers (map.remove = absent key = na = unset)
+        map.remove(curHigh,      idx)
+        map.remove(curLow,       idx)
+        map.remove(curOpen,      idx)
+        map.remove(slotRangeSum, idx)
+        map.remove(curSlotATR,   idx)
+        map.remove(slotSeen,     idx)
+
+// ══════════════════════════════════════════════════════════════════════════════
+// § 7 ─ INTRABAR DATA FETCH
+// Intrabar resolution (i_intrabarMin) is independent of the analysis window
+// (i_windowMin). Smaller intrabar TF = more bars per window = better efficiency
+// ratio accuracy. Works on any chart timeframe (daily, weekly, etc.).
+// ══════════════════════════════════════════════════════════════════════════════
+string _ibTFStr = str.tostring(i_intrabarMin)
+array<int>   _ibT   = request.security_lower_tf(syminfo.tickerid, _ibTFStr, time)
+array<float> _ibH   = request.security_lower_tf(syminfo.tickerid, _ibTFStr, high)
+array<float> _ibL   = request.security_lower_tf(syminfo.tickerid, _ibTFStr, low)
+array<float> _ibO   = request.security_lower_tf(syminfo.tickerid, _ibTFStr, open)
+array<float> _ibC   = request.security_lower_tf(syminfo.tickerid, _ibTFStr, close)
+// ATR at the intrabar resolution — used for normalisation when i_normalize is ON.
+// Computed by ta.atr() running on the intrabar feed, so each element in this array
+// is the ATR(i_atrLen) value as of that intrabar bar.
+array<float> _ibATR = request.security_lower_tf(syminfo.tickerid, _ibTFStr, ta.atr(i_atrLen))
+
+// ══════════════════════════════════════════════════════════════════════════════
+// § 8 ─ INTRABAR PROCESSING LOOP
+// ══════════════════════════════════════════════════════════════════════════════
+int _ibSize = array.size(_ibT)
+for j = 0 to _ibSize - 1
+    if j >= _ibSize  // guard: Pine v6 may fire a spurious iteration on empty arrays
+        break
+
+    int   ibt    = array.get(_ibT,   j)
+    float ibh    = array.get(_ibH,   j)
+    float ibl    = array.get(_ibL,   j)
+    float ibo    = array.get(_ibO,   j)
+    float ibc    = array.get(_ibC,   j)
+    int   _atrSz = array.size(_ibATR)
+    float ibAtr  = _atrSz > 0 and j < _atrSz ? array.get(_ibATR, j) : na
+
+    bool ibInLookback = ibt >= timenow - i_lookback * 86400000
+
+    // Date key in session timezone for day-change detection
+    int  ibDate   = year(ibt, i_sessTZ) * 10000 + month(ibt, i_sessTZ) * 100 + dayofmonth(ibt, i_sessTZ)
+    bool ibNewDay = prevDate != -1 and ibDate != prevDate
+
+    if ibNewDay
+        // Flush previous day's last open slot (accumulate only if in lookback)
+        f_finalize(prevWinIdx, curDayOpen, prevIbClose, prevInLookback)
+        // Clear all accumulator maps in one call — no slot count limit
+        map.clear(slotSeen)
+        map.clear(curHigh)
+        map.clear(curLow)
+        map.clear(curOpen)
+        map.clear(slotRangeSum)
+        map.clear(curSlotATR)
+        curDayOpen := na
+        prevWinIdx := -1
+        prevInSess := false
+
+    // Minute-of-day in session timezone
+    int  ibMOD   = hour(ibt, i_sessTZ) * 60 + minute(ibt, i_sessTZ)
+    bool ibInSess = ibMOD >= _sessStartMin and ibMOD < _sessEndMin
+
+    // Slot index (based on analysis window, not intrabar resolution)
+    int ibWinIdx = -1
+    if ibInSess
+        int raw  = int(math.floor((ibMOD - _sessStartMin) / i_windowMin))
+        ibWinIdx := raw >= 0 and raw < _maxSlots ? raw : _maxSlots - 1
+
+    // Session entry: capture session open for % normalisation
+    if ibInSess and not prevInSess
+        curDayOpen := ibo
+
+    // Slot transition within session
+    if ibInSess and prevInSess and ibWinIdx != prevWinIdx and prevWinIdx >= 0
+        f_finalize(prevWinIdx, curDayOpen, prevIbClose, prevInLookback)
+
+    // Session exit
+    if prevInSess and not ibInSess and prevWinIdx >= 0
+        f_finalize(prevWinIdx, curDayOpen, prevIbClose, prevInLookback)
+
+    // Update running accumulators for the current slot
+    if ibInSess and ibWinIdx >= 0
+        // Accumulate intrabar range for efficiency ratio (always, independent of lookback)
+        map.put(slotRangeSum, ibWinIdx,
+                nz(map.get(slotRangeSum, ibWinIdx), 0.0) + (ibh - ibl))
+
+        if not map.get(slotSeen, ibWinIdx)  // na (absent) treated as false = not yet seen
+            map.put(curOpen,    ibWinIdx, ibo)
+            map.put(curHigh,    ibWinIdx, ibh)
+            map.put(curLow,     ibWinIdx, ibl)
+            map.put(curSlotATR, ibWinIdx, ibAtr)  // ATR snapshot at slot entry
+            map.put(slotSeen,   ibWinIdx, true)
+        else
+            map.put(curHigh, ibWinIdx, math.max(map.get(curHigh, ibWinIdx), ibh))
+            map.put(curLow,  ibWinIdx, math.min(map.get(curLow,  ibWinIdx), ibl))
+
+    prevWinIdx     := ibInSess ? ibWinIdx : -1
+    prevInSess     := ibInSess
+    prevInLookback := ibInLookback
+    prevIbClose    := ibc
+    prevDate       := ibDate
+
+// ══════════════════════════════════════════════════════════════════════════════
+// § 9 ─ TABLE RENDERING  (last bar only)
+// ══════════════════════════════════════════════════════════════════════════════
+var table vtbl = na
+
+if barstate.islast
+
+    float effThreshold = i_minEfficiency / 100.0
+
+    // ── Per-slot statistics ───────────────────────────────────────────────────
+    float[] avgMove  = array.new_float(_maxSlots, -1.0)
+    float[] medMove  = array.new_float(_maxSlots, -1.0)
+    int[]   dayCnt   = array.new_int  (_maxSlots, 0)    // qualifying days
+    int[]   totalCnt = array.new_int  (_maxSlots, 0)    // all days
+
+    // Live in-progress slot (current day, not yet finalized)
+    bool  hasLive  = prevInSess and prevWinIdx >= 0 and not na(curDayOpen) and curDayOpen > 0.0
+    float liveMove = na
+    float liveEff  = na
+    if hasLive
+        float lh = map.get(curHigh,      prevWinIdx)
+        float ll = map.get(curLow,       prevWinIdx)
+        float lo = map.get(curOpen,      prevWinIdx)
+        float rs = nz(map.get(slotRangeSum, prevWinIdx), 0.0)
+        if not na(lh) and not na(ll) and not na(lo)
+            int   _ibCSize   = array.size(_ibC)
+            float _lastClose = _ibCSize > 0 ? array.get(_ibC, _ibCSize - 1) : lh
+            float rawDisp    = i_method == "High-Low Range"
+                               ? (lh - ll)
+                               : math.abs(_lastClose - lo)
+            if i_normalize
+                float liveAtr = map.get(curSlotATR, prevWinIdx)
+                if not na(liveAtr) and liveAtr > 0.0
+                    liveMove := rawDisp / liveAtr
+            else
+                liveMove := rawDisp / curDayOpen * 100.0
+            liveEff  := rs > 0.0 ? math.abs(_lastClose - lo) / rs : 0.0
+
+    for i = 0 to _maxSlots - 1
+        SlotHistory hist    = map.get(slotData, i)
+        bool        isLive  = hasLive and not na(liveMove) and i == prevWinIdx
+        int         base    = na(hist) ? 0 : array.size(hist.moves)
+
+        if base > 0 or isLive
+            // Build display arrays — copy historical data and optionally append live move
+            float[] dMoves = na(hist) ? array.new_float(0) : array.copy(hist.moves)
+            float[] dEffs  = na(hist) ? array.new_float(0) : array.copy(hist.effs)
+            if isLive and not na(liveMove)
+                array.push(dMoves, liveMove)
+                array.push(dEffs,  na(liveEff) ? 0.0 : liveEff)
+
+            int total = array.size(dMoves)
+            array.set(totalCnt, i, total)
+
+            // Apply trend quality filter
+            float[] filtered = array.new_float(0)
+            if i_trendFilter
+                for d = 0 to total - 1
+                    if d < array.size(dEffs) and array.get(dEffs, d) >= effThreshold
+                        array.push(filtered, array.get(dMoves, d))
+            else
+                filtered := dMoves
+
+            int qualifying = array.size(filtered)
+            if qualifying > 0
+                array.set(avgMove, i, array.avg(filtered))
+                array.set(medMove, i, f_median(filtered))
+                array.set(dayCnt,  i, qualifying)
+
+    // ── Build display rows ────────────────────────────────────────────────────
+    array<DisplayRow> rows     = array.new<DisplayRow>(0)
+    int slotsPerGroup = math.max(1, int(math.round(i_consolidateMin / i_windowMin)))
+
+    if not i_consolidate or slotsPerGroup <= 1
+        for i = 0 to _maxSlots - 1
+            if array.get(avgMove, i) >= 0.0
+                array.push(rows, DisplayRow.new(
+                     f_slotLabel(_sessStartMin, i, i_windowMin),
+                     array.get(avgMove, i), array.get(medMove, i),
+                     array.get(dayCnt,  i), array.get(totalCnt, i), false))
+    else
+        // Top-N individual rows
+        // Ensure the highlighted rows (i_topN) are always among those shown individually.
+        // i_topIndividual is the total count — it already includes the highlighted rows.
+        // If someone sets i_topIndividual < i_topN, raise the floor to i_topN so that
+        // no highlighted row ever ends up inside a consolidated group.
+        int nIndividual = math.max(i_topN, i_topIndividual)
+        // Track promoted slots so they are excluded from consolidated groups below.
+        bool[] shownIndividually = array.new_bool(_maxSlots, false)
+        int[] sortedIdxs = array.sort_indices(avgMove, order.descending)
+        int found = 0
+        for r = 0 to _maxSlots - 1
+            int idx = array.get(sortedIdxs, r)
+            if array.get(avgMove, idx) < 0.0
+                break
+            if found < nIndividual
+                array.push(rows, DisplayRow.new(
+                     f_slotLabel(_sessStartMin, idx, i_windowMin),
+                     array.get(avgMove, idx), array.get(medMove, idx),
+                     array.get(dayCnt,  idx), array.get(totalCnt, idx), false))
+                array.set(shownIndividually, idx, true)
+                found += 1
+
+        // Consolidated group rows — slots already shown individually are excluded so
+        // they do not double-count and inflate the group's average.
+        int g = 0
+        while g * slotsPerGroup < _maxSlots
+            int gStart = int(g * slotsPerGroup)
+            int gEnd   = int(math.min(gStart + slotsPerGroup - 1, _maxSlots - 1))
+            float[] gAvgs = array.new_float(0)
+            float[] gMeds = array.new_float(0)
+            int gCnt = 0, gTotal = 0
+            int actualStart = -1
+            int actualEnd   = -1
+            for s = gStart to gEnd
+                // Skip any slot that was already promoted to an individual row
+                if not array.get(shownIndividually, s)
+                    float sa = array.get(avgMove, s)
+                    float sm = array.get(medMove, s)
+                    if sa >= 0.0
+                        if actualStart == -1
+                            actualStart := s
+                        actualEnd := s
+                        array.push(gAvgs, sa)
+                        if sm >= 0.0
+                            array.push(gMeds, sm)
+                        gCnt   := gCnt   + array.get(dayCnt,   s)
+                        gTotal := gTotal + array.get(totalCnt, s)
+            if array.size(gAvgs) > 0 and actualStart != -1
+                int   slots  = array.size(gAvgs)
+                float gAvg   = array.avg(gAvgs)
+                float gMed   = array.size(gMeds) > 0 ? array.avg(gMeds) : na
+                int   gCntN  = slots > 0 ? math.round(gCnt  / slots) : 0
+                int   gTotN  = slots > 0 ? math.round(gTotal / slots) : 0
+                array.push(rows, DisplayRow.new(
+                     f_groupLabel(_sessStartMin, gStart, gEnd, i_windowMin),
+                     gAvg, gMed, gCntN, gTotN, true))
+            g += 1
+
+    // ── Sort by avg descending (via float proxy array) ────────────────────────
+    int nRows = array.size(rows)
+    int[] sortedIdx = array.new_int(0)
+    if nRows > 0
+        float[] rowAvgs = array.new_float(nRows, -1.0)
+        for i = 0 to nRows - 1
+            if i < nRows
+                array.set(rowAvgs, i, array.get(rows, i).avg)
+        sortedIdx := array.sort_indices(rowAvgs, order.descending)
+
+    // ── Render ────────────────────────────────────────────────────────────────
+    if not na(vtbl)
+        table.delete(vtbl)
+
+    string sz = f_tblSz(i_tblSize)
+
+    if nRows == 0
+        vtbl := table.new(f_tblPos(i_tblPos), 1, 2,
+                          bgcolor=color.new(#0d1117, 10),
+                          frame_width=1, frame_color=color.new(color.gray, 60))
+        table.cell(vtbl, 0, 0, "Volatility Time Window Analyzer",
+                   text_color=color.white, bgcolor=color.new(#1a1a2e, 0), text_size=sz)
+        table.cell(vtbl, 0, 1, "Waiting for session data…",
+                   text_color=color.gray, bgcolor=color.new(#0d1117, 20), text_size=sz)
+    else
+        float maxAvg = math.max(0.0001, array.get(rows, array.get(sortedIdx, 0)).avg)
+
+        vtbl := table.new(f_tblPos(i_tblPos), 6, nRows + 1,
+                          bgcolor=color.new(#0d1117, 10),
+                          frame_width=2, frame_color=color.new(#4a4a6a, 40),
+                          border_width=1, border_color=color.new(#4a4a6a, 70))
+
+        color hBg = color.new(#12122a, 0)
+        color hTx = color.new(color.silver, 15)
+        table.cell(vtbl, 0, 0, "#",           text_color=hTx, bgcolor=hBg, text_size=sz, text_halign=text.align_center)
+        table.cell(vtbl, 1, 0, "Time Window", text_color=hTx, bgcolor=hBg, text_size=sz, text_halign=text.align_left)
+        table.cell(vtbl, 2, 0, i_normalize ? "Avg ATR×" : "Avg %",    text_color=hTx, bgcolor=hBg, text_size=sz, text_halign=text.align_right)
+        table.cell(vtbl, 3, 0, i_normalize ? "Med ATR×" : "Median %", text_color=hTx, bgcolor=hBg, text_size=sz, text_halign=text.align_right)
+        table.cell(vtbl, 4, 0, "Days",        text_color=hTx, bgcolor=hBg, text_size=sz, text_halign=text.align_center)
+        table.cell(vtbl, 5, 0, "",            text_color=hTx, bgcolor=hBg, text_size=sz, text_halign=text.align_left)
+
+        for r = 0 to nRows - 1
+            DisplayRow dr = array.get(rows, array.get(sortedIdx, r))
+
+            int  rank   = r + 1
+            bool isTop1 = rank == 1
+            bool isTopN = rank <= i_topN
+
+            color rowBg  = isTop1 ? color.new(#1b5e20, 20)
+                         : isTopN ? color.new(#2e7d32, 45)
+                         : dr.isGroup ? color.new(#1a1f2e, 80)
+                         :              color.new(#1c2833, 75)
+            color txtCol = isTop1 ? color.new(#ffd700, 0) : color.white
+
+            table.cell(vtbl, 0, r + 1,
+                       isTop1 ? "★ 1" : str.tostring(rank),
+                       text_color=txtCol, bgcolor=rowBg, text_size=sz, text_halign=text.align_center)
+
+            table.cell(vtbl, 1, r + 1,
+                       isTop1 ? dr.label + " ◀" : dr.label,
+                       text_color=txtCol, bgcolor=rowBg, text_size=sz, text_halign=text.align_left)
+
+            string avgFmt = i_normalize ? str.tostring(dr.avg, "#.###") + "×" : str.tostring(dr.avg, "#.##") + "%"
+            table.cell(vtbl, 2, r + 1,
+                       avgFmt,
+                       text_color=txtCol, bgcolor=rowBg, text_size=sz, text_halign=text.align_right)
+
+            string medFmt = na(dr.med) or dr.med < 0.0 ? "–"
+                          : i_normalize ? str.tostring(dr.med, "#.###") + "×"
+                          : str.tostring(dr.med, "#.##") + "%"
+            table.cell(vtbl, 3, r + 1,
+                       medFmt,
+                       text_color=color.new(txtCol, 20), bgcolor=rowBg, text_size=sz, text_halign=text.align_right)
+
+            // Days column: show "qualifying/total" when filter is active and meaningful
+            bool filtered = i_trendFilter and dr.total > dr.cnt
+            string daysStr = filtered
+                             ? str.tostring(dr.cnt) + "/" + str.tostring(dr.total)
+                             : str.tostring(dr.cnt)
+            table.cell(vtbl, 4, r + 1,
+                       daysStr,
+                       text_color=filtered ? color.new(#f39c12, 0) : txtCol,
+                       bgcolor=rowBg, text_size=sz, text_halign=text.align_center)
+
+            float pct    = dr.avg / maxAvg
+            int   blocks = math.round(pct * 8)
+            int   transp = int(math.round((1.0 - pct) * 55.0))
+            color barCol = isTop1 ? color.new(#e74c3c, transp)
+                         : isTopN ? color.new(#f39c12, transp)
+                         :          color.new(#95a5a6, transp + 15)
+            table.cell(vtbl, 5, r + 1,
+                       f_barStr(blocks),
+                       text_color=barCol, bgcolor=rowBg, text_size=sz, text_halign=text.align_left)

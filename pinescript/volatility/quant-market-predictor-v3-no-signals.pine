@@ -1,0 +1,173 @@
+//@version=5
+indicator("Quant Market Predictor v3 (No Signals)", overlay=true, max_lines_count=500, max_labels_count=500)
+
+// ============================================================
+// INPUTS
+// ============================================================
+
+// Kalman Filter
+kf_process_noise = input.float(0.01, "Kalman Process Noise", minval=0.0001, maxval=1.0, step=0.001, group="Kalman Filter")
+kf_meas_noise    = input.float(1.0,  "Kalman Measurement Noise", minval=0.01, maxval=100.0, step=0.1, group="Kalman Filter")
+
+// AR Model
+phi1 = input.float(0.6, "AR phi1", minval=-1.0, maxval=1.0, step=0.05, group="AR Model")
+phi2 = input.float(0.3, "AR phi2", minval=-1.0, maxval=1.0, step=0.05, group="AR Model")
+
+// GARCH-like Volatility
+garch_alpha = input.float(0.10, "GARCH Alpha", minval=0.01, maxval=0.5, step=0.01, group="Volatility Model")
+garch_beta  = input.float(0.85, "GARCH Beta",  minval=0.01, maxval=0.99, step=0.01, group="Volatility Model")
+
+// Forecast
+forecast_horizon = input.int(5, "Forecast Horizon (bars)", minval=1, maxval=5, group="Forecast")
+
+// Regime Filter
+trend_len = input.int(20, "Trend Filter Length", minval=5, maxval=200, group="Signal Filters")
+
+// Visualization
+show_bg = input.bool(true, "Show Background Color", group="Visualization")
+
+// ============================================================
+// 1. KALMAN FILTER
+// ============================================================
+var float kf_x = na
+var float kf_p = 1.0
+
+if na(kf_x)
+    kf_x := close
+
+float kf_p_pred = kf_p + kf_process_noise
+float kf_K      = kf_p_pred / (kf_p_pred + kf_meas_noise)
+
+kf_x := kf_x + kf_K * (close - kf_x)
+kf_p := (1.0 - kf_K) * kf_p_pred
+
+float kalman_trend = kf_x
+float kalman_slope = kalman_trend - kalman_trend[3]
+
+bool kalman_up   = kalman_slope > 0
+bool kalman_down = kalman_slope < 0
+
+// ============================================================
+// 2. ADAPTIVE AR(2) MODEL
+// ============================================================
+float dp1 = nz(close - close[1])
+float dp2 = nz(close[1] - close[2])
+
+float vol_proxy = ta.stdev(close, 20)
+float vol_ma    = ta.sma(vol_proxy, 40)
+
+float vol_ratio   = (na(vol_ma) or vol_ma == 0) ? 1.0 : vol_proxy / vol_ma
+float adapt_scale = math.max(0.1, math.min(1.5, 1.0 / math.max(vol_ratio, 0.1)))
+
+float ar_prediction = (phi1 * adapt_scale) * dp1 + (phi2 * adapt_scale) * dp2
+
+// ============================================================
+// 3. GARCH-LIKE VOLATILITY
+// ============================================================
+var float garch_var = na
+
+if na(garch_var)
+    garch_var := dp1 * dp1
+
+garch_var := garch_alpha * dp1 * dp1 + garch_beta * garch_var
+
+float garch_sigma = math.sqrt(math.max(garch_var, 0))
+float sigma_ma    = ta.sma(garch_sigma, trend_len)
+
+bool high_vol_regime = garch_sigma > sigma_ma
+bool low_vol_regime  = not high_vol_regime
+
+// ============================================================
+// 4. MULTI-BAR FORECAST
+// ============================================================
+float f1 = close + ar_prediction
+float f2 = f1 + ar_prediction * math.pow(0.9, 1)
+float f3 = f2 + ar_prediction * math.pow(0.9, 2)
+float f4 = f3 + ar_prediction * math.pow(0.9, 3)
+float f5 = f4 + ar_prediction * math.pow(0.9, 4)
+
+// ============================================================
+// 5. REGIME ANALYSIS
+// ============================================================
+float price_ma = ta.sma(close, trend_len)
+float price_sd = ta.stdev(close, trend_len)
+
+float z_score = price_sd != 0 ? (close - price_ma) / price_sd : 0
+
+// ============================================================
+// 6. VISUALIZATION
+// ============================================================
+
+// Kalman Trend
+plot(kalman_trend, "Kalman Trend", color=color.orange, linewidth=2)
+
+// Volatility Bands
+plot(price_ma + garch_sigma * 2, "Vol Upper", color=color.new(color.purple, 75))
+plot(price_ma - garch_sigma * 2, "Vol Lower", color=color.new(color.purple, 75))
+
+// Forecast Projection
+if barstate.islast
+    int b = bar_index
+
+    float fp1 = f1
+    float fp2 = forecast_horizon >= 2 ? f2 : f1
+    float fp3 = forecast_horizon >= 3 ? f3 : fp2
+    float fp4 = forecast_horizon >= 4 ? f4 : fp3
+    float fp5 = forecast_horizon >= 5 ? f5 : fp4
+
+    color fc = ar_prediction >= 0 ? color.teal : color.red
+
+    line.new(b, close, b + 1, fp1, color=fc, style=line.style_dashed)
+    if forecast_horizon >= 2
+        line.new(b + 1, fp1, b + 2, fp2, color=fc, style=line.style_dashed)
+    if forecast_horizon >= 3
+        line.new(b + 2, fp2, b + 3, fp3, color=fc, style=line.style_dashed)
+    if forecast_horizon >= 4
+        line.new(b + 3, fp3, b + 4, fp4, color=fc, style=line.style_dashed)
+    if forecast_horizon >= 5
+        line.new(b + 4, fp4, b + 5, fp5, color=fc, style=line.style_dashed)
+
+// ============================================================
+// BACKGROUND REGIME
+// ============================================================
+
+color bg_color = na
+
+if show_bg
+    if high_vol_regime and kalman_up
+        bg_color := color.new(color.green, 92)
+    else if high_vol_regime and kalman_down
+        bg_color := color.new(color.red, 92)
+    else
+        bg_color := color.new(color.blue, 95)
+
+bgcolor(bg_color)
+
+// ============================================================
+// INFO TABLE
+// ============================================================
+
+var table info_tbl = table.new(position.top_right, 2, 6, bgcolor=color.new(color.black, 60), border_width=1)
+
+if barstate.islast
+
+    string regime_str = high_vol_regime ? "TREND (High Vol)" : "MEAN REV (Low Vol)"
+    string slope_str  = kalman_up ? "▲ Up" : kalman_down ? "▼ Down" : "Flat"
+
+    table.cell(info_tbl, 0, 0, "Model", text_color=color.white)
+    table.cell(info_tbl, 1, 0, "Value", text_color=color.white)
+
+    table.cell(info_tbl, 0, 1, "Regime", text_color=color.silver)
+    table.cell(info_tbl, 1, 1, regime_str, text_color=color.yellow)
+
+    table.cell(info_tbl, 0, 2, "Kalman Slope", text_color=color.silver)
+    table.cell(info_tbl, 1, 2, slope_str, text_color=color.orange)
+
+    table.cell(info_tbl, 0, 3, "AR Prediction", text_color=color.silver)
+    table.cell(info_tbl, 1, 3, str.tostring(ar_prediction, "#.####"), text_color=color.aqua)
+
+    table.cell(info_tbl, 0, 4, "Z-Score", text_color=color.silver)
+    table.cell(info_tbl, 1, 4, str.tostring(z_score, "#.##"), text_color=color.aqua)
+
+    table.cell(info_tbl, 0, 5, "GARCH σ", text_color=color.silver)
+    table.cell(info_tbl, 1, 5, str.tostring(garch_sigma, "#.####"), text_color=color.purple)

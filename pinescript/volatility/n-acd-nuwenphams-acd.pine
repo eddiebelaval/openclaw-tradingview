@@ -1,0 +1,501 @@
+// This source code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © NuwenPham
+//
+// Fork attribution:
+// - Forked from: QuantCT // "ACD - Layers 1 & 2" @version=4
+// - Lineage note: Original "Opening Range and ACD Levels" indicator family
+//
+// Assisted by: iterative refactor with ChatGPT
+// Description: N-ACD indicator displaying Opening Range (OR) and A/C levels with selectable “operative OR”
+// Version: 1.57, Pine Script® v6
+//
+// NEW (v1.57):
+// - Default plot styling:
+//   • OR Up/Down = dotted line
+//   • OR Mid     = dashed line
+//   • A Up/Down  = circle plots
+//   • C Up/Down  = circle plots
+//
+// Inspect All Previous ORs (HYBRID):
+// - Outer: ONE C-bounded outer box per OR event (object-capped by Lookback).
+// - Inner: 5 internal band fills via fill() between hidden plots (cheap; no Style-tab clutter).
+//
+// Docs:
+// - fill(): https://www.tradingview.com/pine-script-docs/visuals/fills/
+// - plot(): https://www.tradingview.com/pine-script-docs/visuals/plots/
+
+//@version=6
+indicator("N-ACD", overlay = true, max_bars_back = 5000, max_boxes_count = 500)
+
+//====================================================================
+// 0) TRANSPARENCY + BASE COLOR CONSTANTS
+//====================================================================
+
+// === Transparency Constants ===
+// Named by Opacity Level — Used as Pine Script Transparency (100 - Opacity)
+int INVISIBLE  = 100
+int OPACITY03  = 97
+int OPACITY07  = 93
+int OPACITY11  = 89
+int OPACITY15  = 85
+int OPACITY19  = 81
+int OPACITY22  = 78
+int OPACITY33  = 67
+int OPACITY44  = 56
+int OPACITY55  = 45
+int OPACITY66  = 34
+int OPACITY77  = 23
+int OPACITY88  = 12
+int OPAQUE     = 0
+
+// === Base Color Constants ===
+color AQUA   = #00FFFFff
+color PURPLE = #800080ff
+color PINK   = #E91EFFff
+color GRAY   = #808080ff
+color SILVER = #C0C0C0ff
+
+// === Misc constants ===
+int MS_PER_MINUTE = 60 * 1000
+int MAX_BOXES     = 500
+int BOX_BORDER_W  = 1
+
+//====================================================================
+// 1) INPUTS
+//====================================================================
+
+//@group "Display Settings"
+string table_text_size = input.string(
+     title   = "Table & Text Size",
+     options = [size.tiny, size.small, size.normal],
+     defval  = size.tiny,
+     group   = "Display Settings",
+     tooltip = "Controls the size of tables and text elements."
+)
+
+bool show_full_table = input.bool(
+     title   = "Show Full Table",
+     defval  = false,
+     group   = "Display Settings",
+     tooltip = "When enabled, shows all table rows. When disabled, shows only OR Open and OR Length."
+)
+
+bool show_selected_or_box = input.bool(
+     title   = "Show Selected OR Box",
+     defval  = true,
+     group   = "Display Settings",
+     tooltip = "Draw a translucent OR-themed box spanning the operative OR time window and its high/low range."
+)
+
+bool inspect_all_previous_ors = input.bool(
+     title   = "Inspect All Previous ORs",
+     defval  = false,
+     group   = "Display Settings",
+     tooltip = "When enabled, shows ALL prior OR events for the operative OR time only.\n" +
+               "Includes:\n" +
+               "• Outer: C-bounded boxes (capped by Lookback)\n" +
+               "• Inner: A/C/OR band fills during each OR window"
+)
+
+bool show_inspect_edge_lines = input.bool(
+     title   = "Show Inspect Edge Lines",
+     defval  = false,
+     group   = "Display Settings",
+     tooltip = "When enabled, shows the 6 inspect boundary lines (OR/A/C up/down) + optional OR mid.\n" +
+               "When disabled, keeps fills + outer boxes but hides these edge lines."
+)
+
+int inspect_lookback_or_events = input.int(
+     title   = "Inspect Lookback (OR events)",
+     defval  = 500,
+     minval  = 1,
+     maxval  = 500,
+     group   = "Display Settings",
+     tooltip = "How many prior OR events to retain as Inspect outer boxes (operative OR time only)."
+)
+
+bool show_or_mid = input.bool(
+     title   = "Show OR Mid",
+     defval  = true,
+     group   = "Display Settings",
+     tooltip = "Show OR Mid plots (Selected + Inspect)."
+)
+
+//@group "OR Start"
+string or_preset = input.string(
+     title   = "OR Preset",
+     options = ["0700", "0830", "0900", "1030", "1430", "Custom"],
+     defval  = "0900",
+     group   = "OR Start",
+     tooltip = "Select a preset opening range time or choose Custom.\nOperative OR time = this selection."
+)
+
+int or_start_hour = input.int(
+     title   = "Custom OR Hour",
+     defval  = 12,
+     minval  = 0,
+     maxval  = 23,
+     inline  = "ORC",
+     group   = "OR Start",
+     tooltip = "Custom OR hour (used when OR Preset = Custom)."
+)
+
+int or_start_min = input.int(
+     title   = ":",
+     defval  = 0,
+     minval  = 0,
+     maxval  = 59,
+     step    = 1,
+     inline  = "ORC",
+     group   = "OR Start",
+     tooltip = "Custom OR minute (used when OR Preset = Custom)."
+)
+
+int or_gmt_offset = input.int(
+     title   = "GMT Offset",
+     defval  = -5,
+     minval  = -23,
+     maxval  = 23,
+     group   = "OR Start",
+     tooltip = "UTC offset used for OR time detection (example: -5 for Eastern Standard Time)."
+)
+
+int or_mins = input.int(
+     title   = "OR Minutes",
+     defval  = 15,
+     minval  = 1,
+     maxval  = 60,
+     group   = "OR Start",
+     tooltip = "Length of OR in minutes."
+)
+
+//@group "A & C"
+string atr_timeframe = input.timeframe(
+     title   = "ATR Timeframe",
+     defval  = "D",
+     group   = "A & C",
+     tooltip = "ATR is computed on this timeframe to scale A and C distances."
+)
+
+int atr_period = input.int(
+     title   = "ATR Period",
+     defval  = 9,
+     minval  = 2,
+     group   = "A & C",
+     tooltip = "ATR length used for A/C scaling."
+)
+
+float atr_pct_a = input.float(
+     title   = "ATR % A",
+     defval  = 0.125,
+     minval  = 0.05,
+     maxval  = 1,
+     group   = "A & C",
+     tooltip = "Formula:\nA_dist = ATR(ATR Period) on ATR Timeframe × ATR % A\nA_Up = OR_Up + A_dist\nA_Down = OR_Down − A_dist"
+)
+
+float atr_pct_c = input.float(
+     title   = "ATR % C",
+     defval  = 0.618,
+     minval  = 0.05,
+     maxval  = 1,
+     group   = "A & C",
+     tooltip = "Formula:\nC_dist = ATR(ATR Period) on ATR Timeframe × ATR % C\nC_Up = OR_Up + C_dist\nC_Down = OR_Down − C_dist"
+)
+
+//@group "Colors — Operative OR (Selected + Inspect)"
+color or_base_col = input.color(AQUA,   "OR Color", group = "Colors — Operative OR (Selected + Inspect)")
+color a_base_col  = input.color(PURPLE, "A Color",  group = "Colors — Operative OR (Selected + Inspect)")
+color c_base_col  = input.color(PINK,   "C Color",  group = "Colors — Operative OR (Selected + Inspect)")
+
+//====================================================================
+// 2) DERIVED SETTINGS (timezone handling intentionally left as-is)
+//====================================================================
+
+int actual_or_hour =
+     or_preset == "0700" ? 7  :
+     or_preset == "0830" ? 8  :
+     or_preset == "0900" ? 9  :
+     or_preset == "1030" ? 10 :
+     or_preset == "1430" ? 14 :
+     or_start_hour
+
+int actual_or_min =
+     or_preset == "0700" ? 0  :
+     or_preset == "0830" ? 30 :
+     or_preset == "0900" ? 0  :
+     or_preset == "1030" ? 30 :
+     or_preset == "1430" ? 30 :
+     or_start_min
+
+string tz    = or_gmt_offset >= 0 ? "GMT+" + str.tostring(or_gmt_offset) : "GMT" + str.tostring(or_gmt_offset)
+string or_tf = str.tostring(or_mins)
+
+string hh = actual_or_hour < 10 ? "0" + str.tostring(actual_or_hour) : str.tostring(actual_or_hour)
+string mm = actual_or_min  < 10 ? "0" + str.tostring(actual_or_min)  : str.tostring(actual_or_min)
+string or_tstring    = hh + ":" + mm + " " + tz
+string or_tlenstring = str.tostring(or_mins) + "m"
+
+//====================================================================
+// 3) CORE CALCULATIONS (Operative/Selected OR levels)
+//====================================================================
+
+is_or_start_bar(string tmz, int startH, int startM) =>
+    hour(time, tmz) == startH and minute(time, tmz) == startM
+
+f_or_bar(string tmz, int startH, int startM) =>
+    bool is_or = is_or_start_bar(tmz, startH, startM)
+    float _h = na
+    float _l = na
+    int   _t_open  = na
+    int   _t_close = na
+    if is_or
+        _h := high
+        _l := low
+        _t_open  := time
+        _t_close := time_close
+    [_h, _l, _t_open, _t_close]
+
+[sel_or_h_raw, sel_or_l_raw, sel_or_open_raw, sel_or_close_raw] =
+     request.security(syminfo.tickerid, or_tf, f_or_bar(tz, actual_or_hour, actual_or_min), barmerge.gaps_off, barmerge.lookahead_off)
+
+bool sel_or_event = not na(sel_or_open_raw) and na(sel_or_open_raw[1])
+
+float atr_val = request.security(syminfo.tickerid, atr_timeframe, ta.atr(atr_period), barmerge.gaps_off, barmerge.lookahead_off)
+float a_dist  = atr_val * atr_pct_a
+float c_dist  = atr_val * atr_pct_c
+
+var float sel_or_up   = na
+var float sel_or_down = na
+var float sel_a_up    = na
+var float sel_a_down  = na
+var float sel_c_up    = na
+var float sel_c_down  = na
+
+if sel_or_event
+    sel_or_up   := sel_or_h_raw
+    sel_or_down := sel_or_l_raw
+    sel_a_up    := sel_or_up   + a_dist
+    sel_a_down  := sel_or_down - a_dist
+    sel_c_up    := sel_or_up   + c_dist
+    sel_c_down  := sel_or_down - c_dist
+
+float sel_or_mid = (not na(sel_or_up) and not na(sel_or_down)) ? (sel_or_up + sel_or_down) / 2 : na
+
+//====================================================================
+// 4) INSPECT (Previous OR events) — operative OR time only
+//====================================================================
+
+overlaps_window(int w_start, int w_end) =>
+    (time < w_end) and (time_close > w_start)
+
+int OR_MS = or_mins * MS_PER_MINUTE
+int y_tz  = year(time, tz)
+int m_tz  = month(time, tz)
+int d_tz  = dayofmonth(time, tz)
+
+int sOP = timestamp(tz, y_tz, m_tz, d_tz, actual_or_hour, actual_or_min)
+int eOP = sOP + OR_MS
+
+bool inspect_supported_tf = timeframe.isintraday
+bool in_inspect_window = inspect_all_previous_ors and inspect_supported_tf and overlaps_window(sOP, eOP)
+
+// Outer box theme (SILVER)
+color insp_outer_border = color.new(SILVER, OPACITY33)
+color insp_outer_fill   = color.new(SILVER, INVISIBLE)  // outer fill invisible; inner bands carry color
+
+var box[] inspect_outer_boxes = array.new_box(0)
+var box insp_active_box = na
+
+clear_box_buffer(box[] buf) =>
+    while array.size(buf) > 0
+        box b = array.pop(buf)
+        box.delete(b)
+
+push_box_cap(box[] buf, box new_box, int cap) =>
+    while array.size(buf) >= cap
+        box old_b = array.shift(buf)
+        box.delete(old_b)
+    array.push(buf, new_box)
+
+int reserved_boxes =
+     (show_selected_or_box ? 1 : 0) +
+     (inspect_all_previous_ors ? 1 : 0)
+
+int effective_inspect_cap = math.min(inspect_lookback_or_events, MAX_BOXES - reserved_boxes)
+effective_inspect_cap := math.max(effective_inspect_cap, 1)
+
+int inspect_sig = (or_mins * 1000000) + ((or_gmt_offset + 24) * 10000) + (actual_or_hour * 100 + actual_or_min)
+
+var bool last_inspect_on  = false
+var int  last_inspect_cap = na
+var int  last_inspect_sig = na
+
+bool inspect_toggle_changed = (last_inspect_on != inspect_all_previous_ors)
+bool inspect_cap_changed    = (last_inspect_cap != effective_inspect_cap)
+bool inspect_env_changed    = (last_inspect_sig != inspect_sig)
+
+if inspect_toggle_changed or inspect_cap_changed or inspect_env_changed
+    clear_box_buffer(inspect_outer_boxes)
+    if not na(insp_active_box)
+        box.delete(insp_active_box)
+        insp_active_box := na
+
+last_inspect_on  := inspect_all_previous_ors
+last_inspect_cap := effective_inspect_cap
+last_inspect_sig := inspect_sig
+
+var float insp_hi = na
+var float insp_lo = na
+var bool  insp_was_in_window = false
+
+bool insp_start = in_inspect_window and not insp_was_in_window
+bool insp_end   = not in_inspect_window and insp_was_in_window
+
+if insp_start
+    insp_hi := high
+    insp_lo := low
+
+    insp_active_box := box.new(
+         left   = sOP,
+         top    = insp_hi + c_dist,
+         right  = eOP,
+         bottom = insp_lo - c_dist,
+         xloc   = xloc.bar_time,
+         border_width = BOX_BORDER_W,
+         border_color = insp_outer_border,
+         bgcolor      = insp_outer_fill
+    )
+
+if in_inspect_window
+    insp_hi := math.max(nz(insp_hi, high), high)
+    insp_lo := math.min(nz(insp_lo, low),  low)
+
+    if not na(insp_active_box)
+        box.set_top(insp_active_box,    insp_hi + c_dist)
+        box.set_bottom(insp_active_box, insp_lo - c_dist)
+
+if insp_end
+    if not na(insp_active_box)
+        push_box_cap(inspect_outer_boxes, insp_active_box, effective_inspect_cap)
+        insp_active_box := na
+
+insp_was_in_window := in_inspect_window
+
+bool insp_active = in_inspect_window and not na(insp_hi) and not na(insp_lo)
+
+float insp_or_up  = insp_active ? insp_hi : na
+float insp_or_dn  = insp_active ? insp_lo : na
+float insp_a_up   = insp_active ? (insp_hi + a_dist) : na
+float insp_a_dn   = insp_active ? (insp_lo - a_dist) : na
+float insp_c_up   = insp_active ? (insp_hi + c_dist) : na
+float insp_c_dn   = insp_active ? (insp_lo - c_dist) : na
+float insp_or_mid = insp_active ? (insp_hi + insp_lo) / 2 : na
+
+//====================================================================
+// 5) VISUALS — SELECTED (operative) plots (v1.57 default styling)
+//====================================================================
+
+// Selected OR Up/Down: dotted line
+plot(sel_or_up,   title = "OR Up",   style = plot.style_line,   linewidth = 1, color = color.new(or_base_col, OPACITY44), linestyle = plot.linestyle_dotted)
+plot(sel_or_down, title = "OR Down", style = plot.style_line,   linewidth = 1, color = color.new(or_base_col, OPACITY44), linestyle = plot.linestyle_dotted)
+
+// Selected OR Mid: dashed line (optional)
+plot(show_or_mid ? sel_or_mid : na, title = "OR Mid", style = plot.style_line, linewidth = 1, color = color.new(or_base_col, OPACITY55), linestyle = plot.linestyle_dashed)
+
+// Selected A/C: circles
+plot(sel_a_up,    title = "A Up",   style = plot.style_circles, linewidth = 1, color = color.new(a_base_col, OPACITY44))
+plot(sel_a_down,  title = "A Down", style = plot.style_circles, linewidth = 1, color = color.new(a_base_col, OPACITY44))
+plot(sel_c_up,    title = "C Up",   style = plot.style_circles, linewidth = 1, color = color.new(c_base_col, OPACITY44))
+plot(sel_c_down,  title = "C Down", style = plot.style_circles, linewidth = 1, color = color.new(c_base_col, OPACITY44))
+
+//====================================================================
+// 6) INSPECT INTERNAL BAND FILLS (hidden plots + fill())
+//====================================================================
+
+// Hidden boundary plots for fills (must be line-capable styles for clean bands)
+pI_or_up  = plot(insp_or_up,  title = "InspectFill: OR Up",   style = plot.style_linebr, linewidth = 1, color = color.new(or_base_col, INVISIBLE), display = display.none)
+pI_or_dn  = plot(insp_or_dn,  title = "InspectFill: OR Down", style = plot.style_linebr, linewidth = 1, color = color.new(or_base_col, INVISIBLE), display = display.none)
+pI_a_up   = plot(insp_a_up,   title = "InspectFill: A Up",    style = plot.style_linebr, linewidth = 1, color = color.new(a_base_col,  INVISIBLE), display = display.none)
+pI_a_dn   = plot(insp_a_dn,   title = "InspectFill: A Down",  style = plot.style_linebr, linewidth = 1, color = color.new(a_base_col,  INVISIBLE), display = display.none)
+pI_c_up   = plot(insp_c_up,   title = "InspectFill: C Up",    style = plot.style_linebr, linewidth = 1, color = color.new(c_base_col,  INVISIBLE), display = display.none)
+pI_c_dn   = plot(insp_c_dn,   title = "InspectFill: C Down",  style = plot.style_linebr, linewidth = 1, color = color.new(c_base_col,  INVISIBLE), display = display.none)
+
+// Fills at 11% opacity (per your requirement)
+fill(pI_c_up,  pI_a_up,  color = color.new(c_base_col,  OPACITY11))
+fill(pI_a_up,  pI_or_up, color = color.new(a_base_col,  OPACITY11))
+fill(pI_or_up, pI_or_dn, color = color.new(or_base_col, OPACITY11))
+fill(pI_or_dn, pI_a_dn,  color = color.new(a_base_col,  OPACITY11))
+fill(pI_a_dn,  pI_c_dn,  color = color.new(c_base_col,  OPACITY11))
+
+// Optional visible inspect edge lines (v1.57 default styling)
+plot(show_inspect_edge_lines ? insp_or_up : na, title = "Inspect: OR Up",   style = plot.style_linebr, linewidth = 1, color = color.new(or_base_col, OPACITY22), linestyle = plot.linestyle_dotted)
+plot(show_inspect_edge_lines ? insp_or_dn : na, title = "Inspect: OR Down", style = plot.style_linebr, linewidth = 1, color = color.new(or_base_col, OPACITY22), linestyle = plot.linestyle_dotted)
+plot(show_inspect_edge_lines and show_or_mid ? insp_or_mid : na, title = "Inspect: OR Mid", style = plot.style_linebr, linewidth = 1, color = color.new(or_base_col, OPACITY55), linestyle = plot.linestyle_dashed)
+
+plot(show_inspect_edge_lines ? insp_a_up : na, title = "Inspect: A Up",   style = plot.style_circles, linewidth = 1, color = color.new(a_base_col, OPACITY22))
+plot(show_inspect_edge_lines ? insp_a_dn : na, title = "Inspect: A Down", style = plot.style_circles, linewidth = 1, color = color.new(a_base_col, OPACITY22))
+plot(show_inspect_edge_lines ? insp_c_up : na, title = "Inspect: C Up",   style = plot.style_circles, linewidth = 1, color = color.new(c_base_col, OPACITY22))
+plot(show_inspect_edge_lines ? insp_c_dn : na, title = "Inspect: C Down", style = plot.style_circles, linewidth = 1, color = color.new(c_base_col, OPACITY22))
+
+//====================================================================
+// 7) SELECTED OR BOX (object)
+//====================================================================
+var box b_selected = na
+
+if show_selected_or_box and sel_or_event and not na(sel_or_open_raw) and not na(sel_or_close_raw)
+    if not na(b_selected)
+        box.delete(b_selected)
+
+    color sel_border = color.new(or_base_col, OPACITY55)
+    color sel_fill   = color.new(or_base_col, OPACITY11)
+
+    b_selected := box.new(
+         left   = sel_or_open_raw,
+         top    = sel_or_h_raw,
+         right  = sel_or_close_raw,
+         bottom = sel_or_l_raw,
+         xloc   = xloc.bar_time,
+         border_width = BOX_BORDER_W,
+         border_color = sel_border,
+         bgcolor      = sel_fill
+    )
+
+//====================================================================
+// 8) TABLE
+//====================================================================
+int cell_width_base =
+     table_text_size == size.tiny  ? 5 :
+     table_text_size == size.small ? 6 : 8
+
+int cell_width_larger =
+     table_text_size == size.tiny  ? 6 :
+     table_text_size == size.small ? 8 : 10
+
+int row_count = show_full_table ? 8 : 2
+var table t = table.new(position.bottom_left, 2, row_count, border_width = 1)
+
+format_value(float value) =>
+    na(value) ? "—" : str.tostring(value, format.mintick)
+
+if barstate.islast
+    table.cell(t, 0, 0, "OR Open",   width = cell_width_base,   text_size = table_text_size, bgcolor = GRAY)
+    table.cell(t, 0, 1, "OR Length", width = cell_width_larger, text_size = table_text_size, bgcolor = GRAY)
+
+    table.cell(t, 1, 0, or_tstring,    text_size = table_text_size, bgcolor = SILVER)
+    table.cell(t, 1, 1, or_tlenstring, text_size = table_text_size, bgcolor = SILVER)
+
+    if show_full_table
+        table.cell(t, 0, 2, "C Up",    width = cell_width_base, text_size = table_text_size, bgcolor = c_base_col)
+        table.cell(t, 0, 3, "A Up",    width = cell_width_base, text_size = table_text_size, bgcolor = a_base_col)
+        table.cell(t, 0, 4, "OR Up",   width = cell_width_base, text_size = table_text_size, bgcolor = or_base_col)
+        table.cell(t, 0, 5, "OR Down", width = cell_width_base, text_size = table_text_size, bgcolor = or_base_col)
+        table.cell(t, 0, 6, "A Down",  width = cell_width_base, text_size = table_text_size, bgcolor = a_base_col)
+        table.cell(t, 0, 7, "C Down",  width = cell_width_base, text_size = table_text_size, bgcolor = c_base_col)
+
+        table.cell(t, 1, 2, format_value(sel_c_up),    width = cell_width_larger, text_size = table_text_size, bgcolor = SILVER)
+        table.cell(t, 1, 3, format_value(sel_a_up),    width = cell_width_larger, text_size = table_text_size, bgcolor = SILVER)
+        table.cell(t, 1, 4, format_value(sel_or_up),   width = cell_width_larger, text_size = table_text_size, bgcolor = SILVER)
+        table.cell(t, 1, 5, format_value(sel_or_down), width = cell_width_larger, text_size = table_text_size, bgcolor = SILVER)
+        table.cell(t, 1, 6, format_value(sel_a_down),  width = cell_width_larger, text_size = table_text_size, bgcolor = SILVER)
+        table.cell(t, 1, 7, format_value(sel_c_down),  width = cell_width_larger, text_size = table_text_size, bgcolor = SILVER)

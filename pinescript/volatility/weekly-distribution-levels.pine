@@ -1,0 +1,344 @@
+//@version=5
+indicator("Weekly Distribution Levels", "WDL", overlay=true, max_lines_count=500, max_labels_count=500, max_boxes_count=500)
+
+// ═══ INPUTS ══════════════════════════════════════════════════════════
+var GRP_CALC  = "Calculation"
+i_lookback    = input.int(52, "Lookback Weeks", minval=10, maxval=520, group=GRP_CALC,
+     tooltip="Weeks used to calculate standard deviation.\n52 = 1 year, 260 = 5 years")
+i_method      = input.string("StdDev (Close-Open)", "Deviation Method",
+     options=["StdDev (Close-Open)", "Avg Weekly Range"], group=GRP_CALC,
+     tooltip="StdDev: variability of weekly net moves\nAvg Range: mean of weekly (High-Low)")
+
+var GRP_HIST  = "History"
+i_histWeeks   = input.int(3, "Weeks to Show", minval=1, maxval=10, group=GRP_HIST,
+     tooltip="Number of weeks to keep visible on chart (including current)")
+
+var GRP_LVL   = "Levels"
+i_maxDev      = input.float(2.0, "Max Level (±)", minval=0.5, maxval=5.0, step=0.5, group=GRP_LVL)
+i_step        = input.float(0.5, "Step Size", minval=0.25, maxval=1.0, step=0.25, group=GRP_LVL)
+
+var GRP_ZONE  = "Turn Zone"
+i_showZone    = input.bool(true, "Show Turn Zone", group=GRP_ZONE,
+     tooltip="Shaded area around the ±0.5 dev level where price statistically tends to reverse")
+i_zoneCenter  = input.float(0.5, "Zone Center (dev)", minval=0.25, maxval=2.0, step=0.25, group=GRP_ZONE)
+i_zoneWidth   = input.float(0.1, "Zone Width (±dev)", minval=0.05, maxval=0.5, step=0.05, group=GRP_ZONE)
+i_zoneCol     = input.color(color.new(#787B86, 85), "Color", group=GRP_ZONE)
+
+var GRP_OPEN  = "W Open Line"
+i_openCol     = input.color(color.black, "Color", group=GRP_OPEN)
+i_openStyle   = input.string("Solid", "Style", options=["Solid", "Dashed", "Dotted"], group=GRP_OPEN)
+i_openWidth   = input.int(1, "Width", minval=1, maxval=4, group=GRP_OPEN)
+
+var GRP_DEV   = "Upper Levels (+)"
+i_upperCol    = input.color(#f23645, "Color", group=GRP_DEV,
+     tooltip="Color for positive deviation levels (above weekly open)")
+i_lvlStyle    = input.string("Dashed", "Style", options=["Solid", "Dashed", "Dotted"], group=GRP_DEV)
+i_lvlWidth    = input.int(1, "Width", minval=1, maxval=4, group=GRP_DEV)
+i_useGradient = input.bool(false, "Gradient Opacity", group=GRP_DEV,
+     tooltip="Levels get more intense further from open")
+
+var GRP_DEVL  = "Lower Levels (-)"
+i_lowerCol    = input.color(#089981, "Color", group=GRP_DEVL,
+     tooltip="Color for negative deviation levels (below weekly open)")
+
+var GRP_LABELS = "Labels"
+i_showPrice   = input.bool(true, "Show Price on Labels", group=GRP_LABELS,
+     tooltip="Display the actual price level next to the deviation label (e.g., +1.0 (21,450))")
+
+var GRP_BG    = "Background Coloring"
+i_showBg      = input.bool(false, "Color Background Beyond Threshold", group=GRP_BG,
+     tooltip="Shade the chart background when price exceeds a deviation threshold")
+i_bgThresh    = input.float(1.5, "Threshold (σ)", minval=0.5, maxval=5.0, step=0.25, group=GRP_BG)
+i_bgUpCol     = input.color(#f23645, "Above Threshold", group=GRP_BG)
+i_bgDnCol     = input.color(#089981, "Below Threshold", group=GRP_BG)
+i_bgOpacity   = input.int(90, "Opacity", minval=70, maxval=97, group=GRP_BG)
+
+var GRP_ALERT = "Alerts"
+i_alertOn     = input.bool(true, "Enable Alerts", group=GRP_ALERT)
+i_alertLvl    = input.float(1.0, "Alert at ± Deviation", minval=0.25, maxval=5.0, step=0.25, group=GRP_ALERT,
+     tooltip="Fire alert when price crosses this deviation level in either direction")
+
+var GRP_TBL   = "Table"
+i_showTable   = input.bool(true, "Show Info Table", group=GRP_TBL)
+i_tblTheme    = input.string("Dark", "Theme", options=["Dark", "Light"], group=GRP_TBL)
+i_tblPos      = input.string("Top Right", "Position", options=["Top Right", "Top Left", "Bottom Right", "Bottom Left"], group=GRP_TBL)
+i_tblSize     = input.string("Normal", "Table Size", options=["Tiny", "Small", "Normal", "Large"], group=GRP_TBL)
+
+// ═══ STATE ═══════════════════════════════════════════════════════════
+var float   weekOpen     = na
+var bool    linesDrawn   = false
+var line    wOpenLine    = na
+var label   wOpenLabel   = na
+var line[]  upperLines   = array.new_line()
+var line[]  lowerLines   = array.new_line()
+var label[] upperLabels  = array.new_label()
+var label[] lowerLabels  = array.new_label()
+var table   infoTbl      = na
+
+// Turn zone state
+var line     zoneUTop  = na
+var line     zoneUBot  = na
+var line     zoneLTop  = na
+var line     zoneLBot  = na
+var linefill zoneUFill = na
+var linefill zoneLFill = na
+
+// Alert state — track whether level was already crossed this week
+var bool alertedUp   = false
+var bool alertedDown = false
+
+// History tracking for cleanup
+var array<line>  histLines  = array.new_line()
+var array<label> histLabels = array.new_label()
+var array<linefill> histFills = array.new_linefill()
+
+// ═══ DERIVED CONSTANTS ═══════════════════════════════════════════════
+int levelCount = math.floor(i_maxDev / i_step + 1e-6)
+
+// Dynamic cap: ensure (histWeeks + 1 current) stays under max_lines/labels_count (500)
+int linesPerWeek  = 1 + 2 * levelCount + 4   // open + upper/lower levels + zone borders
+int labelsPerWeek = 1 + 2 * levelCount        // open + upper/lower levels
+int maxByLines  = math.floor(500 / linesPerWeek) - 1
+int maxByLabels = math.floor(500 / labelsPerWeek) - 1
+int maxSafeWeeks = math.max(1, math.min(maxByLines, maxByLabels))
+int histWeeks = math.min(i_histWeeks, maxSafeWeeks)
+string sizeVal = i_tblSize == "Tiny" ? size.tiny : i_tblSize == "Large" ? size.large : i_tblSize == "Normal" ? size.normal : size.small
+
+// Line style maps
+var openLineStyle = i_openStyle == "Solid" ? line.style_solid : i_openStyle == "Dotted" ? line.style_dotted : line.style_dashed
+var lvlLineStyle  = i_lvlStyle == "Solid"  ? line.style_solid : i_lvlStyle == "Dotted"  ? line.style_dotted : line.style_dashed
+
+// Table theme
+var color tblBg       = i_tblTheme == "Dark" ? color.new(color.black, 80) : color.new(color.white, 80)
+var color tblBorder   = color.new(color.gray, 80)
+var color tblLabelCol = i_tblTheme == "Dark" ? color.gray                 : #787B86
+var color tblTextCol  = i_tblTheme == "Dark" ? color.white                : color.black
+var color tblAccent   = i_tblTheme == "Dark" ? color.yellow               : #E65100
+
+// Table position
+string tblPos = i_tblPos == "Top Right" ? position.top_right : i_tblPos == "Top Left" ? position.top_left : i_tblPos == "Bottom Right" ? position.bottom_right : position.bottom_left
+
+// ═══ GRADIENT HELPER ═════════════════════════════════════════════════
+// Returns opacity based on absolute deviation multiplier (0.5 → faint, 5.0 → intense)
+// Consistent regardless of how many levels are displayed
+get_opacity(float mult) =>
+    if i_useGradient
+        int maxOpacity = 85
+        int minOpacity = 15
+        int span = maxOpacity - minOpacity
+        // Scale: 0.5 dev = faintest, 5.0 dev = most intense
+        maxOpacity - math.round(span * math.min(mult, 5.0) / 5.0)
+    else
+        0
+
+// ═══ TABLE SETUP ═════════════════════════════════════════════════════
+if i_showTable and barstate.isfirst
+    infoTbl := table.new(tblPos, 2, 5, bgcolor=tblBg, border_color=tblBorder, border_width=1)
+
+// ═══ WEEKLY DEVIATION UNIT ═══════════════════════════════════════════
+var float devUnit = na
+float rawDev = i_method == "StdDev (Close-Open)"
+     ? request.security(syminfo.tickerid, "W", ta.stdev(close - open, i_lookback)[1], lookahead=barmerge.lookahead_off)
+     : request.security(syminfo.tickerid, "W", ta.sma(high - low, i_lookback)[1], lookahead=barmerge.lookahead_off)
+if not na(rawDev) and rawDev > 0
+    devUnit := rawDev
+
+// ═══ WEEK DETECTION ═══════════════════════════════════════════════════
+bool isNewWeek = ta.change(time("W")) != 0
+
+if isNewWeek
+    weekOpen   := open
+    linesDrawn := false
+    alertedUp  := false
+    alertedDown := false
+
+    // ── Track previous week objects for history ──
+    if not na(wOpenLine)
+        line.set_x2(wOpenLine, bar_index - 1)
+        array.push(histLines, wOpenLine)
+    if not na(wOpenLabel)
+        array.push(histLabels, wOpenLabel)
+
+    if array.size(upperLines) > 0
+        for i = 0 to array.size(upperLines) - 1
+            line.set_x2(array.get(upperLines, i), bar_index - 1)
+            array.push(histLines, array.get(upperLines, i))
+    if array.size(lowerLines) > 0
+        for i = 0 to array.size(lowerLines) - 1
+            line.set_x2(array.get(lowerLines, i), bar_index - 1)
+            array.push(histLines, array.get(lowerLines, i))
+
+    if array.size(upperLabels) > 0
+        for i = 0 to array.size(upperLabels) - 1
+            array.push(histLabels, array.get(upperLabels, i))
+    if array.size(lowerLabels) > 0
+        for i = 0 to array.size(lowerLabels) - 1
+            array.push(histLabels, array.get(lowerLabels, i))
+
+    // ── Close out zone lines and push to history ──
+    if not na(zoneUTop)
+        line.set_x2(zoneUTop, bar_index - 1)
+        array.push(histLines, zoneUTop)
+    if not na(zoneUBot)
+        line.set_x2(zoneUBot, bar_index - 1)
+        array.push(histLines, zoneUBot)
+    if not na(zoneLTop)
+        line.set_x2(zoneLTop, bar_index - 1)
+        array.push(histLines, zoneLTop)
+    if not na(zoneLBot)
+        line.set_x2(zoneLBot, bar_index - 1)
+        array.push(histLines, zoneLBot)
+
+    if not na(zoneUFill)
+        array.push(histFills, zoneUFill)
+        zoneUFill := na
+    if not na(zoneLFill)
+        array.push(histFills, zoneLFill)
+        zoneLFill := na
+
+    // ── Cull old history beyond lookback weeks ──
+    // Each week produces: 1 open line + 1 open label + levelCount*2 lines + levelCount*2 labels + 4 zone lines + 2 fills
+    int objsPerWeek_lines  = 1 + levelCount * 2 + 4
+    int objsPerWeek_labels = 1 + levelCount * 2
+    int maxHistLines  = histWeeks * objsPerWeek_lines
+    int maxHistLabels = histWeeks * objsPerWeek_labels
+    int maxHistFills  = histWeeks * 2
+
+    while array.size(histLines) > maxHistLines
+        line.delete(array.shift(histLines))
+    while array.size(histLabels) > maxHistLabels
+        label.delete(array.shift(histLabels))
+    while array.size(histFills) > maxHistFills
+        linefill.delete(array.shift(histFills))
+
+    array.clear(upperLines)
+    array.clear(lowerLines)
+    array.clear(upperLabels)
+    array.clear(lowerLabels)
+    wOpenLine  := na
+    wOpenLabel := na
+    zoneUTop   := na
+    zoneUBot   := na
+    zoneLTop   := na
+    zoneLBot   := na
+
+// ═══ CREATE LINES (once per week when data is ready) ═════════════════
+if not linesDrawn and not na(weekOpen) and not na(devUnit) and devUnit > 0
+    linesDrawn := true
+
+    wOpenLine := line.new(bar_index, weekOpen, bar_index + 1, weekOpen,
+         color=i_openCol, style=openLineStyle, width=i_openWidth)
+    wOpenLabel := label.new(bar_index, weekOpen, "W Open",
+         style=label.style_none, textcolor=i_openCol, size=sizeVal)
+
+    for i = 1 to levelCount
+        float mult    = i * i_step
+        float upPrice = weekOpen + mult * devUnit
+        float dnPrice = weekOpen - mult * devUnit
+        string multStr = str.tostring(mult, "#.##")
+
+        int opac = get_opacity(mult)
+        color upCol = color.new(i_upperCol, opac)
+        color dnCol = color.new(i_lowerCol, opac)
+
+        array.push(upperLines, line.new(bar_index, upPrice, bar_index + 1, upPrice,
+             color=upCol, style=lvlLineStyle, width=i_lvlWidth))
+        array.push(lowerLines, line.new(bar_index, dnPrice, bar_index + 1, dnPrice,
+             color=dnCol, style=lvlLineStyle, width=i_lvlWidth))
+
+        string upLbl = i_showPrice ? "+" + multStr + " (" + str.tostring(upPrice, "#.##") + ")" : "+" + multStr
+        string dnLbl = i_showPrice ? "-" + multStr + " (" + str.tostring(dnPrice, "#.##") + ")" : "-" + multStr
+
+        array.push(upperLabels, label.new(bar_index, upPrice, upLbl,
+             style=label.style_none, textcolor=upCol, size=sizeVal))
+        array.push(lowerLabels, label.new(bar_index, dnPrice, dnLbl,
+             style=label.style_none, textcolor=dnCol, size=sizeVal))
+
+    // ── Turn zone (shaded area around ±zone center dev) ──
+    if i_showZone
+        float zuT = weekOpen + (i_zoneCenter + i_zoneWidth) * devUnit
+        float zuB = weekOpen + (i_zoneCenter - i_zoneWidth) * devUnit
+        float zlT = weekOpen - (i_zoneCenter - i_zoneWidth) * devUnit
+        float zlB = weekOpen - (i_zoneCenter + i_zoneWidth) * devUnit
+
+        zoneUTop := line.new(bar_index, zuT, bar_index + 1, zuT, color=color.new(color.white, 100))
+        zoneUBot := line.new(bar_index, zuB, bar_index + 1, zuB, color=color.new(color.white, 100))
+        zoneLTop := line.new(bar_index, zlT, bar_index + 1, zlT, color=color.new(color.white, 100))
+        zoneLBot := line.new(bar_index, zlB, bar_index + 1, zlB, color=color.new(color.white, 100))
+
+        zoneUFill := linefill.new(zoneUTop, zoneUBot, i_zoneCol)
+        zoneLFill := linefill.new(zoneLTop, zoneLBot, i_zoneCol)
+
+// ═══ EXTEND CURRENT WEEK'S LINES & LABELS ═══════════════════════════
+if linesDrawn
+    if not na(wOpenLine)
+        line.set_x2(wOpenLine, bar_index)
+    if not na(wOpenLabel)
+        label.set_x(wOpenLabel, bar_index)
+    if array.size(upperLines) > 0
+        for i = 0 to array.size(upperLines) - 1
+            line.set_x2(array.get(upperLines, i), bar_index)
+    if array.size(lowerLines) > 0
+        for i = 0 to array.size(lowerLines) - 1
+            line.set_x2(array.get(lowerLines, i), bar_index)
+    if array.size(upperLabels) > 0
+        for i = 0 to array.size(upperLabels) - 1
+            label.set_x(array.get(upperLabels, i), bar_index)
+    if array.size(lowerLabels) > 0
+        for i = 0 to array.size(lowerLabels) - 1
+            label.set_x(array.get(lowerLabels, i), bar_index)
+
+    // Extend zone anchor lines
+    if i_showZone
+        if not na(zoneUTop)
+            line.set_x2(zoneUTop, bar_index)
+        if not na(zoneUBot)
+            line.set_x2(zoneUBot, bar_index)
+        if not na(zoneLTop)
+            line.set_x2(zoneLTop, bar_index)
+        if not na(zoneLBot)
+            line.set_x2(zoneLBot, bar_index)
+
+// ═══ ALERTS ═══════════════════════════════════════════════════════════
+if i_alertOn and not na(weekOpen) and not na(devUnit) and devUnit > 0
+    float alertUp = weekOpen + i_alertLvl * devUnit
+    float alertDn = weekOpen - i_alertLvl * devUnit
+
+    if not alertedUp and high >= alertUp
+        alertedUp := true
+        alert("WDL: Price reached +" + str.tostring(i_alertLvl, "#.##") + "σ (" + str.tostring(alertUp, "#.##") + ") — " + syminfo.ticker, alert.freq_once_per_bar)
+    if not alertedDown and low <= alertDn
+        alertedDown := true
+        alert("WDL: Price reached -" + str.tostring(i_alertLvl, "#.##") + "σ (" + str.tostring(alertDn, "#.##") + ") — " + syminfo.ticker, alert.freq_once_per_bar)
+
+// ═══ BACKGROUND COLORING ═════════════════════════════════════════════
+// Temporal filter: only shade bars within the visible history window
+bool isRecentWeek = time >= timenow - histWeeks * 7 * 24 * 60 * 60 * 1000
+float curDevBg = not na(weekOpen) and not na(devUnit) and devUnit > 0 ? (close - weekOpen) / devUnit : na
+color bgCol = na
+if i_showBg and isRecentWeek and not na(curDevBg)
+    if curDevBg >= i_bgThresh
+        bgCol := color.new(i_bgUpCol, i_bgOpacity)
+    else if curDevBg <= -i_bgThresh
+        bgCol := color.new(i_bgDnCol, i_bgOpacity)
+
+bgcolor(bgCol, title="Deviation Background")
+
+// ═══ INFO TABLE ═══════════════════════════════════════════════════════
+if i_showTable and barstate.islast and not na(infoTbl)
+    // Current deviation reading
+    float curDev = not na(weekOpen) and not na(devUnit) and devUnit > 0 ? (close - weekOpen) / devUnit : na
+    string devSign = not na(curDev) ? (curDev >= 0 ? "+" : "") : ""
+    string devText = not na(curDev) ? devSign + str.tostring(curDev, "#.##") + "σ" : "N/A"
+    color  devCol  = not na(curDev) ? (curDev >= 0 ? i_upperCol : i_lowerCol) : tblLabelCol
+
+    table.cell(infoTbl, 0, 0, "Method",    text_color=tblLabelCol, text_size=sizeVal)
+    table.cell(infoTbl, 1, 0, i_method,    text_color=tblTextCol,  text_size=sizeVal)
+    table.cell(infoTbl, 0, 1, "Lookback",  text_color=tblLabelCol, text_size=sizeVal)
+    table.cell(infoTbl, 1, 1, str.tostring(i_lookback) + "w", text_color=tblTextCol, text_size=sizeVal)
+    table.cell(infoTbl, 0, 2, "1 Dev",     text_color=tblLabelCol, text_size=sizeVal)
+    table.cell(infoTbl, 1, 2, not na(devUnit) ? str.tostring(devUnit, "#.##") + " pts" : "N/A", text_color=tblAccent, text_size=sizeVal)
+    table.cell(infoTbl, 0, 3, "W Open",    text_color=tblLabelCol, text_size=sizeVal)
+    table.cell(infoTbl, 1, 3, not na(weekOpen) ? str.tostring(weekOpen, "#.##") : "N/A", text_color=i_openCol, text_size=sizeVal)
+    table.cell(infoTbl, 0, 4, "Current",   text_color=tblLabelCol, text_size=sizeVal)
+    table.cell(infoTbl, 1, 4, devText,     text_color=devCol,      text_size=sizeVal)

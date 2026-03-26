@@ -1,0 +1,154 @@
+// The MIT License (MIT)
+// © mihakralj
+//@version=6
+indicator("Parabolic SAR Extended", "SAREXT", overlay=true)
+
+//@function Calculates Parabolic SAR Extended with asymmetric acceleration factors
+//@param start_value Explicit start value (0=auto-detect, >0=force long, <0=force short)
+//@param offset_on_reverse Offset applied to SAR on each reversal
+//@param af_init_long Initial AF for long positions
+//@param af_long AF increment per new high in long mode
+//@param af_max_long Maximum AF for long positions
+//@param af_init_short Initial AF for short positions
+//@param af_short AF increment per new low in short mode
+//@param af_max_short Maximum AF for short positions
+//@returns Sign-encoded SAR: positive=long (SAR below price), negative=short (SAR above price)
+//@optimized O(1) per bar state machine, asymmetric AF for long/short
+sarext(simple float start_value=0.0, simple float offset_on_reverse=0.0,
+       simple float af_init_long=0.02, simple float af_long=0.02, simple float af_max_long=0.20,
+       simple float af_init_short=0.02, simple float af_short=0.02, simple float af_max_short=0.20) =>
+    if af_init_long < 0
+        runtime.error("AF init long must be >= 0")
+    if af_long < 0
+        runtime.error("AF long must be >= 0")
+    if af_max_long < af_init_long
+        runtime.error("AF max long must be >= AF init long")
+    if af_init_short < 0
+        runtime.error("AF init short must be >= 0")
+    if af_short < 0
+        runtime.error("AF short must be >= 0")
+    if af_max_short < af_init_short
+        runtime.error("AF max short must be >= AF init short")
+
+    var bool is_long = true
+    var float sar = na
+    var float ep = na
+    var float af = af_init_long
+    var float result = na
+
+    if bar_index == 0
+        // Bar 0: store first bar, no output yet (need 2 bars for DM)
+        result := na
+    else if bar_index == 1
+        // Bar 1: determine initial direction
+        if start_value > 0
+            // Forced long
+            is_long := true
+            sar := math.abs(start_value)
+        else if start_value < 0
+            // Forced short
+            is_long := false
+            sar := math.abs(start_value)
+        else
+            // Auto-detect from directional movement
+            float plus_dm = high - high[1]
+            float minus_dm = low[1] - low
+            if plus_dm < 0
+                plus_dm := 0
+            if minus_dm < 0
+                minus_dm := 0
+            is_long := plus_dm > minus_dm
+            // Initial SAR from prior bar extreme
+            sar := is_long ? low[1] : high[1]
+
+        // Set initial EP and AF
+        ep := is_long ? high : low
+        af := is_long ? af_init_long : af_init_short
+
+        // Clamp SAR
+        if is_long
+            if sar > low[1]
+                sar := low[1]
+            if sar > low
+                sar := low
+        else
+            if sar < high[1]
+                sar := high[1]
+            if sar < high
+                sar := high
+
+        // Sign-encode
+        result := is_long ? sar : -sar
+    else
+        // Bar 2+: standard SAR with asymmetric AF
+        float new_sar = sar + af * (ep - sar)
+
+        if is_long
+            // Clamp to prior lows
+            new_sar := math.min(new_sar, low[1])
+            new_sar := math.min(new_sar, low[2])
+
+            // Reversal check
+            if low < new_sar
+                // Reverse to short
+                is_long := false
+                new_sar := ep
+                if offset_on_reverse != 0
+                    new_sar := new_sar + offset_on_reverse
+                ep := low
+                af := af_init_short
+            else
+                // New extreme point?
+                if high > ep
+                    ep := high
+                    af := math.min(af + af_long, af_max_long)
+        else
+            // Short mode: clamp to prior highs
+            new_sar := math.max(new_sar, high[1])
+            new_sar := math.max(new_sar, high[2])
+
+            // Reversal check
+            if high > new_sar
+                // Reverse to long
+                is_long := true
+                new_sar := ep
+                if offset_on_reverse != 0
+                    new_sar := new_sar - offset_on_reverse
+                ep := high
+                af := af_init_long
+            else
+                // New extreme point?
+                if low < ep
+                    ep := low
+                    af := math.min(af + af_short, af_max_short)
+
+        sar := new_sar
+        result := is_long ? new_sar : -new_sar
+
+    result
+
+// ---------- Main loop ----------
+
+// Inputs
+i_start_value     = input.float(0.0,  "Start Value",       step=0.1,                        tooltip="0=auto-detect, >0=force long, <0=force short")
+i_offset_reverse  = input.float(0.0,  "Offset on Reverse", minval=0.0, step=0.1,            tooltip="Buffer added to SAR on reversal")
+i_af_init_long    = input.float(0.02, "AF Init Long",      minval=0.0, maxval=1.0, step=0.001)
+i_af_long         = input.float(0.02, "AF Long",           minval=0.0, maxval=1.0, step=0.001)
+i_af_max_long     = input.float(0.20, "AF Max Long",       minval=0.0, maxval=1.0, step=0.01)
+i_af_init_short   = input.float(0.02, "AF Init Short",     minval=0.0, maxval=1.0, step=0.001)
+i_af_short        = input.float(0.02, "AF Short",          minval=0.0, maxval=1.0, step=0.001)
+i_af_max_short    = input.float(0.20, "AF Max Short",      minval=0.0, maxval=1.0, step=0.01)
+
+// Calculation
+sarext_val = sarext(i_start_value, i_offset_reverse,
+                    i_af_init_long, i_af_long, i_af_max_long,
+                    i_af_init_short, i_af_short, i_af_max_short)
+
+// Decode sign: absolute value = SAR level, sign = direction
+sar_abs = math.abs(sarext_val)
+sar_long  = sarext_val > 0 ? sar_abs : na
+sar_short = sarext_val < 0 ? sar_abs : na
+
+// Plot
+plot(sar_long,  "SAREXT Long",  color=color.green, style=plot.style_linebr, linewidth=2)
+plot(sar_short, "SAREXT Short", color=color.red,   style=plot.style_linebr, linewidth=2)

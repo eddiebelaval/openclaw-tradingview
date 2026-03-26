@@ -1,0 +1,131 @@
+//@version=6
+// ============================================================================
+// © 2026 Ibotrade
+// SCRIPT: Volume Sentiment Drift
+// Open-Source (MPL 2.0) — Read-Only Market Context Indicator
+// ============================================================================
+// COMPLIANCE NOTICE:
+// - This is a purely analytical tool for market regime identification.
+// - NO BUY/SELL signals are provided. No trade execution is implied.
+// - Educational use only.
+// ============================================================================
+
+indicator("Volume Sentiment Drift", shorttitle="VSD", overlay=false, max_labels_count=200)
+
+// =====================================================================
+// █ INPUTS & DYNAMIC CONTROLS
+// =====================================================================
+groupCore   = "Core Engine"
+volLen      = input.int(20, "Baseline Volume Lookback", minval=5, group=groupCore)
+atrLen      = input.int(14, "ATR Length (Efficiency)", minval=1, group=groupCore)
+
+groupSmooth = "Regime Smoothing"
+eeSmoothLen     = input.int(21, "Energy Smoothing", minval=5, group=groupSmooth)
+driftSmoothLen  = input.int(21, "Drift Smoothing",  minval=5, group=groupSmooth)
+
+groupState  = "State Engine (Non-Signal)"
+confirmBars = input.int(5, "Confirmation Bars", minval=2, group=groupState)
+hystBand    = input.float(0.08, "Dead-Zone Threshold", minval=0.0, step=0.01, group=groupState)
+
+groupDash   = "Interpreter Dashboard"
+showDash    = input.bool(true, "Show Context Table", group=groupDash)
+dashLoc     = input.string("Bottom Right", "Location", options=["Top Left","Top Right","Bottom Left","Bottom Right"], group=groupDash)
+dashTextOpt = input.string("Normal", "Text Size", options=["Tiny","Small","Normal","Large"], group=groupDash)
+
+// =====================================================================
+// █ CORE: PARTICIPATION × PRICE EFFICIENCY
+// =====================================================================
+// 1. Participation (Relative Volume)
+volMA = ta.sma(volume, volLen)
+rvol  = volMA > 0 ? volume / volMA : 1.0
+
+// 2. Price Efficiency (ATR-normalized True Range)
+atr = ta.atr(atrLen)
+tr  = ta.tr(true)
+effRaw = atr > 0 ? tr / atr : 0.0
+eff    = math.min(effRaw, 3.0)
+
+// 3. Emotional / Sentiment Energy
+eeRaw = rvol * eff
+ee    = ta.ema(eeRaw, eeSmoothLen)
+
+// 4. Drift (Change in Energy)
+driftRaw = ee - nz(ee[1])
+drift    = ta.ema(driftRaw, driftSmoothLen)
+
+// 5. Normalization for Scale Stability
+scale  = ta.stdev(drift, math.max(10, driftSmoothLen))
+driftN = scale > 0 ? drift / scale : 0.0
+
+// Warm-up logic to prevent erratic initial values
+barsReady = bar_index > math.max(volLen, atrLen, eeSmoothLen, driftSmoothLen) + 10
+driftN    := barsReady ? driftN : 0.0
+
+/// =====================================================================
+// █ STATE ENGINE (Persistence Logic)
+// =====================================================================
+var string state = "BALANCED"
+var int accelCnt = 0
+var int decayCnt = 0
+
+isAccel = driftN >  hystBand
+isDecay = driftN < -hystBand
+
+accelCnt := isAccel ? accelCnt + 1 : 0
+decayCnt := isDecay ? decayCnt + 1 : 0
+
+// 1. Determine Current Logic State
+if accelCnt >= confirmBars
+    state := "ACCELERATING"
+else if decayCnt >= confirmBars
+    state := "DECAYING"
+else if not isAccel and not isDecay
+    state := "BALANCED"
+
+// 2. Real-time Smoothing (Prevents "Flickering" UI)
+// We use a safe fallback for the very first bar of the chart
+string prev_state = not na(state[1]) ? state[1] : "BALANCED"
+string dispState  = (barstate.isrealtime and not barstate.isconfirmed) ? prev_state : state
+
+// 3. Visual Assignment (Color)
+// Separating color from the string assignment fixes the line 87 error
+color stateColor = dispState == "ACCELERATING" ? color.lime : 
+                   dispState == "DECAYING"     ? color.red  : 
+                   color.gray
+// =====================================================================
+// █ VISUALS & PLOTS
+// =====================================================================
+// Equilibrium Zone
+hline(0, "Equilibrium", color=color.new(color.white, 50), linestyle=hline.style_dotted)
+
+// Dead-Zone Identification (Crucial for TV Transparency)
+p_up = plot(hystBand,  "Dead-Zone +", color=color.new(color.gray, 60))
+p_dn = plot(-hystBand, "Dead-Zone -", color=color.new(color.gray, 60))
+fill(p_up, p_dn, color=color.new(color.gray, 90), title="Dead-Zone Fill")
+
+// Main Sentiment Drift Line
+plot(driftN, "Sentiment Drift", color=stateColor, linewidth=3, style=plot.style_line)
+
+// =====================================================================
+// █ COMPLIANCE DASHBOARD
+// =====================================================================
+f_bullets(string s) =>
+    string b1 = "No trend identified."
+    string b2 = "Market is in equilibrium."
+    if s == "ACCELERATING"
+        b1 := "Price efficiency is rising relative to participation."
+        b2 := "Tape favored by ease of movement (Continuance potential)."
+    else if s == "DECAYING"
+        b1 := "Effort is producing less result (Potential rotation)."
+        b2 := "Prior sentiment velocity is cooling (Absorption phase)."
+    [b1, b2]
+
+if showDash and barstate.islast
+    t = table.new(dashLoc == "Top Left" ? position.top_left : dashLoc == "Top Right" ? position.top_right : dashLoc == "Bottom Left" ? position.bottom_left : position.bottom_right, 1, 4)
+    [b1, b2] = f_bullets(dispState)
+    sz = dashTextOpt == "Tiny" ? size.tiny : dashTextOpt == "Small" ? size.small : dashTextOpt == "Large" ? size.large : size.normal
+    
+    table.cell(t, 0, 0, "REGIME: " + dispState, bgcolor=stateColor, text_color=color.black, text_size=sz)
+    table.cell(t, 0, 1, "• " + b1, bgcolor=color.black, text_color=color.white, text_size=sz)
+    table.cell(t, 0, 2, "• " + b2, bgcolor=color.black, text_color=color.white, text_size=sz)
+    table.cell(t, 0, 3, "Non-Signal Context Tool", bgcolor=color.black, text_color=color.gray, text_size=size.tiny)

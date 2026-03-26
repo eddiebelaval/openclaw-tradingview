@@ -1,0 +1,300 @@
+//@version=5
+indicator("BSC P-Level Engine LITE", overlay=true, max_lines_count=200, max_labels_count=200)
+
+//====================================================
+// INPUTS
+//====================================================
+anchorMode = input.string("New York Open", "Anchor Mode", options=["Globex Open", "New York Open", "London Open", "Custom Session"])
+customSession = input.session("0930-1600", "Custom Session")
+sessionTZ = input.string("America/New_York", "Session TZ")
+
+lookback = input.int(60, "Lookback Sessions", minval=10, maxval=300)
+useATRNorm = input.bool(true, "ATR Normalize")
+atrLen = input.int(14, "ATR Length")
+
+showTargets = input.bool(true, "Show Targets")
+showLabels = input.bool(true, "Show Labels")
+extendRight = input.bool(true, "Extend Lines Right")
+lineWidth = input.int(2, "Line Width", minval=1, maxval=5)
+
+anchorColor = input.color(color.aqua, "Anchor Color")
+p50UpColor = input.color(color.aqua, "P50 Up Color")
+p75UpColor = input.color(color.yellow, "P75 Up Color")
+p50DnColor = input.color(color.aqua, "P50 Down Color")
+p75DnColor = input.color(color.yellow, "P75 Down Color")
+
+labelTextColor = input.color(color.white, "Label Text Color")
+labelSizeInput = input.string("Small", "Label Size", options=["Tiny", "Small", "Normal", "Large"])
+
+showTable = input.bool(true, "Show Lite Table")
+tablePosInput = input.string("Top Right", "Table Position", options=["Top Left", "Top Center", "Top Right", "Middle Left", "Middle Center", "Middle Right", "Bottom Left", "Bottom Center", "Bottom Right"])
+tableBGcolor = input.color(color.new(color.black, 70), "Table Background")
+textColor = input.color(color.white, "Table Text Color")
+borderColor = input.color(color.gray, "Border Color")
+borderWidth = input.int(1, "Border Width", minval=0, maxval=5)
+
+showHitMarkers = input.bool(true, "Show P75 Hit Markers")
+hitMarkerSizeInput = input.string("Tiny", "Hit Marker Size", options=["Tiny", "Small", "Normal"])
+
+//====================================================
+// STYLE HELPERS
+//====================================================
+labelSize =
+     labelSizeInput == "Tiny" ? size.tiny :
+     labelSizeInput == "Small" ? size.small :
+     labelSizeInput == "Normal" ? size.normal :
+     size.large
+
+hitMarkerSize =
+     hitMarkerSizeInput == "Tiny" ? size.tiny :
+     hitMarkerSizeInput == "Small" ? size.small :
+     size.normal
+
+tablePos =
+     tablePosInput == "Top Left" ? position.top_left :
+     tablePosInput == "Top Center" ? position.top_center :
+     tablePosInput == "Top Right" ? position.top_right :
+     tablePosInput == "Middle Left" ? position.middle_left :
+     tablePosInput == "Middle Center" ? position.middle_center :
+     tablePosInput == "Middle Right" ? position.middle_right :
+     tablePosInput == "Bottom Left" ? position.bottom_left :
+     tablePosInput == "Bottom Center" ? position.bottom_center :
+     position.bottom_right
+
+//====================================================
+// HELPERS
+//====================================================
+f_inSession(_sess, _tz) =>
+    not na(time(timeframe.period, _sess, _tz))
+
+f_fmt(_v) =>
+    na(_v) ? "na" : str.tostring(_v, format.mintick)
+
+f_percentileFromArray(_arr, _pct) =>
+    array.size(_arr) >= 3 ? array.percentile_linear_interpolation(_arr, _pct) : na
+
+f_deleteLine(_ln) =>
+    if not na(_ln)
+        line.delete(_ln)
+
+f_deleteLabel(_lb) =>
+    if not na(_lb)
+        label.delete(_lb)
+
+f_lineUpdate(_ln, _price, _col) =>
+    line out = _ln
+    if not showTargets or na(_price)
+        if not na(out)
+            line.delete(out)
+        out := na
+    else
+        if na(out)
+            out := line.new(x1=bar_index, y1=_price, x2=bar_index + 1, y2=_price, xloc=xloc.bar_index, extend=extendRight ? extend.right : extend.none)
+        if barstate.islast
+            line.set_xy1(out, bar_index, _price)
+            line.set_xy2(out, bar_index + 1, _price)
+            line.set_extend(out, extendRight ? extend.right : extend.none)
+            line.set_color(out, _col)
+            line.set_width(out, lineWidth)
+    out
+
+f_labelUpdate(_lb, _price, _txt, _bg) =>
+    label out = _lb
+    if not showTargets or not showLabels or na(_price)
+        if not na(out)
+            label.delete(out)
+        out := na
+    else
+        if na(out)
+            out := label.new(x=bar_index + 1, y=_price, text=_txt, xloc=xloc.bar_index, style=label.style_label_left)
+        if barstate.islast
+            label.set_x(out, bar_index + 1)
+            label.set_y(out, _price)
+            label.set_text(out, _txt)
+            label.set_color(out, _bg)
+            label.set_textcolor(out, labelTextColor)
+            label.set_size(out, labelSize)
+    out
+
+//====================================================
+// SESSION
+//====================================================
+globexSession = "1800-1700"
+nySession = "0930-1600"
+ldnSession = "0300-1200"
+
+inSession =
+     anchorMode == "Globex Open" ? f_inSession(globexSession, sessionTZ) :
+     anchorMode == "New York Open" ? f_inSession(nySession, sessionTZ) :
+     anchorMode == "London Open" ? f_inSession(ldnSession, sessionTZ) :
+     f_inSession(customSession, sessionTZ)
+
+newSession = inSession and not inSession[1]
+
+//====================================================
+// STATE
+//====================================================
+atr = ta.atr(atrLen)
+
+var float anchor = na
+var float anchorATR = na
+var float hi = na
+var float lo = na
+
+var array<float> upArr = array.new_float()
+var array<float> dnArr = array.new_float()
+
+var float p50 = na
+var float p75 = na
+var float n50 = na
+var float n75 = na
+
+var bool hitP75Up = false
+var bool hitP75Dn = false
+
+//====================================================
+// LINE + LABEL HANDLES
+//====================================================
+var line lnAnchor = na
+var line lnP50Up = na
+var line lnP75Up = na
+var line lnP50Dn = na
+var line lnP75Dn = na
+
+var label lbAnchor = na
+var label lbP50Up = na
+var label lbP75Up = na
+var label lbP50Dn = na
+var label lbP75Dn = na
+
+//====================================================
+// NEW SESSION LOGIC
+//====================================================
+if newSession
+    if not na(anchor) and not na(hi) and not na(lo)
+        upMoveRaw = math.max(hi - anchor, 0)
+        dnMoveRaw = math.max(anchor - lo, 0)
+
+        upStored = useATRNorm and not na(anchorATR) and anchorATR > 0 ? upMoveRaw / anchorATR : upMoveRaw
+        dnStored = useATRNorm and not na(anchorATR) and anchorATR > 0 ? dnMoveRaw / anchorATR : dnMoveRaw
+
+        array.push(upArr, upStored)
+        array.push(dnArr, dnStored)
+
+        if array.size(upArr) > lookback
+            array.shift(upArr)
+        if array.size(dnArr) > lookback
+            array.shift(dnArr)
+
+    anchor := open
+    anchorATR := atr
+    hi := high
+    lo := low
+
+    hitP75Up := false
+    hitP75Dn := false
+
+    up50base = f_percentileFromArray(upArr, 50)
+    up75base = f_percentileFromArray(upArr, 75)
+    dn50base = f_percentileFromArray(dnArr, 50)
+    dn75base = f_percentileFromArray(dnArr, 75)
+
+    p50 := useATRNorm and not na(anchorATR) and not na(up50base) ? anchor + up50base * anchorATR : na
+    p75 := useATRNorm and not na(anchorATR) and not na(up75base) ? anchor + up75base * anchorATR : na
+    n50 := useATRNorm and not na(anchorATR) and not na(dn50base) ? anchor - dn50base * anchorATR : na
+    n75 := useATRNorm and not na(anchorATR) and not na(dn75base) ? anchor - dn75base * anchorATR : na
+
+    f_deleteLine(lnAnchor)
+    f_deleteLine(lnP50Up)
+    f_deleteLine(lnP75Up)
+    f_deleteLine(lnP50Dn)
+    f_deleteLine(lnP75Dn)
+
+    f_deleteLabel(lbAnchor)
+    f_deleteLabel(lbP50Up)
+    f_deleteLabel(lbP75Up)
+    f_deleteLabel(lbP50Dn)
+    f_deleteLabel(lbP75Dn)
+
+    lnAnchor := na
+    lnP50Up := na
+    lnP75Up := na
+    lnP50Dn := na
+    lnP75Dn := na
+
+    lbAnchor := na
+    lbP50Up := na
+    lbP75Up := na
+    lbP50Dn := na
+    lbP75Dn := na
+
+//====================================================
+// LIVE SESSION UPDATE
+//====================================================
+if inSession
+    hi := math.max(nz(hi, high), high)
+    lo := math.min(nz(lo, low), low)
+
+    if not hitP75Up and not na(p75) and high >= p75
+        hitP75Up := true
+
+    if not hitP75Dn and not na(n75) and low <= n75
+        hitP75Dn := true
+
+liveUp = not na(anchor) ? math.max(high - anchor, 0) : na
+liveDn = not na(anchor) ? math.max(anchor - low, 0) : na
+
+bias =
+     liveUp > liveDn and close > anchor ? "Bullish" :
+     liveDn > liveUp and close < anchor ? "Bearish" :
+     "Neutral"
+
+//====================================================
+// DRAW TARGETS
+//====================================================
+if not na(anchor)
+    lnAnchor := f_lineUpdate(lnAnchor, anchor, anchorColor)
+
+    lnP50Up := f_lineUpdate(lnP50Up, p50, p50UpColor)
+    lnP75Up := f_lineUpdate(lnP75Up, p75, p75UpColor)
+    lnP50Dn := f_lineUpdate(lnP50Dn, n50, p50DnColor)
+    lnP75Dn := f_lineUpdate(lnP75Dn, n75, p75DnColor)
+
+    lbAnchor := f_labelUpdate(lbAnchor, anchor, "ANCHOR " + f_fmt(anchor), anchorColor)
+    lbP50Up := f_labelUpdate(lbP50Up, p50, "P50 ↑ " + f_fmt(p50), p50UpColor)
+    lbP75Up := f_labelUpdate(lbP75Up, p75, "P75 ↑ " + f_fmt(p75), p75UpColor)
+    lbP50Dn := f_labelUpdate(lbP50Dn, n50, "P50 ↓ " + f_fmt(n50), p50DnColor)
+    lbP75Dn := f_labelUpdate(lbP75Dn, n75, "P75 ↓ " + f_fmt(n75), p75DnColor)
+
+//====================================================
+// HIT MARKERS
+//====================================================
+p75UpHit = showHitMarkers and not na(p75) and high >= p75 and high[1] < p75
+p75DnHit = showHitMarkers and not na(n75) and low <= n75 and low[1] > n75
+
+plotshape(p75UpHit and hitMarkerSizeInput=="Tiny",   title="P75 Up Hit Tiny",   style=shape.triangleup,   location=location.abovebar, color=p75UpColor, size=size.tiny,   text="P75")
+plotshape(p75UpHit and hitMarkerSizeInput=="Small",  title="P75 Up Hit Small",  style=shape.triangleup,   location=location.abovebar, color=p75UpColor, size=size.small,  text="P75")
+plotshape(p75UpHit and hitMarkerSizeInput=="Normal", title="P75 Up Hit Normal", style=shape.triangleup,   location=location.abovebar, color=p75UpColor, size=size.normal, text="P75")
+
+plotshape(p75DnHit and hitMarkerSizeInput=="Tiny",   title="P75 Dn Hit Tiny",   style=shape.triangledown, location=location.belowbar, color=p75DnColor, size=size.tiny,   text="P75")
+plotshape(p75DnHit and hitMarkerSizeInput=="Small",  title="P75 Dn Hit Small",  style=shape.triangledown, location=location.belowbar, color=p75DnColor, size=size.small,  text="P75")
+plotshape(p75DnHit and hitMarkerSizeInput=="Normal", title="P75 Dn Hit Normal", style=shape.triangledown, location=location.belowbar, color=p75DnColor, size=size.normal, text="P75")
+
+//====================================================
+// LITE TABLE
+//====================================================
+var table t = table.new(tablePos, 4, 2, border_width=borderWidth, frame_width=borderWidth, border_color=borderColor, frame_color=borderColor)
+
+if barstate.islast
+    table.clear(t, 0, 0, 3, 1)
+
+    if showTable
+        table.cell(t, 0, 0, "Mode\n" + anchorMode, text_color=textColor, bgcolor=tableBGcolor, text_size=size.small)
+        table.cell(t, 1, 0, "Anch\n" + f_fmt(anchor), text_color=textColor, bgcolor=tableBGcolor, text_size=size.small)
+        table.cell(t, 2, 0, "P50\n" + f_fmt(p50) + " / " + f_fmt(n50), text_color=textColor, bgcolor=tableBGcolor, text_size=size.small)
+        table.cell(t, 3, 0, "P75\n" + f_fmt(p75) + " / " + f_fmt(n75), text_color=textColor, bgcolor=tableBGcolor, text_size=size.small)
+
+        table.cell(t, 0, 1, "Live Up\n" + f_fmt(liveUp), text_color=textColor, bgcolor=tableBGcolor, text_size=size.small)
+        table.cell(t, 1, 1, "Live Dn\n" + f_fmt(liveDn), text_color=textColor, bgcolor=tableBGcolor, text_size=size.small)
+        table.cell(t, 2, 1, "Bias\n" + bias, text_color=textColor, bgcolor=tableBGcolor, text_size=size.small)
+        table.cell(t, 3, 1, "Lookback\n" + str.tostring(array.size(upArr)), text_color=textColor, bgcolor=tableBGcolor, text_size=size.small)

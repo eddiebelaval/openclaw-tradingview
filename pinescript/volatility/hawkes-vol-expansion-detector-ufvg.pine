@@ -1,0 +1,107 @@
+//@version=5
+indicator("Hawkes Vol-Expansion Detector [UFVG]", shorttitle="HAWKES-VE[UFVG]",
+     overlay=true, format=format.price, precision=4, max_bars_back=500)
+
+grp1 = "Hawkes Process Parameters"
+use_auto_tf = input.bool(true, "Auto-adjust by Timeframe", group=grp1)
+mu_input    = input.float(0.05, "μ  Baseline intensity (manual)",    minval=0.001, maxval=1.0,  step=0.01,  group=grp1)
+alpha_input = input.float(0.15, "α  Excitation (manual)",            minval=0.01,  maxval=1.0,  step=0.01,  group=grp1)
+beta_input  = input.float(0.08, "β  Decay rate (manual)",            minval=0.01,  maxval=0.5,  step=0.01,  group=grp1)
+
+grp2 = "Volume Shock Detection"
+vol_len     = input.int(50,   "Volume MA length",       minval=10,  maxval=200, group=grp2)
+zscore_thr  = input.float(1.8, "Z-score threshold (manual)", minval=0.5, maxval=5.0, step=0.1, group=grp2)
+use_atr     = input.bool(true, "Require ATR displacement", group=grp2)
+atr_len     = input.int(14,    "ATR length",             minval=5,   maxval=50,  group=grp2)
+atr_mult    = input.float(0.8, "ATR move multiplier",    minval=0.1, maxval=3.0, step=0.1, group=grp2)
+
+grp3 = "Alert Zones"
+elevated_thr  = input.float(0.15, "Elevated threshold",    minval=0.05, maxval=1.0, step=0.01, group=grp3)
+expansion_thr = input.float(0.35, "Expansion threshold",  minval=0.1,  maxval=2.0, step=0.01, group=grp3)
+
+grp4 = "Visual Settings"
+show_bg      = input.bool(true,  "Highlight chart background", group=grp4)
+show_events  = input.bool(true,  "Mark shock events",         group=grp4)
+show_br      = input.bool(true,  "Show branching ratio",      group=grp4)
+
+float mu_eff     = mu_input
+float alpha_eff  = alpha_input
+float beta_eff   = beta_input
+float z_eff      = zscore_thr
+
+if use_auto_tf
+    if timeframe.isintraday
+        m = timeframe.multiplier
+        if m <= 5
+            mu_eff := 0.03
+            alpha_eff := 0.12
+            beta_eff := 0.06
+            z_eff := 2.0
+        else if m >= 15 and m <= 60
+            mu_eff := 0.05
+            alpha_eff := 0.15
+            beta_eff := 0.08
+            z_eff := 1.8
+        else
+            mu_eff := 0.065
+            alpha_eff := 0.175
+            beta_eff := 0.09
+            z_eff := 1.65
+    else
+        mu_eff := 0.08
+        alpha_eff := 0.20
+        beta_eff := 0.10
+        z_eff := 1.5
+
+vol         = volume
+vol_ma      = ta.sma(vol, vol_len)
+vol_std     = ta.stdev(vol, vol_len)
+vol_zscore  = vol_std > 0 ? (vol - vol_ma) / vol_std : 0.0
+
+atr_val     = ta.atr(atr_len)
+candle_range = math.abs(high - low)
+atr_ok      = use_atr ? candle_range > atr_val * atr_mult : true
+
+is_shock    = vol_zscore >= z_eff and atr_ok
+
+var float lambda = mu_eff
+
+lambda := mu_eff + (nz(lambda[1], mu_eff) - mu_eff) * math.exp(-beta_eff) + (is_shock ? alpha_eff : 0.0)
+
+branching_ratio = alpha_eff / beta_eff
+
+excess_intensity = math.max(0, lambda - mu_eff)
+
+zone_expansion = excess_intensity >= expansion_thr
+zone_elevated  = excess_intensity >= elevated_thr and not zone_expansion
+zone_calm      = not zone_elevated and not zone_expansion
+
+base_color = excess_intensity <= elevated_thr * 0.5 ? 
+     color.from_gradient(excess_intensity, 0, elevated_thr * 0.5, color.teal, color.green) :
+     excess_intensity <= elevated_thr ? 
+     color.from_gradient(excess_intensity, elevated_thr * 0.5, elevated_thr, color.green, color.orange) :
+     color.from_gradient(excess_intensity, elevated_thr, expansion_thr, color.orange, color.red)
+
+bounded_excess = math.min(excess_intensity, expansion_thr)
+transp_pct = 90 - (bounded_excess / expansion_thr) * 15
+
+bg_color   = color.new(base_color, transp_pct)
+fill_color = color.new(base_color, transp_pct + 5)
+line_color = base_color
+
+p_lambda = plot(lambda, "λ(t) Intensity", color=line_color, linewidth=2)
+p_base   = plot(mu_eff, "μ Baseline", color=color.new(color.gray, 50), style=plot.style_circles, linewidth=1)
+
+h_elev   = plot(mu_eff + elevated_thr,  "Elevated",  color=color.new(color.orange, 60), linewidth=1)
+h_expan  = plot(mu_eff + expansion_thr, "Expansion", color=color.new(color.red, 60),    linewidth=1)
+
+fill(p_lambda, p_base, color = fill_color)
+
+plotshape(show_events and is_shock ? lambda : na, "Shock Event",
+     style=shape.diamond, location=location.absolute, color=color.new(color.yellow, 0), size=size.tiny)
+
+bgcolor(show_bg ? bg_color : na, title="Zone Background")
+
+alertcondition(zone_expansion and not zone_expansion[1], title="Volatility Expansion", message="HAWKES: Volatility expansion expected")
+alertcondition(zone_elevated and not zone_elevated[1] and not zone_expansion[1], title="Elevated Intensity", message="HAWKES: Intensity elevated")
+alertcondition(is_shock, title="Volume Shock Event", message="HAWKES: Volume shock detected (Z={{plot_0}})")

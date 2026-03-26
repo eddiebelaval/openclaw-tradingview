@@ -1,0 +1,140 @@
+//@version=6
+indicator("Z-Score Volume & Range Anomaly Detector",
+     shorttitle       = "ZScoreAn",
+     overlay          = false,   // barcolor() δουλεύει κανονικά – βλ. σχόλιο παραπάνω
+     max_labels_count = 500)
+
+// ┌─────────────────────────────────────────────────────────────────────┐
+// │  SECTION 1 ─ INPUTS                                                 │
+// └─────────────────────────────────────────────────────────────────────┘
+G_CORE = "── Core ──"
+G_THR  = "── Thresholds ──"
+G_DISP = "── Display ──"
+G_PCT  = "── Percentile Mode ──"
+
+i_length     = input.int  (100,   "Lookback Length",
+                           minval  = 5, group = G_CORE,
+                           tooltip = "Rolling window για mean & std-dev | ≤ 200 συνιστάται για Percentile mode")
+i_zVolThr    = input.float(2.5,   "Z-Volume Threshold",  step = 0.1, group = G_THR)
+i_zRangeThr  = input.float(2.0,   "Z-Range Threshold",   step = 0.1, group = G_THR)
+i_zExtreme   = input.float(3.5,   "Extreme Threshold",   step = 0.1, group = G_THR)
+i_onlyAnom   = input.bool (false, "Only Show Anomalies", group = G_DISP,
+                           tooltip = "Non-anomaly bars → barcolor(na): επιστρέφουν στο default chart colour")
+i_showLabels = input.bool (true,  "Show Labels",         group = G_DISP)
+i_usePct     = input.bool (false, "Use Percentile Instead of Z-Score", group = G_PCT,
+                           tooltip = "⚠ O(n) loop ανά bar — κράτα Lookback ≤ 150 για καλή απόδοση")
+i_pctThr     = input.float(95.0,  "Percentile Threshold (%)",
+                           step = 1.0, minval = 50.0, maxval = 100.0, group = G_PCT)
+
+// ┌─────────────────────────────────────────────────────────────────────┐
+// │  SECTION 2 ─ ROLLING STATISTICS                                     │
+// └─────────────────────────────────────────────────────────────────────┘
+candleRange = high - low
+
+meanVol   = ta.sma  (volume,      i_length)
+stdVol    = ta.stdev(volume,      i_length)
+meanRange = ta.sma  (candleRange, i_length)
+stdRange  = ta.stdev(candleRange, i_length)
+
+// Αποφυγή division by zero (flat markets / νέα symbols χωρίς αρκετή ιστορία)
+safeDiv(num, denom) =>
+    denom != 0.0 ? num / denom : 0.0
+
+// ┌─────────────────────────────────────────────────────────────────────┐
+// │  SECTION 3 ─ Z-SCORE                                                │
+// └─────────────────────────────────────────────────────────────────────┘
+zVol   = safeDiv(volume      - meanVol,   stdVol)
+zRange = safeDiv(candleRange - meanRange, stdRange)
+
+// ┌─────────────────────────────────────────────────────────────────────┐
+// │  SECTION 4 ─ PERCENTILE RANK  (μόνο όταν i_usePct = true)          │
+// │  Μετράει πόσα bars στο window έχουν τιμή ≤ current → 0-100%        │
+// │  Complexity: O(length) per bar                                      │
+// └─────────────────────────────────────────────────────────────────────┘
+percentileRank(src, len) =>
+    cnt = 0
+    for i = 0 to len - 1
+        if src[i] <= src
+            cnt += 1
+    float(cnt) / float(len) * 100.0
+
+pctVol   = i_usePct ? percentileRank(volume,      i_length) : na
+pctRange = i_usePct ? percentileRank(candleRange, i_length) : na
+
+// ┌─────────────────────────────────────────────────────────────────────┐
+// │  SECTION 5 ─ ANOMALY CLASSIFICATION                                 │
+// │  Priority (υψηλότερο → χαμηλότερο): extreme > combined > volOnly   │
+// └─────────────────────────────────────────────────────────────────────┘
+isExtreme  = not i_usePct and (zVol > i_zExtreme)
+isCombined = not i_usePct and (zVol > i_zVolThr) and (zRange > i_zRangeThr) and not isExtreme
+isVolOnly  = not i_usePct and (zVol > i_zVolThr) and not isExtreme and not isCombined
+isPctAnom  = i_usePct     and (pctVol > i_pctThr)
+isAnyAnom  = isExtreme or isCombined or isVolOnly or isPctAnom
+
+// ┌─────────────────────────────────────────────────────────────────────┐
+// │  SECTION 6 ─ BAR COLOR                                              │
+// │  Η σειρά στο ternary chain = priority order                         │
+// └─────────────────────────────────────────────────────────────────────┘
+barCol = isPctAnom  ? color.purple :
+         isExtreme  ? color.red    :
+         isCombined ? color.orange :
+         isVolOnly  ? color.yellow : na
+
+// i_onlyAnom = true  → non-anomaly bars παίρνουν barcolor(na) = default colour
+// i_onlyAnom = false → non-anomaly bars αφήνονται ανέπαφα (na = no override)
+barcolor(i_onlyAnom and not isAnyAnom ? na : barCol, title = "Anomaly Bar")
+
+// ┌─────────────────────────────────────────────────────────────────────┐
+// │  SECTION 7 ─ LABELS  (τοποθετούνται στο sub-pane στο επίπεδο       │
+// │              του plotted value, όχι στο price chart)                │
+// └─────────────────────────────────────────────────────────────────────┘
+labelY = i_usePct ? pctVol : zVol   // y-axis reference μέσα στο sub-pane
+
+if i_showLabels and isAnyAnom
+    lTxt = i_usePct
+         ? "Pct: "  + str.tostring(pctVol, "#.#") + "%"
+         : "zVol: " + str.tostring(zVol,   "#.#")
+    lCol = na(barCol) ? color.gray : barCol
+    label.new(bar_index, labelY,
+         text      = lTxt,
+         style     = label.style_label_down,
+         color     = lCol,
+         textcolor = color.white,
+         size      = size.small)
+
+// ┌─────────────────────────────────────────────────────────────────────┐
+// │  SECTION 8 ─ PLOTS  (sub-pane)                                      │
+// └─────────────────────────────────────────────────────────────────────┘
+plotVol = i_usePct ? pctVol   : zVol
+plotRng = i_usePct ? pctRange : zRange
+
+plot(plotVol, "Z-Volume / Pct-Vol",   color = color.new(color.blue, 0), linewidth = 2)
+plot(plotRng, "Z-Range  / Pct-Range", color = color.new(color.teal, 0), linewidth = 1)
+
+// Γραμμή μηδενός — πάντα ορατή
+hline(0, "Zero", color = color.new(color.gray, 50))
+
+// Threshold lines — auto-switch ανάλογα με το mode
+// Z-Score mode: z thresholds | Percentile mode: pct threshold
+// Χρήση plot() με na για να κρύψουμε τις γραμμές που δεν ισχύουν
+plot(not i_usePct ? i_zVolThr   : na, "Z-Vol Threshold",
+     color = color.new(color.yellow, 0), linewidth = 1, style = plot.style_line)
+plot(not i_usePct ? i_zRangeThr : na, "Z-Range Threshold",
+     color = color.new(color.orange, 0), linewidth = 1, style = plot.style_line)
+plot(not i_usePct ? i_zExtreme  : na, "Extreme Threshold",
+     color = color.new(color.red,    0), linewidth = 2, style = plot.style_line)
+plot(i_usePct     ? i_pctThr    : na, "Pct Threshold",
+     color = color.new(color.purple, 0), linewidth = 2, style = plot.style_line)
+
+// Subtle background flash στα anomaly bars του sub-pane
+bgcolor(isAnyAnom ? color.new(color.yellow, 85) : na, title = "Anomaly BG")
+
+// ┌─────────────────────────────────────────────────────────────────────┐
+// │  SECTION 9 ─ ALERT CONDITIONS  (bonus)                              │
+// └─────────────────────────────────────────────────────────────────────┘
+if isExtreme
+    alert("Extreme Spike | zVol: " + str.tostring(zVol, "#.##") + " | Threshold: " + str.tostring(i_zExtreme), alert.freq_once_per_bar)
+if isCombined
+    alert("Combined Spike | zVol: " + str.tostring(zVol, "#.##") + " | zRange: " + str.tostring(zRange, "#.##"), alert.freq_once_per_bar)
+if isPctAnom
+    alert("Percentile Anomaly | Pct: " + str.tostring(pctVol, "#.#") + "% > " + str.tostring(i_pctThr) + "%", alert.freq_once_per_bar)

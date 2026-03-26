@@ -1,0 +1,370 @@
+//@version=6
+indicator("VEP Engine v1.0 – Volatility Edge Pullback | SP/BPS Strategy Filter", overlay=true)
+
+// ==============================
+// INPUTS
+// ==============================
+minPrice   = input.float(10, "Min Price ($)")
+minMktCapB = input.float(10, "Min Market Cap ($B)")
+
+ma21Len  = input.int(21, "MA 21 (D)")
+ma50Len  = input.int(50, "MA 50 (D)")
+ma200Len = input.int(200, "MA 200 (D)")
+
+useRSI = input.bool(true, "Use RSI Filter")
+rsiLen = input.int(14, "RSI Length (D)")
+rsiMin = input.float(45, "RSI Min (D)")
+
+hvLen  = input.int(30, "HV Length (D)")
+ivLen  = input.int(10, "IV Proxy Length (D)")  // realized-vol proxy window
+ivLookback = input.int(252, "IV Rank/Pctl Lookback (D)")
+
+// NEW: IV Mode
+ivMode = input.string("StdDev Proxy", "IV Mode", options=["StdDev Proxy", "Model IV (DTE-based)"])
+dteDays = input.int(45, "Model IV DTE (days)", minval=5)
+intervalWidth = input.float(1.0, "Model IV Interval Width", step=0.25)
+
+vrpMin    = input.float(1.05, "Min VRP (IV/HV)")
+ivRankMin = input.float(40, "Min IV Rank")
+ivPctMin  = input.float(40, "Min IV Percentile")
+
+useSPXFilter = input.bool(false, "Require SPX > MA21 (Initial)")
+tblPos = input.string("Middle Right","Table Position", options=["Top Left","Middle Left","Bottom Left","Top Right","Middle Right","Bottom Right"])
+
+// ==============================
+// HELPERS (SAFE)
+// ==============================
+f_pos(string opt) =>
+    if opt == "Top Left"
+        position.top_left
+    else if opt == "Middle Left"
+        position.middle_left
+    else if opt == "Bottom Left"
+        position.bottom_left
+    else if opt == "Top Right"
+        position.top_right
+    else if opt == "Middle Right"
+        position.middle_right
+    else
+        position.bottom_right
+
+f_clamp(float x, float lo, float hi) =>
+    math.max(lo, math.min(hi, x))
+
+f_linScore(float x, float x0, float x1, float pts) =>
+    float r = (x - x0) / (x1 - x0)
+    float rc = f_clamp(r, 0.0, 1.0)
+    rc * pts
+
+// ==============================
+// DAILY DATA
+// ==============================
+dClose = request.security(syminfo.tickerid, "D", close)
+dLog   = request.security(syminfo.tickerid, "D", math.log(close / close[1]))
+
+dMA21  = request.security(syminfo.tickerid, "D", ta.sma(close, ma21Len))
+dMA50  = request.security(syminfo.tickerid, "D", ta.sma(close, ma50Len))
+dMA200 = request.security(syminfo.tickerid, "D", ta.sma(close, ma200Len))
+
+trendOK = dClose > dMA21 and dClose > dMA50 and dClose > dMA200
+
+dRSI = request.security(syminfo.tickerid, "D", ta.rsi(close, rsiLen))
+rsiOK = not useRSI or (not na(dRSI) and dRSI >= rsiMin)
+
+tso = request.financial(syminfo.tickerid, "TOTAL_SHARES_OUTSTANDING", "FQ")
+mktCapB = (tso * dClose) / 1e9
+mktCapOK = not na(mktCapB) and mktCapB >= minMktCapB
+
+priceOK = dClose >= minPrice
+
+dOpen = request.security(syminfo.tickerid, "D", open)
+dATR  = request.security(syminfo.tickerid, "D", ta.atr(14))
+
+// ==============================
+// VOLATILITY (HV + IV Proxy + Model IV + IV Used)
+// ==============================
+
+// HV (annualized %)
+hv = request.security(syminfo.tickerid, "D", ta.stdev(dLog, hvLen) * math.sqrt(252) * 100.0)
+
+// IV Proxy (annualized %) – realized-vol proxy
+ivProxy = request.security(syminfo.tickerid, "D", ta.stdev(dLog, ivLen) * math.sqrt(252) * 100.0)
+
+// Model IV (DTE-based) – model-derived, not options-derived
+avgRet = request.security(syminfo.tickerid, "D", ta.sma(dLog, dteDays))
+stRet  = request.security(syminfo.tickerid, "D", ta.stdev(dLog, dteDays))
+
+timeAvg = dteDays * avgRet
+timeStd = stRet * math.sqrt(dteDays)
+
+upper = dClose * math.exp(timeAvg + intervalWidth * timeStd)
+lower = dClose * math.exp(timeAvg - intervalWidth * timeStd)
+
+width = upper - lower
+standard_dev = width / 2.0
+
+float sigma = na
+if not na(standard_dev) and not na(dClose) and dClose > 0
+    sigma := standard_dev / (dClose * math.sqrt(dteDays / 365.0))
+
+float sigmaAdj = na
+if not na(sigma)
+    sigmaAdj := sigma > 1.0 ? (sigma / 2.0) : sigma
+
+modelIV = not na(sigmaAdj) ? (sigmaAdj * 100.0) : na
+
+// choose series
+ivUsed = ivMode == "Model IV (DTE-based)" ? modelIV : ivProxy
+
+// ==============================
+// VRP / Rank / Percentile (based on ivUsed)
+// ==============================
+
+// VRP
+vrp = (not na(hv) and hv > 0 and not na(ivUsed)) ? (ivUsed / hv) : na
+vrpOK = not na(vrp) and vrp >= vrpMin
+
+// IV Rank (on ivUsed)
+ivLo = ta.lowest(ivUsed, ivLookback)
+ivHi = ta.highest(ivUsed, ivLookback)
+ivRank = (not na(ivHi) and not na(ivLo) and ivHi != ivLo) ? (100.0 * (ivUsed - ivLo) / (ivHi - ivLo)) : na
+ivRankOK = not na(ivRank) and ivRank >= ivRankMin
+
+// IV Percentile (true percentile rank on ivUsed)
+float cnt = 0.0
+for i = 0 to ivLookback - 1
+    cnt += (ivUsed[i] <= ivUsed ? 1.0 : 0.0)
+ivPct = 100.0 * cnt / ivLookback
+ivPctOK = not na(ivPct) and ivPct >= ivPctMin
+
+// Vol gating (Initial): VRP Pflicht + (Rank oder Pctl) als Bestätigung
+volOK = vrpOK and (ivRankOK or ivPctOK)
+
+// ==============================
+// SPX FILTER (optional)
+// ==============================
+spxClose = request.security("SP:SPX", "D", close)
+spxMA21  = request.security("SP:SPX", "D", ta.sma(close, 21))
+spxOK    = not useSPXFilter or (spxClose > spxMA21)
+
+// ==============================
+// MARKET STRESS (optional Anzeige, nicht als Gate)
+// Normalisierte VIX-Position 0–100
+// ==============================
+vix = request.security("CBOE:VIX", "D", close)
+vixLow  = ta.lowest(vix, 252)
+vixHigh = ta.highest(vix, 252)
+
+float marketStress = na
+if not na(vixLow) and not na(vixHigh) and vixHigh != vixLow
+    marketStress := 100.0 * (vix - vixLow) / (vixHigh - vixLow)
+
+string stressZone = "na"
+if not na(marketStress)
+    if marketStress > 70
+        stressZone := "High"
+    else if marketStress > 40
+        stressZone := "Neutral"
+    else
+        stressZone := "Low"
+
+// ==============================
+// PASS (Initial)
+// ==============================
+pass = priceOK and mktCapOK and trendOK and rsiOK and volOK and spxOK
+
+// ==============================
+// SCORE SYSTEM (VolScore 0–50, Total 0–100)
+// Struktur: 50 Punkte (Trend 30, RSI 10, MktCap 10)
+// Vol: 50 Punkte (VRP 20, IV Rank 15, IV Pctl 15)
+// ==============================
+
+// --- Strukturscore ---
+float structureScore = 0.0
+if trendOK
+    structureScore += 30.0
+
+if not useRSI
+    structureScore += 10.0
+else if not na(dRSI)
+    structureScore += f_linScore(dRSI, rsiMin, 65.0, 10.0)
+
+if mktCapOK
+    structureScore += 10.0
+
+structureScore := f_clamp(structureScore, 0.0, 50.0)
+
+// --- Volscore ---
+float vrpScore  = na(vrp)    ? 0.0 : f_linScore(vrp,    vrpMin,    1.25, 20.0)
+float rankScore = na(ivRank) ? 0.0 : f_linScore(ivRank, ivRankMin, 70.0, 15.0)
+float pctScore  = na(ivPct)  ? 0.0 : f_linScore(ivPct,  ivPctMin,  80.0, 15.0)
+
+float volaScore = vrpScore + rankScore + pctScore
+volaScore := f_clamp(volaScore, 0.0, 50.0)
+
+float totalScore = structureScore + volaScore
+totalScore := f_clamp(totalScore, 0.0, 100.0)
+
+// ==============================
+// PULLBACK SCORE (0–100)
+// ==============================
+
+float pullbackScore = 0.0
+
+// --- 1) Trend structure (35) ---
+if dClose > dMA50
+    pullbackScore += 15.0
+
+if dClose > dMA200
+    pullbackScore += 10.0
+
+if dMA50 > dMA200
+    pullbackScore += 10.0
+
+// --- 2) Pullback zone (25) ---
+if dClose <= dMA21 and dClose >= dMA50
+    pullbackScore += 25.0
+else if dClose > dMA21 and ((dClose - dMA21) / dMA21) <= 0.03
+    pullbackScore += 20.0
+else if dClose < dMA21 and dClose > dMA50
+    pullbackScore += 15.0
+else if math.abs(dClose - dMA50) / dMA50 <= 0.03 and dClose > dMA200
+    pullbackScore += 10.0
+
+// --- 3) RSI condition (20) ---
+if not na(dRSI)
+    if dRSI >= 40 and dRSI <= 55
+        pullbackScore += 20.0
+    else if dRSI >= 35 and dRSI <= 60
+        pullbackScore += 12.0
+    else if dRSI >= 30 and dRSI <= 65
+        pullbackScore += 5.0
+
+// --- 4) Damage / impulsiveness (20) ---
+float dayDamage = 0.0
+float threeDayChangePct = na
+
+if not na(dATR) and dATR > 0
+    if dClose >= dOpen
+        dayDamage := 10.0
+    else if (dOpen - dClose) <= dATR
+        dayDamage := 10.0
+    else if (dOpen - dClose) <= 1.5 * dATR
+        dayDamage := 5.0
+    else
+        dayDamage := 0.0
+
+threeDayChangePct := ((dClose / request.security(syminfo.tickerid, "D", close[3])) - 1.0) * 100.0
+
+float multiDayDamage = 0.0
+if not na(threeDayChangePct)
+    if threeDayChangePct > -3.0
+        multiDayDamage := 10.0
+    else if threeDayChangePct > -6.0
+        multiDayDamage := 5.0
+    else
+        multiDayDamage := 0.0
+
+pullbackScore += dayDamage + multiDayDamage
+pullbackScore := f_clamp(pullbackScore, 0.0, 100.0)
+
+// ==============================
+// TRADE BIAS (Initial) – nutzt MarketStress nur als Risiko-Gear
+// ==============================
+string tradeBias = "No Trade"
+if pass
+    if not na(marketStress) and marketStress > 70
+        tradeBias := "No Trade"
+    else if not na(marketStress) and marketStress > 40
+        tradeBias := "Short Put (Reduced)"
+    else
+        if not na(vrp) and vrp >= 1.20
+            tradeBias := "Bull Put Spread"
+        else
+            tradeBias := "Short Put"
+else
+    tradeBias := "No Trade"
+
+// ==============================
+// TABLE (black background, readable)
+// ==============================
+bg  = color.rgb(0, 0, 0)
+txt = color.white
+
+color stressBg = color.gray
+if not na(marketStress)
+    if marketStress > 70
+        stressBg := color.red
+    else if marketStress > 40
+        stressBg := color.yellow
+    else
+        stressBg := color.lime
+
+// Increased rows to fit debug
+var table t = table.new(f_pos(tblPos), 2, 15, border_width=1)
+
+if barstate.islast
+    table.clear(t, 0, 0, 1, 14)
+
+    table.cell(t, 0, 0, "STATUS", bgcolor=bg, text_color=txt)
+    table.cell(t, 1, 0, pass ? "PASS" : "NO",
+        bgcolor=pass ? color.new(color.green, 70) : color.new(color.red, 70),
+        text_color=txt)
+
+    table.cell(t, 0, 1, "Total Score (0-100)", bgcolor=bg, text_color=txt)
+    table.cell(t, 1, 1, str.tostring(totalScore, "#.0"), bgcolor=bg,
+        text_color=totalScore >= 80 ? color.lime : totalScore >= 60 ? color.yellow : color.red)
+
+    table.cell(t, 0, 2, "Vola Score (0-50)", bgcolor=bg, text_color=txt)
+    table.cell(t, 1, 2, str.tostring(volaScore, "#.0"), bgcolor=bg,
+        text_color=volaScore >= 40 ? color.lime : volaScore >= 25 ? color.yellow : color.red)
+
+    table.cell(t, 0, 3, "Pullback Score (0-100)", bgcolor=bg, text_color=txt)
+    table.cell(t, 1, 3, str.tostring(pullbackScore, "#.0"), bgcolor=bg,
+    text_color=pullbackScore >= 75 ? color.lime : pullbackScore >= 55 ? color.yellow : color.red)
+    
+    // NEW: IV Mode + Used
+    //table.cell(t, 0, 3, "IV Mode", bgcolor=bg, text_color=txt)
+    //table.cell(t, 1, 3, ivMode, bgcolor=bg, text_color=txt)
+
+    //table.cell(t, 0, 4, "IV Used (%)", bgcolor=bg, text_color=color.blue)
+    //table.cell(t, 1, 4, na(ivUsed) ? "na" : (str.tostring(ivUsed, "#.1") + "%"), bgcolor=bg, text_color=txt)
+
+    // Existing (kept)
+    table.cell(t, 0, 5, "HV %", bgcolor=bg, text_color=color.yellow)
+    table.cell(t, 1, 5, na(hv) ? "na" : (str.tostring(hv, "#.1") + "%"), bgcolor=bg, text_color=txt)
+
+    // DEBUG comparisons (kept visible)
+    table.cell(t, 0, 6, "IV Proxy %", bgcolor=bg, text_color=color.lime)
+    table.cell(t, 1, 6, na(ivProxy) ? "na" : (str.tostring(ivProxy, "#.1") + "%"), bgcolor=bg, text_color=txt)
+
+    table.cell(t, 0, 7, "Model IV %", bgcolor=bg, text_color=color.blue)
+    table.cell(t, 1, 7, na(modelIV) ? "na" : (str.tostring(modelIV, "#.1") + "%"), bgcolor=bg, text_color=txt)
+
+    // Your previous items (kept)
+    table.cell(t, 0, 8, "IV Rank", bgcolor=bg, text_color=txt)
+    table.cell(t, 1, 8, na(ivRank) ? "na" : str.tostring(ivRank, "#.1"), bgcolor=bg,
+        text_color=ivRankOK ? color.lime : color.red)
+
+    table.cell(t, 0, 9, "IV Percentile", bgcolor=bg, text_color=txt)
+    table.cell(t, 1, 9, na(ivPct) ? "na" : str.tostring(ivPct, "#.1"), bgcolor=bg,
+        text_color=ivPctOK ? color.lime : color.red)
+
+    // Optional: keep your commented lines commented
+    // table.cell(t, 0, 10, "VRP (IV/HV)", bgcolor=bg, text_color=txt)
+    // table.cell(t, 1, 10, na(vrp) ? "na" : str.tostring(vrp, "#.2"), bgcolor=bg, text_color=(not na(vrp) and vrp >= vrpMin) ? color.lime : color.red)
+
+    // table.cell(t, 0, 11, "VIX", bgcolor=bg, text_color=txt)
+    // table.cell(t, 1, 11, na(vix) ? "na" : str.tostring(vix, "#.1"), bgcolor=bg, text_color=txt)
+
+    // table.cell(t, 0, 12, "Market Stress", bgcolor=bg, text_color=txt)
+    // table.cell(t, 1, 12, na(marketStress) ? "na" : str.tostring(marketStress, "#.1"), bgcolor=stressBg, text_color=color.black)
+
+    // table.cell(t, 0, 13, "Stress Zone", bgcolor=bg, text_color=txt)
+    // table.cell(t, 1, 13, stressZone, bgcolor=bg, text_color=txt)
+
+    // table.cell(t, 0, 14, "Bias", bgcolor=bg, text_color=txt)
+    // table.cell(t, 1, 14, tradeBias, bgcolor=bg, text_color=tradeBias == "Bull Put Spread" ? color.lime : tradeBias == "Short Put" ? color.yellow : color.orange)
+
+    // table.cell(t, 0, 15, "Ticker", bgcolor=bg, text_color=txt)
+    // table.cell(t, 1, 15, syminfo.ticker, bgcolor=bg, text_color=txt)

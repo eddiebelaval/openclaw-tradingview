@@ -1,0 +1,138 @@
+// This Pine Script™ code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © CrestAlgo
+
+//@version=6
+indicator("Volatility Regime Scanner [CrestAlgo]", overlay=false)
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ░░░ VOLATILITY REGIME SCANNER ░░░
+// FREE OPEN-SOURCE indicator by CrestAlgo
+// Identifies 4 market regimes: Low Vol Trending, High Vol Trending, 
+// Low Vol Ranging, High Vol Ranging (Chaotic)
+// Uses ATR normalization + directional efficiency + squeeze detection
+// ══════════════════════════════════════════════════════════════════════════════
+
+// ── INPUTS ──────────────────────────────────────────────────────────────────
+grp_core = "⚙️ Core Settings"
+atr_len  = input.int(14, "ATR Length", minval=5, maxval=50, group=grp_core)
+er_len   = input.int(10, "Efficiency Ratio Length", minval=5, maxval=30, group=grp_core)
+bb_len   = input.int(20, "Bollinger Band Length", group=grp_core)
+bb_mult  = input.float(2.0, "BB Multiplier", step=0.1, group=grp_core)
+kc_len   = input.int(20, "Keltner Channel Length", group=grp_core)
+kc_mult  = input.float(1.5, "KC Multiplier", step=0.1, group=grp_core)
+
+grp_vis  = "🎨 Visual Settings"
+regime_1_color = input.color(#00E676, "Low Vol + Trending (Best)", group=grp_vis)
+regime_2_color = input.color(#FFD600, "High Vol + Trending (Caution)", group=grp_vis)
+regime_3_color = input.color(#2979FF, "Low Vol + Ranging (Squeeze)", group=grp_vis)
+regime_4_color = input.color(#FF1744, "High Vol + Ranging (Avoid)", group=grp_vis)
+
+grp_sig  = "📊 Signal Settings"
+show_transitions = input.bool(true, "Show Regime Transitions", group=grp_sig)
+show_squeeze     = input.bool(true, "Show Squeeze Markers", group=grp_sig)
+
+// ── CALCULATIONS ────────────────────────────────────────────────────────────
+
+// 1. NORMALIZED VOLATILITY (0-100)
+atr_val = ta.atr(atr_len)
+atr_percentile_high = ta.percentile_linear_interpolation(atr_val, 100, 80)
+atr_percentile_low  = ta.percentile_linear_interpolation(atr_val, 100, 20)
+atr_range = atr_percentile_high - atr_percentile_low
+norm_vol = atr_range > 0 ? math.min(100, math.max(0, (atr_val - atr_percentile_low) / atr_range * 100)) : 50
+
+// 2. EFFICIENCY RATIO (how directional is the movement)
+er_direction = math.abs(close - close[er_len])
+er_path      = math.sum(math.abs(close - close[1]), er_len)
+eff_ratio    = er_path != 0 ? er_direction / er_path * 100 : 0
+
+// 3. SQUEEZE DETECTION (Bollinger inside Keltner)
+bb_basis = ta.sma(close, bb_len)
+bb_upper = bb_basis + bb_mult * ta.stdev(close, bb_len)
+bb_lower = bb_basis - bb_mult * ta.stdev(close, bb_len)
+
+kc_basis = ta.ema(close, kc_len)
+kc_upper = kc_basis + kc_mult * ta.atr(kc_len)
+kc_lower = kc_basis - kc_mult * ta.atr(kc_len)
+
+squeeze_on = bb_lower > kc_lower and bb_upper < kc_upper
+squeeze_off = not squeeze_on
+squeeze_fire = squeeze_on[1] and squeeze_off  // Squeeze just released
+
+// 4. REGIME CLASSIFICATION
+vol_threshold = 50
+er_threshold  = 40
+
+regime = norm_vol <= vol_threshold and eff_ratio >= er_threshold ? 1 :  // Low Vol Trending (BEST)
+         norm_vol > vol_threshold and eff_ratio >= er_threshold ? 2 :   // High Vol Trending
+         norm_vol <= vol_threshold and eff_ratio < er_threshold ? 3 :   // Low Vol Ranging (Squeeze)
+         4                                                               // High Vol Ranging (AVOID)
+
+regime_color = regime == 1 ? regime_1_color :
+               regime == 2 ? regime_2_color :
+               regime == 3 ? regime_3_color :
+               regime_4_color
+
+// 5. REGIME MOMENTUM (direction within regime)
+momentum_val = ta.ema(close - close[1], 5) / atr_val * 50 + 50
+
+// ── PLOTTING ────────────────────────────────────────────────────────────────
+
+// Efficiency Ratio
+plot(eff_ratio, "Efficiency Ratio", color=color.new(color.white, 30), linewidth=2)
+
+// Normalized Volatility  
+plot(norm_vol, "Norm Volatility", color=color.new(#B388FF, 40), linewidth=1, style=plot.style_area)
+
+// Thresholds
+hline(vol_threshold, "Volatility Threshold", color=color.new(#B388FF, 70), linestyle=hline.style_dashed)
+hline(er_threshold, "Efficiency Threshold", color=color.new(color.white, 70), linestyle=hline.style_dashed)
+
+// Regime background
+bgcolor(color.new(regime_color, 90))
+
+// Squeeze markers
+plotshape(show_squeeze and squeeze_on, "Squeeze On", shape.square, location.bottom, color.new(regime_3_color, 20), size=size.tiny)
+plotshape(show_squeeze and squeeze_fire, "Squeeze Fire!", shape.diamond, location.bottom, color.new(#FFD600, 0), size=size.small)
+
+// Regime transitions
+regime_changed = regime != regime[1]
+plotshape(show_transitions and regime_changed and regime == 1, "→ Best Regime", shape.arrowup, location.top, regime_1_color, size=size.small)
+plotshape(show_transitions and regime_changed and regime == 4, "→ Worst Regime", shape.arrowdown, location.top, regime_4_color, size=size.small)
+
+// ── ALERTS ──────────────────────────────────────────────────────────────────
+alertcondition(regime_changed and regime == 1, "Entered Best Regime", "🟢 Market entered Low-Vol Trending regime - optimal trading conditions!")
+alertcondition(regime_changed and regime == 4, "Entered Worst Regime", "🔴 Market entered High-Vol Ranging regime - consider sitting out!")
+alertcondition(squeeze_fire, "Squeeze Released!", "💥 Volatility Squeeze just released - expect big move!")
+alertcondition(regime_changed, "Any Regime Change", "🔄 Market regime just changed")
+
+// ── DASHBOARD ───────────────────────────────────────────────────────────────
+if barstate.islast
+    var table dash = table.new(position.top_right, 2, 7, bgcolor=color.new(#1a1a2e, 5), frame_color=color.new(#16213e, 0), frame_width=2, border_color=color.new(#0f3460, 0), border_width=1)
+    
+    table.cell(dash, 0, 0, "⚡ Regime", text_color=#e94560, text_size=size.small)
+    table.cell(dash, 1, 0, "Scanner", text_color=#e94560, text_size=size.small)
+    
+    regime_txt = regime == 1 ? "LOW VOL TREND" :
+                 regime == 2 ? "HIGH VOL TREND" :
+                 regime == 3 ? "SQUEEZE/RANGE" :
+                 "CHAOTIC - AVOID"
+    table.cell(dash, 0, 1, "Regime:", text_color=color.white, text_size=size.tiny)
+    table.cell(dash, 1, 1, regime_txt, text_color=regime_color, text_size=size.tiny)
+    
+    tradability = regime == 1 ? "★★★★★" : regime == 2 ? "★★★☆☆" : regime == 3 ? "★★☆☆☆" : "★☆☆☆☆"
+    table.cell(dash, 0, 2, "Tradability:", text_color=color.white, text_size=size.tiny)
+    table.cell(dash, 1, 2, tradability, text_color=regime_color, text_size=size.tiny)
+    
+    table.cell(dash, 0, 3, "Volatility:", text_color=color.white, text_size=size.tiny)
+    table.cell(dash, 1, 3, str.tostring(math.round(norm_vol, 1)) + "%", text_color=#B388FF, text_size=size.tiny)
+    
+    table.cell(dash, 0, 4, "Efficiency:", text_color=color.white, text_size=size.tiny)
+    table.cell(dash, 1, 4, str.tostring(math.round(eff_ratio, 1)) + "%", text_color=color.white, text_size=size.tiny)
+    
+    table.cell(dash, 0, 5, "Squeeze:", text_color=color.white, text_size=size.tiny)
+    table.cell(dash, 1, 5, squeeze_on ? "🟡 ACTIVE" : "⚪ OFF", text_color=squeeze_on ? #FFD600 : color.gray, text_size=size.tiny)
+    
+    dir_txt = momentum_val > 55 ? "⬆ BULLISH" : momentum_val < 45 ? "⬇ BEARISH" : "↔ NEUTRAL"
+    dir_color = momentum_val > 55 ? #00E676 : momentum_val < 45 ? #FF1744 : color.gray
+    table.cell(dash, 0, 6, "Direction:", text_color=color.white, text_size=size.tiny)
+    table.cell(dash, 1, 6, dir_txt, text_color=dir_color, text_size=size.tiny)

@@ -1,0 +1,371 @@
+//@version=6
+indicator("Daily Range Risk Filter", overlay=true)
+// ═══════════════════════════════════════════════════════════════════════════════
+// INPUTS
+// ═══════════════════════════════════════════════════════════════════════════════
+// Range calculation mode
+useAutoRange = input.bool(true, "Use Built-In VXN Calculator", group="Core Settings", tooltip="ON = Automatically calculates expected range at 16:45 NY using NQ close + VXN close\nOFF = Use manual input below")
+manualExpectedRange = input.float(300.0, "Manual Expected Range (points)", minval=1.0, group="Core Settings", tooltip="Only used when Built-In Calculator is OFF")
+rangeTolerance = input.float(50.0, "Range Buffer (±points)", minval=0.0, group="Core Settings", tooltip="Your typical ±50 point buffer (e.g., 300 → 250-350 range)")
+// Auto-calculation settings
+vxnSymbol = input.string("VXN", "VXN Symbol", group="Calculator Settings", tooltip="CBOE NASDAQ Volatility Index symbol")
+volatilityMultiplier = input.float(1.0, "Calibration Multiplier", minval=0.1, maxval=5.0, step=0.1, group="Calculator Settings", tooltip="Adjust if calculated ranges are consistently too high/low\n1.0 = standard, 1.2 = +20%, 0.8 = -20%")
+atrPeriod = input.int(14, "ATR Period (Fallback)", minval=1, group="Calculator Settings", tooltip="Used if VXN data unavailable")
+// Probability thresholds
+greenThreshold = input.float(40.0, "Green Threshold (% used)", minval=0.0, maxval=100.0, group="Visual Thresholds")
+yellowThreshold = input.float(70.0, "Yellow Threshold (% used)", minval=0.0, maxval=100.0, group="Visual Thresholds")
+// Session analysis
+enableSessions = input.bool(true, "Enable Session Analysis", group="Advanced Features")
+showSessionLabels = input.bool(true, "Show Session Labels", group="Advanced Features")
+// Empirical bins
+enableBins = input.bool(false, "Enable Empirical Probability Bins", group="Advanced Features")
+showBinTable = input.bool(false, "Show Bin Table", group="Advanced Features")
+// Alerts
+enableAlerts = input.bool(true, "Enable Alerts", group="Alerts")
+alertThreshold = input.float(20.0, "Alert Threshold (% remaining)", minval=0.0, maxval=100.0, group="Alerts")
+// Label settings
+showLabel = input.bool(true, "Show Live Label", group="Display")
+labelSize = input.string("normal", "Label Size", options=["tiny", "small", "normal", "large"], group="Display")
+// Enhanced features
+showRangeZones = input.bool(true, "Show Range Expansion Zones", group="Enhanced Features", tooltip="Plots horizontal zones showing 25%, 50%, 75% range levels")
+showMomentum = input.bool(true, "Show Range Momentum", group="Enhanced Features", tooltip="Displays rate of range consumption")
+showVolRegime = input.bool(true, "Show Volatility Regime", group="Enhanced Features", tooltip="Low/Medium/High volatility classification")
+showTimeRisk = input.bool(true, "Show Time-of-Day Risk", group="Enhanced Features", tooltip="Risk level based on current session and time")
+// ═══════════════════════════════════════════════════════════════════════════════
+// TIME ZONE & SESSION DETECTION
+// ═══════════════════════════════════════════════════════════════════════════════
+// Get NY time
+nyHour = hour(time, "America/New_York")
+nyMinute = minute(time, "America/New_York")
+// Session boundary: 18:00 NY (futures rollover)
+isNewDay = (nyHour == 18 and nyMinute == 0)
+// Close time for range calculation: 16:45 NY
+isCloseTime = (nyHour == 16 and nyMinute == 45)
+// Session detection
+isAsia = (nyHour >= 18) or (nyHour < 2)
+isLondon = (nyHour >= 2 and nyHour < 8) or (nyHour == 8 and nyMinute < 30)
+isNY = (nyHour == 8 and nyMinute >= 30) or (nyHour > 8 and nyHour < 16)
+// ═══════════════════════════════════════════════════════════════════════════════
+// AUTO RANGE CALCULATION (VXN-BASED CALCULATOR)
+// ═══════════════════════════════════════════════════════════════════════════════
+// This replicates your manual VXN calculator process:
+// 1. At 16:45 NY, capture NQ close and VXN close
+// 2. Calculate expected daily range using volatility formula
+// 3. Apply buffer (±50 points by default)
+var float calculatedRange = na
+var float lastClosePrice = na
+var float lastVXNClose = na
+var bool rangeCalculatedToday = false
+if useAutoRange
+    // Get VXN data (daily close)
+    vxnClose = request.security(vxnSymbol, "D", close, lookahead=barmerge.lookahead_off)
+    // At 16:45 NY, capture close prices for next day's calculation
+    if isCloseTime and not rangeCalculatedToday
+        lastClosePrice := close
+        lastVXNClose := vxnClose
+        rangeCalculatedToday := true
+        // YOUR CALCULATOR FORMULA:
+        // Expected Daily Range = (Price × VXN × 0.01 × √(1/252)) × Adjustment Factor
+        // This converts VXN (annualized implied volatility) to expected daily move
+        if not na(lastVXNClose) and not na(lastClosePrice) and lastVXNClose > 0
+            // Convert VXN to daily volatility
+            // VXN is annual %, so: (VXN / 100) gives decimal, then × √(1/252) for daily
+            dailyVolPct = (lastVXNClose / 100.0) * math.sqrt(1.0 / 252.0)
+            // Expected daily range = price × daily volatility %
+            baseRange = lastClosePrice * dailyVolPct
+            // Apply multiplier for calibration (default 1.0)
+            calculatedRange := baseRange * volatilityMultiplier
+    // Reset flag at new day
+    if isNewDay
+        rangeCalculatedToday := false
+// Fallback ATR calculation (extracted to global scope for consistency)
+atrValue = ta.atr(atrPeriod)
+fallbackRange = atrValue * 2.5 * volatilityMultiplier
+// Apply fallback if needed
+if useAutoRange and (na(calculatedRange) or calculatedRange <= 0)
+    calculatedRange := fallbackRange
+// Final expected range (manual or auto)
+expectedRange = useAutoRange and not na(calculatedRange) ? calculatedRange : manualExpectedRange
+// ═══════════════════════════════════════════════════════════════════════════════
+// DAILY RANGE TRACKING (18:00 NY → 17:00 NY)
+// ═══════════════════════════════════════════════════════════════════════════════
+var float dayHigh = na
+var float dayLow = na
+var int dayStartTime = na
+// Reset at new day
+if isNewDay
+    dayHigh := high
+    dayLow := low
+    dayStartTime := time
+else if not na(dayHigh)
+    dayHigh := math.max(dayHigh, high)
+    dayLow := math.min(dayLow, low)
+else
+    // Initialize if starting mid-day
+    dayHigh := high
+    dayLow := low
+// Calculate actual range
+actualRange = dayHigh - dayLow
+// ═══════════════════════════════════════════════════════════════════════════════
+// RANGE COMPLETION & PROBABILITY CALCULATION
+// ═══════════════════════════════════════════════════════════════════════════════
+// Range used percentage
+rangeUsed = (actualRange / expectedRange) * 100
+// Remaining probability (conditional probability)
+remainingProb = 100 - rangeUsed
+// Clamp for display
+remainingProbDisplay = math.max(0, remainingProb)
+// ═══════════════════════════════════════════════════════════════════════════════
+// SESSION-SPECIFIC RANGE TRACKING
+// ═══════════════════════════════════════════════════════════════════════════════
+var float asiaHigh = na
+var float asiaLow = na
+var float londonHigh = na
+var float londonLow = na
+var float nyHigh = na
+var float nyLow = na
+var bool asiaSessionStarted = false
+var bool londonSessionStarted = false
+var bool nySessionStarted = false
+if enableSessions
+    // Track Asia session (resets at 18:00)
+    if isAsia
+        if isNewDay or not asiaSessionStarted
+            asiaHigh := high
+            asiaLow := low
+            asiaSessionStarted := true
+        else
+            asiaHigh := math.max(asiaHigh, high)
+            asiaLow := math.min(asiaLow, low)
+    // Track London session (resets at 02:00)
+    if isLondon
+        if (nyHour == 2 and nyMinute == 0) or not londonSessionStarted
+            londonHigh := high
+            londonLow := low
+            londonSessionStarted := true
+        else
+            londonHigh := math.max(londonHigh, high)
+            londonLow := math.min(londonLow, low)
+    // Track NY session (resets at 08:30)
+    if isNY
+        if (nyHour == 8 and nyMinute == 30) or not nySessionStarted
+            nyHigh := high
+            nyLow := low
+            nySessionStarted := true
+        else
+            nyHigh := math.max(nyHigh, high)
+            nyLow := math.min(nyLow, low)
+    // Reset session flags at new day
+    if isNewDay
+        londonSessionStarted := false
+        nySessionStarted := false
+// Calculate session ranges
+asiaRange = not na(asiaHigh) and not na(asiaLow) ? asiaHigh - asiaLow : 0
+londonRange = not na(londonHigh) and not na(londonLow) ? londonHigh - londonLow : 0
+nyRange = not na(nyHigh) and not na(nyLow) ? nyHigh - nyLow : 0
+// Session contribution to expected range
+asiaContribution = (asiaRange / expectedRange) * 100
+londonContribution = (londonRange / expectedRange) * 100
+nyContribution = (nyRange / expectedRange) * 100
+// ═══════════════════════════════════════════════════════════════════════════════
+// EMPIRICAL PROBABILITY BINS
+// ═══════════════════════════════════════════════════════════════════════════════
+var array<int> binCounts = array.new_int(10, 0)
+var array<int> binExceeded = array.new_int(10, 0)
+var int totalDays = 0
+if enableBins
+    // At end of day (17:00 NY), categorize outcome
+    if nyHour == 17 and nyMinute == 0
+        int binIndex = math.floor(rangeUsed / 10)
+        if binIndex > 9
+            binIndex := 9
+        // Increment bin count
+        array.set(binCounts, binIndex, array.get(binCounts, binIndex) + 1)
+        // Track if range was exceeded
+        if rangeUsed > 100
+            array.set(binExceeded, binIndex, array.get(binExceeded, binIndex) + 1)
+        totalDays += 1
+// ═══════════════════════════════════════════════════════════════════════════════
+// BACKGROUND HEATMAP
+// ═══════════════════════════════════════════════════════════════════════════════
+bgColor = rangeUsed < greenThreshold ? color.new(color.green, 92) : rangeUsed < yellowThreshold ? color.new(color.yellow, 92) : color.new(color.red, 92)
+bgcolor(bgColor, title="Range Heatmap")
+// ═══════════════════════════════════════════════════════════════════════════════
+// LIVE INFORMATION LABEL
+// ═══════════════════════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════════════════
+// ENHANCED FEATURES
+// ═══════════════════════════════════════════════════════════════════════════════
+// Range Momentum (rate of range consumption)
+var float lastRangeUsed = 0.0
+var int lastRangeTime = 0
+rangeMomentum = 0.0
+if bar_index > 0 and (time - lastRangeTime) > 0
+    timeDiff = (time - lastRangeTime) / 60000.0
+    if timeDiff > 0
+        rangeMomentum := (rangeUsed - lastRangeUsed) / timeDiff
+lastRangeUsed := rangeUsed
+lastRangeTime := time
+momentumLabel = rangeMomentum > 0.5 ? "🔥 Fast" : rangeMomentum > 0.2 ? "⚡ Medium" : "🐌 Slow"
+// Volatility Regime Detection (ATR calculations extracted to global scope)
+atr14 = ta.atr(14)
+avgATR50 = ta.sma(atr14, 50)
+var string volRegime = "Medium"
+if not na(lastVXNClose)
+    volRegime := lastVXNClose < 15 ? "😴 Low Vol" : lastVXNClose < 25 ? "📊 Normal Vol" : "🌋 High Vol"
+else
+    volRegime := atr14 < avgATR50 * 0.8 ? "😴 Low Vol" : atr14 < avgATR50 * 1.2 ? "📊 Normal Vol" : "🌋 High Vol"
+// Time-of-Day Risk Assessment
+timeRisk = "Unknown"
+if isAsia
+    timeRisk := rangeUsed < 20 ? "✅ Low Risk" : rangeUsed < 40 ? "⚠️ Medium Risk" : "🛑 High Risk"
+else if isLondon
+    timeRisk := rangeUsed < 50 ? "✅ Low Risk" : rangeUsed < 70 ? "⚠️ Medium Risk" : "🛑 High Risk"
+else if isNY
+    timeRisk := rangeUsed < 60 ? "✅ Low Risk" : rangeUsed < 80 ? "⚠️ Medium Risk" : "🛑 High Risk"
+else
+    timeRisk := "💤 Off Hours"
+// ═══════════════════════════════════════════════════════════════════════════════
+// LIVE INFORMATION TABLE (FIXED TOP-RIGHT POSITION)
+// ═══════════════════════════════════════════════════════════════════════════════
+if showLabel and barstate.islast
+    var table infoTable = table.new(position.top_right, 2, 20, bgcolor=color.new(color.black, 10), border_width=1, border_color=color.gray)
+    calcMode = useAutoRange ? "Calc" : "Manual"
+    // Determine color based on range state
+    tableColor = rangeUsed < greenThreshold ? color.new(color.green, 10) : rangeUsed < yellowThreshold ? color.new(color.yellow, 10) : color.new(color.red, 10)
+    textColor = rangeUsed < greenThreshold ? color.white : rangeUsed < yellowThreshold ? color.black : color.white
+    // Header
+    table.cell(infoTable, 0, 0, "📊 RANGE RISK", text_color=textColor, bgcolor=tableColor, text_size=size.small)
+    table.merge_cells(infoTable, 0, 0, 1, 0)
+    // Core metrics
+    row = 1
+    table.cell(infoTable, 0, row, "Used:", text_color=color.white, text_size=size.tiny)
+    table.cell(infoTable, 1, row, str.tostring(rangeUsed, "#.#") + "%", text_color=textColor, bgcolor=tableColor, text_size=size.tiny)
+    row += 1
+    table.cell(infoTable, 0, row, "Prob:", text_color=color.white, text_size=size.tiny)
+    table.cell(infoTable, 1, row, str.tostring(remainingProbDisplay, "#.#") + "%", text_color=color.white, text_size=size.tiny)
+    row += 1
+    table.cell(infoTable, 0, row, "Actual:", text_color=color.white, text_size=size.tiny)
+    table.cell(infoTable, 1, row, str.tostring(actualRange, "#.#"), text_color=color.white, text_size=size.tiny)
+    row += 1
+    table.cell(infoTable, 0, row, "Expected:", text_color=color.white, text_size=size.tiny)
+    table.cell(infoTable, 1, row, str.tostring(expectedRange, "#.#"), text_color=color.white, text_size=size.tiny)
+    row += 1
+    // Calculator details if using auto mode
+    if useAutoRange and not na(lastVXNClose) and not na(lastClosePrice)
+        table.cell(infoTable, 0, row, "VXN:", text_color=color.yellow, text_size=size.tiny)
+        table.cell(infoTable, 1, row, str.tostring(lastVXNClose, "#.#"), text_color=color.yellow, text_size=size.tiny)
+        row += 1
+    // Session info if enabled
+    if enableSessions and showSessionLabels
+        table.cell(infoTable, 0, row, "Asia:", text_color=color.gray, text_size=size.tiny)
+        table.cell(infoTable, 1, row, str.tostring(asiaContribution, "#.#") + "%", text_color=color.gray, text_size=size.tiny)
+        row += 1
+        table.cell(infoTable, 0, row, "London:", text_color=color.gray, text_size=size.tiny)
+        table.cell(infoTable, 1, row, str.tostring(londonContribution, "#.#") + "%", text_color=color.gray, text_size=size.tiny)
+        row += 1
+        table.cell(infoTable, 0, row, "NY:", text_color=color.gray, text_size=size.tiny)
+        table.cell(infoTable, 1, row, str.tostring(nyContribution, "#.#") + "%", text_color=color.gray, text_size=size.tiny)
+        row += 1
+    // Enhanced features (condensed)
+    if showMomentum
+        table.cell(infoTable, 0, row, "Momentum:", text_color=color.white, text_size=size.tiny)
+        table.cell(infoTable, 1, row, momentumLabel, text_color=color.white, text_size=size.tiny)
+        row += 1
+    if showVolRegime
+        table.cell(infoTable, 0, row, "Vol:", text_color=color.white, text_size=size.tiny)
+        table.cell(infoTable, 1, row, volRegime, text_color=color.white, text_size=size.tiny)
+        row += 1
+    if showTimeRisk
+        table.cell(infoTable, 0, row, "Risk:", text_color=color.white, text_size=size.tiny)
+        table.cell(infoTable, 1, row, timeRisk, text_color=color.white, text_size=size.tiny)
+        row += 1
+// ═══════════════════════════════════════════════════════════════════════════════
+// EMPIRICAL BINS TABLE (OPTIONAL)
+// ═══════════════════════════════════════════════════════════════════════════════
+if enableBins and showBinTable and barstate.islast
+    var table binTable = table.new(position.bottom_right, 4, 11, bgcolor=color.new(color.black, 20), border_width=1, border_color=color.gray)
+    // Headers
+    table.cell(binTable, 0, 0, "Range Used", text_color=color.white, bgcolor=color.new(color.gray, 50))
+    table.cell(binTable, 1, 0, "Count", text_color=color.white, bgcolor=color.new(color.gray, 50))
+    table.cell(binTable, 2, 0, "Exceeded", text_color=color.white, bgcolor=color.new(color.gray, 50))
+    table.cell(binTable, 3, 0, "Respect %", text_color=color.white, bgcolor=color.new(color.gray, 50))
+    // Data rows
+    for i = 0 to 9
+        binLabel = str.tostring(i * 10) + "-" + str.tostring((i + 1) * 10) + "%"
+        binCount = array.get(binCounts, i)
+        binExceed = array.get(binExceeded, i)
+        respectRate = binCount > 0 ? ((binCount - binExceed) / binCount) * 100 : 0
+        table.cell(binTable, 0, i + 1, binLabel, text_color=color.white)
+        table.cell(binTable, 1, i + 1, str.tostring(binCount), text_color=color.white)
+        table.cell(binTable, 2, i + 1, str.tostring(binExceed), text_color=color.white)
+        table.cell(binTable, 3, i + 1, str.tostring(respectRate, "#.#") + "%", text_color=color.white)
+// ═══════════════════════════════════════════════════════════════════════════════
+// VISUAL REFERENCE LINES
+// ═══════════════════════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════════════════
+// RANGE EXPANSION ZONES (FIXED PRICE LEVELS WITH LABELS)
+// ═══════════════════════════════════════════════════════════════════════════════
+// Store previous day's levels to avoid redrawing
+var float prev25Level = na
+var float prev50Level = na
+var float prev75Level = na
+var float prevTopLevel = na
+var line line25 = na
+var line line50 = na
+var line line75 = na
+var line lineTop = na
+var label label25 = na
+var label label50 = na
+var label label75 = na
+var label labelTop = na
+if showRangeZones and not na(dayLow) and not na(expectedRange)
+    // Calculate zone levels
+    level25 = dayLow + (expectedRange * 0.25)
+    level50 = dayLow + (expectedRange * 0.50)
+    level75 = dayLow + (expectedRange * 0.75)
+    levelTop = dayLow + expectedRange
+    // Only redraw if levels changed (new day)
+    if level25 != prev25Level or level50 != prev50Level or level75 != prev75Level or levelTop != prevTopLevel
+        // Delete old lines and labels
+        if not na(line25)
+            line.delete(line25)
+            label.delete(label25)
+        if not na(line50)
+            line.delete(line50)
+            label.delete(label50)
+        if not na(line75)
+            line.delete(line75)
+            label.delete(label75)
+        if not na(lineTop)
+            line.delete(lineTop)
+            label.delete(labelTop)
+        // Create new lines at EXACT price levels
+        line25 := line.new(bar_index - 50, level25, bar_index + 500, level25, extend=extend.right, color=color.new(color.green, 60), width=1, style=line.style_dashed)
+        line50 := line.new(bar_index - 50, level50, bar_index + 500, level50, extend=extend.right, color=color.new(color.yellow, 60), width=1, style=line.style_dashed)
+        line75 := line.new(bar_index - 50, level75, bar_index + 500, level75, extend=extend.right, color=color.new(color.orange, 50), width=2, style=line.style_solid)
+        lineTop := line.new(bar_index - 50, levelTop, bar_index + 500, levelTop, extend=extend.right, color=color.new(color.red, 40), width=2, style=line.style_solid)
+        // Create price labels on the right
+        label25 := label.new(bar_index, level25, "25% (" + str.tostring(level25, "#.##") + ")", style=label.style_none, color=color.new(color.green, 100), textcolor=color.green, size=size.tiny, xloc=xloc.bar_index, yloc=yloc.price)
+        label50 := label.new(bar_index, level50, "50% (" + str.tostring(level50, "#.##") + ")", style=label.style_none, color=color.new(color.yellow, 100), textcolor=color.yellow, size=size.tiny, xloc=xloc.bar_index, yloc=yloc.price)
+        label75 := label.new(bar_index, level75, "75% (" + str.tostring(level75, "#.##") + ")", style=label.style_none, color=color.new(color.orange, 100), textcolor=color.orange, size=size.small, xloc=xloc.bar_index, yloc=yloc.price)
+        labelTop := label.new(bar_index, levelTop, "100% (" + str.tostring(levelTop, "#.##") + ")", style=label.style_none, color=color.new(color.red, 100), textcolor=color.red, size=size.small, xloc=xloc.bar_index, yloc=yloc.price)
+        // Store current levels
+        prev25Level := level25
+        prev50Level := level50
+        prev75Level := level75
+        prevTopLevel := levelTop
+// ═══════════════════════════════════════════════════════════════════════════════
+// ALERTS
+// ═══════════════════════════════════════════════════════════════════════════════
+// Alert when probability drops below threshold
+alertCondition = enableAlerts and remainingProb < alertThreshold and remainingProb[1] >= alertThreshold
+if alertCondition
+    alert("⚠️ High Risk: Only " + str.tostring(remainingProbDisplay, "#.#") + "% probability remaining", alert.freq_once_per_bar)
+alertcondition(alertCondition, title="Low Probability Alert", message="⚠️ Range Risk Alert: Only {{plot_0}}% probability remaining")
+// ═══════════════════════════════════════════════════════════════════════════════
+// PLOTS FOR ALERTCONDITION
+// ═══════════════════════════════════════════════════════════════════════════════
+plot(remainingProbDisplay, "Remaining Probability", display=display.none)
+plot(rangeUsed, "Range Used", display=display.none)
+plot(actualRange, "Actual Range", display=display.none)

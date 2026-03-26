@@ -1,0 +1,146 @@
+// This source code is subject to the terms of the Mozilla Public License 2.0
+//@version=6
+indicator("BB Volatility Squeeze / Expansion", overlay=true, max_labels_count=500)
+
+// ─────────────────────────────────────────────
+//  INPUTS
+// ─────────────────────────────────────────────
+
+// Bollinger Bands
+bbLen    = input.int(20,   "BB Length",             minval=1,  group="Bollinger Bands")
+bbMult   = input.float(2.0,"BB StdDev Multiplier",  minval=0.1, step=0.1, group="Bollinger Bands")
+
+// Keltner Channels
+kLen     = input.int(20,   "Keltner Length",         minval=1,  group="Keltner Channels")
+kMult    = input.float(1.5,"Keltner ATR Multiplier", minval=0.1, step=0.1, group="Keltner Channels")
+
+// Percentile method
+pctLookback = input.int(125, "Percentile Lookback (bars)", minval=10,  group="Percentile Method")
+pctThresh   = input.float(25, "Squeeze Threshold (percentile)", minval=1, maxval=99, step=1, group="Percentile Method")
+
+// Squeeze method selector
+SQZ_KELTNER    = "Keltner-Based"
+SQZ_PERCENTILE = "Percentile-Based"
+SQZ_BOTH       = "Both (either fires)"
+sqzMethod = input.string(SQZ_BOTH, "Squeeze Method",
+     options=[SQZ_KELTNER, SQZ_PERCENTILE, SQZ_BOTH], group="Squeeze Method")
+
+// MTF timeframes
+tf1 = input.timeframe("15",  "MTF Timeframe 1", group="MTF Table")
+tf2 = input.timeframe("60",  "MTF Timeframe 2", group="MTF Table")
+tf3 = input.timeframe("240", "MTF Timeframe 3", group="MTF Table")
+tf4 = input.timeframe("D",   "MTF Timeframe 4", group="MTF Table")
+
+// Dot offset below bars
+dotOffset = input.float(0.5, "Squeeze Dot Offset (% of bar range)", minval=0.01, step=0.05, group="Visuals")
+
+// ─────────────────────────────────────────────
+//  CORE CALCULATIONS  (current timeframe)
+// ─────────────────────────────────────────────
+
+f_bbw(src, len, mult) =>
+    basis = ta.sma(src, len)
+    dev   = mult * ta.stdev(src, len)
+    upper = basis + dev
+    lower = basis - dev
+    width = (upper - lower) / basis
+    [basis, upper, lower, width]
+
+f_kc(src, len, mult) =>
+    basis = ta.sma(src, len)
+    rng   = mult * ta.atr(len)
+    upper = basis + rng
+    lower = basis - rng
+    [upper, lower]
+
+f_sqz(src, bbL, bbM, kL, kM, pctLB, pctThr) =>
+    [bbBasis, bbUpper, bbLower, bbWidth] = f_bbw(src, bbL, bbM)
+    [kcUpper, kcLower]                   = f_kc(src, kL, kM)
+    sqzKelt = bbLower > kcLower and bbUpper < kcUpper
+    sqzPct  = ta.percentrank(bbWidth, pctLB) < pctThr
+    [sqzKelt, sqzPct, bbBasis, bbUpper, bbLower]
+
+[sqzKelt, sqzPct, bbBasis, bbUpper, bbLower] =
+     f_sqz(close, bbLen, bbMult, kLen, kMult, pctLookback, pctThresh)
+
+sqzActive = switch sqzMethod
+    SQZ_KELTNER    => sqzKelt
+    SQZ_PERCENTILE => sqzPct
+    => sqzKelt or sqzPct   // SQZ_BOTH
+
+// ─────────────────────────────────────────────
+//  BAND COLORS  (squeeze = cool, expansion = warm)
+// ─────────────────────────────────────────────
+
+cSqueeze   = color.new(color.blue,  10)
+cExpansion = color.new(color.orange, 10)
+cFillSqz   = color.new(color.blue,  80)
+cFillExp   = color.new(color.orange, 80)
+
+bandColor = sqzActive ? cSqueeze : cExpansion
+
+// ─────────────────────────────────────────────
+//  BB OVERLAY PLOTS
+// ─────────────────────────────────────────────
+
+pUpper  = plot(bbUpper,  "BB Upper",  color=bandColor, linewidth=1)
+pLower  = plot(bbLower,  "BB Lower",  color=bandColor, linewidth=1)
+pBasis  = plot(bbBasis,  "BB Basis",  color=color.new(bandColor, 40), linewidth=1, style=plot.style_circles)
+
+fill(pUpper, pLower, color=sqzActive ? cFillSqz : cFillExp, title="BB Fill")
+
+// ─────────────────────────────────────────────
+//  SQUEEZE DOTS  (plotted below each bar)
+// ─────────────────────────────────────────────
+//  Color legend:
+//    Green  = no squeeze at all
+//    Red    = Keltner squeeze only
+//    Orange = Percentile squeeze only
+//    Yellow = Both methods agree on squeeze
+
+dotColor = not sqzKelt and not sqzPct ? color.green  : sqzKelt and sqzPct ? color.yellow : sqzKelt ? color.red : color.orange
+barRng    = high - low
+dotY      = low - barRng * dotOffset
+
+plotshape(dotY, title="Squeeze Dot", style=shape.circle, location=location.absolute,
+          color=dotColor, size=size.tiny)
+
+// ─────────────────────────────────────────────
+//  MTF HELPER FUNCTION
+// ─────────────────────────────────────────────
+
+f_mtfSqz(tf) =>
+    [sqzK, sqzP, _b, _u, _l] = request.security(syminfo.tickerid, tf,
+         f_sqz(close, bbLen, bbMult, kLen, kMult, pctLookback, pctThresh),
+         lookahead=barmerge.lookahead_off)
+    [sqzK, sqzP]
+
+// ─────────────────────────────────────────────
+//  MTF TABLE
+// ─────────────────────────────────────────────
+
+var tbl = table.new(position.top_right, 3, 5,
+          border_color=color.new(color.gray, 60), border_width=1,
+          frame_color=color.new(color.gray, 40), frame_width=1)
+
+// Header row
+if barstate.islast
+    table.cell(tbl, 0, 0, "TF",         text_color=color.white, bgcolor=color.new(color.gray, 20), text_size=size.small)
+    table.cell(tbl, 1, 0, "Kelt Sqz",   text_color=color.white, bgcolor=color.new(color.gray, 20), text_size=size.small)
+    table.cell(tbl, 2, 0, "Pct Sqz",    text_color=color.white, bgcolor=color.new(color.gray, 20), text_size=size.small)
+
+f_fillRow(row, tf) =>
+    [kSqz, pSqz] = f_mtfSqz(tf)
+    kColor = kSqz ? color.new(color.red,   30) : color.new(color.green, 30)
+    pColor = pSqz ? color.new(color.red,   30) : color.new(color.green, 30)
+    kTxt   = kSqz ? "SQZ" : "—"
+    pTxt   = pSqz ? "SQZ" : "—"
+    if barstate.islast
+        table.cell(tbl, 0, row, tf,   text_color=color.white, bgcolor=color.new(color.gray, 40), text_size=size.small)
+        table.cell(tbl, 1, row, kTxt, text_color=color.white, bgcolor=kColor,                    text_size=size.small)
+        table.cell(tbl, 2, row, pTxt, text_color=color.white, bgcolor=pColor,                    text_size=size.small)
+
+f_fillRow(1, tf1)
+f_fillRow(2, tf2)
+f_fillRow(3, tf3)
+f_fillRow(4, tf4)

@@ -1,0 +1,327 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © Yuval Haspel
+//@version=6
+indicator("Volatility Alignment Monitor", shorttitle="VolAlign", precision=3)
+
+spot = input.source(close, "Source", display=display.data_window)
+volatility_choice = input.string(title="Choose Volatility Data", defval="IV Rank", options=["Implied Volatility", "IV Rank", "IV Percentile", "Volatility Skew Index"], display=display.data_window)
+pricevol_length = input.int(22, "PriceVol Length (recommended: 9, 22, 66, 132, 252)", minval=1, display=display.data_window)
+pricevol_rank_len = input.int(252, "PriceVol Rank/Percentile Length", minval=1, display=display.data_window)
+
+inside_high_vol_color = input.color(color.orange, "Inside High Volatility", display=display.data_window)
+outside_high_vol_color = input.color(color.aqua, "Outside High Volatility", display=display.data_window)
+
+fear_source = input.string("None", "Fear Indicator Source", options=["None", "VIX", "VTA35", "Custom"], display=display.data_window)
+custom_fear_symbol = input.symbol("CBOE:VIX", "Custom Fear Indicator Symbol", display=display.data_window)
+show_fear_overlay = input.bool(true, "Show Fear Overlay", display=display.data_window)
+fear_overlay_color = input.color(color.fuchsia, "Fear Overlay Color", display=display.data_window)
+fear_normalization = input.string("Rank", "Normalize Fear Index To", options=["Rank", "Percentile"], display=display.data_window)
+confirmation_mode = input.string("Off", "Confirmation Mode", options=["Off", "Confirm Both", "Blend", "Divergence"], display=display.data_window)
+fear_blend_weight = input.float(50.0, "Fear Weight in Blend Mode (%)", minval=0.0, maxval=100.0, step=5.0, display=display.data_window)
+
+use_higher_tf_confirmation = input.bool(false, "Use Higher Timeframe Confirmation", display=display.data_window)
+higher_tf = input.timeframe("D", "Higher Timeframe", display=display.data_window)
+
+confirmed_low_vol_color = input.color(color.teal, "Confirmed Low Volatility", display=display.data_window)
+confirmed_high_vol_color = input.color(color.red, "Confirmed High Volatility", display=display.data_window)
+pricevol_leads_color = input.color(color.yellow, "PriceVol Leads Fear", display=display.data_window)
+fear_leads_color = input.color(color.purple, "Fear Leads PriceVol", display=display.data_window)
+
+show_divergence_markers = input.bool(false, "Show Divergence Markers", display=display.data_window)
+background_shading_mode = input.string("Off", "Background Shading Mode", options=["Off", "State", "Confirmation"], display=display.data_window)
+background_shading_transparency = input.int(88, "Background Shading Transparency", minval=0, maxval=100, display=display.data_window)
+show_regime_zones = input.bool(false, "Show Regime Zones", display=display.data_window)
+calm_zone_threshold = input.float(25.0, "Calm Threshold", minval=0.0, maxval=100.0, step=1.0, display=display.data_window)
+elevated_zone_threshold = input.float(50.0, "Elevated Threshold", minval=0.0, maxval=100.0, step=1.0, display=display.data_window)
+extreme_zone_threshold = input.float(75.0, "Extreme Threshold", minval=0.0, maxval=100.0, step=1.0, display=display.data_window)
+high_vol_threshold = input.float(50.0, "High/Low Regime Threshold", minval=0.0, maxval=100.0, step=1.0, display=display.data_window)
+show_neutral_zone_line = input.bool(false, "Show Middle Threshold Line", display=display.data_window)
+show_summary_table = input.bool(false, "Show Summary Table", display=display.data_window)
+show_state_label = input.bool(false, "Show Last-Bar State Label", display=display.data_window)
+state_label_size_input = input.string("Normal", "Last-Bar State Label Size", options=["Tiny", "Small", "Normal", "Large", "Huge"], display=display.data_window)
+summary_table_position_input = input.string("Top Right", "Summary Table Position", options=["Top Left", "Top Right", "Bottom Left", "Bottom Right"], display=display.data_window)
+state_change_threshold = input.float(2.0, "Expansion/Contraction Threshold", minval=0.0, step=0.1, display=display.data_window)
+
+normalize_rank(src, len) =>
+    lo = ta.lowest(src, len)
+    hi = ta.highest(src, len)
+    rng = hi - lo
+    rng != 0.0 ? (src - lo) / rng * 100.0 : na
+
+normalize_percentile(src, len) =>
+    ta.percentrank(src, len)
+
+calc_price_vol(src, low_src, len) =>
+    hi = ta.highest(src, len)
+    hi != 0.0 ? (hi - low_src) / hi * 100.0 : na
+
+pricevol_side(mult, is_up, spot_stdev, low_stdev) =>
+    spot_adj = is_up ? spot + spot_stdev * mult : spot - spot_stdev * mult
+    low_adj = is_up ? low + low_stdev * mult : low - low_stdev * mult
+    spot_hi = ta.highest(spot_adj, pricevol_length)
+    spot_hi != 0.0 ? (spot_hi - low_adj) / spot_hi * 100.0 : na
+
+get_fear_symbol(src, custom_symbol) =>
+    src == "VIX" ? "CBOE:VIX" : src == "VTA35" ? "TASE:VTA35" : custom_symbol
+
+get_fear_label(src, custom_symbol) =>
+    src == "Custom" ? custom_symbol : src
+
+fmt_value(v) =>
+    na(v) ? "n/a" : str.tostring(v, "#.##")
+
+get_regime_text(is_enabled, state) =>
+    not is_enabled ? "PriceVol Only" : state == 1 ? "Confirmed High" : state == 0 ? "Confirmed Low" : state == 2 ? "PriceVol Leads" : "Fear Leads"
+
+get_zone_text(v, is_visible, calm_threshold, elevated_threshold, extreme_threshold) =>
+    not is_visible or na(v) ? "n/a" : v < calm_threshold ? "Calm" : v < elevated_threshold ? "Neutral" : v < extreme_threshold ? "Elevated" : "Extreme"
+
+get_zone_bg(v, is_visible, calm_threshold, elevated_threshold, extreme_threshold) =>
+    not is_visible or na(v) ? color.new(color.gray, 85) : v < calm_threshold ? color.new(color.teal, 75) : v < elevated_threshold ? color.new(color.silver, 85) : v < extreme_threshold ? color.new(color.orange, 80) : color.new(color.red, 75)
+
+get_motion_text(state) =>
+    state == 1 ? "Expanding" : state == -1 ? "Contracting" : state == 2 ? "Stable High" : state == 0 ? "Stable Low" : "n/a"
+
+get_motion_bg(state) =>
+    state == 1 ? color.new(color.orange, 72) : state == -1 ? color.new(color.aqua, 72) : state == 2 ? color.new(color.red, 75) : state == 0 ? color.new(color.teal, 75) : color.new(color.gray, 85)
+
+get_mtf_text(is_enabled, is_ready, current_high, htf_high) =>
+    not is_enabled ? "Off" : not is_ready ? "n/a" : current_high and htf_high ? "Confirmed High" : not current_high and not htf_high ? "Confirmed Low" : current_high ? "Current High / HTF Low" : "Current Low / HTF High"
+
+get_mtf_bg(is_enabled, is_ready, current_high, htf_high) =>
+    not is_enabled ? color.new(color.gray, 85) : not is_ready ? color.new(color.gray, 85) : current_high and htf_high ? color.new(color.red, 75) : not current_high and not htf_high ? color.new(color.teal, 75) : color.new(color.yellow, 75)
+
+spot_stdev = ta.stdev(spot, pricevol_length)
+low_stdev = ta.stdev(low, pricevol_length)
+
+avg_up = (pricevol_side(1.0, true, spot_stdev, low_stdev) + pricevol_side(2.0, true, spot_stdev, low_stdev) + pricevol_side(3.0, true, spot_stdev, low_stdev)) / 3.0
+avg_dn = (pricevol_side(1.0, false, spot_stdev, low_stdev) + pricevol_side(2.0, false, spot_stdev, low_stdev) + pricevol_side(3.0, false, spot_stdev, low_stdev)) / 3.0
+pricevol_skew = avg_up - avg_dn
+
+price_vol = calc_price_vol(spot, low, pricevol_length)
+price_rank = normalize_rank(price_vol, pricevol_rank_len)
+price_percentile = normalize_percentile(price_vol, pricevol_rank_len)
+price_norm = fear_normalization == "Rank" ? price_rank : price_percentile
+
+fear_symbol = get_fear_symbol(fear_source, custom_fear_symbol)
+float fear_raw = na
+if fear_source != "None"
+    fear_raw := request.security(fear_symbol, timeframe.period, close, gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off)
+
+fear_rank = normalize_rank(fear_raw, pricevol_rank_len)
+fear_percentile = normalize_percentile(fear_raw, pricevol_rank_len)
+fear_norm = fear_normalization == "Rank" ? fear_rank : fear_percentile
+
+htf_price_vol = use_higher_tf_confirmation ? request.security(syminfo.tickerid, higher_tf, calc_price_vol(spot, low, pricevol_length), gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off) : na
+htf_price_rank = use_higher_tf_confirmation ? request.security(syminfo.tickerid, higher_tf, normalize_rank(calc_price_vol(spot, low, pricevol_length), pricevol_rank_len), gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off) : na
+htf_price_percentile = use_higher_tf_confirmation ? request.security(syminfo.tickerid, higher_tf, normalize_percentile(calc_price_vol(spot, low, pricevol_length), pricevol_rank_len), gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off) : na
+htf_price_norm = fear_normalization == "Rank" ? htf_price_rank : htf_price_percentile
+
+float base_out = na
+if volatility_choice == "IV Percentile"
+    base_out := price_percentile
+else if volatility_choice == "IV Rank"
+    base_out := price_rank
+else if volatility_choice == "Volatility Skew Index"
+    base_out := pricevol_skew
+else
+    base_out := price_vol * 100.0
+
+fear_ready = fear_source != "None" and not na(fear_norm)
+confirmation_enabled = confirmation_mode != "Off" and fear_ready
+
+price_high = not na(price_norm) and price_norm >= high_vol_threshold
+fear_high = fear_ready and fear_norm >= high_vol_threshold
+prev_price_high = not na(price_norm[1]) and price_norm[1] >= high_vol_threshold
+prev_fear_high = fear_source != "None" and not na(fear_norm[1]) and fear_norm[1] >= high_vol_threshold
+prev_fear_ready = fear_source != "None" and not na(fear_norm[1])
+
+int vol_state = 0
+if price_high and fear_high
+    vol_state := 1
+else if not price_high and not fear_high
+    vol_state := 0
+else if price_high and not fear_high
+    vol_state := 2
+else
+    vol_state := 3
+
+prev_vol_state = nz(vol_state[1], -1)
+
+fear_weight = fear_blend_weight / 100.0
+price_weight = 1.0 - fear_weight
+blend_out = fear_ready ? price_norm * price_weight + fear_norm * fear_weight : na
+divergence_out = fear_ready ? price_norm - fear_norm : na
+
+float out = base_out
+if confirmation_enabled and confirmation_mode == "Blend"
+    out := blend_out
+else if confirmation_enabled and confirmation_mode == "Divergence"
+    out := divergence_out
+
+mtf_current_src = confirmation_enabled and confirmation_mode == "Blend" ? blend_out : price_norm
+mtf_ready = use_higher_tf_confirmation and not na(htf_price_norm) and not na(mtf_current_src)
+mtf_current_high = mtf_ready and mtf_current_src >= high_vol_threshold
+htf_high = mtf_ready and htf_price_norm >= high_vol_threshold
+prev_htf_ready = use_higher_tf_confirmation and not na(htf_price_norm[1]) and not na((confirmation_enabled and confirmation_mode == "Blend" ? blend_out[1] : price_norm[1]))
+prev_mtf_current_src = confirmation_enabled and confirmation_mode == "Blend" ? blend_out[1] : price_norm[1]
+prev_mtf_current_high = prev_htf_ready and prev_mtf_current_src >= high_vol_threshold
+prev_htf_high = prev_htf_ready and htf_price_norm[1] >= high_vol_threshold
+mtf_confirms = not use_higher_tf_confirmation or (mtf_ready and mtf_current_high == htf_high)
+mtf_confirms_high = not use_higher_tf_confirmation or (mtf_ready and mtf_current_high and htf_high)
+prev_mtf_confirms_high = not use_higher_tf_confirmation or (prev_htf_ready and prev_mtf_current_high and prev_htf_high)
+mtf_text = get_mtf_text(use_higher_tf_confirmation, mtf_ready, mtf_current_high, htf_high)
+mtf_bg = get_mtf_bg(use_higher_tf_confirmation, mtf_ready, mtf_current_high, htf_high)
+
+color out_color = inside_high_vol_color
+if confirmation_enabled
+    out_color := vol_state == 1 ? confirmed_high_vol_color : vol_state == 0 ? confirmed_low_vol_color : vol_state == 2 ? pricevol_leads_color : fear_leads_color
+else if volatility_choice == "IV Percentile" or volatility_choice == "IV Rank"
+    out_color := base_out < high_vol_threshold ? outside_high_vol_color : inside_high_vol_color
+
+zones_applicable = (confirmation_enabled and confirmation_mode == "Blend") or ((not confirmation_enabled or confirmation_mode == "Confirm Both") and (volatility_choice == "IV Rank" or volatility_choice == "IV Percentile"))
+zones_visible = show_regime_zones and zones_applicable
+zone_text = get_zone_text(out, zones_visible, calm_zone_threshold, elevated_zone_threshold, extreme_zone_threshold)
+zone_bg = get_zone_bg(out, zones_visible, calm_zone_threshold, elevated_zone_threshold, extreme_zone_threshold)
+
+motion_src = confirmation_enabled and confirmation_mode == "Blend" ? blend_out : price_norm
+motion_change = not na(motion_src) and not na(motion_src[1]) ? motion_src - motion_src[1] : na
+int motion_state = na
+if not na(motion_change)
+    if motion_change > state_change_threshold
+        motion_state := 1
+    else if motion_change < -state_change_threshold
+        motion_state := -1
+    else if motion_src >= high_vol_threshold
+        motion_state := 2
+    else
+        motion_state := 0
+
+prev_motion_state = nz(motion_state[1], 999)
+motion_text = get_motion_text(motion_state)
+motion_bg = get_motion_bg(motion_state)
+state_label_size = state_label_size_input == "Tiny" ? size.tiny : state_label_size_input == "Small" ? size.small : state_label_size_input == "Large" ? size.large : state_label_size_input == "Huge" ? size.huge : size.normal
+
+color state_shade_color = na
+if motion_state == 1
+    state_shade_color := color.new(color.orange, background_shading_transparency)
+else if motion_state == -1
+    state_shade_color := color.new(color.blue, background_shading_transparency)
+else if motion_state == 2
+    state_shade_color := color.new(color.red, background_shading_transparency)
+else if motion_state == 0
+    state_shade_color := color.new(color.teal, background_shading_transparency)
+
+color confirmation_shade_color = na
+if confirmation_enabled
+    if vol_state == 1
+        confirmation_shade_color := color.new(confirmed_high_vol_color, background_shading_transparency)
+    else if vol_state == 0
+        confirmation_shade_color := color.new(confirmed_low_vol_color, background_shading_transparency)
+    else if vol_state == 2
+        confirmation_shade_color := color.new(pricevol_leads_color, background_shading_transparency)
+    else
+        confirmation_shade_color := color.new(fear_leads_color, background_shading_transparency)
+else if volatility_choice == "IV Percentile" or volatility_choice == "IV Rank"
+    confirmation_shade_color := base_out < high_vol_threshold ? color.new(outside_high_vol_color, background_shading_transparency) : color.new(inside_high_vol_color, background_shading_transparency)
+
+color background_shade_color = na
+if background_shading_mode == "State"
+    background_shade_color := state_shade_color
+else if background_shading_mode == "Confirmation"
+    background_shade_color := confirmation_shade_color
+
+zone_min_line = hline(0.0, "Zone Minimum", color=color.new(color.teal, 100), linestyle=hline.style_dashed, linewidth=1)
+zone_25_line = hline(calm_zone_threshold, "Calm Threshold", color=show_regime_zones ? color.teal : color.new(color.teal, 100), linestyle=hline.style_dashed, linewidth=1)
+zone_50_line = hline(elevated_zone_threshold, "Elevated Threshold", color=show_regime_zones and show_neutral_zone_line ? color.gray : color.new(color.gray, 100), linestyle=hline.style_dashed, linewidth=1)
+zone_75_line = hline(extreme_zone_threshold, "Extreme Threshold", color=show_regime_zones ? color.red : color.new(color.red, 100), linestyle=hline.style_dashed, linewidth=1)
+zone_max_line = hline(100.0, "Zone Maximum", color=color.new(color.red, 100), linestyle=hline.style_dashed, linewidth=1)
+
+fill(zone_min_line, zone_25_line, title="Calm Zone", color=show_regime_zones ? color.new(color.teal, 92) : color.new(color.teal, 100))
+fill(zone_75_line, zone_max_line, title="Extreme Zone", color=show_regime_zones ? color.new(color.red, 90) : color.new(color.red, 100))
+
+bgcolor(background_shade_color, title="Background Regime Shading")
+plot(out, color=out_color, title="VolStress Data", display=display.all - display.status_line)
+plot(show_fear_overlay and fear_ready ? fear_norm : na, color=fear_overlay_color, title="Fear Overlay", display=display.all - display.status_line)
+
+var label state_label = na
+if barstate.islast
+    if not na(state_label)
+        label.delete(state_label)
+    if show_state_label and not na(out) and motion_text != "n/a"
+        state_label := label.new(bar_index, out, motion_text, xloc=xloc.bar_index, yloc=yloc.price, style=label.style_label_left, textcolor=color.white, color=motion_bg, size=state_label_size)
+
+confirmed_high_active = confirmation_enabled and vol_state == 1 and mtf_confirms_high
+prev_confirmation_enabled = confirmation_mode != "Off" and prev_fear_ready
+prev_confirmed_high_active = prev_confirmation_enabled and prev_vol_state == 1 and prev_mtf_confirms_high
+confirmed_high_start = confirmed_high_active and not prev_confirmed_high_active
+confirmed_high_end = prev_confirmed_high_active and not confirmed_high_active
+pricevol_leads_start = confirmation_enabled and vol_state == 2 and prev_vol_state != 2
+fear_leads_start = confirmation_enabled and vol_state == 3 and prev_vol_state != 3
+divergence_start = confirmation_enabled and vol_state != 1 and vol_state != 0 and prev_vol_state != 2 and prev_vol_state != 3
+divergence_end = confirmation_enabled and vol_state != 2 and vol_state != 3 and (prev_vol_state == 2 or prev_vol_state == 3)
+fear_confirms_price_stress = confirmation_enabled and price_high and fear_high and prev_price_high and not prev_fear_high and mtf_confirms_high
+expanding_start = not na(motion_state) and motion_state == 1 and prev_motion_state != 1
+contracting_start = not na(motion_state) and motion_state == -1 and prev_motion_state != -1
+stable_high_start = not na(motion_state) and motion_state == 2 and prev_motion_state != 2
+stable_low_start = not na(motion_state) and motion_state == 0 and prev_motion_state != 0
+
+plotshape(show_divergence_markers and pricevol_leads_start, title="PriceVol Leads Marker", style=shape.labelup, location=location.bottom, color=pricevol_leads_color, text="PV", textcolor=color.black, size=size.tiny)
+plotshape(show_divergence_markers and fear_leads_start, title="Fear Leads Marker", style=shape.labeldown, location=location.top, color=fear_leads_color, text="FI", textcolor=color.white, size=size.tiny)
+
+alertcondition(confirmed_high_start, title="Confirmed High Volatility Starts", message="VolAlign: PriceVol and Fear Index are both in a high-volatility regime.")
+alertcondition(confirmed_high_end, title="Confirmed High Volatility Ends", message="VolAlign: Confirmed high-volatility regime has ended.")
+alertcondition(pricevol_leads_start, title="PriceVol Leads Fear", message="VolAlign: PriceVol is elevated while the Fear Index is not yet elevated.")
+alertcondition(fear_leads_start, title="Fear Leads PriceVol", message="VolAlign: Fear Index is elevated while PriceVol is not yet elevated.")
+alertcondition(divergence_start, title="Volatility Divergence Starts", message="VolAlign: PriceVol and Fear Index have diverged.")
+alertcondition(divergence_end, title="Volatility Divergence Ends", message="VolAlign: PriceVol and Fear Index divergence has ended.")
+alertcondition(fear_confirms_price_stress, title="Fear Confirms Price Stress", message="VolAlign: Fear Index has moved high and now confirms existing PriceVol stress.")
+alertcondition(expanding_start, title="Volatility Expanding", message="VolAlign: Normalized volatility is expanding.")
+alertcondition(contracting_start, title="Volatility Contracting", message="VolAlign: Normalized volatility is contracting.")
+alertcondition(stable_high_start, title="Volatility Stable High", message="VolAlign: Normalized volatility is stable in a high regime.")
+alertcondition(stable_low_start, title="Volatility Stable Low", message="VolAlign: Normalized volatility is stable in a low regime.")
+
+summary_table_position = summary_table_position_input == "Top Left" ? position.top_left : summary_table_position_input == "Bottom Left" ? position.bottom_left : summary_table_position_input == "Bottom Right" ? position.bottom_right : position.top_right
+var table summary_table = table.new(summary_table_position, 2, 15, border_width=1)
+
+header_bg = color.new(color.gray, 75)
+cell_bg = color.new(color.black, 0)
+regime_bg = confirmation_enabled ? color.new(out_color, 75) : color.new(color.gray, 75)
+regime_text = get_regime_text(confirmation_enabled, vol_state)
+fear_label = get_fear_label(fear_source, custom_fear_symbol)
+plot_mode_label = confirmation_enabled and confirmation_mode == "Blend" ? "Blend" : confirmation_enabled and confirmation_mode == "Divergence" ? "Divergence" : volatility_choice
+blend_label = str.tostring(price_weight * 100.0, "#") + "/" + str.tostring(fear_weight * 100.0, "#")
+
+if barstate.islast
+    table.clear(summary_table, 0, 0, 1, 14)
+    if show_summary_table
+        table.cell(summary_table, 0, 0, "Metric", text_color=color.white, bgcolor=header_bg)
+        table.cell(summary_table, 1, 0, "Value", text_color=color.white, bgcolor=header_bg)
+        table.cell(summary_table, 0, 1, "Plot Mode", text_color=color.white, bgcolor=cell_bg)
+        table.cell(summary_table, 1, 1, plot_mode_label, text_color=color.white, bgcolor=cell_bg)
+        table.cell(summary_table, 0, 2, "PriceVol Raw", text_color=color.white, bgcolor=cell_bg)
+        table.cell(summary_table, 1, 2, fmt_value(price_vol), text_color=color.white, bgcolor=cell_bg)
+        table.cell(summary_table, 0, 3, "PriceVol Norm", text_color=color.white, bgcolor=cell_bg)
+        table.cell(summary_table, 1, 3, fmt_value(price_norm), text_color=color.white, bgcolor=cell_bg)
+        table.cell(summary_table, 0, 4, "HTF", text_color=color.white, bgcolor=cell_bg)
+        table.cell(summary_table, 1, 4, use_higher_tf_confirmation ? higher_tf : "Off", text_color=color.white, bgcolor=cell_bg)
+        table.cell(summary_table, 0, 5, "HTF Norm", text_color=color.white, bgcolor=cell_bg)
+        table.cell(summary_table, 1, 5, fmt_value(htf_price_norm), text_color=color.white, bgcolor=cell_bg)
+        table.cell(summary_table, 0, 6, "HTF Status", text_color=color.white, bgcolor=mtf_bg)
+        table.cell(summary_table, 1, 6, mtf_text, text_color=color.white, bgcolor=mtf_bg)
+        table.cell(summary_table, 0, 7, "Fear Source", text_color=color.white, bgcolor=cell_bg)
+        table.cell(summary_table, 1, 7, fear_label, text_color=color.white, bgcolor=cell_bg)
+        table.cell(summary_table, 0, 8, "Fear Raw", text_color=color.white, bgcolor=cell_bg)
+        table.cell(summary_table, 1, 8, fmt_value(fear_raw), text_color=color.white, bgcolor=cell_bg)
+        table.cell(summary_table, 0, 9, "Fear Norm", text_color=color.white, bgcolor=cell_bg)
+        table.cell(summary_table, 1, 9, fmt_value(fear_norm), text_color=color.white, bgcolor=cell_bg)
+        table.cell(summary_table, 0, 10, "Blend P/F", text_color=color.white, bgcolor=cell_bg)
+        table.cell(summary_table, 1, 10, blend_label, text_color=color.white, bgcolor=cell_bg)
+        table.cell(summary_table, 0, 11, "Confirmation", text_color=color.white, bgcolor=cell_bg)
+        table.cell(summary_table, 1, 11, confirmation_enabled ? confirmation_mode : "Off", text_color=color.white, bgcolor=cell_bg)
+        table.cell(summary_table, 0, 12, "Plot Value", text_color=color.white, bgcolor=cell_bg)
+        table.cell(summary_table, 1, 12, fmt_value(out), text_color=color.white, bgcolor=cell_bg)
+        table.cell(summary_table, 0, 13, "Regime", text_color=color.white, bgcolor=regime_bg)
+        table.cell(summary_table, 1, 13, regime_text, text_color=color.white, bgcolor=regime_bg)
+        table.cell(summary_table, 0, 14, "State", text_color=color.white, bgcolor=motion_bg)
+        table.cell(summary_table, 1, 14, motion_text, text_color=color.white, bgcolor=motion_bg)

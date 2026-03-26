@@ -1,0 +1,803 @@
+// This Pine Script™ code is subject to the terms of the Mozilla Public License 2.0
+//@version=6
+indicator("Top-Down HTF Candles [Confirmed]", overlay=true,
+     max_boxes_count=500, max_lines_count=500, max_labels_count=100)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  TOP-DOWN HTF CANDLES [Confirmed]
+//  CodaPro Confirmed Series | The Architect (ArisCodes)
+//
+//  90% of traders ignore timeframe alignment. Every key level on a higher
+//  timeframe works perfectly when paired with its correct lower timeframe.
+//
+//  TIMEFRAME PAIRS (auto-detected):
+//  5min  chart → shows 1H  candles
+//  15min chart → shows 4H  candles
+//  1H    chart → shows D   candles
+//  4H    chart → shows W   candles
+//  Manual override available
+//
+//  HTF candles project to the RIGHT of current price — always in view
+//  Swing highs/lows marked as liquidity levels
+//  Structure breaks highlighted
+//  Gap (FVG) zones drawn on HTF
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// ─────────────────────────────────────────────────────────────────────────────
+// INPUT GROUPS
+// ─────────────────────────────────────────────────────────────────────────────
+grp_htf  = "HTF Settings"
+grp_disp = "Display"
+grp_liq  = "Liquidity & Structure"
+grp_vis  = "Visuals"
+grp_tm   = "Trade Management"
+
+// HTF
+htfAuto   = input.bool(true,   "Auto-Pair Timeframe",   group=grp_htf,
+            tooltip="Auto pairs your chart TF to its correct HTF.\n5min→1H  15min→4H  1H→Daily  4H→Weekly")
+htfManual = input.string("60", "Manual HTF (if not auto)",group=grp_htf,
+            options=["15", "30", "60", "240", "D", "W"],
+            tooltip="Only used when Auto-Pair is OFF")
+numCandles= input.int(8,       "# HTF Candles to Show", group=grp_htf, minval=3, maxval=20)
+
+// Display
+gapBars   = input.int(5,       "Gap (bars) from Price",  group=grp_disp, minval=1, maxval=30,
+            tooltip="How many bars of space between live price and HTF candles")
+candleW   = input.int(8,       "HTF Candle Width (bars)", group=grp_disp, minval=3, maxval=30)
+candleGap = input.int(2,       "Gap Between Candles",     group=grp_disp, minval=1, maxval=10)
+showWicks = input.bool(true,   "Show Wicks",              group=grp_disp)
+showLabels= input.bool(true,   "Show OHLC Labels",        group=grp_disp)
+showPair  = input.bool(true,   "Show TF Pair Label",      group=grp_disp)
+
+// Liquidity & Structure
+showSwings = input.bool(true,  "Show Swing Highs/Lows",   group=grp_liq,
+             tooltip="HTF swing highs = BSL (Buy-Side Liquidity)\nHTF swing lows = SSL (Sell-Side Liquidity)")
+swingLen   = input.int(3,      "Swing Pivot Length",       group=grp_liq, minval=2, maxval=10)
+showFVG    = input.bool(true,  "Show FVG Zones",           group=grp_liq,
+             tooltip="Fair Value Gaps on the HTF — imbalances where price tends to return")
+showBOS    = input.bool(true,  "Show Structure Breaks",    group=grp_liq,
+             tooltip="Breaks of Structure on HTF — directional bias confirmation")
+extendLvls = input.bool(true,  "Extend Levels Left",       group=grp_liq,
+             tooltip="Extend HTF key levels back onto current chart as horizontal lines")
+extendBars = input.int(50,     "Extend Bars Left",         group=grp_liq, minval=10, maxval=300)
+
+// Visuals
+colBull    = input.color(color.new(#00FF88,  0), "Bull Candle",    group=grp_vis)
+colBear    = input.color(color.new(#FF4466,  0), "Bear Candle",    group=grp_vis)
+colDoji    = input.color(color.new(#FFD700,  0), "Doji Candle",    group=grp_vis)
+colBSL     = input.color(color.new(#FF4466, 20), "BSL (Swing High)", group=grp_vis)
+colSSL     = input.color(color.new(#00FF88, 20), "SSL (Swing Low)",  group=grp_vis)
+colFVG     = input.color(color.new(#FFD700, 80), "FVG Zone",       group=grp_vis)
+colBOS     = input.color(color.new(#FF8800, 70), "BOS Zone",       group=grp_vis)
+showDash   = input.bool(true,  "Show Dashboard",            group=grp_vis)
+showGhost  = input.bool(true,  "Ghost Candles",             group=grp_vis)
+
+// Trade Management
+tpPct     = input.float(0.5,  "TP %",              group=grp_tm, minval=0.05, maxval=20.0, step=0.05,
+            tooltip="Take profit % from entry. Overridden by HTF H/L when in range.\nFutures (MNQ): 0.3-0.8%   Crypto: 1.0-3.0%")
+slPct     = input.float(0.25, "SL %",              group=grp_tm, minval=0.05, maxval=20.0, step=0.05,
+            tooltip="Stop loss % from entry.\nFutures (MNQ): 0.2-0.5%   Crypto: 0.5-2.0%")
+maxBars   = input.int(40,     "Max Bars in Trade", group=grp_tm, minval=5,    maxval=500)
+cooldown  = input.int(5,      "Cooldown Bars",     group=grp_tm, minval=1,    maxval=100,
+            tooltip="Min bars between signals. Futures: 3-8   Crypto: 5-15")
+rsiLen    = input.int(14,     "RSI Length",        group=grp_tm, minval=2,    maxval=50)
+rsiOB     = input.int(70,     "RSI OB Filter",     group=grp_tm, minval=60,   maxval=90,
+            tooltip="Block BUY signals when RSI above this level")
+rsiOS     = input.int(30,     "RSI OS Filter",     group=grp_tm, minval=10,   maxval=40,
+            tooltip="Block SELL signals when RSI below this level")
+confirmB  = input.int(2,      "Confirmation Bars", group=grp_tm, minval=1, maxval=5,
+            tooltip="Bars closing beyond level to confirm cross.\n1 = fastest, most signals\n2–3 = filtered, higher quality")
+showSig   = input.bool(true,  "Show Entry Labels", group=grp_tm)
+showTPSL  = input.bool(true,  "Show TP/SL Lines",  group=grp_tm)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// COLORS
+// ─────────────────────────────────────────────────────────────────────────────
+color C_TEAL   = #00F5D4
+color C_GOLD   = #FFD700
+color C_BULL   = #00FF88
+color C_BEAR   = #FF4466
+color C_MUTED  = color.new(#AAAAAA, 40)
+color C_HDR_BG = color.new(#0d1f1e,  0)
+color C_COL_BG = color.new(#0a0a14, 10)
+color C_COL_ALT= color.new(#0d1117, 30)
+color C_STRIPE = color.new(#00F5D4, 20)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// TRADE STATE — CodaPro standard, global scope
+// ─────────────────────────────────────────────────────────────────────────────
+var bool  g_inTrade   = false
+var int   lastSigBar  = 0
+var int   entryBar    = 0
+var float entryPrice  = na
+var bool  g_isLong    = false
+var float g_tp        = na
+var float g_sl        = na
+var line  g_tpLine    = na
+var line  g_slLine    = na
+
+// Explicit prev-bar trackers — bulletproof cross detection (no Pine series on var floats)
+var float prevClose   = na
+var float prevHTFH    = na
+var float prevHTFL    = na
+var float prevHTFMid  = na   // HTF midline tracker
+var float prevHTFO    = na   // HTF open tracker
+var int   barsAboveL  = 0    // confirmation window counter — bull
+var int   barsBelowH  = 0    // confirmation window counter — bear
+var int   barsAboveMid= 0    // confirmation window counter — mid bull
+var int   barsBelowMid= 0    // confirmation window counter — mid bear
+var int   barsAboveO  = 0    // confirmation window counter — open bull
+var int   barsBelowO  = 0    // confirmation window counter — open bear
+
+// ─────────────────────────────────────────────────────────────────────────────
+// AUTO TIMEFRAME PAIRING
+// 5min→1H   15min→4H   30min→4H   1H→D   4H→W   D→W
+// ─────────────────────────────────────────────────────────────────────────────
+f_autoHTF() =>
+    tf = timeframe.period
+    result = switch tf
+        "5"   => "60"
+        "10"  => "60"
+        "15"  => "240"
+        "30"  => "240"
+        "60"  => "D"
+        "120" => "D"
+        "240" => "W"
+        "D"   => "W"
+        => "D"
+    result
+
+string htfTF  = htfAuto ? f_autoHTF() : htfManual
+
+// Human-readable TF name
+f_tfName(string tf) =>
+    switch tf
+        "5"   => "5m"
+        "15"  => "15m"
+        "30"  => "30m"
+        "60"  => "1H"
+        "120" => "2H"
+        "240" => "4H"
+        "D"   => "Daily"
+        "W"   => "Weekly"
+        => tf
+
+string currentTFName = f_tfName(timeframe.period)
+string htfTFName     = f_tfName(htfTF)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// HTF DATA — request.security
+// ─────────────────────────────────────────────────────────────────────────────
+[htfO, htfH, htfL, htfC, htfV] = request.security(syminfo.tickerid, htfTF,
+     [open, high, low, close, volume],
+     lookahead=barmerge.lookahead_off)
+
+// Pull array of last N+2 HTF bars (extra for FVG/BOS detection)
+int   MAX_C = 22
+float[] aO = array.new<float>(MAX_C, na)
+float[] aH = array.new<float>(MAX_C, na)
+float[] aL = array.new<float>(MAX_C, na)
+float[] aC = array.new<float>(MAX_C, na)
+
+// Fill arrays using request.security with offset
+[o0,h0,l0,c0]   = request.security(syminfo.tickerid, htfTF, [open[0],high[0],low[0],close[0]], lookahead=barmerge.lookahead_off)
+[o1,h1,l1,c1]   = request.security(syminfo.tickerid, htfTF, [open[1],high[1],low[1],close[1]], lookahead=barmerge.lookahead_off)
+[o2,h2,l2,c2]   = request.security(syminfo.tickerid, htfTF, [open[2],high[2],low[2],close[2]], lookahead=barmerge.lookahead_off)
+[o3,h3,l3,c3]   = request.security(syminfo.tickerid, htfTF, [open[3],high[3],low[3],close[3]], lookahead=barmerge.lookahead_off)
+[o4,h4,l4,c4]   = request.security(syminfo.tickerid, htfTF, [open[4],high[4],low[4],close[4]], lookahead=barmerge.lookahead_off)
+[o5,h5,l5,c5]   = request.security(syminfo.tickerid, htfTF, [open[5],high[5],low[5],close[5]], lookahead=barmerge.lookahead_off)
+[o6,h6,l6,c6]   = request.security(syminfo.tickerid, htfTF, [open[6],high[6],low[6],close[6]], lookahead=barmerge.lookahead_off)
+[o7,h7,l7,c7]   = request.security(syminfo.tickerid, htfTF, [open[7],high[7],low[7],close[7]], lookahead=barmerge.lookahead_off)
+[o8,h8,l8,c8]   = request.security(syminfo.tickerid, htfTF, [open[8],high[8],low[8],close[8]], lookahead=barmerge.lookahead_off)
+[o9,h9,l9,c9]   = request.security(syminfo.tickerid, htfTF, [open[9],high[9],low[9],close[9]], lookahead=barmerge.lookahead_off)
+[o10,h10,l10,c10] = request.security(syminfo.tickerid, htfTF, [open[10],high[10],low[10],close[10]], lookahead=barmerge.lookahead_off)
+[o11,h11,l11,c11] = request.security(syminfo.tickerid, htfTF, [open[11],high[11],low[11],close[11]], lookahead=barmerge.lookahead_off)
+[o12,h12,l12,c12] = request.security(syminfo.tickerid, htfTF, [open[12],high[12],low[12],close[12]], lookahead=barmerge.lookahead_off)
+[o13,h13,l13,c13] = request.security(syminfo.tickerid, htfTF, [open[13],high[13],low[13],close[13]], lookahead=barmerge.lookahead_off)
+[o14,h14,l14,c14] = request.security(syminfo.tickerid, htfTF, [open[14],high[14],low[14],close[14]], lookahead=barmerge.lookahead_off)
+[o15,h15,l15,c15] = request.security(syminfo.tickerid, htfTF, [open[15],high[15],low[15],close[15]], lookahead=barmerge.lookahead_off)
+[o16,h16,l16,c16] = request.security(syminfo.tickerid, htfTF, [open[16],high[16],low[16],close[16]], lookahead=barmerge.lookahead_off)
+[o17,h17,l17,c17] = request.security(syminfo.tickerid, htfTF, [open[17],high[17],low[17],close[17]], lookahead=barmerge.lookahead_off)
+[o18,h18,l18,c18] = request.security(syminfo.tickerid, htfTF, [open[18],high[18],low[18],close[18]], lookahead=barmerge.lookahead_off)
+[o19,h19,l19,c19] = request.security(syminfo.tickerid, htfTF, [open[19],high[19],low[19],close[19]], lookahead=barmerge.lookahead_off)
+[o20,h20,l20,c20] = request.security(syminfo.tickerid, htfTF, [open[20],high[20],low[20],close[20]], lookahead=barmerge.lookahead_off)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// DRAW ENGINE — runs on barstate.islast only
+// All boxes/lines deleted and redrawn each bar
+// ─────────────────────────────────────────────────────────────────────────────
+var box[]      drawnBoxes  = array.new<box>()
+var line[]     drawnLines  = array.new<line>()
+var label[]    drawnLabels = array.new<label>()
+
+f_clearAll() =>
+    if array.size(drawnBoxes) > 0
+        for _i = 0 to array.size(drawnBoxes) - 1
+            box.delete(array.get(drawnBoxes, _i))
+    array.clear(drawnBoxes)
+    if array.size(drawnLines) > 0
+        for _i = 0 to array.size(drawnLines) - 1
+            line.delete(array.get(drawnLines, _i))
+    array.clear(drawnLines)
+    if array.size(drawnLabels) > 0
+        for _i = 0 to array.size(drawnLabels) - 1
+            label.delete(array.get(drawnLabels, _i))
+    array.clear(drawnLabels)
+
+if barstate.islast
+    f_clearAll()
+
+    // Load arrays from fetched data (oldest first = index 0 is oldest shown)
+    // We show numCandles candles. Index 0 = oldest, index numCandles-1 = newest (current)
+    float[] os = array.from(o20,o19,o18,o17,o16,o15,o14,o13,o12,o11,o10,o9,o8,o7,o6,o5,o4,o3,o2,o1,o0)
+    float[] hs = array.from(h20,h19,h18,h17,h16,h15,h14,h13,h12,h11,h10,h9,h8,h7,h6,h5,h4,h3,h2,h1,h0)
+    float[] ls = array.from(l20,l19,l18,l17,l16,l15,l14,l13,l12,l11,l10,l9,l8,l7,l6,l5,l4,l3,l2,l1,l0)
+    float[] cs = array.from(c20,c19,c18,c17,c16,c15,c14,c13,c12,c11,c10,c9,c8,c7,c6,c5,c4,c3,c2,c1,c0)
+
+    int totalSlots = 21
+    int startIdx   = totalSlots - numCandles  // e.g. numCandles=8 → startIdx=13
+
+    // X start: gap bars to the right of last bar
+    int xStart = bar_index + gapBars
+    int slotW  = candleW + candleGap
+
+    // ── DRAW HTF CANDLES ────────────────────────────────────────────────────
+    for _i = 0 to numCandles - 1
+        int   arrIdx  = startIdx + _i
+        float cO = array.get(os, arrIdx)
+        float cH = array.get(hs, arrIdx)
+        float cL = array.get(ls, arrIdx)
+        float cC = array.get(cs, arrIdx)
+
+        if na(cO) or na(cH) or na(cL) or na(cC)
+            continue
+
+        bool  isBull = cC >= cO
+        bool  isDoji = math.abs(cC - cO) < (cH - cL) * 0.1
+        color bodyCol = isDoji ? colDoji : isBull ? colBull : colBear
+        color wickCol = color.new(bodyCol, 30)
+
+        int   x1 = xStart + _i * slotW
+        int   x2 = x1 + candleW
+
+        float bodyTop = math.max(cO, cC)
+        float bodyBot = math.min(cO, cC)
+
+        // Body box
+        b = box.new(x1, bodyTop, x2, bodyBot,
+             border_color=bodyCol,
+             bgcolor=color.new(bodyCol, isBull ? 50 : 50),
+             border_width=1)
+        array.push(drawnBoxes, b)
+
+        // Wicks
+        if showWicks
+            int wickX = int(math.avg(x1, x2))
+            // Upper wick
+            if cH > bodyTop
+                ul = line.new(wickX, bodyTop, wickX, cH, color=wickCol, width=1)
+                array.push(drawnLines, ul)
+            // Lower wick
+            if cL < bodyBot
+                ll = line.new(wickX, bodyBot, wickX, cL, color=wickCol, width=1)
+                array.push(drawnLines, ll)
+
+        // Current candle = last slot — mark with bright border
+        if _i == numCandles - 1
+            box.set_border_color(b, C_TEAL)
+            box.set_border_width(b, 2)
+            lbl = label.new(int(math.avg(x1, x2)), cH,
+                 "◈ NOW",
+                 yloc=yloc.price, style=label.style_label_down,
+                 color=color.new(C_TEAL, 85), textcolor=C_TEAL, size=size.tiny,
+                 text_font_family=font.family_monospace)
+            array.push(drawnLabels, lbl)
+
+    // ── SWING HIGHS/LOWS (Liquidity Levels) ─────────────────────────────────
+    if showSwings
+        for _i = swingLen to numCandles - 1 - swingLen
+            int   arrIdx = startIdx + _i
+            if arrIdx < 0 or arrIdx >= totalSlots
+                continue
+            float cH = array.get(hs, arrIdx)
+            float cL = array.get(ls, arrIdx)
+
+            // Check if swing high
+            bool isSwingH = true
+            bool isSwingL = true
+            for _s = 1 to swingLen
+                int lArr = arrIdx - _s
+                int rArr = arrIdx + _s
+                if lArr >= 0 and lArr < totalSlots
+                    if array.get(hs, lArr) >= cH
+                        isSwingH := false
+                    if array.get(ls, lArr) <= cL
+                        isSwingL := false
+                if rArr >= 0 and rArr < totalSlots
+                    if array.get(hs, rArr) >= cH
+                        isSwingH := false
+                    if array.get(ls, rArr) <= cL
+                        isSwingL := false
+
+            int x1 = xStart + _i * slotW
+            int x2 = x1 + candleW
+
+            if isSwingH
+                // BSL line across the candle
+                sl = line.new(x1, cH, x2, cH, color=colBSL, width=2, style=line.style_solid)
+                array.push(drawnLines, sl)
+                lbl = label.new(x1, cH, " BSL",
+                     yloc=yloc.price, style=label.style_label_right,
+                     color=color.new(colBSL, 80), textcolor=color.new(#FF4466, 0), size=size.tiny,
+                     text_font_family=font.family_monospace)
+                array.push(drawnLabels, lbl)
+                // Extend left onto chart
+                if extendLvls
+                    el = line.new(bar_index - extendBars, cH, bar_index + gapBars, cH,
+                         color=color.new(colBSL, 60), width=1, style=line.style_dotted)
+                    array.push(drawnLines, el)
+
+            if isSwingL
+                sl = line.new(x1, cL, x2, cL, color=colSSL, width=2, style=line.style_solid)
+                array.push(drawnLines, sl)
+                lbl = label.new(x1, cL, " SSL",
+                     yloc=yloc.price, style=label.style_label_right,
+                     color=color.new(colSSL, 80), textcolor=color.new(#00FF88, 0), size=size.tiny,
+                     text_font_family=font.family_monospace)
+                array.push(drawnLabels, lbl)
+                if extendLvls
+                    el = line.new(bar_index - extendBars, cL, bar_index + gapBars, cL,
+                         color=color.new(colSSL, 60), width=1, style=line.style_dotted)
+                    array.push(drawnLines, el)
+
+    // ── FVG ZONES ────────────────────────────────────────────────────────────
+    // FVG = gap between candle[i-2].high and candle[i].low (bull FVG)
+    //       gap between candle[i-2].low and candle[i].high (bear FVG)
+    if showFVG
+        for _i = 2 to numCandles - 1
+            int arr0 = startIdx + _i
+            int arr2 = startIdx + _i - 2
+            if arr0 < 0 or arr0 >= totalSlots or arr2 < 0 or arr2 >= totalSlots
+                continue
+            float h2   = array.get(hs, arr2)
+            float l2   = array.get(ls, arr2)
+            float cH   = array.get(hs, arr0)
+            float cL   = array.get(ls, arr0)
+            float midC = array.get(cs, arr0 - 1)  // middle candle close
+
+            int x1 = xStart + (_i - 1) * slotW
+            int x2 = x1 + candleW
+
+            // Bullish FVG: gap between prev-prev high and current low
+            if cL > h2
+                fb = box.new(x1, cL, x2, h2,
+                     border_color=color.new(C_GOLD, 60), bgcolor=colFVG, border_width=1)
+                array.push(drawnBoxes, fb)
+                if extendLvls
+                    // Extend FVG midline
+                    float mid = math.avg(cL, h2)
+                    fl = line.new(bar_index - extendBars, mid, bar_index + gapBars, mid,
+                         color=color.new(C_GOLD, 70), width=1, style=line.style_dashed)
+                    array.push(drawnLines, fl)
+
+            // Bearish FVG: gap between current high and prev-prev low
+            if cH < l2
+                fb = box.new(x1, l2, x2, cH,
+                     border_color=color.new(C_GOLD, 60), bgcolor=colFVG, border_width=1)
+                array.push(drawnBoxes, fb)
+                if extendLvls
+                    float mid = math.avg(l2, cH)
+                    fl = line.new(bar_index - extendBars, mid, bar_index + gapBars, mid,
+                         color=color.new(C_GOLD, 70), width=1, style=line.style_dashed)
+                    array.push(drawnLines, fl)
+
+    // ── STRUCTURE BREAKS (BOS) ────────────────────────────────────────────────
+    // BOS: close breaks above prev swing high = bullish BOS
+    //      close breaks below prev swing low  = bearish BOS
+    if showBOS
+        // Track running swing high/low across displayed candles
+        float trackH = array.get(hs, startIdx)
+        float trackL = array.get(ls, startIdx)
+        for _i = 1 to numCandles - 1
+            int arrIdx = startIdx + _i
+            if arrIdx >= totalSlots
+                break
+            float cC = array.get(cs, arrIdx)
+            float cH = array.get(hs, arrIdx)
+            float cL = array.get(ls, arrIdx)
+            int   x1 = xStart + _i * slotW
+            int   x2 = x1 + candleW
+            int   mid = int(math.avg(x1, x2))
+
+            // Bullish BOS — close breaks above running high
+            if cC > trackH
+                bl = line.new(x1, trackH, x2, trackH,
+                     color=color.new(C_BULL, 40), width=2, style=line.style_dashed)
+                array.push(drawnLines, bl)
+                lbl = label.new(mid, trackH, "BOS ▲",
+                     yloc=yloc.price, style=label.style_label_up,
+                     color=color.new(C_BULL, 80), textcolor=C_BULL, size=size.tiny,
+                     text_font_family=font.family_monospace)
+                array.push(drawnLabels, lbl)
+                trackH := cH  // update high
+            // Bearish BOS — close breaks below running low
+            else if cC < trackL
+                bl = line.new(x1, trackL, x2, trackL,
+                     color=color.new(C_BEAR, 40), width=2, style=line.style_dashed)
+                array.push(drawnLines, bl)
+                lbl = label.new(mid, trackL, "BOS ▼",
+                     yloc=yloc.price, style=label.style_label_down,
+                     color=color.new(C_BEAR, 80), textcolor=C_BEAR, size=size.tiny,
+                     text_font_family=font.family_monospace)
+                array.push(drawnLabels, lbl)
+                trackL := cL  // update low
+            else
+                trackH := math.max(trackH, cH)
+                trackL := math.min(trackL, cL)
+
+    // ── TF PAIR LABEL ─────────────────────────────────────────────────────────
+    if showPair
+        int lblX = xStart + int(numCandles * slotW / 2)
+        float lblY = array.get(hs, startIdx + numCandles - 1)
+        lbl = label.new(xStart, lblY,
+             currentTFName + "  →  " + htfTFName + " ",
+             yloc=yloc.price, style=label.style_label_right,
+             color=color.new(C_HDR_BG, 0), textcolor=C_TEAL, size=size.small,
+             text_font_family=font.family_monospace)
+        array.push(drawnLabels, lbl)
+
+    // ── HTF OPEN LINE ─────────────────────────────────────────────────────────
+    // Current HTF open = key reference level
+    if not na(htfO)
+        int xE = xStart + numCandles * slotW
+        ol = line.new(bar_index - extendBars, htfO, xE, htfO,
+             color=color.new(C_GOLD, 50), width=1, style=line.style_dashed)
+        array.push(drawnLines, ol)
+        lbl = label.new(bar_index - extendBars, htfO, " HTF OPEN",
+             yloc=yloc.price, style=label.style_label_right,
+             color=color.new(C_GOLD, 85), textcolor=C_GOLD, size=size.tiny,
+             text_font_family=font.family_monospace)
+        array.push(drawnLabels, lbl)
+
+    // ── CURRENT HTF C/H/L LABELS ──────────────────────────────────────────────
+    if showLabels and not na(htfH) and not na(htfL)
+        int lastX = xStart + (numCandles - 1) * slotW + candleW
+        lbl_h = label.new(lastX, htfH, "  H " + str.tostring(htfH, format.mintick),
+             yloc=yloc.price, style=label.style_label_left,
+             color=color.new(C_HDR_BG, 0), textcolor=C_MUTED, size=size.tiny,
+             text_font_family=font.family_monospace)
+        lbl_l = label.new(lastX, htfL, "  L " + str.tostring(htfL, format.mintick),
+             yloc=yloc.price, style=label.style_label_left,
+             color=color.new(C_HDR_BG, 0), textcolor=C_MUTED, size=size.tiny,
+             text_font_family=font.family_monospace)
+        array.push(drawnLabels, lbl_h)
+        array.push(drawnLabels, lbl_l)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// HTF BIAS — must be declared BEFORE signal logic
+// ─────────────────────────────────────────────────────────────────────────────
+bool  htfBull   = not na(htfC) and not na(htfO) and htfC >= htfO
+bool  htfAbvO   = not na(htfC) and not na(htfO) and close > htfO
+float htfRange  = not na(htfH) and not na(htfL) ? htfH - htfL : na
+float htfMid    = not na(htfH) and not na(htfL) ? math.avg(htfH, htfL) : na
+bool  atHTFMid  = not na(htfMid) and not na(htfRange) and math.abs(close - htfMid) < htfRange * 0.05
+string biasStr  = htfBull ? "BULLISH ▲" : "BEARISH ▼"
+color  biasCol  = htfBull ? C_BULL : C_BEAR
+
+// ─────────────────────────────────────────────────────────────────────────────
+// RSI FILTER
+// ─────────────────────────────────────────────────────────────────────────────
+float rsi14 = ta.rsi(close, rsiLen)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ── A) UPDATE CONFIRMATION COUNTERS — runs every confirmed bar ───────────────
+// Counts consecutive bars above/below each HTF level
+// Reset immediately when level jumps (new HTF candle) or direction flips
+if barstate.isconfirmed
+    // HTF Low (SSL) — bull counter
+    if prevHTFL != htfL
+        barsAboveL := 0   // level changed = reset, no fake count
+    else if close > htfL
+        barsAboveL := barsAboveL + 1
+    else
+        barsAboveL := 0
+
+    // HTF High (BSL) — bear counter
+    if prevHTFH != htfH
+        barsBelowH := 0
+    else if close < htfH
+        barsBelowH := barsBelowH + 1
+    else
+        barsBelowH := 0
+
+    // HTF Mid — both directions
+    if not na(htfMid) and prevHTFMid == htfMid
+        barsAboveMid := close > htfMid ? barsAboveMid + 1 : 0
+        barsBelowMid := close < htfMid ? barsBelowMid + 1 : 0
+    else
+        barsAboveMid := 0
+        barsBelowMid := 0
+
+    // HTF Open — both directions
+    if not na(htfO) and prevHTFO == htfO
+        barsAboveO := close > htfO ? barsAboveO + 1 : 0
+        barsBelowO := close < htfO ? barsBelowO + 1 : 0
+    else
+        barsAboveO := 0
+        barsBelowO := 0
+
+// SIGNAL LOGIC — 6 trigger points, no bias gate, confirmation window
+// B) NO BIAS GATE: buy AND sell fire at H, L, Mid, Open regardless of HTF direction
+//    Let the market structure speak — RSI filter handles quality
+// C) CONFIRMATION WINDOW: confirmB consecutive closes beyond level = confirmed break
+//    Catches multi-bar approaches, not just exact 1-bar flips
+// Level stability already baked into counters above (reset on level change)
+// ─────────────────────────────────────────────────────────────────────────────
+bool cdOK  = bar_index - lastSigBar >= cooldown
+bool ready = not g_inTrade and cdOK and barstate.isconfirmed
+
+bool buySignal  = false
+bool sellSignal = false
+
+// Counter logic already encodes directional cross:
+// Counter only builds when close is on the signal side of the level
+// Counter resets to 0 the moment price flips back — so reaching confirmB
+// means price genuinely crossed AND held for confirmB bars. No separate
+// _wasBelow check needed — that was blocking every single signal.
+if ready and not na(prevClose)
+    // ── HTF LOW (SSL reclaim) — buy ──────────────────────────────────────────
+    // barsAboveL only counts while close > htfL, resets on close <= htfL
+    // Reaching confirmB = confirmed breakout above SSL
+    if not na(htfL) and prevHTFL == htfL
+        if barsAboveL == confirmB and rsi14 < rsiOB
+            buySignal := true
+
+    // ── HTF HIGH (BSL reclaim) — sell ────────────────────────────────────────
+    if not na(htfH) and prevHTFH == htfH and not buySignal
+        if barsBelowH == confirmB and rsi14 > rsiOS
+            sellSignal := true
+
+    // ── HTF MID — both directions ────────────────────────────────────────────
+    if not na(htfMid) and prevHTFMid == htfMid
+        if not buySignal and not sellSignal
+            if barsAboveMid == confirmB and rsi14 < rsiOB
+                buySignal := true
+        if not buySignal and not sellSignal
+            if barsBelowMid == confirmB and rsi14 > rsiOS
+                sellSignal := true
+
+    // ── HTF OPEN — both directions ───────────────────────────────────────────
+    if not na(htfO) and prevHTFO == htfO
+        if not buySignal and not sellSignal
+            if barsAboveO == confirmB and rsi14 < rsiOB
+                buySignal := true
+        if not buySignal and not sellSignal
+            if barsBelowO == confirmB and rsi14 > rsiOS
+                sellSignal := true
+
+// ─────────────────────────────────────────────────────────────────────────────
+// TRADE EXITS — run FIRST so g_inTrade clears before entry check same bar
+// TP/SL intrabar | time exit on barstate.isconfirmed
+// ─────────────────────────────────────────────────────────────────────────────
+if g_inTrade
+    bool tpHit    = g_isLong ? high >= g_tp : low  <= g_tp
+    bool slHit    = g_isLong ? low  <= g_sl : high >= g_sl
+    bool timeExit = barstate.isconfirmed and (bar_index - entryBar) >= maxBars
+
+    if tpHit
+        g_inTrade := false
+        if not na(g_tpLine)
+            line.delete(g_tpLine)
+        if not na(g_slLine)
+            line.delete(g_slLine)
+        label.new(bar_index, na, " ✦ TP +" + str.tostring(tpPct, "#.##") + "% ",
+             yloc=g_isLong ? yloc.abovebar : yloc.belowbar,
+             style=g_isLong ? label.style_label_down : label.style_label_up,
+             color=color.new(C_TEAL, 85), textcolor=C_TEAL, size=size.small)
+
+    else if slHit
+        g_inTrade := false
+        if not na(g_tpLine)
+            line.delete(g_tpLine)
+        if not na(g_slLine)
+            line.delete(g_slLine)
+        label.new(bar_index, na, " SL -" + str.tostring(slPct, "#.##") + "% ",
+             yloc=g_isLong ? yloc.belowbar : yloc.abovebar,
+             style=g_isLong ? label.style_label_up : label.style_label_down,
+             color=color.new(C_BEAR, 85), textcolor=C_BEAR, size=size.tiny)
+
+    else if timeExit
+        float exitPnl = g_isLong ? (close - entryPrice) / entryPrice * 100 : (entryPrice - close) / entryPrice * 100
+        g_inTrade := false
+        if not na(g_tpLine)
+            line.delete(g_tpLine)
+        if not na(g_slLine)
+            line.delete(g_slLine)
+        label.new(bar_index, na, " TIME " + str.tostring(exitPnl, "#.##") + "% ",
+             yloc=g_isLong ? yloc.belowbar : yloc.abovebar,
+             style=g_isLong ? label.style_label_up : label.style_label_down,
+             color=color.new(C_GOLD, 85), textcolor=C_GOLD, size=size.tiny)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// TRADE EXECUTION — one trade at a time, else if gate
+// TP = HTF High (buys) or HTF Low (sells) — the natural HTF liquidity target
+// Fallback to % if HTF level already passed
+// ─────────────────────────────────────────────────────────────────────────────
+if buySignal and not g_inTrade
+    g_inTrade  := true
+    g_isLong   := true
+    entryBar   := bar_index
+    entryPrice := close
+    lastSigBar := bar_index
+    // TP = nearest HTF level above entry: Mid → High (whichever is closer but above)
+    float _midAbove = not na(htfMid) and htfMid > close ? htfMid : na
+    float _hiAbove  = not na(htfH)   and htfH   > close ? htfH   : na
+    float tpTarget  = not na(_midAbove) and not na(_hiAbove) ? math.min(_midAbove, _hiAbove) : not na(_midAbove) ? _midAbove : not na(_hiAbove) ? _hiAbove : close * (1 + tpPct / 100)
+    g_tp := tpTarget
+    g_sl := close * (1 - slPct / 100)
+    if not na(g_tpLine)
+        line.delete(g_tpLine)
+    if not na(g_slLine)
+        line.delete(g_slLine)
+    if showTPSL
+        g_tpLine := line.new(bar_index, g_tp, bar_index + maxBars, g_tp,
+             color=color.new(C_TEAL, 25), style=line.style_dashed, width=2)
+        g_slLine := line.new(bar_index, g_sl, bar_index + maxBars, g_sl,
+             color=color.new(C_BEAR, 40), style=line.style_dashed, width=1)
+    if showSig
+        label.new(bar_index, na, "▲ BUY  TP: " + str.tostring(g_tp, format.mintick) + "  SL: " + str.tostring(g_sl, format.mintick),
+             yloc=yloc.belowbar, style=label.style_label_up,
+             color=color.new(C_BULL, 65), textcolor=C_BULL, size=size.small,
+             text_font_family=font.family_monospace)
+
+else if sellSignal and not g_inTrade
+    g_inTrade  := true
+    g_isLong   := false
+    entryBar   := bar_index
+    entryPrice := close
+    lastSigBar := bar_index
+    // TP = nearest HTF level below entry: Mid → Low (whichever is closer but below)
+    float _midBelow = not na(htfMid) and htfMid < close ? htfMid : na
+    float _loBelow  = not na(htfL)   and htfL   < close ? htfL   : na
+    float tpTarget  = not na(_midBelow) and not na(_loBelow) ? math.max(_midBelow, _loBelow) : not na(_midBelow) ? _midBelow : not na(_loBelow) ? _loBelow : close * (1 - tpPct / 100)
+    g_tp := tpTarget
+    g_sl := close * (1 + slPct / 100)
+    if not na(g_tpLine)
+        line.delete(g_tpLine)
+    if not na(g_slLine)
+        line.delete(g_slLine)
+    if showTPSL
+        g_tpLine := line.new(bar_index, g_tp, bar_index + maxBars, g_tp,
+             color=color.new(C_TEAL, 25), style=line.style_dashed, width=2)
+        g_slLine := line.new(bar_index, g_sl, bar_index + maxBars, g_sl,
+             color=color.new(C_BEAR, 40), style=line.style_dashed, width=1)
+    if showSig
+        label.new(bar_index, na, "▼ SELL  TP: " + str.tostring(g_tp, format.mintick) + "  SL: " + str.tostring(g_sl, format.mintick),
+             yloc=yloc.abovebar, style=label.style_label_down,
+             color=color.new(C_BEAR, 65), textcolor=C_BEAR, size=size.small,
+             text_font_family=font.family_monospace)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// UPDATE PREV-BAR TRACKERS — ALWAYS LAST, after all logic
+// ─────────────────────────────────────────────────────────────────────────────
+prevClose  := close
+prevHTFH   := htfH
+prevHTFL   := htfL
+prevHTFMid := htfMid
+prevHTFO   := htfO
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GHOST CANDLES
+// ─────────────────────────────────────────────────────────────────────────────
+barcolor(showGhost ? color.new(color.gray, 80) : na)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// HTF BIAS — based on current HTF candle direction
+// ─────────────────────────────────────────────────────────────────────────────
+// htfBull/htfMid/biasStr — declared above signal logic
+
+// ─────────────────────────────────────────────────────────────────────────────
+// DASHBOARD — 9×4 cinema bar, bottom_center
+// ─────────────────────────────────────────────────────────────────────────────
+if showDash and barstate.islast
+    string locTxt = atHTFMid ? "AT MID ◈" : close > htfMid ? "ABOVE MID▲" : "BELOW MID▼"
+    color  locCol = atHTFMid ? C_GOLD : close > htfMid ? C_BULL : C_BEAR
+
+    string posTxt = not g_inTrade ? "  FLAT  --" : g_isLong ? "LONG   ●" : "SHORT  ●"
+    color  posCol = not g_inTrade ? C_MUTED : g_isLong ? C_BULL : C_BEAR
+    string tpDTxt = not g_inTrade or na(g_tp) ? "--" : str.tostring(g_tp, format.mintick)
+    string cdTxt  = g_inTrade ? "IN TRADE" : bar_index - lastSigBar < cooldown ? "CD " + str.tostring(cooldown - (bar_index - lastSigBar)) + "b" : "READY ✅"
+    color  cdCol  = g_inTrade ? C_GOLD : bar_index - lastSigBar < cooldown ? C_GOLD : C_BULL
+
+    string htfHTxt = na(htfH) ? "--" : str.tostring(htfH, format.mintick)
+    string htfLTxt = na(htfL) ? "--" : str.tostring(htfL, format.mintick)
+    string htfOTxt = na(htfO) ? "--" : str.tostring(htfO, format.mintick)
+    string htfCTxt = na(htfC) ? "--" : str.tostring(htfC, format.mintick)
+    string rngTxt  = na(htfRange) ? "--" : str.tostring(htfRange, format.mintick)
+    string midTxt  = na(htfMid) ? "--" : str.tostring(htfMid, format.mintick)
+
+    var table dash = table.new(position.bottom_center, 9, 4,
+         bgcolor=C_COL_BG, border_width=1, border_color=color.new(C_TEAL, 55))
+
+    // ROW 0 — STRIPE
+    for _c = 0 to 8
+        table.cell(dash, _c, 0, "", bgcolor=C_STRIPE, text_size=size.tiny)
+    table.cell(dash, 0, 0, " ◈ TOP-DOWN HTF CANDLES ◈ ",
+         text_color=C_TEAL, text_size=size.small, text_font_family=font.family_monospace, bgcolor=C_HDR_BG)
+    table.cell(dash, 8, 0, " CONFIRMED ◈ ",
+         text_color=C_TEAL, text_size=size.small, text_font_family=font.family_monospace, bgcolor=C_HDR_BG)
+
+    // ROW 1 — HEADERS
+    table.cell(dash, 0, 1, " ◈ TF PAIR ",
+         text_color=C_TEAL, text_size=size.small, text_font_family=font.family_monospace, bgcolor=C_HDR_BG)
+    table.cell(dash, 1, 1, " ◈ HTF BIAS ",
+         text_color=biasCol, text_size=size.small, text_font_family=font.family_monospace, bgcolor=color.new(#0a0a20, 30))
+    table.cell(dash, 2, 1, " ◈ HTF OPEN ",
+         text_color=C_GOLD, text_size=size.small, text_font_family=font.family_monospace, bgcolor=color.new(#1a1400, 30))
+    table.cell(dash, 3, 1, " ◈ HTF HIGH ",
+         text_color=C_BEAR, text_size=size.small, text_font_family=font.family_monospace, bgcolor=color.new(#1a0008, 30))
+    table.cell(dash, 4, 1, " ◈ HTF LOW ",
+         text_color=C_BULL, text_size=size.small, text_font_family=font.family_monospace, bgcolor=color.new(#001a08, 30))
+    table.cell(dash, 5, 1, " ◈ HTF MID ",
+         text_color=locCol, text_size=size.small, text_font_family=font.family_monospace, bgcolor=C_COL_ALT)
+    table.cell(dash, 6, 1, " ◈ HTF RANGE ",
+         text_color=C_MUTED, text_size=size.small, text_font_family=font.family_monospace, bgcolor=C_COL_BG)
+    table.cell(dash, 7, 1, " ◈ POSITION ",
+         text_color=posCol, text_size=size.small, text_font_family=font.family_monospace, bgcolor=C_COL_ALT)
+    table.cell(dash, 8, 1, " ◈ CONFIG ",
+         text_color=C_MUTED, text_size=size.small, text_font_family=font.family_monospace, bgcolor=C_COL_BG)
+
+    // ROW 2 — PRIMARY DATA
+    table.cell(dash, 0, 2, " " + currentTFName + "  →  " + htfTFName,
+         text_color=C_TEAL, text_size=size.small, text_font_family=font.family_monospace, bgcolor=C_HDR_BG)
+    table.cell(dash, 1, 2, " " + biasStr,
+         text_color=biasCol, text_size=size.small, text_font_family=font.family_monospace, bgcolor=color.new(#0a0a20, 40))
+    table.cell(dash, 2, 2, " O  " + htfOTxt,
+         text_color=C_GOLD, text_size=size.small, text_font_family=font.family_monospace, bgcolor=color.new(#1a1400, 40))
+    table.cell(dash, 3, 2, " H  " + htfHTxt,
+         text_color=C_BEAR, text_size=size.small, text_font_family=font.family_monospace, bgcolor=color.new(#1a0008, 40))
+    table.cell(dash, 4, 2, " L  " + htfLTxt,
+         text_color=C_BULL, text_size=size.small, text_font_family=font.family_monospace, bgcolor=color.new(#001a08, 40))
+    table.cell(dash, 5, 2, " MID " + midTxt,
+         text_color=locCol, text_size=size.small, text_font_family=font.family_monospace, bgcolor=C_COL_ALT)
+    table.cell(dash, 6, 2, " " + rngTxt + " pts",
+         text_color=C_MUTED, text_size=size.small, text_font_family=font.family_monospace, bgcolor=C_COL_BG)
+    table.cell(dash, 7, 2, " " + posTxt,
+         text_color=posCol, text_size=size.small, text_font_family=font.family_monospace, bgcolor=C_COL_ALT)
+    table.cell(dash, 8, 2, " " + str.tostring(numCandles) + " candles",
+         text_color=C_MUTED, text_size=size.small, text_font_family=font.family_monospace, bgcolor=C_COL_BG)
+
+    // ROW 3 — SECONDARY
+    table.cell(dash, 0, 3, " AUTO: " + (htfAuto ? "ON" : "OFF"),
+         text_color=color.new(C_TEAL, 40), text_size=size.tiny, text_font_family=font.family_monospace, bgcolor=C_HDR_BG)
+    table.cell(dash, 1, 3, " Abv Open: " + (htfAbvO ? "YES ▲" : "NO  ▼"),
+         text_color=htfAbvO ? C_BULL : C_BEAR, text_size=size.tiny, text_font_family=font.family_monospace, bgcolor=C_COL_BG)
+    table.cell(dash, 2, 3, " C  " + htfCTxt,
+         text_color=color.new(C_GOLD, 40), text_size=size.tiny, text_font_family=font.family_monospace, bgcolor=C_COL_BG)
+    table.cell(dash, 3, 3, " BSL = Swing Highs",
+         text_color=color.new(C_BEAR, 50), text_size=size.tiny, text_font_family=font.family_monospace, bgcolor=C_COL_BG)
+    table.cell(dash, 4, 3, " SSL = Swing Lows",
+         text_color=color.new(C_BULL, 50), text_size=size.tiny, text_font_family=font.family_monospace, bgcolor=C_COL_BG)
+    table.cell(dash, 5, 3, " Midline Reference",
+         text_color=C_MUTED, text_size=size.tiny, text_font_family=font.family_monospace, bgcolor=C_COL_BG)
+    table.cell(dash, 6, 3, " FVG + BOS zones",
+         text_color=C_MUTED, text_size=size.tiny, text_font_family=font.family_monospace, bgcolor=C_COL_BG)
+    table.cell(dash, 7, 3, " TP " + tpDTxt + "  " + cdTxt,
+         text_color=cdCol, text_size=size.tiny, text_font_family=font.family_monospace, bgcolor=C_COL_BG)
+    table.cell(dash, 8, 3, " W=" + str.tostring(candleW) + " G=" + str.tostring(gapBars),
+         text_color=C_MUTED, text_size=size.tiny, text_font_family=font.family_monospace, bgcolor=C_COL_BG)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ALERTS
+// ─────────────────────────────────────────────────────────────────────────────
+alertcondition(buySignal,  "HTF BUY Signal",  "Top-Down HTF — BUY: SSL reclaim, HTF bias bullish, entry confirmed")
+alertcondition(sellSignal, "HTF SELL Signal", "Top-Down HTF — SELL: BSL reclaim, HTF bias bearish, entry confirmed")
+alertcondition(not na(htfH) and ta.cross(close, htfH), "HTF High Cross",  "Top-Down — Price crossed HTF High")
+alertcondition(not na(htfL) and ta.cross(close, htfL), "HTF Low Cross",   "Top-Down — Price crossed HTF Low")
+alertcondition(not na(htfO) and ta.cross(close, htfO), "HTF Open Cross",  "Top-Down — Price crossed HTF Open")
+alertcondition(not na(htfMid) and ta.cross(close, htfMid), "HTF Mid Cross","Top-Down — Price crossed HTF Midline")
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  For educational and informational purposes only. Not financial advice.
+//  Created by ArisCodes | CodaPro Engine | 2026
+// ─────────────────────────────────────────────────────────────────────────────

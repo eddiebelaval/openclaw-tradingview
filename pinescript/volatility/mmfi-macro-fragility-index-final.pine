@@ -1,0 +1,406 @@
+//@version=6
+indicator("MMFI - Macro Fragility Index v3.5", overlay=false, max_labels_count=200, max_lines_count=50)
+
+// ============================================================================
+// Inputs
+// ============================================================================
+groupSyms = "Symbols (Fragility Core)"
+symSPY  = input.string("SPY",  "SPY (Equity baseline)", group=groupSyms)
+symHYG  = input.string("HYG",  "HYG (Credit)", group=groupSyms)
+symEEM  = input.string("EEM",  "EEM (EM)", group=groupSyms)
+symFXI  = input.string("FXI",  "FXI (China)", group=groupSyms)
+symUUP  = input.string("UUP",  "UUP (USD)", group=groupSyms)
+symVIXY = input.string("VIXY", "VIXY (Vol proxy)", group=groupSyms)
+symGLD  = input.string("GLD",  "GLD (Haven)", group=groupSyms)
+
+groupCore = "Core"
+tf        = input.timeframe("D", "Signal Timeframe", group=groupCore)
+zLen      = input.int(60, "Z-Score Length", minval=20, group=groupCore)
+rocFast   = input.int(5, "ROC Fast", minval=2, group=groupCore)
+rocSlow   = input.int(14, "ROC Slow", minval=3, group=groupCore)
+volLen    = input.int(20, "Volatility Window", minval=10, group=groupCore)
+smoothLen = input.int(5, "Score Smoothing (EMA)", minval=1, group=groupCore)
+
+groupW = "Weights (Fragility Leading)"
+wCreditRel = input.float(2.0, "Credit vs Equity (HYG/SPY)", minval=0.0, step=0.1, group=groupW)
+wEmRel     = input.float(1.6, "EM vs Equity (EEM/SPY)", minval=0.0, step=0.1, group=groupW)
+wChinaRel  = input.float(1.4, "China vs Equity (FXI/SPY)", minval=0.0, step=0.1, group=groupW)
+wUsdAccel  = input.float(1.5, "USD Acceleration (UUP)", minval=0.0, step=0.1, group=groupW)
+wVolAccel  = input.float(2.2, "Vol Acceleration (VIXY)", minval=0.0, step=0.1, group=groupW)
+wHavenRel  = input.float(0.8, "Haven vs Equity (GLD/SPY)", minval=0.0, step=0.1, group=groupW)
+
+groupThr = "Thresholds (0-100)"
+thrWatch  = input.float(30.0, "Watch",   minval=0.0, maxval=100.0, step=0.5, group=groupThr)
+thrCaut   = input.float(45.0, "Caution", minval=0.0, maxval=100.0, step=0.5, group=groupThr)
+thrDerisk = input.float(60.0, "De-risk", minval=0.0, maxval=100.0, step=0.5, group=groupThr)
+thrDef    = input.float(75.0, "Defense", minval=0.0, maxval=100.0, step=0.5, group=groupThr)
+
+groupAcc = "Accuracy Controls"
+persistBars = input.int(3, "Regime Persistence Bars", minval=1, group=groupAcc)
+rocLenScore = input.int(5, "Score ROC Length", minval=1, group=groupAcc)
+stressVolThreshold = input.float(0.60, "Stress Vol Trigger", minval=0.0, maxval=1.0, step=0.01, group=groupAcc)
+
+groupGates = "Institutional Gates (v3.5)"
+liqLen     = input.int(200, "Liquidity MA (SPY)", minval=50, group=groupGates)
+credLen    = input.int(50,  "Credit MA (HYG)", minval=20, group=groupGates)
+
+groupExec = "Execution (Futures + Triggers)"
+overlaySym  = input.string("NQ1!", "Overlay Futures Symbol (ES1! or NQ1!)", group=groupExec)
+overlayWin  = input.int(120, "Overlay Normalization Window", minval=20, group=groupExec)
+maLen       = input.int(50, "Structure MA Length (Futures)", minval=20, group=groupExec)
+divLen      = input.int(40, "Divergence Lookback", minval=10, group=groupExec)
+showOverlay = input.bool(true, "Show Futures Overlay (Normalized)", group=groupExec)
+
+groupUI = "UI"
+showTable  = input.bool(true, "Show Table", group=groupUI)
+tblPosOpt  = input.string("Middle Right", "Table Position",
+     options=["Top Right","Middle Right","Bottom Right","Top Left","Middle Left","Bottom Left","Top Center","Middle Center","Bottom Center"], group=groupUI)
+
+// ============================================================================
+// Helpers
+// ============================================================================
+f_zscore(_x, _len) =>
+    float _m = ta.sma(_x, _len)
+    float _s = ta.stdev(_x, _len)
+    float _z = 0.0
+    if not na(_m) and not na(_s) and _s != 0.0
+        _z := (_x - _m) / _s
+    _z
+
+f_clamp01(_x) =>
+    float _y = _x
+    if _y < 0.0
+        _y := 0.0
+    if _y > 1.0
+        _y := 1.0
+    _y
+
+f_z_to_01(_z) =>
+    float _v = 0.5 + (_z * 0.25)
+    f_clamp01(_v)
+
+f_clampInt(_v, _lo, _hi) =>
+    int _x = _v
+    if _x < _lo
+        _x := _lo
+    if _x > _hi
+        _x := _hi
+    _x
+
+f_tblPos(_opt) =>
+    var int _dummy = 0
+    _pos = position.middle_right
+    if _opt == "Top Right"
+        _pos := position.top_right
+    if _opt == "Middle Right"
+        _pos := position.middle_right
+    if _opt == "Bottom Right"
+        _pos := position.bottom_right
+    if _opt == "Top Left"
+        _pos := position.top_left
+    if _opt == "Middle Left"
+        _pos := position.middle_left
+    if _opt == "Bottom Left"
+        _pos := position.bottom_left
+    if _opt == "Top Center"
+        _pos := position.top_center
+    if _opt == "Middle Center"
+        _pos := position.middle_center
+    if _opt == "Bottom Center"
+        _pos := position.bottom_center
+    _pos
+
+// ============================================================================
+// Series Fetch
+// ============================================================================
+cSPY  = request.security(symSPY,  tf, close)
+cHYG  = request.security(symHYG,  tf, close)
+cEEM  = request.security(symEEM,  tf, close)
+cFXI  = request.security(symFXI,  tf, close)
+cUUP  = request.security(symUUP,  tf, close)
+cVIXY = request.security(symVIXY, tf, close)
+cGLD  = request.security(symGLD,  tf, close)
+
+cOv = request.security(overlaySym, tf, close)
+
+// ============================================================================
+// Institutional Gates (Liquidity + Credit)
+// ============================================================================
+spyMA = ta.sma(cSPY, liqLen)
+hygMA = ta.sma(cHYG, credLen)
+
+bool liqRisk = not na(spyMA) and cSPY < spyMA
+bool credBreak = not na(hygMA) and cHYG < hygMA
+
+// Ratios
+float creditRatio = na
+float emRatio     = na
+float chinaRatio  = na
+float havenRatio  = na
+if not na(cSPY) and cSPY != 0.0
+    creditRatio := cHYG / cSPY
+    emRatio     := cEEM / cSPY
+    chinaRatio  := cFXI / cSPY
+    havenRatio  := cGLD / cSPY
+
+// ============================================================================
+// Fragility Components (0..1)
+// ============================================================================
+creditMom = ta.roc(creditRatio, rocSlow)
+emMom     = ta.roc(emRatio,     rocSlow)
+chinaMom  = ta.roc(chinaRatio,  rocSlow)
+havenMom  = ta.roc(havenRatio,  rocSlow)
+
+zCredit = f_zscore(creditMom, zLen)
+zEM     = f_zscore(emMom,     zLen)
+zChina  = f_zscore(chinaMom,  zLen)
+zHaven  = f_zscore(havenMom,  zLen)
+
+// Negative relative momentum => fragility rises
+credit01 = 1.0 - f_z_to_01(zCredit)
+em01     = 1.0 - f_z_to_01(zEM)
+china01  = 1.0 - f_z_to_01(zChina)
+haven01  = f_z_to_01(zHaven)
+
+// USD acceleration
+usdFast  = ta.roc(cUUP, rocFast)
+usdSlow  = ta.roc(cUUP, rocSlow)
+usdAccel = usdFast - usdSlow
+usd01    = f_z_to_01(f_zscore(usdAccel, zLen))
+
+// Vol acceleration (realized vol of VIXY returns)
+vixRet   = ta.roc(cVIXY, 1)
+rv       = ta.stdev(vixRet, volLen)
+rvFast   = ta.roc(rv, rocFast)
+rvSlow   = ta.roc(rv, rocSlow)
+volAccel = rvFast - rvSlow
+vol01    = f_z_to_01(f_zscore(volAccel, zLen))
+
+// ============================================================================
+// Weighted Score (0..100)
+// ============================================================================
+wSum = (wCreditRel + wEmRel + wChinaRel + wUsdAccel + wVolAccel + wHavenRel)
+
+raw01 = 0.0
+raw01 := raw01 + (credit01 * wCreditRel)
+raw01 := raw01 + (em01     * wEmRel)
+raw01 := raw01 + (china01  * wChinaRel)
+raw01 := raw01 + (usd01    * wUsdAccel)
+raw01 := raw01 + (vol01    * wVolAccel)
+raw01 := raw01 + (haven01  * wHavenRel)
+
+scoreRaw = 0.0
+if wSum != 0.0
+    scoreRaw := (raw01 / wSum) * 100.0
+
+score    = ta.ema(scoreRaw, smoothLen)
+scoreRoc = ta.roc(score, rocLenScore)
+bool rising = scoreRoc > 0.0
+
+// ============================================================================
+// Accuracy: Persistence + Stress Gating
+// ============================================================================
+bool aboveCaut   = score >= thrCaut
+bool aboveDerisk = score >= thrDerisk
+bool cautPersist   = ta.barssince(not aboveCaut) >= persistBars
+bool deriskPersist = ta.barssince(not aboveDerisk) >= persistBars
+
+bool stressExpansionRaw = (score >= thrCaut) and rising and (vol01 > stressVolThreshold)
+bool stressConfirmed    = stressExpansionRaw and cautPersist
+
+// ============================================================================
+// Drivers string
+// ============================================================================
+string drivers = ""
+if vol01 > 0.65
+    drivers := drivers + "VOL "
+if usd01 > 0.65
+    drivers := drivers + "USD "
+if credit01 > 0.65
+    drivers := drivers + "CREDIT "
+if em01 > 0.65
+    drivers := drivers + "EM "
+if china01 > 0.65
+    drivers := drivers + "CHINA "
+if haven01 > 0.65
+    drivers := drivers + "HAVEN "
+if str.length(drivers) == 0
+    drivers := "None"
+
+// ============================================================================
+// Expansion Probability (gated by macro regimes)
+// ============================================================================
+float expansionProb = 25.0
+if score >= thrWatch
+    expansionProb := 40.0
+if score >= thrCaut
+    expansionProb := 55.0
+if score >= thrCaut and rising
+    expansionProb := 65.0
+if stressExpansionRaw
+    expansionProb := 75.0
+if cautPersist
+    expansionProb := 85.0
+if deriskPersist
+    expansionProb := 95.0
+
+// Macro gates adjust probability (institutional filtering)
+if liqRisk
+    expansionProb := math.min(100.0, expansionProb + 10.0)
+if credBreak
+    expansionProb := math.min(100.0, expansionProb + 10.0)
+
+// ============================================================================
+// Execution: Divergence + Structural Breakdown (GATED)
+// ============================================================================
+ovMA = ta.sma(cOv, maLen)
+bool belowMA = not na(ovMA) and cOv < ovMA
+
+scoreNewHigh = score > ta.highest(score[1], divLen)
+priceNewHigh = cOv > ta.highest(cOv[1], divLen)
+bool divWarn = scoreNewHigh and priceNewHigh and (score >= thrWatch)
+
+// Breakdown trigger must have confirmed stress AND macro gate
+bool macroGate = liqRisk or credBreak
+bool breakdownTrigger = belowMA and stressConfirmed and macroGate and (score >= thrCaut)
+
+// ============================================================================
+// Regime + Action (institutional ladder)
+// ============================================================================
+string regime = "CALM"
+string action = "Hold baseline risk."
+
+if score >= thrWatch
+    regime := "WATCH"
+    action := "Tighten stops. Reduce leverage."
+
+// Promote to CAUTION only if persistence is met
+if score >= thrCaut and cautPersist
+    regime := "CAUTION"
+    action := "Monitor risk. Favor quality."
+
+if score >= thrCaut and cautPersist and rising
+    regime := "CAUTION"
+    action := "Trim beta. Favor quality."
+
+// De-risk requires its own persistence
+if score >= thrDerisk and deriskPersist
+    regime := "DE-RISK"
+    action := "Prep hedges. Reduce exposure."
+
+if score >= thrDerisk and deriskPersist and rising
+    regime := "DE-RISK"
+    action := "Hedge or cut exposure now."
+
+if score >= thrDef
+    regime := "DEFENSE"
+    action := "Capital protection mode."
+
+// Stress language: confirmed vs attempt
+if stressConfirmed and macroGate
+    action := "SHORT BIAS - Stress confirmed with macro gate."
+if stressExpansionRaw and not cautPersist
+    action := "EARLY WARNING - Stress attempt (not confirmed)."
+
+// If stress confirmed but macro gate is OFF, keep it defensive not aggressive
+if stressConfirmed and not macroGate
+    action := "RISK ROTATION - Stress confirmed but no macro gate."
+
+// If breakdown trigger is true, override action
+if breakdownTrigger
+    action := "EXECUTE - Breakdown trigger (MA breach + gated stress)."
+
+// ============================================================================
+// Overlay normalized (0..100)
+// ============================================================================
+oMin = ta.lowest(cOv, overlayWin)
+oMax = ta.highest(cOv, overlayWin)
+float ovNorm = na
+if not na(oMin) and not na(oMax) and (oMax - oMin) != 0.0
+    ovNorm := 100.0 * (cOv - oMin) / (oMax - oMin)
+
+float plotOv = na
+if showOverlay
+    plotOv := ovNorm
+
+// ============================================================================
+// Institutional Gradient Histogram (smooth 0..100)
+// ============================================================================
+float scoreNorm = score / 100.0
+int r = f_clampInt(int(255 * scoreNorm), 0, 255)
+int g = f_clampInt(int(200 * (1.0 - scoreNorm)), 0, 255)
+int b = f_clampInt(int(40  * (1.0 - scoreNorm)), 0, 255)
+color histColor = color.rgb(r, g, b)
+
+// ============================================================================
+// Visuals
+// ============================================================================
+plot(score, title="MMFI Wave (0-100)", linewidth=2)
+plot(score, title="MMFI Histogram (Gradient)", style=plot.style_columns, linewidth=2, color=histColor)
+plot(plotOv, title="Futures Overlay (Normalized 0-100)", linewidth=2)
+
+hline(thrWatch,  "Watch",   linestyle=hline.style_dotted)
+hline(thrCaut,   "Caution", linestyle=hline.style_dotted)
+hline(thrDerisk, "De-risk", linestyle=hline.style_dotted)
+hline(thrDef,    "Defense", linestyle=hline.style_solid)
+
+// Background (subtle)
+color bg = na
+if score >= thrWatch
+    bg := color.new(color.orange, 94)
+if score >= thrCaut
+    bg := color.new(color.orange, 92)
+if score >= thrDerisk
+    bg := color.new(color.red, 93)
+if score >= thrDef
+    bg := color.new(color.red, 91)
+bgcolor(bg)
+
+// ============================================================================
+// Lamp / State (macro desk language)
+// ============================================================================
+string lamp = "NEUTRAL"
+if stressExpansionRaw and not cautPersist
+    lamp := "EARLY WARNING"
+if stressConfirmed and not macroGate
+    lamp := "CONFIRMED (NO GATE)"
+if stressConfirmed and macroGate
+    lamp := "STRESS CONFIRMED"
+if divWarn and not breakdownTrigger
+    lamp := "DIVERGENCE WARNING"
+if breakdownTrigger
+    lamp := "BREAKDOWN TRIGGER"
+
+// Gate string
+string gateStr = "GATE: OFF"
+if macroGate
+    gateStr := "GATE: ON"
+
+// ============================================================================
+// Table (1 col x 9 rows) - explicit clear bounds
+// ============================================================================
+var table t = na
+if showTable and na(t)
+    t := table.new(f_tblPos(tblPosOpt), 1, 9)
+
+if showTable and not na(t)
+    table.clear(t, 0, 0, 0, 8)
+    table.cell(t, 0, 0, "MMFI - Macro Fragility Index v3.5", text_color=color.white, bgcolor=color.new(color.black, 0))
+    table.cell(t, 0, 1, "Score: " + str.tostring(score, "#.0") + " | " + regime, text_color=color.white, bgcolor=color.new(color.black, 0))
+    table.cell(t, 0, 2, "ROC: " + str.tostring(scoreRoc, "#.2") + " | Rising: " + str.tostring(rising), text_color=color.white, bgcolor=color.new(color.black, 0))
+    table.cell(t, 0, 3, "Persist (C/D): " + str.tostring(cautPersist) + " / " + str.tostring(deriskPersist), text_color=color.white, bgcolor=color.new(color.black, 0))
+    table.cell(t, 0, 4, "Expansion Prob: " + str.tostring(expansionProb, "#") + "% | Lamp: " + lamp, text_color=color.white, bgcolor=color.new(color.black, 0))
+    table.cell(t, 0, 5, gateStr + " | LiquidityRisk: " + str.tostring(liqRisk) + " | CreditBreak: " + str.tostring(credBreak), text_color=color.white, bgcolor=color.new(color.black, 0))
+    table.cell(t, 0, 6, "Drivers: " + drivers, text_color=color.white, bgcolor=color.new(color.black, 0))
+    table.cell(t, 0, 7, "BreakdownTrig: " + str.tostring(breakdownTrigger) + " | BelowMA: " + str.tostring(belowMA), text_color=color.white, bgcolor=color.new(color.black, 0))
+    table.cell(t, 0, 8, "Action: " + action, text_color=color.white, bgcolor=color.new(color.black, 0))
+
+// ============================================================================
+// Alerts (ASCII only)
+// ============================================================================
+alertcondition(stressConfirmed and macroGate, title="MMFI Stress Confirmed Gate ON", message="MMFI: Stress confirmed and macro gate ON.")
+alertcondition(stressConfirmed and not macroGate, title="MMFI Stress Confirmed Gate OFF", message="MMFI: Stress confirmed but macro gate OFF (risk rotation).")
+alertcondition(stressExpansionRaw and not cautPersist, title="MMFI Stress Attempt", message="MMFI: Stress attempt (not confirmed).")
+alertcondition(divWarn, title="MMFI Divergence Warning", message="MMFI: Divergence warning (score and price making highs).")
+alertcondition(breakdownTrigger, title="MMFI Breakdown Trigger", message="MMFI: Breakdown trigger (MA breach + gated stress).")
+alertcondition(score >= thrDef, title="MMFI Defense", message="MMFI: Defense regime reached.")

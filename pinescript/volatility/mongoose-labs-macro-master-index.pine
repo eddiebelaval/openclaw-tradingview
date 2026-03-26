@@ -1,0 +1,288 @@
+//@version=6
+indicator("Mongoose Labs: Macro Master Index [ASCII]", overlay=false, max_labels_count=300)
+
+// ============================================================================
+// Inputs
+// ============================================================================
+groupRates = "Rates (YieldPulse)"
+sym10Y = input.symbol("TVC:TNX",    "10Y Yield (TNX)", group=groupRates)
+sym2Y  = input.symbol("TVC:US02Y",  "2Y Yield (US02Y)", group=groupRates)
+sym3M  = input.symbol("CBOE:IRX.P", "3M Yield (IRX.P)", group=groupRates)
+
+groupCredit = "Credit Stress (MCSW Core)"
+symSPX     = input.symbol("SP:SPX",    "SPX (Stress Proxy)", group=groupCredit)
+symREVOLSL = input.symbol("REVOLSL",   "REVOLSL (Revolving Credit)", group=groupCredit)
+symDRCCLAC = input.symbol("DRCCLACBS", "DRCCLACBS (Card Delinquency)", group=groupCredit)
+
+groupModel = "Model"
+lenZ     = input.int(126, "Z Lookback", minval=30, group=groupModel)
+kLogit   = input.float(1.25, "Probability Steepness (k)", minval=0.25, step=0.05, group=groupModel)
+useClamp = input.bool(true, "Clamp Z (stability)", group=groupModel)
+clampAbs = input.float(3.0, "Clamp Abs(Z)", minval=1.0, step=0.5, group=groupModel)
+
+thrExp = input.float(0.75, "Expansion Threshold (MMI_Z)", step=0.05, group=groupModel)
+thrCon = input.float(-0.75,"Contraction Threshold (MMI_Z)", step=0.05, group=groupModel)
+
+groupConfirm = "Confirm (Optional)"
+useSPXTrendConfirm = input.bool(false, "Confirm Expansion w/ SPX Trend", group=groupConfirm)
+spxMaLen          = input.int(200, "SPX MA Length", minval=20, group=groupConfirm)
+
+groupUI = "UI"
+showComponents = input.bool(true, "Show Components (YieldZ, CreditAdjZ)", group=groupUI)
+showRibbon     = input.bool(true, "Show Regime Ribbon", group=groupUI)
+useBgWash      = input.bool(true, "Background Regime Wash", group=groupUI)
+washOpacity    = input.int(84, "Wash Opacity 70-95 (lower=stronger)", minval=70, maxval=95, group=groupUI)
+
+showProbTint   = input.bool(true, "Probability Tint", group=groupUI)
+tintOpacity    = input.int(92, "Tint Opacity 80-97 (lower=stronger)", minval=80, maxval=97, group=groupUI)
+
+ribbonOpacity  = input.int(45, "Ribbon Opacity 0-80 (higher=softer)", minval=0, maxval=80, group=groupUI)
+gradRange      = input.float(4.0, "Gradient Range (wider=less saturated)", minval=2.0, step=0.5, group=groupUI)
+
+showLineTags   = input.bool(true, "Name Lines On-Chart", group=groupUI)
+
+showTable    = input.bool(true, "Show Dashboard", group=groupUI)
+tblPosOpt    = input.string("Middle Right", "Table Position",
+                 options=["Top Right","Middle Right","Bottom Right","Top Left","Middle Left","Bottom Left"], group=groupUI)
+tableOpacity = input.int(90, "Table Opacity 0-100", minval=0, maxval=100, group=groupUI)
+decimals     = input.int(2, "Decimals (0-4)", minval=0, maxval=4, group=groupUI)
+
+// ============================================================================
+// Helpers
+// ============================================================================
+f_pos(opt) =>
+    opt == "Top Right" ? position.top_right :
+     opt == "Middle Right" ? position.middle_right :
+     opt == "Bottom Right" ? position.bottom_right :
+     opt == "Top Left" ? position.top_left :
+     opt == "Middle Left" ? position.middle_left :
+     position.bottom_left
+
+f_z(x, n) =>
+    float m = ta.sma(x, n)
+    float s = ta.stdev(x, n)
+    s == 0.0 ? 0.0 : (x - m) / s
+
+f_fmt(x, d) =>
+    d == 0 ? str.tostring(x, "#") :
+     d == 1 ? str.tostring(x, "#.#") :
+     d == 2 ? str.tostring(x, "#.##") :
+     d == 3 ? str.tostring(x, "#.###") :
+     str.tostring(x, "#.####")
+
+f_logitProb(z, k) =>
+    100.0 / (1.0 + math.exp(-k * z))
+
+f_normRate(v) =>
+    v > 20.0 ? v / 10.0 : v
+
+f_clamp(x, a) =>
+    math.max(-a, math.min(a, x))
+
+f_gradZ(z, gradRangeVal) =>
+    float zz = f_clamp(z, gradRangeVal)
+    color.from_gradient(zz, -gradRangeVal, gradRangeVal, color.red, color.lime)
+
+f_gradP(p) =>
+    color.from_gradient(p, 0.0, 100.0, color.red, color.lime)
+
+f_bg(op) =>
+    color.new(color.black, 100 - op)
+
+// ============================================================================
+// Data: Rates (YieldPulse)
+// ============================================================================
+r10 = f_normRate(request.security(sym10Y, timeframe.period, close, barmerge.gaps_on,  barmerge.lookahead_off))
+r2  = f_normRate(request.security(sym2Y,  timeframe.period, close, barmerge.gaps_on,  barmerge.lookahead_off))
+r3  = f_normRate(request.security(sym3M,  timeframe.period, close, barmerge.gaps_on,  barmerge.lookahead_off))
+
+s10_2 = r10 - r2
+s10_3 = r10 - r3
+s2_3  = r2  - r3
+
+z10_2 = f_z(s10_2, lenZ)
+z10_3 = f_z(s10_3, lenZ)
+z2_3  = f_z(s2_3,  lenZ)
+
+float yieldZ_raw = (z10_2 + z10_3 + z2_3) / 3.0
+float yieldZ     = useClamp ? f_clamp(yieldZ_raw, clampAbs) : yieldZ_raw
+
+// ============================================================================
+// Data: Credit Stress (hardened for low-frequency econ series)
+// Fixes:
+// - Econ series use barmerge.gaps_off to carry-forward prints
+// - Safe averaging is Pine-safe (no multiline expression assignments)
+// ============================================================================
+float spxClose = request.security(symSPX, timeframe.period, close, barmerge.gaps_on,  barmerge.lookahead_off)
+float spxMA    = ta.sma(spxClose, spxMaLen)
+bool  spxUp    = spxClose > spxMA
+
+float spxMom    = ta.roc(spxClose, 20)
+float spxStress = -f_z(spxMom, lenZ)
+
+float revol  = request.security(symREVOLSL, timeframe.period, close, barmerge.gaps_off, barmerge.lookahead_off)
+float delinq = request.security(symDRCCLAC, timeframe.period, close, barmerge.gaps_off, barmerge.lookahead_off)
+
+float revolZ  = f_z(revol, lenZ)
+float delinqZ = f_z(delinq, lenZ)
+
+// Safe averaging (no line continuation issues)
+int c1 = not na(spxStress) ? 1 : 0
+int c2 = not na(revolZ)    ? 1 : 0
+int c3 = not na(delinqZ)   ? 1 : 0
+int creditCount = c1 + c2 + c3
+
+float s1 = not na(spxStress) ? spxStress : 0.0
+float s2 = not na(revolZ)    ? revolZ    : 0.0
+float s3 = not na(delinqZ)   ? delinqZ   : 0.0
+float creditSum = s1 + s2 + s3
+
+float creditZ_raw = creditCount > 0 ? (creditSum / creditCount) : 0.0
+float creditZ     = useClamp ? f_clamp(creditZ_raw, clampAbs) : creditZ_raw
+float creditAdjZ  = -creditZ
+
+// ============================================================================
+// Macro Master Index (Equal Weight Z Engine)
+// ============================================================================
+float mmiZ_raw = (yieldZ + creditAdjZ) / 2.0
+float mmiZ     = useClamp ? f_clamp(mmiZ_raw, clampAbs) : mmiZ_raw
+
+string baseRegime =
+     mmiZ >= thrExp ? "EXPANSION" :
+     mmiZ <= thrCon ? "CONTRACTION" :
+     "NEUTRAL"
+
+string regime =
+     (useSPXTrendConfirm and baseRegime == "EXPANSION" and not spxUp) ? "NEUTRAL" : baseRegime
+
+float probExpansion   = f_logitProb(mmiZ, kLogit)
+float probContraction = 100.0 - probExpansion
+
+float confZ = math.min(100.0, math.abs(mmiZ) / 2.0 * 100.0)
+float confP = math.min(100.0, math.abs(probExpansion - 50.0) * 2.0)
+float confidence = confZ * 0.6 + confP * 0.4
+
+var int barsInRegime = 0
+bool regimeFlip = regime != regime[1]
+barsInRegime := regimeFlip ? 0 : (barsInRegime + 1)
+
+float mmiSlope = ta.sma(ta.change(mmiZ), 5)
+
+string callTxt =
+     regime == "EXPANSION" ? "Increase beta on pullbacks; favor cyclicals/financials; keep stops." :
+     regime == "CONTRACTION" ? "Reduce beta; raise quality/cash; prefer defensives; tighten risk." :
+     "Selective risk; wait for confirmation; trade smaller."
+
+// ============================================================================
+// Visuals
+// ============================================================================
+color mmiCol  = f_gradZ(mmiZ, gradRange)
+color probCol = f_gradP(probExpansion)
+
+color bg1 = useBgWash ? color.new(mmiCol, washOpacity) : na
+color bg2 = showProbTint ? color.new(probCol, tintOpacity) : na
+bgcolor(bg1)
+bgcolor(bg2)
+
+float ribbonY = thrCon - 0.15
+plot(showRibbon ? ribbonY : na, "Regime Ribbon", color=color.new(mmiCol, ribbonOpacity), linewidth=10, style=plot.style_line)
+
+plot(mmiZ, "MMI_Z", linewidth=3, color=mmiCol)
+hline(0.0, "Zero", linestyle=hline.style_dotted)
+hline(thrExp, "Expansion", linestyle=hline.style_dashed)
+hline(thrCon, "Contraction", linestyle=hline.style_dashed)
+
+plot(showComponents ? yieldZ : na, "YieldZ", linewidth=2, color=color.new(color.aqua, 0))
+plot(showComponents ? creditAdjZ : na, "CreditAdjZ", linewidth=2, color=color.new(color.orange, 0))
+
+// ============================================================================
+// Right-edge tags
+// ============================================================================
+var label labMMI = na
+var label labY   = na
+var label labC   = na
+
+if barstate.islast and showLineTags
+    if not na(labMMI)
+        label.delete(labMMI)
+    if not na(labY)
+        label.delete(labY)
+    if not na(labC)
+        label.delete(labC)
+
+    labMMI := label.new(bar_index, mmiZ, "MMI_Z  " + f_fmt(mmiZ, decimals), xloc=xloc.bar_index,
+         style=label.style_label_left, textcolor=color.white, color=color.new(mmiCol, 70), size=size.small)
+
+    if showComponents
+        labY := label.new(bar_index, yieldZ, "YieldZ  " + f_fmt(yieldZ, decimals), xloc=xloc.bar_index,
+             style=label.style_label_left, textcolor=color.white, color=color.new(color.aqua, 70), size=size.small)
+        labC := label.new(bar_index, creditAdjZ, "CreditAdjZ  " + f_fmt(creditAdjZ, decimals), xloc=xloc.bar_index,
+             style=label.style_label_left, textcolor=color.white, color=color.new(color.orange, 70), size=size.small)
+
+// ============================================================================
+// Alerts
+// ============================================================================
+bool isExpansion   = regime == "EXPANSION"
+bool isContraction = regime == "CONTRACTION"
+bool isNeutral     = regime == "NEUTRAL"
+
+alertcondition(ta.crossover(mmiZ, thrExp),   "MMI: Expansion Trigger",   "MMI_Z crossed above Expansion threshold.")
+alertcondition(ta.crossunder(mmiZ, thrCon),  "MMI: Contraction Trigger", "MMI_Z crossed below Contraction threshold.")
+alertcondition(isExpansion and not isExpansion[1],     "MMI: Flip to Expansion",   "MMI regime flipped to EXPANSION.")
+alertcondition(isContraction and not isContraction[1], "MMI: Flip to Contraction", "MMI regime flipped to CONTRACTION.")
+alertcondition(isNeutral and not isNeutral[1],         "MMI: Flip to Neutral",     "MMI regime flipped to NEUTRAL.")
+
+// ============================================================================
+// Table
+// ============================================================================
+var table t = table.new(f_pos(tblPosOpt), 2, 12, border_width=1)
+
+f_cell(row, col, txt, txtCol, bgCol) =>
+    table.cell(t, col, row, txt, text_color=txtCol, bgcolor=bgCol, text_size=size.small)
+
+if showTable
+    table.clear(t, 0, 0)
+
+    color hdrBg = color.new(color.gray, 65)
+    color rowBg = f_bg(tableOpacity)
+
+    color regCol =
+         regime == "EXPANSION" ? color.lime :
+         regime == "CONTRACTION" ? color.red :
+         color.silver
+
+    f_cell(0, 0, "Macro Master Index", color.white, hdrBg)
+    f_cell(0, 1, "Mongoose Labs", color.white, hdrBg)
+
+    f_cell(1, 0, "Regime", color.white, rowBg)
+    f_cell(1, 1, regime, regCol, rowBg)
+
+    f_cell(2, 0, "Prob Expansion", color.white, rowBg)
+    f_cell(2, 1, f_fmt(probExpansion, decimals) + "%", color.new(probCol, 0), rowBg)
+
+    f_cell(3, 0, "Prob Contraction", color.white, rowBg)
+    f_cell(3, 1, f_fmt(probContraction, decimals) + "%", color.white, rowBg)
+
+    f_cell(4, 0, "MMI_Z", color.white, rowBg)
+    f_cell(4, 1, f_fmt(mmiZ, decimals), color.new(mmiCol, 0), rowBg)
+
+    f_cell(5, 0, "Slope (5)", color.white, rowBg)
+    f_cell(5, 1, f_fmt(mmiSlope, decimals), color.white, rowBg)
+
+    f_cell(6, 0, "Confidence", color.white, rowBg)
+    f_cell(6, 1, f_fmt(confidence, 0) + "%", color.white, rowBg)
+
+    f_cell(7, 0, "Bars in Regime", color.white, rowBg)
+    f_cell(7, 1, str.tostring(barsInRegime), color.white, rowBg)
+
+    f_cell(8, 0, "YieldZ", color.white, rowBg)
+    f_cell(8, 1, f_fmt(yieldZ, decimals), color.new(color.aqua, 0), rowBg)
+
+    f_cell(9, 0, "CreditAdjZ", color.white, rowBg)
+    f_cell(9, 1, f_fmt(creditAdjZ, decimals), color.new(color.orange, 0), rowBg)
+
+    f_cell(10, 0, "Credit Inputs Used", color.white, rowBg)
+    f_cell(10, 1, str.tostring(creditCount) + "/3", color.white, rowBg)
+
+    f_cell(11, 0, "Call", color.white, rowBg)
+    f_cell(11, 1, callTxt, color.white, rowBg)

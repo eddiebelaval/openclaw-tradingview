@@ -1,0 +1,312 @@
+//@version=6
+indicator("Naked POC ", overlay=true, max_lines_count=500, max_labels_count=500)
+
+// -----------------------------------------------------------------------------
+// 1. 参数设置
+// -----------------------------------------------------------------------------
+grp_algo  = "核心算法"
+volType   = input.string("ZS-HV", "触发模式", options=["ZS-HV", "MAM-HV"], group=grp_algo)
+threshold = input.float(2.0, "触发阈值", minval=0.1, step=0.1, group=grp_algo)
+volLen    = input.int(50, "均线基准", minval=20, group=grp_algo)
+
+grp_filter = "智能筛选 (Smart Filter)"
+use_peak   = input.bool(true, "启用峰值过滤", group=grp_filter)
+lookback   = input.int(20, "局部回溯 (Lookback)", minval=5, group=grp_filter)
+peak_tol   = input.float(0.85, "峰值宽容度 (Tolerance)", minval=0.5, maxval=1.0, step=0.05, group=grp_filter, tooltip="解决连续放量不显示的问题。\n1.0 = 严格模式 (必须破新高才显示)。\n0.8 = 只要达到前高 80% 的量就显示。")
+prominence = input.float(1.8, "突出度系数 (Prominence)", minval=1.0, maxval=3.0, step=0.1, group=grp_filter, tooltip="当前量能需要是周围平均量的X倍才触发\n1.5 = 宽松 | 1.8 = 推荐 | 2.5 = 严格\n解决'中等放量'被误识别的问题")
+min_range  = input.float(0.6, "最小波幅% (Min Range)", minval=0.1, maxval=3.0, step=0.1, group=grp_filter, tooltip="K线波幅需达到价格的X%才触发\n0.5 = 宽松 | 0.8 = 推荐 | 1.5 = 严格\n过滤价格波动不明显的放量K线")
+use_rev    = input.bool(true, "启用反转特权", group=grp_filter)
+wick_ratio = input.float(0.38, "影线占比", minval=0.1, step=0.01, group=grp_filter)
+
+grp_data   = "全网聚合 & 周期"
+use_fusion = input.bool(true, "启用跨交易所聚合", group=grp_data)
+inc_bin    = input.bool(true, "Binance", group=grp_data, inline="ex1")
+inc_cb     = input.bool(true, "Coinbase", group=grp_data, inline="ex1")
+inc_byb    = input.bool(true, "Bybit", group=grp_data, inline="ex2")
+inc_okx    = input.bool(true, "OKX", group=grp_data, inline="ex2")
+
+tf_input   = input.string("1m", "微观扫描周期", options=["1m", "5m", "15m", "15s (Premium)", "30s (Premium)"], group=grp_data)
+string ltf_res = switch tf_input
+    "1m" => "1"
+    "5m" => "5"
+    "15m" => "15"
+    "15s (Premium)" => "15S"
+    "30s (Premium)" => "30S"
+    => "1"
+
+grp_vis    = "视觉 (所见即所得)"
+c_up       = input.color(#00B5FF, "阳线颜色 (Blue)", group=grp_vis)
+c_dn       = input.color(#FF005E, "阴线颜色 (Red)", group=grp_vis)
+show_label = input.bool(true, "显示价格标签", group=grp_vis)
+show_bg    = input.bool(false, "显示背景高亮", group=grp_vis)
+max_touch  = input.int(2, "触碰消失次数", minval=1, group=grp_vis)
+
+style_in   = input.string("Dashed (虚线)", "nPOC 样式", options=["Solid (实线)", "Dashed (虚线)", "Dotted (点状)"], group=grp_vis)
+string my_style = switch style_in
+    "Solid (实线)" => line.style_solid
+    "Dashed (虚线)" => line.style_dashed
+    "Dotted (点状)" => line.style_dotted
+    => line.style_dashed
+
+// ⭐ 新增：实时nPOC视觉设置
+grp_realtime = "实时nPOC设置"
+show_realtime = input.bool(true, "显示实时nPOC", group=grp_realtime, tooltip="未收盘K线也会显示nPOC并实时更新")
+realtime_style = input.string("Dotted (点状)", "实时nPOC样式", options=["Solid (实线)", "Dashed (虚线)", "Dotted (点状)"], group=grp_realtime)
+string rt_style = switch realtime_style
+    "Solid (实线)" => line.style_solid
+    "Dashed (虚线)" => line.style_dashed
+    "Dotted (点状)" => line.style_dotted
+    => line.style_dotted
+realtime_width = input.int(2, "实时nPOC线宽", minval=1, maxval=4, group=grp_realtime)
+
+// -----------------------------------------------------------------------------
+// 2. 数据获取
+// -----------------------------------------------------------------------------
+string base = syminfo.basecurrency
+string t_bin = "BINANCE:" + base + "USDT"
+string t_cb  = "COINBASE:" + base + "USD"
+string t_byb = "BYBIT:" + base + "USDT"
+string t_okx = "OKX:" + base + "USDT"
+
+float[] v_bin = use_fusion and inc_bin ? request.security_lower_tf(t_bin, ltf_res, volume, ignore_invalid_symbol=true) : na
+float[] v_cb  = use_fusion and inc_cb  ? request.security_lower_tf(t_cb,  ltf_res, volume, ignore_invalid_symbol=true) : na
+float[] v_byb = use_fusion and inc_byb ? request.security_lower_tf(t_byb, ltf_res, volume, ignore_invalid_symbol=true) : na
+float[] v_okx = use_fusion and inc_okx ? request.security_lower_tf(t_okx, ltf_res, volume, ignore_invalid_symbol=true) : na
+
+float[] v_curr = request.security_lower_tf(syminfo.tickerid, ltf_res, volume)
+float[] p_curr = request.security_lower_tf(syminfo.tickerid, ltf_res, hlc3)
+
+// -----------------------------------------------------------------------------
+// 3. 核心计算函数（提取为函数以便复用）
+// -----------------------------------------------------------------------------
+f_checkSignal(float vol, float vol_avg, float vol_stdev, float h, float l, float c, float o) =>
+    // 基础计算
+    float z_val = (vol_stdev != 0) ? (vol - vol_avg) / vol_stdev : 0
+    float ratio_val = (vol_avg != 0) ? vol / vol_avg : 0
+    
+    // 形态计算
+    float range_k = h - l
+    float body_k  = math.abs(c - o)
+    float wick_up = h - math.max(c, o)
+    float wick_dn = math.min(c, o) - l
+    bool isReversalShape = (wick_up > range_k * wick_ratio) or (wick_dn > range_k * wick_ratio)
+    float price_range_pct = c > 0 ? (h - l) / c * 100 : 0
+    
+    // 【轨道一：恐慌/贪婪巨量通道】
+    bool isPanicVol = (ratio_val >= 2.5) or (z_val >= 3.0)
+    
+    // 【轨道二：常规突破通道】
+    bool baseTrigger = (volType == "ZS-HV") ? (z_val > threshold) : (ratio_val > threshold)
+    
+    float recent_avg_vol = ta.sma(volume, 5)
+    bool isProminent = vol > (recent_avg_vol * prominence)
+    
+    bool hasSignificantRange = price_range_pct >= min_range
+    
+    float local_max_vol = ta.highest(volume, lookback)[1]
+    bool isNearPeak = vol >= (local_max_vol * peak_tol)
+    float vol_rank = ta.percentrank(volume, 50)
+    bool isHighRank = vol_rank >= 85.0
+    
+    bool isRegularVol = baseTrigger and isProminent and hasSignificantRange and (not use_peak or isNearPeak or isHighRank)
+    
+    // 最终信号
+    bool signal = isPanicVol or isRegularVol or (use_rev and baseTrigger and isReversalShape)
+    signal
+
+// 计算已收盘K线的信号
+volAvg = ta.sma(volume, volLen)
+volStdev = ta.stdev(volume, volLen)
+bool isSignal = f_checkSignal(volume, volAvg, volStdev, high, low, close, open)
+
+// ⭐ 计算当前K线的实时信号（即使未收盘）
+bool isRealtimeSignal = show_realtime ? f_checkSignal(volume, volAvg, volStdev, high, low, close, open) : false
+
+// -----------------------------------------------------------------------------
+// 4. nPOC 定位函数（提取为函数）
+// -----------------------------------------------------------------------------
+f_calcPOC() =>
+    float poc = na
+    int len_c = array.size(p_curr)
+    if len_c > 0
+        float max_val = -1.0
+        int max_idx = 0
+        for i = 0 to len_c - 1
+            float total_vol = 0.0
+            if use_fusion
+                if not na(v_bin) and array.size(v_bin) > i 
+                    total_vol += array.get(v_bin, i)
+                if not na(v_cb)  and array.size(v_cb)  > i 
+                    total_vol += array.get(v_cb, i)
+                if not na(v_byb) and array.size(v_byb) > i 
+                    total_vol += array.get(v_byb, i)
+                if not na(v_okx) and array.size(v_okx) > i 
+                    total_vol += array.get(v_okx, i)
+                if total_vol == 0 
+                    total_vol := array.get(v_curr, i)
+            else
+                total_vol := array.get(v_curr, i)
+            
+            if total_vol > max_val
+                max_val := total_vol
+                max_idx := i
+        poc := array.get(p_curr, max_idx)
+    else
+        poc := hlc3
+    poc
+
+// 计算nPOC
+var float calc_poc = na
+if isSignal
+    calc_poc := f_calcPOC()
+
+// ⭐ 实时nPOC计算
+var float realtime_poc = na
+if isRealtimeSignal
+    realtime_poc := f_calcPOC()
+
+// -----------------------------------------------------------------------------
+// 5. 绘图 (Visuals)
+// -----------------------------------------------------------------------------
+bool is_bull = close >= open
+color signal_col = is_bull ? c_up : c_dn
+
+float vol_ratio = math.min(volume / ta.highest(volume, 100), 1.0)
+float dyn_transp = 75.0 - (vol_ratio * 75.0) 
+if dyn_transp < 0 
+    dyn_transp := 0
+color final_col = color.new(signal_col, dyn_transp)
+
+barcolor(isSignal or isRealtimeSignal ? final_col : na)
+bgcolor(show_bg and (isSignal or isRealtimeSignal) ? color.new(signal_col, 85) : na)
+
+type SmartObj
+    line  ln
+    label lb
+    float price
+    int   touches
+    int   start_time
+    color self_color
+    bool  is_dead
+    bool  is_realtime  // ⭐ 新增：标记是否为实时nPOC
+
+var SmartObj[] levels = array.new<SmartObj>()
+
+// ⭐ 存储当前实时nPOC对象的引用
+var SmartObj current_realtime = na
+
+if array.size(levels) > 490
+    SmartObj old = array.shift(levels)
+    line.delete(old.ln)
+    label.delete(old.lb)
+
+// 更新已有的nPOC线
+if array.size(levels) > 0
+    for i = array.size(levels) - 1 to 0
+        SmartObj obj = array.get(levels, i)
+        if not obj.is_dead
+            line.set_y1(obj.ln, obj.price)
+            line.set_y2(obj.ln, obj.price)
+            label.set_y(obj.lb, obj.price)
+            
+            bool touched = (high >= obj.price and low <= obj.price) and (time > obj.start_time)
+            if touched
+                obj.touches += 1
+            
+            if obj.touches >= max_touch
+                obj.is_dead := true
+                line.set_style(obj.ln, line.style_dotted)
+                line.set_color(obj.ln, obj.self_color) 
+                label.delete(obj.lb)
+                line.set_x2(obj.ln, time) 
+            else
+                int ext_time = time_close + (time - time[1]) * 8
+                line.set_x2(obj.ln, ext_time)
+                label.set_x(obj.lb, ext_time)
+
+// ⭐ 处理实时nPOC（未收盘K线）
+if show_realtime and isRealtimeSignal and not barstate.isconfirmed
+    float finalPoc = na(realtime_poc) ? hlc3 : realtime_poc
+    
+    // 如果已经存在实时nPOC，更新它
+    if not na(current_realtime)
+        // 更新价格
+        current_realtime.price := finalPoc
+        line.set_y1(current_realtime.ln, finalPoc)
+        line.set_y2(current_realtime.ln, finalPoc)
+        if not na(current_realtime.lb)
+            label.set_y(current_realtime.lb, finalPoc)
+            label.set_text(current_realtime.lb, str.tostring(finalPoc, format.mintick))
+        
+        // 更新颜色
+        current_realtime.self_color := signal_col
+        line.set_color(current_realtime.ln, color.new(signal_col, 30)) // 半透明
+        if not na(current_realtime.lb)
+            label.set_textcolor(current_realtime.lb, signal_col)
+    else
+        // 创建新的实时nPOC
+        int ext_time = time_close + (time - time[1]) * 8
+        line l = line.new(time, finalPoc, ext_time, finalPoc, 
+                         xloc=xloc.bar_time, 
+                         color=color.new(signal_col, 30),  // 半透明表示实时
+                         style=rt_style, 
+                         width=realtime_width)
+        
+        label b = na
+        if show_label
+            b := label.new(ext_time, finalPoc, 
+                          str.tostring(finalPoc, format.mintick) + " ⚡", 
+                          xloc=xloc.bar_time, 
+                          style=label.style_none, 
+                          textcolor=signal_col, 
+                          size=size.normal)
+        
+        current_realtime := SmartObj.new(l, b, finalPoc, 0, time, signal_col, false, true)
+
+// ⭐ 当K线收盘时，转换实时nPOC为确认nPOC
+if barstate.isconfirmed
+    if not na(current_realtime)
+        // 如果这根K线依然满足信号条件，转为正式nPOC
+        if isSignal
+            // 更新样式为正式版本
+            line.set_style(current_realtime.ln, my_style)
+            line.set_color(current_realtime.ln, signal_col)
+            line.set_width(current_realtime.ln, 1)
+            current_realtime.is_realtime := false
+            
+            // 更新标签
+            if not na(current_realtime.lb)
+                label.set_text(current_realtime.lb, str.tostring(current_realtime.price, format.mintick))
+            
+            // 加入正式列表
+            array.push(levels, current_realtime)
+        else
+            // 如果最终不满足条件，删除实时nPOC
+            line.delete(current_realtime.ln)
+            label.delete(current_realtime.lb)
+        
+        // 清空实时引用
+        current_realtime := na
+
+// 处理已确认的信号（原有逻辑）
+if isSignal and barstate.isconfirmed
+    float finalPoc = na(calc_poc) ? hlc3 : calc_poc
+    
+    // 如果刚才有实时nPOC转正，就不重复创建了
+    if na(current_realtime)
+        line l = line.new(time, finalPoc, time_close + (time-time[1])*8, finalPoc, 
+                         xloc=xloc.bar_time, 
+                         color=signal_col, 
+                         style=my_style, 
+                         width=1)
+        
+        label b = na
+        if show_label
+            b := label.new(time_close + (time-time[1])*8, finalPoc, 
+                          str.tostring(finalPoc, format.mintick), 
+                          xloc=xloc.bar_time, 
+                          style=label.style_none, 
+                          textcolor=signal_col, 
+                          size=size.normal)
+        
+        array.push(levels, SmartObj.new(l, b, finalPoc, 0, time, signal_col, false, false))

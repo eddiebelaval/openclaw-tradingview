@@ -1,0 +1,243 @@
+// This source code is subject to the terms of the Mozilla Public License 2.0
+//@version=5
+indicator("SizeTale", overlay=true, max_lines_count=10, max_labels_count=5, max_boxes_count=5)
+
+// ─────────────────────────────────────────────
+//  INPUTS — 2 líneas arrastrables
+// ─────────────────────────────────────────────
+i_stop   = input.price(0.0, "Stop",   confirm=true)
+i_freeze = input.price(0.0, "Freeze", confirm=true)
+
+grp_s = "Sizing"
+i_max_loss = input.float(3000, "Max Loss ($)",       step=10,  minval=1,   group=grp_s)
+i_R        = input.float(120,  "1R = $",             step=10,  minval=1,   group=grp_s)
+i_lots     = input.int(10,     "N entradas",         minval=1, maxval=20,  group=grp_s)
+i_lot_size = input.int(0,      "Lote fijo (0=Auto)", minval=0, step=100,   group=grp_s)
+
+grp_b = "Boost (opcional)"
+i_boost_entry = input.int(0, "Boost entrada n (0=off)", minval=0, maxval=20, group=grp_b)
+i_boost_mult  = input.int(2, "Multiplicador",            minval=1, maxval=10, group=grp_b)
+
+grp_d = "Visualizacion"
+i_show_table = input.bool(true, "Mostrar tabla", group=grp_d)
+
+// ─────────────────────────────────────────────
+//  PRECIO DE REFERENCIA
+//  Capturado UNA SOLA VEZ al cargar el ticker.
+//  Se usa para detectar si i_stop es de otro ticker.
+// ─────────────────────────────────────────────
+var float ref_price = na
+if barstate.islastconfirmedhistory
+    ref_price := close
+if na(ref_price)
+    ref_price := close
+
+// ─────────────────────────────────────────────
+//  STOP
+//  Válido si está dentro de ±30% de ref_price (fijo).
+//  Si no → fallback a ref_price * 1.05 (también fijo).
+// ─────────────────────────────────────────────
+stop_ok  = i_stop > 0 and i_stop > ref_price * 0.70 and i_stop < ref_price * 1.30
+stop_raw = stop_ok ? i_stop : ref_price * 1.05
+
+// ─────────────────────────────────────────────
+//  DIRECCIÓN AUTO
+// ─────────────────────────────────────────────
+is_short = stop_raw > close
+dir      = is_short ? 1.0 : -1.0
+
+// ─────────────────────────────────────────────
+//  FREEZE
+//  Si el usuario ha colocado la línea (i_freeze > 0) → úsala siempre.
+//  Si aún no la ha colocado (0) → auto 2% desde stop como posición inicial.
+//  Así line.new() y input.price siempre coinciden → solo 2 líneas visibles.
+// ─────────────────────────────────────────────
+freeze_auto = is_short ? stop_raw * 0.98 : stop_raw * 1.02
+freeze_raw  = i_freeze > 0 ? i_freeze : freeze_auto
+
+// ─────────────────────────────────────────────
+//  FREEZE LOGIC
+//  SHORT: tabla se congela mientras precio >= freeze_raw
+//  LONG:  tabla se congela mientras precio <= freeze_raw
+// ─────────────────────────────────────────────
+freeze_triggered = is_short ? close >= freeze_raw : close <= freeze_raw
+
+var float frozen_entry = na
+var float _prev_stop   = na
+
+stop_moved = not na(_prev_stop) and math.abs(stop_raw - _prev_stop) > stop_raw * 0.0002
+_prev_stop := stop_raw
+
+if freeze_triggered and na(frozen_entry)
+    frozen_entry := freeze_raw
+
+if stop_moved or not freeze_triggered
+    frozen_entry := na
+
+is_frozen = not na(frozen_entry)
+entry_raw = is_frozen ? frozen_entry : close
+
+// ─────────────────────────────────────────────
+//  SIZING
+// ─────────────────────────────────────────────
+valid    = entry_raw > 0 and stop_raw > 0 and entry_raw != stop_raw and
+           (is_short ? entry_raw < stop_raw : entry_raw > stop_raw)
+range_sd = math.abs(stop_raw - entry_raw)
+spacing  = i_lots > 1 ? range_sd / i_lots : range_sd
+
+fmt_cents(v) =>
+    c = v * 100
+    c >= 1.0 ? str.tostring(math.round(c)) + "c" : str.tostring(c, "#.##") + "c"
+
+calc_auto_lot() =>
+    rf = 0.0
+    for i = 0 to i_lots - 1
+        px       = entry_raw + dir * i * spacing
+        stop_hit = is_short ? px >= stop_raw : px <= stop_raw
+        if stop_hit
+            break
+        dist = math.abs(stop_raw - px)
+        mult = (i_boost_entry > 0 and (i + 1) == i_boost_entry) ? float(i_boost_mult) : 1.0
+        rf  := rf + dist * mult
+    rf <= 0 ? 0.0 : math.floor(i_max_loss / rf)
+
+base_lot = i_lot_size > 0 ? float(i_lot_size) : calc_auto_lot()
+
+// ─────────────────────────────────────────────
+//  COLORES
+// ─────────────────────────────────────────────
+C_STOP   = color.new(#ef4444, 0)
+C_FREEZE = color.new(#fbbf24, 0)
+C_BOOST  = color.new(#f97316, 0)
+C_GREEN  = color.new(#22c55e, 0)
+C_RED    = color.new(#ef4444, 0)
+C_MUTED  = color.new(#7a8aaa, 0)
+C_WHITE  = color.new(#dce4f0, 0)
+C_BG     = color.new(#0d0d14, 80)
+C_BG2    = color.new(#13131e, 76)
+C_BORDER = color.new(#252540, 55)
+C_BLUE   = color.new(#60a5fa, 0)
+C_INDIGO = color.new(#a5b4fc, 0)
+C_RT     = color.new(#34d399, 0)
+
+// ─────────────────────────────────────────────
+//  DIBUJO — line.new() se superpone exactamente sobre input.price
+//  Resultado: 2 líneas visibles, arrastrables, con color custom
+// ─────────────────────────────────────────────
+var line ln_stop   = na
+var line ln_freeze = na
+
+if barstate.islast
+    line.delete(ln_stop)
+    line.delete(ln_freeze)
+
+    ln_stop := line.new(bar_index - 500, stop_raw, bar_index + 500, stop_raw,
+         color=color.new(#ef4444, 0), width=2, style=line.style_dashed, extend=extend.both)
+
+    freeze_col = is_frozen ? color.new(#fbbf24, 0) : color.new(#94a3b8, 50)
+    ln_freeze  := line.new(bar_index - 500, freeze_raw, bar_index + 500, freeze_raw,
+         color=freeze_col, width=1, style=line.style_dotted, extend=extend.both)
+
+// ─────────────────────────────────────────────
+//  TABLA
+// ─────────────────────────────────────────────
+var table tbl = na
+
+if i_show_table and valid and barstate.islast
+    tbl := table.new(position.bottom_left, 5, 26, bgcolor=C_BG, border_color=C_BORDER,
+         border_width=1, frame_color=color.new(#3a3a60, 50), frame_width=2)
+
+    mode_col = C_RT
+    if is_frozen
+        mode_col := C_FREEZE
+
+    mode_lbl = is_short ? "SHORT" : "LONG"
+    if is_frozen
+        mode_lbl := "FREEZE"
+
+    hdr_bg = color.new(#1a0008, 70)
+    if is_frozen
+        hdr_bg := color.new(#2d1f00, 70)
+    else if not is_short
+        hdr_bg := color.new(#001a0a, 70)
+
+    hdr_cols = array.from(mode_lbl, "Precio", "CumSh", "R/ent", "CumR")
+    for c = 0 to 4
+        hdr_tc = c == 0 ? mode_col : C_MUTED
+        table.cell(tbl, c, 0, array.get(hdr_cols, c), text_color=hdr_tc, bgcolor=hdr_bg,
+             text_size=size.normal, text_halign=text.align_center)
+
+    cum_risk = 0.0
+    cum_sh   = 0
+    last_row = 1
+
+    for i = 0 to i_lots - 1
+        px       = entry_raw + dir * i * spacing
+        stop_hit = is_short ? px >= stop_raw : px <= stop_raw
+        if stop_hit
+            break
+
+        is_boost  = i_boost_entry > 0 and (i + 1) == i_boost_entry
+        lot_here  = is_boost ? int(base_lot) * i_boost_mult : int(base_lot)
+        dist      = math.abs(stop_raw - px)
+        risk_this = lot_here * dist
+        cum_risk := cum_risk + risk_this
+        cum_sh   := cum_sh + lot_here
+        last_row := i + 1
+
+        over_max = cum_risk > i_max_loss
+        cum_col  = over_max ? C_RED : color.new(#818cf8, 0)
+
+        row_bg = color.new(#0d0d14, 82)
+        if i == 0
+            if is_frozen
+                row_bg := color.new(#2d1f00, 78)
+            else if is_short
+                row_bg := color.new(#1a0008, 80)
+            else
+                row_bg := color.new(#001a0a, 80)
+        else if is_boost
+            row_bg := color.new(#f97316, 91)
+
+        px_col    = i == 0 ? mode_col : is_boost ? C_BOOST : C_WHITE
+        sh_col    = is_boost ? C_BOOST : C_GREEN
+        boost_sfx = is_boost ? "x" + str.tostring(i_boost_mult) : ""
+
+        table.cell(tbl, 0, i + 1, str.tostring(i + 1),
+             text_color=px_col, bgcolor=row_bg, text_size=size.large, text_halign=text.align_center)
+        table.cell(tbl, 1, i + 1, "$" + str.tostring(px, "#.###"),
+             text_color=px_col, bgcolor=row_bg, text_size=size.large, text_halign=text.align_right)
+        table.cell(tbl, 2, i + 1, str.tostring(cum_sh) + boost_sfx + "sh",
+             text_color=sh_col, bgcolor=row_bg, text_size=size.large, text_halign=text.align_right)
+        table.cell(tbl, 3, i + 1, str.tostring(risk_this / i_R, "#.##") + "R",
+             text_color=C_INDIGO, bgcolor=row_bg, text_size=size.large, text_halign=text.align_right)
+        table.cell(tbl, 4, i + 1, str.tostring(cum_risk / i_R, "#.##") + "R",
+             text_color=cum_col, bgcolor=row_bg, text_size=size.large, text_halign=text.align_right)
+
+    sep_row = last_row + 1
+    for c = 0 to 4
+        table.cell(tbl, c, sep_row, "", bgcolor=color.new(#3a3a60, 72))
+
+    total_row = sep_row + 1
+    ok_col  = cum_risk <= i_max_loss ? C_GREEN : C_RED
+    total_R = cum_risk / i_R
+
+    table.cell(tbl, 0, total_row, mode_lbl,
+         text_color=mode_col, bgcolor=C_BG2, text_size=size.small, text_halign=text.align_center)
+    table.cell(tbl, 1, total_row, "cada " + fmt_cents(spacing),
+         text_color=C_BLUE, bgcolor=C_BG2, text_size=size.large, text_halign=text.align_right)
+    table.cell(tbl, 2, total_row, "$" + str.tostring(math.round(cum_risk)),
+         text_color=ok_col, bgcolor=C_BG2, text_size=size.huge, text_halign=text.align_right)
+    table.cell(tbl, 3, total_row, str.tostring(total_R, "#.#") + "R",
+         text_color=ok_col, bgcolor=C_BG2, text_size=size.huge, text_halign=text.align_right)
+    table.cell(tbl, 4, total_row, str.tostring(int(base_lot)) + "sh /lote",
+         text_color=C_GREEN, bgcolor=C_BG2, text_size=size.large, text_halign=text.align_right)
+
+    lot_row = total_row + 1
+    table.cell(tbl, 0, lot_row, i_lot_size > 0 ? "fijo" : "auto",
+         text_color=C_MUTED, bgcolor=color.new(#0a0a0f, 80), text_size=size.normal, text_halign=text.align_left)
+    table.merge_cells(tbl, 0, lot_row, 1, lot_row)
+    table.cell(tbl, 2, lot_row,
+         str.tostring(int(base_lot)) + "sh x" + str.tostring(i_lots) + " = " + str.tostring(int(base_lot) * i_lots) + "sh max",
+         text_color=C_GREEN, bgcolor=color.new(#0a0a0f, 80), text_size=size.normal, text_halign=text.align_right)
+    table.merge_cells(tbl, 2, lot_row, 4, lot_row)

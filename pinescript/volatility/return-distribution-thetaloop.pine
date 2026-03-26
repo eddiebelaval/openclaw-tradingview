@@ -1,0 +1,157 @@
+//@version=6
+indicator("Return Distribution [ThetaLoop]", shorttitle="ReturnDst", overlay=false, precision=2)
+
+// ═══════════════════════════════════════════════════════════════
+//  RETURN DISTRIBUTION ANALYZER
+//  by ThetaLoop Research
+//
+//  Measures Skewness and Excess Kurtosis of price returns
+//  over a rolling window. Pure statistics, no curve-fitting.
+//
+//  Why this matters for options sellers:
+//  - High Kurtosis = fat tails = your short puts blow up more often
+//  - Negative Skew = left tail is fatter = downside risk elevated
+//  - Normal Kurtosis + Neutral Skew = calm regime, sell premium
+// ═══════════════════════════════════════════════════════════════
+
+// ─── INPUTS ───────────────────────────────────────────────────
+grp_calc = "Distribution Settings"
+length   = input.int(60, "Lookback Period", minval=20, maxval=252, group=grp_calc,
+                     tooltip="Rolling window for return distribution (trading days). 60 = ~3 months.")
+ret_type = input.string("Log", "Return Type", options=["Log", "Simple"], group=grp_calc,
+                        tooltip="Log returns are standard in quantitative finance. Simple = percentage change.")
+
+grp_kurt = "Kurtosis Levels"
+kurt_warn  = input.float(1.5, "Elevated (yellow)", minval=0.5, step=0.5, group=grp_kurt)
+kurt_alert = input.float(3.0, "Extreme (red)",     minval=1.0, step=0.5, group=grp_kurt)
+
+grp_skew = "Skewness Levels"
+skew_warn  = input.float(-0.5, "Mild Negative",  maxval=0.0, step=0.25, group=grp_skew)
+skew_alert = input.float(-1.0, "Heavy Negative",  maxval=0.0, step=0.25, group=grp_skew)
+
+grp_style = "Display"
+show_mode = input.string("Both", "Show", options=["Both", "Kurtosis", "Skewness"], group=grp_style)
+
+// ─── RETURN CALCULATION ───────────────────────────────────────
+raw_ret = ret_type == "Log" ? math.log(close / close[1]) : (close - close[1]) / close[1]
+
+// ─── ROLLING STATISTICS (Manual — Pine has no built-in skew/kurt) ──
+
+// Step 1: Rolling Mean
+roll_mean = ta.sma(raw_ret, length)
+
+// Step 2: Centered moments via manual summation
+// We need sum of (x - mean)^2, (x - mean)^3, (x - mean)^4
+var float sum2 = 0.0
+var float sum3 = 0.0
+var float sum4 = 0.0
+
+// Efficient rolling: subtract oldest, add newest
+// But Pine doesn't allow dynamic array indexing easily,
+// so we use a direct loop (acceptable for length <= 252)
+sum2 := 0.0
+sum3 := 0.0
+sum4 := 0.0
+
+for i = 0 to length - 1
+    float dev = nz(raw_ret[i]) - roll_mean
+    float dev2 = dev * dev
+    sum2 += dev2
+    sum3 += dev2 * dev
+    sum4 += dev2 * dev2
+
+// Step 3: Variance, Skewness, Kurtosis
+float n = length
+float variance = sum2 / n
+float stddev = math.sqrt(variance)
+
+// Skewness: E[(x-mu)^3] / sigma^3
+// Using sample-corrected formula: [n/((n-1)(n-2))] * sum((x-mu)/s)^3
+float skewness = 0.0
+if stddev > 0 and n > 2
+    skewness := (n / ((n - 1) * (n - 2))) * (sum3 / (stddev * stddev * stddev))
+
+// Excess Kurtosis: E[(x-mu)^4] / sigma^4 - 3
+// Sample-corrected: [(n(n+1))/((n-1)(n-2)(n-3))] * sum((x-mu)/s)^4 - [3(n-1)^2]/[(n-2)(n-3)]
+float kurtosis = 0.0
+if stddev > 0 and n > 3
+    float term1 = (n * (n + 1)) / ((n - 1) * (n - 2) * (n - 3))
+    float term2 = sum4 / (variance * variance)
+    float term3 = (3 * (n - 1) * (n - 1)) / ((n - 2) * (n - 3))
+    kurtosis := term1 * term2 - term3
+
+// ─── COLORS ───────────────────────────────────────────────────
+col_kurt_extreme = color.new(color.red,    0)
+col_kurt_warn    = color.new(color.orange, 0)
+col_kurt_normal  = color.new(color.teal,   0)
+
+col_skew_extreme = color.new(color.red,    0)
+col_skew_warn    = color.new(color.orange, 0)
+col_skew_normal  = color.new(color.teal,   0)
+
+kurt_col = kurtosis > kurt_alert ? col_kurt_extreme :
+           kurtosis > kurt_warn  ? col_kurt_warn    : col_kurt_normal
+
+skew_col = skewness < skew_alert ? col_skew_extreme :
+           skewness < skew_warn  ? col_skew_warn    : col_skew_normal
+
+// ─── PLOTS ────────────────────────────────────────────────────
+plot(show_mode == "Both" or show_mode == "Kurtosis" ? kurtosis : na,
+     "Excess Kurtosis", color=kurt_col, linewidth=2)
+
+plot(show_mode == "Both" or show_mode == "Skewness" ? skewness : na,
+     "Skewness", color=skew_col, linewidth=2, style=plot.style_line)
+
+// Reference lines
+hline(0,           "Normal",     color=color.new(color.gray, 50), linewidth=1)
+hline(kurt_alert,  "Kurt Alert", color=color.new(color.red, 60),  linewidth=1, linestyle=hline.style_dashed)
+hline(kurt_warn,   "Kurt Warn",  color=color.new(color.orange, 60), linewidth=1, linestyle=hline.style_dotted)
+hline(skew_alert,  "Skew Alert", color=color.new(color.red, 60),  linewidth=1, linestyle=hline.style_dashed)
+hline(skew_warn,   "Skew Warn",  color=color.new(color.orange, 60), linewidth=1, linestyle=hline.style_dotted)
+
+// ─── INFO TABLE ───────────────────────────────────────────────
+var table t = table.new(position.top_right, 2, 6,
+     bgcolor=color.new(color.black, 70), border_width=1, border_color=color.new(color.gray, 60))
+
+// Regime classification
+string tail_regime = kurtosis > kurt_alert ? "FAT TAILS" :
+                     kurtosis > kurt_warn  ? "ELEVATED"  : "NORMAL"
+
+string skew_regime = skewness < skew_alert ? "LEFT HEAVY" :
+                     skewness < skew_warn  ? "LEFT MILD"  :
+                     skewness > 0.5        ? "RIGHT SKEW" : "SYMMETRIC"
+
+// Combined risk label for options sellers
+string risk_label = "LOW RISK"
+color risk_col = col_kurt_normal
+if kurtosis > kurt_alert and skewness < skew_warn
+    risk_label := "HIGH RISK"
+    risk_col := col_kurt_extreme
+else if kurtosis > kurt_warn or skewness < skew_warn
+    risk_label := "CAUTION"
+    risk_col := col_kurt_warn
+
+if barstate.islast
+    table.cell(t, 0, 0, "Put Sell",   text_color=color.gray, text_size=size.small)
+    table.cell(t, 1, 0, risk_label,   text_color=risk_col,   text_size=size.normal)
+    table.cell(t, 0, 1, "Kurtosis",   text_color=color.gray, text_size=size.small)
+    table.cell(t, 1, 1, str.tostring(kurtosis, "#.##"),
+               text_color=kurt_col, text_size=size.small)
+    table.cell(t, 0, 2, "Tails",      text_color=color.gray, text_size=size.small)
+    table.cell(t, 1, 2, tail_regime,  text_color=kurt_col,   text_size=size.small)
+    table.cell(t, 0, 3, "Skewness",   text_color=color.gray, text_size=size.small)
+    table.cell(t, 1, 3, str.tostring(skewness, "#.##"),
+               text_color=skew_col, text_size=size.small)
+    table.cell(t, 0, 4, "Shape",      text_color=color.gray, text_size=size.small)
+    table.cell(t, 1, 4, skew_regime,  text_color=skew_col,   text_size=size.small)
+    table.cell(t, 0, 5, "Window",     text_color=color.gray, text_size=size.small)
+    table.cell(t, 1, 5, str.tostring(length) + "d",
+               text_color=color.white, text_size=size.small)
+
+// ─── ALERTS ───────────────────────────────────────────────────
+alertcondition(kurtosis > kurt_alert and skewness < skew_warn,
+               "High Risk Regime",  "Fat tails + negative skew detected — elevated risk for short options")
+alertcondition(kurtosis > kurt_alert,
+               "Fat Tails Detected", "Excess Kurtosis above alert threshold — tail risk elevated")
+alertcondition(skewness < skew_alert,
+               "Heavy Left Skew",   "Skewness deeply negative — downside distribution stretched")

@@ -1,0 +1,173 @@
+//@version=6
+indicator("VEP Engine v1.0 – Volatility & Score History Panel", overlay=false)
+
+// ==============================
+// INPUTS
+// ==============================
+hvLen      = input.int(30,  "HV Length (D)", minval=5)
+ivLen      = input.int(10,  "IV Proxy Length (D)", minval=2)
+lookback   = input.int(252, "Lookback (Rank/Pctl)", minval=50)
+
+ma21Len    = input.int(21,  "MA 21 (D)", minval=1)
+ma50Len    = input.int(50,  "MA 50 (D)", minval=1)
+ma200Len   = input.int(200, "MA 200 (D)", minval=1)
+
+useRSI     = input.bool(true, "Use RSI in TotalScore")
+rsiLen     = input.int(14, "RSI Length (D)", minval=2)
+rsiMin     = input.float(45, "RSI Min (D)")
+
+minMktCapB = input.float(10, "Min Market Cap ($B) for Score gating")
+vrpMin     = input.float(1.05, "VRP Min (for Score scaling)")
+ivRankMin  = input.float(40, "IV Rank Min (for Score scaling)")
+ivPctMin   = input.float(40, "IV Percentile Min (for Score scaling)")
+
+// NEW: IV Mode
+ivMode = input.string("StdDev Proxy", "IV Mode", options=["StdDev Proxy", "Model IV (DTE-based)"])
+dteDays = input.int(45, "Model IV DTE (days)", minval=5)
+intervalWidth = input.float(1.0, "Model IV Interval Width", step=0.25)
+
+// What to plot
+showIVUsed   = input.bool(true,  "Plot IV Used % (Daily)")
+showHV       = input.bool(true,  "Plot HV % (Daily)")
+showRank     = input.bool(false, "Plot IV Rank (0–100, Daily)")
+showPct      = input.bool(true,  "Plot IV Percentile (0–100, Daily)")
+showScore    = input.bool(true,  "Plot TotalScore (0–100, Daily)")
+showVRP      = input.bool(false, "Plot VRP (Daily)")
+showIVProxy  = input.bool(false, "Plot Debug: IV Proxy %")
+showModelIV  = input.bool(false, "Plot Debug: Model IV %")
+
+// Display options
+mapPctToVolScale  = input.bool(true, "Map Percentile to Vol scale (Daily)")
+showMappedPctLine = input.bool(true, "Plot mapped Percentile line (Daily, vol scale)")
+
+// ==============================
+// HELPERS
+// ==============================
+f_clamp(float x, float lo, float hi) =>
+    math.max(lo, math.min(hi, x))
+
+f_linScore(float x, float x0, float x1, float pts) =>
+    float r = (x - x0) / (x1 - x0)
+    float rc = f_clamp(r, 0.0, 1.0)
+    rc * pts
+
+// ==============================
+// DAILY SERIES
+// ==============================
+dClose = request.security(syminfo.tickerid, "D", close)
+dLog   = request.security(syminfo.tickerid, "D", math.log(close / close[1]))
+
+// HV
+hv = request.security(syminfo.tickerid, "D", ta.stdev(dLog, hvLen) * math.sqrt(252) * 100.0)
+
+// IV Proxy
+ivProxy = request.security(syminfo.tickerid, "D", ta.stdev(dLog, ivLen) * math.sqrt(252) * 100.0)
+
+// ==============================
+// MODEL IV (DTE-BASED)
+// ==============================
+avgRet = request.security(syminfo.tickerid, "D", ta.sma(dLog, dteDays))
+stRet  = request.security(syminfo.tickerid, "D", ta.stdev(dLog, dteDays))
+
+timeAvg = dteDays * avgRet
+timeStd = stRet * math.sqrt(dteDays)
+
+upper = dClose * math.exp(timeAvg + intervalWidth * timeStd)
+lower = dClose * math.exp(timeAvg - intervalWidth * timeStd)
+
+width = upper - lower
+standard_dev = width / 2.0
+
+float sigma = na
+if not na(standard_dev) and not na(dClose) and dClose > 0
+    sigma := standard_dev / (dClose * math.sqrt(dteDays / 365.0))
+
+float sigmaAdj = na
+if not na(sigma)
+    sigmaAdj := sigma > 1.0 ? (sigma / 2.0) : sigma
+
+modelIV = not na(sigmaAdj) ? (sigmaAdj * 100.0) : na
+
+// Select IV series
+ivUsed = ivMode == "Model IV (DTE-based)" ? modelIV : ivProxy
+
+// ==============================
+// VRP / RANK / PERCENTILE
+// ==============================
+vrp = (not na(hv) and hv > 0 and not na(ivUsed)) ? (ivUsed / hv) : na
+
+ivLo = ta.lowest(ivUsed, lookback)
+ivHi = ta.highest(ivUsed, lookback)
+ivRank = (not na(ivHi) and not na(ivLo) and ivHi != ivLo) ? (100.0 * (ivUsed - ivLo) / (ivHi - ivLo)) : na
+
+float cnt = 0.0
+for i = 0 to lookback - 1
+    cnt += (ivUsed[i] <= ivUsed ? 1.0 : 0.0)
+ivPct = 100.0 * cnt / lookback
+
+// Percentile mapped to vol scale
+hvLo_map = ta.lowest(hv, lookback)
+hvHi_map = ta.highest(hv, lookback)
+
+float pctMapped = na
+if mapPctToVolScale and not na(ivPct) and not na(hvLo_map) and not na(hvHi_map) and hvHi_map != hvLo_map
+    pctMapped := hvLo_map + (ivPct / 100.0) * (hvHi_map - hvLo_map)
+
+// ==============================
+// TOTAL SCORE (Daily-only)
+// Structure 50: Trend 30 + RSI 10 + MktCap 10
+// Vol 50: VRP 20 + Rank 15 + Pctl 15
+// ==============================
+dMA21  = ta.sma(dClose, ma21Len)
+dMA50  = ta.sma(dClose, ma50Len)
+dMA200 = ta.sma(dClose, ma200Len)
+trendOK = dClose > dMA21 and dClose > dMA50 and dClose > dMA200
+
+dRSI = ta.rsi(dClose, rsiLen)
+rsiOK = (not useRSI) or (not na(dRSI) and dRSI >= rsiMin)
+
+tso = request.financial(syminfo.tickerid, "TOTAL_SHARES_OUTSTANDING", "FQ")
+mktCapB = (tso * dClose) / 1e9
+mktCapOK = not na(mktCapB) and mktCapB >= minMktCapB
+
+float structureScore = 0.0
+if trendOK
+    structureScore += 30.0
+
+if not useRSI
+    structureScore += 10.0
+else if not na(dRSI)
+    structureScore += f_linScore(dRSI, rsiMin, 65.0, 10.0)
+
+if mktCapOK
+    structureScore += 10.0
+
+structureScore := f_clamp(structureScore, 0.0, 50.0)
+
+float vrpScore  = na(vrp)    ? 0.0 : f_linScore(vrp,    vrpMin,    1.25, 20.0)
+float rankScore = na(ivRank) ? 0.0 : f_linScore(ivRank, ivRankMin, 70.0, 15.0)
+float pctScore  = na(ivPct)  ? 0.0 : f_linScore(ivPct,  ivPctMin,  80.0, 15.0)
+
+float volaScore  = f_clamp(vrpScore + rankScore + pctScore, 0.0, 50.0)
+float totalScore = f_clamp(structureScore + volaScore, 0.0, 100.0)
+
+// ==============================
+// PLOTS
+// ==============================
+
+// Vol scale plots
+plot(showIVUsed ? ivUsed : na, title="IV Used % (Daily)", linewidth=2)
+plot(showHV ? hv : na, title="HV % (Daily)", linewidth=2)
+plot(showVRP ? vrp : na, title="VRP (Daily)", linewidth=2)
+
+// Debug comparison
+plot(showIVProxy ? ivProxy : na, title="DEBUG IV Proxy % (Daily)", linewidth=2)
+plot(showModelIV ? modelIV : na, title="DEBUG Model IV % (Daily)", linewidth=2)
+
+// 0-100 series
+plot(showPct ? ivPct : na, title="IV Percentile (0-100, Daily)", linewidth=2)
+plot(showRank ? ivRank : na, title="IV Rank (0-100, Daily)", linewidth=2)
+plot(showScore ? totalScore : na, title="TotalScore (0-100, Daily)", linewidth=2)
+
+// Optional mapped percentile to vol scale
+plot((showMappedPctLine and mapPctToVolScale) ? pctMapped : na, title="IV Percentile (mapped to vol scale, Daily)", linewidth=2)

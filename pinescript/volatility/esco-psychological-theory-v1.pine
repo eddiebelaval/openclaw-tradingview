@@ -1,0 +1,796 @@
+// This Pine Script™ source code is subject to the terms of the Mozilla Public License 2.0
+// https://mozilla.org/MPL/2.0/
+
+//@version=6
+indicator("Esco Psychological Theory [v3]", overlay=true, max_lines_count=300, max_labels_count=200, max_boxes_count=120)
+
+
+// ═══════════════════════════════════════════════════════════════
+// INPUTS
+// ═══════════════════════════════════════════════════════════════
+
+grp_core = "━━━ Structure ━━━"
+swingLen        = input.int(14, "Swing Lookback", minval=5, maxval=100, group=grp_core, tooltip="Smaller = more sensitive. 10-14 for lower TF, 21+ for higher TF")
+majorLen        = input.int(50, "Major Swing Lookback", minval=10, maxval=200, group=grp_core)
+maxSwings       = input.int(12, "Max Stored Swings", minval=6, maxval=30, group=grp_core)
+
+grp_regime = "━━━ Emotional Regime ━━━"
+showRegime      = input.bool(true, "Show Regime Transitions", group=grp_regime, tooltip="Labels appear only when market psychology shifts")
+showRegimeBG    = input.bool(true, "Regime Background", group=grp_regime, tooltip="Subtle color wash showing current emotional state")
+showRegimeRib   = input.bool(true, "Regime Ribbon (bottom)", group=grp_regime, tooltip="Thin color strip at bottom showing regime over time")
+
+grp_zones = "━━━ Pressure Zones ━━━"
+showPsychZones  = input.bool(true, "Show Pressure Zones", group=grp_zones)
+zoneMaxAge      = input.int(50, "Max Zone Age (bars)", minval=10, maxval=200, group=grp_zones)
+maxZonesDrawn   = input.int(4, "Max Zones Visible", minval=1, maxval=8, group=grp_zones)
+
+grp_pain = "━━━ Pain & Pressure ━━━"
+showPainBands   = input.bool(true, "Show Pain Gradient", group=grp_pain, tooltip="Soft bands above/below showing directional pain intensity")
+showPressureBar = input.bool(true, "Pressure Bar Color", group=grp_pain, tooltip="Tints candles when psychological pressure is extreme")
+
+grp_eq = "━━━ Equilibrium ━━━"
+showEQ          = input.bool(true, "Show Equilibrium", group=grp_eq)
+showEQLines     = input.bool(true, "Show EQH / EQL", group=grp_eq)
+showPDShade     = input.bool(true, "Premium / Discount Shading", group=grp_eq, tooltip="Soft gradient showing premium and discount zones")
+
+grp_marks = "━━━ Event Markers ━━━"
+showDisp        = input.bool(true, "Color Displacement Candles", group=grp_marks)
+showSweepMark   = input.bool(true, "Mark Sweeps", group=grp_marks)
+showMSS         = input.bool(true, "Mark Structure Shifts", group=grp_marks)
+showSqueeze     = input.bool(true, "Show Squeeze Fire", group=grp_marks)
+
+grp_dash = "━━━ Dashboard ━━━"
+showDash        = input.bool(true, "Show Dashboard", group=grp_dash)
+dashPos         = input.string("Top Right", "Position", options=["Top Right", "Top Left", "Bottom Right", "Bottom Left"], group=grp_dash)
+
+
+// ═══════════════════════════════════════════════════════════════
+// PALETTE
+// ═══════════════════════════════════════════════════════════════
+
+R_COMFORT = #4A8C6F
+R_TENSION = #B8943E
+R_HOPE    = #5B8FB9
+R_TRAP    = #8B6AAE
+R_PANIC   = #C75B5B
+R_CAP     = #A63D3D
+R_RELIEF  = #5B9E7A
+R_REACC   = #5B8FB9
+
+C_BULL    = #5B9E7A
+C_BEAR    = #C75B5B
+C_WARN    = #B8943E
+C_TRAP_   = #8B6AAE
+C_NEUT    = #6E7681
+C_DIM     = #484D56
+C_GOLD    = #C9A84C
+
+C_DBG     = #0C1016
+C_DLBL    = #6E7681
+C_DVAL    = #B0B8C4
+
+
+// ═══════════════════════════════════════════════════════════════
+// CORE DETECTION ENGINE
+// ═══════════════════════════════════════════════════════════════
+
+// ─── Pivots ───
+pivHi    = ta.pivothigh(high, swingLen, swingLen)
+pivLo    = ta.pivotlow(low, swingLen, swingLen)
+majPivHi = ta.pivothigh(high, majorLen, majorLen)
+majPivLo = ta.pivotlow(low, majorLen, majorLen)
+
+var float[] hiP = array.new_float(0)
+var int[]   hiB = array.new_int(0)
+var float[] loP = array.new_float(0)
+var int[]   loB = array.new_int(0)
+var float[] mhP = array.new_float(0)
+var int[]   mhB = array.new_int(0)
+var float[] mlP = array.new_float(0)
+var int[]   mlB = array.new_int(0)
+
+_push(ap, ab, p, idx, c) =>
+    array.unshift(ap, p)
+    array.unshift(ab, idx)
+    if array.size(ap) > c
+        array.pop(ap)
+        array.pop(ab)
+
+if not na(pivHi)
+    _push(hiP, hiB, pivHi, bar_index - swingLen, maxSwings)
+if not na(pivLo)
+    _push(loP, loB, pivLo, bar_index - swingLen, maxSwings)
+if not na(majPivHi)
+    _push(mhP, mhB, majPivHi, bar_index - majorLen, maxSwings)
+if not na(majPivLo)
+    _push(mlP, mlB, majPivLo, bar_index - majorLen, maxSwings)
+
+// ─── ATR / Volatility ───
+atrVal    = ta.atr(14)
+atrFast   = ta.atr(7)
+atrSlow   = ta.atr(50)
+atrRatio  = nz(atrSlow) > 0 ? atrFast / atrSlow : 1.0
+
+// ─── Displacement ───
+body_        = math.abs(close - open)
+isDisp       = body_ > atrVal * 1.5
+isBullDisp   = isDisp and close > open
+isBearDisp   = isDisp and close < open
+dispStr      = isDisp ? body_ / atrVal : 0.0
+
+var int consDispBull = 0
+var int consDispBear = 0
+consDispBull := isBullDisp ? consDispBull + 1 : 0
+consDispBear := isBearDisp ? consDispBear + 1 : 0
+
+// ─── Wicks ───
+uWick      = high - math.max(close, open)
+dWick      = math.min(close, open) - low
+barRange   = high - low
+wRatioUp   = barRange > 0 ? uWick / barRange : 0.0
+wRatioDown = barRange > 0 ? dWick / barRange : 0.0
+rejUp      = wRatioUp > 0.55
+rejDn      = wRatioDown > 0.55
+
+// ─── Squeeze ───
+bbB = ta.sma(close, 20)
+bbD = 2.0 * ta.stdev(close, 20)
+kcB = ta.ema(close, 20)
+kcR = ta.atr(10) * 1.5
+inSqueeze    = (bbB + bbD) < (kcB + kcR) and (bbB - bbD) > (kcB - kcR)
+squeezeFired = inSqueeze[1] and not inSqueeze
+isComp       = atrRatio < 0.6
+
+// ─── Trend ───
+ema21 = ta.ema(close, 21)
+ema55 = ta.ema(close, 55)
+tBull = ema21 > ema55
+tBear = ema21 < ema55
+
+// ADX for trend clarity
+dmiLen = 14
+[diPlus, diMinus, adxVal] = ta.dmi(dmiLen, dmiLen)
+trendClarity = adxVal
+
+// ─── Equilibrium ───
+var float eqH = na
+var float eqL = na
+var float eqM = na
+if array.size(mhP) >= 1 and array.size(mlP) >= 1
+    eqH := array.get(mhP, 0)
+    eqL := array.get(mlP, 0)
+    if eqH > eqL
+        eqM := (eqH + eqL) / 2.0
+eqRange = not na(eqH) and not na(eqL) and eqH > eqL ? eqH - eqL : atrVal * 10
+distEQ  = not na(eqM) and eqRange > 0 ? (close - eqM) / eqRange : 0.0
+pdPct   = not na(eqH) and not na(eqL) and eqH > eqL ? (close - eqL) / (eqH - eqL) * 100 : 50.0
+
+// ─── Market Structure ───
+var float msHH = na
+var float msLL = na
+var int   msTrend = 0
+var bool  bosUp = false
+var bool  bosDn = false
+var bool  mssUp = false
+var bool  mssDn = false
+
+bosUp := false
+bosDn := false
+mssUp := false
+mssDn := false
+
+if not na(pivHi)
+    if not na(msHH) and pivHi > msHH
+        if msTrend != 1
+            mssUp := true
+            msTrend := 1
+        else
+            bosUp := true
+    msHH := pivHi
+if not na(pivLo)
+    if not na(msLL) and pivLo < msLL
+        if msTrend != -1
+            mssDn := true
+            msTrend := -1
+        else
+            bosDn := true
+    msLL := pivLo
+
+var int barsSinceMSS = 500
+barsSinceMSS := mssUp or mssDn ? 0 : barsSinceMSS + 1
+
+// ─── Equal Highs / Lows ───
+eqTol = 0.3
+var bool  hasEQH = false
+var bool  hasEQL = false
+var float eqhLvl = na
+var float eqlLvl = na
+hasEQH := false
+hasEQL := false
+
+if array.size(hiP) >= 2
+    for i = 0 to math.min(array.size(hiP) - 2, 3)
+        for j = i + 1 to math.min(array.size(hiP) - 1, i + 2)
+            if math.abs(array.get(hiP, i) - array.get(hiP, j)) / array.get(hiP, i) * 100 < eqTol
+                hasEQH := true
+                eqhLvl := math.avg(array.get(hiP, i), array.get(hiP, j))
+
+if array.size(loP) >= 2
+    for i = 0 to math.min(array.size(loP) - 2, 3)
+        for j = i + 1 to math.min(array.size(loP) - 1, i + 2)
+            if math.abs(array.get(loP, i) - array.get(loP, j)) / array.get(loP, i) * 100 < eqTol
+                hasEQL := true
+                eqlLvl := math.avg(array.get(loP, i), array.get(loP, j))
+
+// ─── Sweeps ───
+sweepHi = hasEQH and not na(eqhLvl) and high > eqhLvl and close < eqhLvl and high[1] <= eqhLvl
+sweepLo = hasEQL and not na(eqlLvl) and low < eqlLvl and close > eqlLvl and low[1] >= eqlLvl
+
+var int barsSinceSweep = 500
+barsSinceSweep := (sweepHi or sweepLo) ? 0 : barsSinceSweep + 1
+
+// ─── Failed Breakout ───
+var float boHighRef = na
+var float boLowRef  = na
+var int   boHighTimer = 100
+var int   boLowTimer  = 100
+var bool  fbHigh = false
+var bool  fbLow  = false
+fbHigh := false
+fbLow  := false
+
+if array.size(hiP) >= 1
+    rH = array.get(hiP, 0)
+    if high > rH and close[1] <= rH and close > rH
+        boHighRef   := rH
+        boHighTimer := 0
+    boHighTimer += 1
+    if boHighTimer > 0 and boHighTimer <= 5 and not na(boHighRef)
+        if close < boHighRef and close < open
+            fbHigh := true
+
+if array.size(loP) >= 1
+    rL = array.get(loP, 0)
+    if low < rL and close[1] >= rL and close < rL
+        boLowRef   := rL
+        boLowTimer := 0
+    boLowTimer += 1
+    if boLowTimer > 0 and boLowTimer <= 5 and not na(boLowRef)
+        if close > boLowRef and close > open
+            fbLow := true
+
+var int barsSinceFB = 500
+barsSinceFB := (fbHigh or fbLow) ? 0 : barsSinceFB + 1
+
+// ─── Rejection Counting ───
+var int rejAtHigh = 0
+var int rejAtLow  = 0
+if array.size(hiP) >= 1
+    nearH = math.abs(high - array.get(hiP, 0)) / array.get(hiP, 0) * 100 < 0.25
+    rejAtHigh := nearH and rejUp ? rejAtHigh + 1 : (not na(pivHi) ? 0 : rejAtHigh)
+if array.size(loP) >= 1
+    nearL = math.abs(low - array.get(loP, 0)) / array.get(loP, 0) * 100 < 0.25
+    rejAtLow := nearL and rejDn ? rejAtLow + 1 : (not na(pivLo) ? 0 : rejAtLow)
+
+// ─── Volume ───
+volSMA       = ta.sma(volume, 20)
+volSpike     = volume > volSMA * 1.8
+volDeclining = ta.sma(volume, 5) < ta.sma(volume, 20) * 0.7
+volRatio     = nz(volSMA) > 0 ? volume / volSMA : 1.0
+
+// ─── Overextension ───
+overextBull = pdPct > 80 and consDispBull >= 1
+overextBear = pdPct < 20 and consDispBear >= 1
+
+
+// ═══════════════════════════════════════════════════════════════
+// MODULE 1: EMOTIONAL REGIME — Sequential State Machine
+// ═══════════════════════════════════════════════════════════════
+
+var int regime = 0
+var int regimeBars = 0
+
+canComfort  = (tBull and msTrend == 1 or tBear and msTrend == -1) and isComp and trendClarity > 20 and not isDisp and barsSinceSweep > 10 and barsSinceFB > 10
+canTension  = (hasEQH or hasEQL) or (rejAtHigh >= 2 or rejAtLow >= 2) or (isComp and (hasEQH or hasEQL)) or (atrRatio < 0.55 and trendClarity > 25)
+canHope     = (isDisp and (bosUp or bosDn)) or squeezeFired or (isDisp and volSpike)
+canTrap     = fbHigh or fbLow or (sweepHi or sweepLo) or (isDisp and barsSinceFB < 3) or (overextBull or overextBear)
+canPanic    = (mssUp or mssDn) or (isDisp and atrRatio > 1.4 and volSpike) or (barsSinceMSS < 3 and isDisp)
+canCap      = consDispBull >= 2 or consDispBear >= 2 or (dispStr > 2.5 and volSpike and (mssUp or mssDn))
+canRelief   = not isDisp and atrRatio < 0.9 and not (mssUp or mssDn) and volDeclining
+canReacc    = isComp and (not na(pivHi) or not na(pivLo)) and volDeclining and not isDisp
+
+newRegime = regime
+
+if regime == 0
+    if canTension
+        newRegime := 1
+    else if canPanic
+        newRegime := 4
+else if regime == 1
+    if canHope
+        newRegime := 2
+    else if canPanic
+        newRegime := 4
+    else if canComfort and regimeBars > 15
+        newRegime := 0
+else if regime == 2
+    if canTrap
+        newRegime := 3
+    else if canPanic
+        newRegime := 4
+    else if canComfort and regimeBars > 10
+        newRegime := 0
+else if regime == 3
+    if canPanic
+        newRegime := 4
+    else if canComfort and regimeBars > 8
+        newRegime := 0
+else if regime == 4
+    if canCap
+        newRegime := 5
+    else if canRelief and regimeBars > 5
+        newRegime := 6
+else if regime == 5
+    if canRelief and regimeBars > 3
+        newRegime := 6
+else if regime == 6
+    if canReacc and regimeBars > 5
+        newRegime := 7
+    else if canTension
+        newRegime := 1
+    else if canComfort and regimeBars > 10
+        newRegime := 0
+else if regime == 7
+    if canComfort and regimeBars > 5
+        newRegime := 0
+    else if canTension
+        newRegime := 1
+    else if canHope
+        newRegime := 2
+
+regimeChanged = newRegime != regime
+regimeBars := regimeChanged ? 0 : regimeBars + 1
+regime := newRegime
+
+regimeStr = switch regime
+    0 => "COMFORT"
+    1 => "TENSION"
+    2 => "HOPE"
+    3 => "TRAP RISK"
+    4 => "PANIC"
+    5 => "CAPITULATION"
+    6 => "RELIEF"
+    7 => "REACCUM."
+    => "—"
+
+regimeHex = switch regime
+    0 => R_COMFORT
+    1 => R_TENSION
+    2 => R_HOPE
+    3 => R_TRAP
+    4 => R_PANIC
+    5 => R_CAP
+    6 => R_RELIEF
+    7 => R_REACC
+    => C_NEUT
+
+regimeSev = switch regime
+    0 => 0
+    1 => 1
+    2 => 1
+    3 => 2
+    4 => 3
+    5 => 3
+    6 => 1
+    7 => 0
+    => 0
+
+regimeBGCol = switch regime
+    0 => color.new(R_COMFORT, 97)
+    1 => color.new(R_TENSION, 96)
+    2 => color.new(R_HOPE, 97)
+    3 => color.new(R_TRAP, 95)
+    4 => color.new(R_PANIC, 94)
+    5 => color.new(R_CAP, 93)
+    6 => color.new(R_RELIEF, 97)
+    7 => color.new(R_REACC, 97)
+    => na
+
+bgcolor(showRegimeBG ? regimeBGCol : na, title="Regime BG")
+
+ribbonCol = color.new(regimeHex, 30)
+plot(showRegimeRib ? 0.0 : na, title="Regime Ribbon", color=ribbonCol, linewidth=4, style=plot.style_columns, histbase=0.0, display=display.pane)
+
+if showRegime and regimeChanged
+    label.new(bar_index, high + atrVal * 0.4, regimeStr, style=label.style_label_down, color=color.new(regimeHex, 20), textcolor=color.white, size=size.tiny)
+
+
+// ═══════════════════════════════════════════════════════════════
+// MODULE 2: SMART MONEY INTENT
+// ═══════════════════════════════════════════════════════════════
+
+iAccum = 0.0
+iAccum += rejAtLow >= 2 ? 25.0 : 0.0
+iAccum += volDeclining and tBear ? 15.0 : 0.0
+iAccum += isComp and distEQ < -0.25 ? 20.0 : 0.0
+iAccum += rejDn and not isDisp ? 15.0 : 0.0
+iAccum += regime == 6 or regime == 7 ? 15.0 : 0.0
+iAccum += pdPct < 30 and isComp ? 10.0 : 0.0
+
+iDistrib = 0.0
+iDistrib += rejAtHigh >= 2 ? 25.0 : 0.0
+iDistrib += volDeclining and tBull ? 15.0 : 0.0
+iDistrib += isComp and distEQ > 0.25 ? 20.0 : 0.0
+iDistrib += rejUp and not isDisp ? 15.0 : 0.0
+iDistrib += regime == 0 and pdPct > 70 ? 15.0 : 0.0
+iDistrib += pdPct > 70 and isComp ? 10.0 : 0.0
+
+iLiqHarv = 0.0
+iLiqHarv += sweepHi or sweepLo ? 35.0 : 0.0
+iLiqHarv += barsSinceSweep < 3 and isDisp ? 25.0 : 0.0
+iLiqHarv += (hasEQH or hasEQL) and (rejUp or rejDn) ? 15.0 : 0.0
+iLiqHarv += volSpike and (sweepHi or sweepLo) ? 15.0 : 0.0
+iLiqHarv += regime == 4 ? 10.0 : 0.0
+
+iTrap = 0.0
+iTrap += fbHigh or fbLow ? 35.0 : 0.0
+iTrap += hasEQH and rejAtHigh >= 1 ? 15.0 : 0.0
+iTrap += hasEQL and rejAtLow >= 1 ? 15.0 : 0.0
+iTrap += overextBull or overextBear ? 15.0 : 0.0
+iTrap += regime == 3 ? 10.0 : 0.0
+iTrap += barsSinceFB < 5 ? 10.0 : 0.0
+
+iAbsorb = 0.0
+iAbsorb += rejAtHigh >= 3 ? 25.0 : 0.0
+iAbsorb += rejAtLow >= 3 ? 25.0 : 0.0
+iAbsorb += not isDisp and (rejUp or rejDn) ? 15.0 : 0.0
+iAbsorb += volDeclining and (rejUp or rejDn) ? 15.0 : 0.0
+iAbsorb += isComp ? 10.0 : 0.0
+iAbsorb += trendClarity < 15 ? 10.0 : 0.0
+
+iReprice = 0.0
+iReprice += consDispBull >= 2 or consDispBear >= 2 ? 30.0 : 0.0
+iReprice += dispStr > 2.0 ? 20.0 : 0.0
+iReprice += (bosUp or bosDn) and isDisp ? 20.0 : 0.0
+iReprice += volSpike and atrRatio > 1.3 ? 15.0 : 0.0
+iReprice += regime == 5 ? 15.0 : 0.0
+
+float smMx = math.max(iAccum, math.max(iDistrib, math.max(iLiqHarv, math.max(iTrap, math.max(iAbsorb, iReprice)))))
+smIntent = smMx < 35 ? -1 : smMx == iAccum ? 0 : smMx == iDistrib ? 1 : smMx == iLiqHarv ? 2 : smMx == iTrap ? 3 : smMx == iAbsorb ? 4 : 5
+smConf   = math.min(100.0, smMx)
+
+smStr = switch smIntent
+    0 => "ACCUMULATION"
+    1 => "DISTRIBUTION"
+    2 => "LIQ. HARVEST"
+    3 => "TRAP ENGINEERING"
+    4 => "ABSORPTION"
+    5 => "REPRICING"
+    => "—"
+
+smCol = switch smIntent
+    0 => C_BULL
+    1 => C_BEAR
+    2 => C_BEAR
+    3 => C_TRAP_
+    4 => C_NEUT
+    5 => C_WARN
+    => C_DIM
+
+
+// ═══════════════════════════════════════════════════════════════
+// MODULE 3: CROWD BIAS
+// ═══════════════════════════════════════════════════════════════
+
+crowdLongBias   = (tBull ? 20.0 : 0.0) + (distEQ > 0.3 ? 15.0 : 0.0) + (pdPct > 65 ? 15.0 : 0.0) + (bosUp and not fbHigh ? 15.0 : 0.0) + (regime == 0 and tBull ? 10.0 : 0.0) + (consDispBull >= 1 ? 10.0 : 0.0)
+crowdShortBias  = (tBear ? 20.0 : 0.0) + (distEQ < -0.3 ? 15.0 : 0.0) + (pdPct < 35 ? 15.0 : 0.0) + (bosDn and not fbLow ? 15.0 : 0.0) + (regime == 0 and tBear ? 10.0 : 0.0) + (consDispBear >= 1 ? 10.0 : 0.0)
+crowdTrapLong   = (fbHigh ? 35.0 : 0.0) + (mssDn and tBull[3] ? 25.0 : 0.0) + (sweepHi ? 20.0 : 0.0) + (overextBull ? 15.0 : 0.0)
+crowdTrapShort  = (fbLow ? 35.0 : 0.0) + (mssUp and tBear[3] ? 25.0 : 0.0) + (sweepLo ? 20.0 : 0.0) + (overextBear ? 15.0 : 0.0)
+crowdChase      = (squeezeFired and isDisp ? 35.0 : 0.0) + (consDispBull >= 2 or consDispBear >= 2 ? 25.0 : 0.0) + (volSpike and isDisp ? 15.0 : 0.0)
+crowdIndecisive = (math.abs(distEQ) < 0.15 ? 25.0 : 0.0) + (isComp ? 20.0 : 0.0) + (trendClarity < 15 ? 20.0 : 0.0) + (not isDisp and not (bosUp or bosDn or mssUp or mssDn) ? 15.0 : 0.0)
+
+float cMx = math.max(crowdTrapLong, math.max(crowdTrapShort, math.max(crowdChase, math.max(crowdIndecisive, math.max(crowdLongBias, crowdShortBias)))))
+
+crowdSt = cMx < 30 ? 4 : cMx == crowdTrapLong ? 1 : cMx == crowdTrapShort ? 3 : cMx == crowdChase ? 5 : cMx == crowdIndecisive ? 4 : cMx == crowdLongBias ? 0 : 2
+
+crowdStr = switch crowdSt
+    0 => "POSITIONED LONG"
+    1 => "TRAPPED LONG"
+    2 => "POSITIONED SHORT"
+    3 => "TRAPPED SHORT"
+    4 => "INDECISIVE"
+    5 => "CHASING"
+    => "—"
+
+crowdCol = switch crowdSt
+    0 => C_BULL
+    1 => C_BEAR
+    2 => C_BEAR
+    3 => C_BULL
+    4 => C_NEUT
+    5 => C_WARN
+    => C_DIM
+
+
+// ═══════════════════════════════════════════════════════════════
+// MODULE 4: PAIN & PRESSURE ENGINE
+// ═══════════════════════════════════════════════════════════════
+
+painUp = 0.0
+painUp += crowdSt == 3 ? 20.0 : 0.0
+painUp += sweepLo ? 15.0 : 0.0
+painUp += barsSinceSweep < 5 and msTrend == 1 ? 10.0 : 0.0
+painUp += fbLow ? 15.0 : 0.0
+painUp += iDistrib > 50 ? 10.0 : 0.0
+if array.size(hiP) >= 1
+    toResist = array.get(hiP, 0) - close
+    painUp += toResist > 0 and toResist < atrVal * 2 ? 15.0 : 0.0
+painUp += pdPct < 30 and isComp ? 10.0 : 0.0
+painUp += hasEQH ? 5.0 : 0.0
+
+painDn = 0.0
+painDn += crowdSt == 1 ? 20.0 : 0.0
+painDn += sweepHi ? 15.0 : 0.0
+painDn += barsSinceSweep < 5 and msTrend == -1 ? 10.0 : 0.0
+painDn += fbHigh ? 15.0 : 0.0
+painDn += iAccum > 50 ? 10.0 : 0.0
+if array.size(loP) >= 1
+    toSupport = close - array.get(loP, 0)
+    painDn += toSupport > 0 and toSupport < atrVal * 2 ? 15.0 : 0.0
+painDn += pdPct > 70 and isComp ? 10.0 : 0.0
+painDn += hasEQL ? 5.0 : 0.0
+
+painBias = painUp - painDn
+painStr_ = painBias > 10 ? "UPWARD" : painBias < -10 ? "DOWNWARD" : "BALANCED"
+painCol  = painBias > 10 ? color.new(C_BULL, 25) : painBias < -10 ? color.new(C_BEAR, 25) : color.new(C_NEUT, 35)
+
+pressure = 0.0
+pressure += math.max(painUp, painDn) * 0.5
+pressure += regime >= 3 ? 15.0 : 0.0
+pressure += barsSinceSweep < 5 ? 10.0 : 0.0
+pressure += barsSinceFB < 5 ? 10.0 : 0.0
+pressure += isComp and (hasEQH or hasEQL) ? 10.0 : 0.0
+pressure += overextBull or overextBear ? 10.0 : 0.0
+pressure += math.abs(distEQ) > 0.6 ? 5.0 : 0.0
+pressure := math.min(100.0, pressure)
+
+
+// ═══════════════════════════════════════════════════════════════
+// MODULE 5: PRESSURE ZONES
+// ═══════════════════════════════════════════════════════════════
+
+var int[]   pzT  = array.new_int(0)
+var float[] pzHi = array.new_float(0)
+var float[] pzLo = array.new_float(0)
+var int[]   pzBr = array.new_int(0)
+var bool[]  pzOn = array.new_bool(0)
+
+_zone(typ, hi_, lo_, bi_) =>
+    dup = false
+    mid_ = (hi_ + lo_) / 2
+    if array.size(pzT) > 0
+        for k = 0 to array.size(pzT) - 1
+            if array.get(pzT, k) == typ and array.get(pzOn, k)
+                eMid = (array.get(pzHi, k) + array.get(pzLo, k)) / 2
+                if eMid > 0 and math.abs(eMid - mid_) / eMid * 100 < 0.4
+                    dup := true
+                    break
+    if not dup and hi_ > lo_
+        array.unshift(pzT, typ)
+        array.unshift(pzHi, hi_)
+        array.unshift(pzLo, lo_)
+        array.unshift(pzBr, bi_)
+        array.unshift(pzOn, true)
+        if array.size(pzT) > 20
+            array.pop(pzT)
+            array.pop(pzHi)
+            array.pop(pzLo)
+            array.pop(pzBr)
+            array.pop(pzOn)
+
+if showPsychZones
+    if isBullDisp and bosUp
+        _zone(0, high + atrVal * 0.2, high, bar_index)
+    if isBearDisp and bosDn
+        _zone(0, low, low - atrVal * 0.2, bar_index)
+    if fbHigh and array.size(hiP) >= 1
+        _zone(1, high, array.get(hiP, 0), bar_index)
+    if fbLow and array.size(loP) >= 1
+        _zone(1, array.get(loP, 0), low, bar_index)
+    if sweepHi and not na(eqhLvl)
+        _zone(2, high, eqhLvl, bar_index)
+    if sweepLo and not na(eqlLvl)
+        _zone(2, eqlLvl, low, bar_index)
+    if regime >= 4 and regime <= 5 and regimeChanged
+        _zone(3, high, low, bar_index)
+
+    if array.size(pzOn) > 0
+        for i = 0 to array.size(pzOn) - 1
+            if array.get(pzOn, i)
+                age = bar_index - array.get(pzBr, i)
+                if age > zoneMaxAge
+                    array.set(pzOn, i, false)
+                else if age > 3
+                    if close > array.get(pzHi, i) and close[1] > array.get(pzHi, i)
+                        array.set(pzOn, i, false)
+                    if close < array.get(pzLo, i) and close[1] < array.get(pzLo, i)
+                        array.set(pzOn, i, false)
+
+
+// ═══════════════════════════════════════════════════════════════
+// VISUAL OUTPUT
+// ═══════════════════════════════════════════════════════════════
+
+barcolor(showDisp and isBullDisp ? color.new(C_BULL, 5) : showDisp and isBearDisp ? color.new(C_BEAR, 5) : na, title="Displacement")
+barcolor(showPressureBar and pressure > 70 and not isDisp ? color.new(C_WARN, 75) : na, title="Pressure Tint")
+
+plotshape(showSweepMark and sweepHi, title="Sweep Hi", style=shape.diamond, location=location.abovebar, color=color.new(C_BEAR, 10), size=size.tiny)
+plotshape(showSweepMark and sweepLo, title="Sweep Lo", style=shape.diamond, location=location.belowbar, color=color.new(C_BULL, 10), size=size.tiny)
+
+if showMSS and mssUp
+    label.new(bar_index - swingLen, pivHi, "MSS", style=label.style_label_down, color=color.new(C_BULL, 30), textcolor=color.white, size=size.tiny)
+if showMSS and mssDn
+    label.new(bar_index - swingLen, pivLo, "MSS", style=label.style_label_up, color=color.new(C_BEAR, 30), textcolor=color.white, size=size.tiny)
+
+plotshape(showSqueeze and squeezeFired, title="Squeeze Fire", style=shape.triangleup, location=location.bottom, color=color.new(C_BULL, 15), size=size.tiny)
+
+
+// ═══════════════════════════════════════════════════════════════
+// DRAWING — LAST BAR ONLY
+// ═══════════════════════════════════════════════════════════════
+
+_sb(b) => math.max(b, bar_index - 500)
+
+if barstate.islast
+
+    // ─── PRESSURE ZONES ───
+    if showPsychZones and array.size(pzOn) > 0
+        n = 0
+        for i = 0 to array.size(pzOn) - 1
+            if n >= maxZonesDrawn
+                break
+            if array.get(pzOn, i)
+                typ = array.get(pzT, i)
+                t_  = array.get(pzHi, i)
+                b_  = array.get(pzLo, i)
+                sb  = _sb(array.get(pzBr, i))
+                age = bar_index - array.get(pzBr, i)
+                ageFade = math.min(10, math.round(age / 6))
+
+                zFill = switch typ
+                    0 => color.new(C_WARN, 88 + ageFade)
+                    1 => color.new(C_TRAP_, 87 + ageFade)
+                    2 => color.new(C_BEAR, 85 + ageFade)
+                    3 => color.new(C_BEAR, 83 + ageFade)
+                    => color.new(C_NEUT, 90)
+
+                zEdge = switch typ
+                    0 => color.new(C_WARN, 55 + ageFade)
+                    1 => color.new(C_TRAP_, 50 + ageFade)
+                    2 => color.new(C_BEAR, 48 + ageFade)
+                    3 => color.new(C_BEAR, 45 + ageFade)
+                    => color.new(C_NEUT, 60)
+
+                zLbl = switch typ
+                    0 => "FOMO"
+                    1 => "REGRET"
+                    2 => "TRAP"
+                    3 => "FORCED"
+                    => ""
+
+                box.new(sb, t_, bar_index + 8, b_, bgcolor=zFill, border_color=zEdge, border_width=1)
+                label.new(sb + 1, t_, zLbl, style=label.style_none, textcolor=zEdge, size=size.tiny)
+                n += 1
+
+    // ─── PAIN GRADIENT BANDS ───
+    if showPainBands and not na(eqH) and not na(eqL) and eqH > eqL
+        painNormUp = math.min(1.0, painUp / 60.0)
+        painNormDn = math.min(1.0, painDn / 60.0)
+
+        if painNormUp > 0.3
+            pBandTop = close + atrVal * 3 * painNormUp
+            pBandBot = close + atrVal * 0.5
+            box.new(bar_index - 15, pBandTop, bar_index + 20, pBandBot, bgcolor=color.new(C_BULL, 93), border_color=color.new(color.white, 100))
+
+        if painNormDn > 0.3
+            pBandTop = close - atrVal * 0.5
+            pBandBot = close - atrVal * 3 * painNormDn
+            box.new(bar_index - 15, pBandTop, bar_index + 20, pBandBot, bgcolor=color.new(C_BEAR, 93), border_color=color.new(color.white, 100))
+
+    // ─── PREMIUM / DISCOUNT SHADING ───
+    if showPDShade and not na(eqH) and not na(eqL) and eqH > eqL
+        eq75 = eqL + (eqH - eqL) * 0.75
+        eq25 = eqL + (eqH - eqL) * 0.25
+        box.new(bar_index - 30, eqH, bar_index + 15, eq75, bgcolor=color.new(C_BEAR, 95), border_color=color.new(color.white, 100))
+        label.new(bar_index + 17, (eqH + eq75) / 2, "PREM", style=label.style_none, textcolor=color.new(C_BEAR, 55), size=size.tiny)
+        box.new(bar_index - 30, eq25, bar_index + 15, eqL, bgcolor=color.new(C_BULL, 95), border_color=color.new(color.white, 100))
+        label.new(bar_index + 17, (eq25 + eqL) / 2, "DISC", style=label.style_none, textcolor=color.new(C_BULL, 55), size=size.tiny)
+
+    // ─── EQUILIBRIUM ───
+    if showEQ and not na(eqM) and not na(eqH) and eqH > eqL
+        line.new(bar_index - 40, eqM, bar_index + 15, eqM, color=color.new(C_NEUT, 55), width=1, style=line.style_dotted)
+        label.new(bar_index + 17, eqM, "EQ", style=label.style_none, textcolor=color.new(C_NEUT, 40), size=size.tiny)
+
+    // ─── EQH / EQL ───
+    if showEQLines and hasEQH and not na(eqhLvl)
+        line.new(bar_index - 40, eqhLvl, bar_index + 12, eqhLvl, color=color.new(C_WARN, 50), width=1, style=line.style_dashed)
+        label.new(bar_index + 14, eqhLvl, "EQH", style=label.style_none, textcolor=color.new(C_WARN, 35), size=size.tiny)
+    if showEQLines and hasEQL and not na(eqlLvl)
+        line.new(bar_index - 40, eqlLvl, bar_index + 12, eqlLvl, color=color.new(C_WARN, 50), width=1, style=line.style_dashed)
+        label.new(bar_index + 14, eqlLvl, "EQL", style=label.style_none, textcolor=color.new(C_WARN, 35), size=size.tiny)
+
+
+// ═══════════════════════════════════════════════════════════════
+// DASHBOARD
+// ═══════════════════════════════════════════════════════════════
+
+dPos_ = switch dashPos
+    "Top Right" => position.top_right
+    "Top Left" => position.top_left
+    "Bottom Right" => position.bottom_right
+    => position.bottom_left
+
+var table dash = table.new(dPos_, 3, 11, bgcolor=color.new(C_DBG, 5), border_width=0)
+
+if barstate.islast and showDash
+
+    table.cell(dash, 0, 0, "ESCO", text_color=C_GOLD, text_size=size.small, text_halign=text.align_left)
+    table.cell(dash, 1, 0, "PSYCHOLOGICAL", text_color=color.new(C_GOLD, 45), text_size=size.tiny, text_halign=text.align_center)
+    table.cell(dash, 2, 0, "THEORY", text_color=color.new(C_GOLD, 45), text_size=size.tiny, text_halign=text.align_right)
+
+    table.cell(dash, 0, 1, "", text_size=size.tiny)
+    table.cell(dash, 1, 1, "", text_size=size.tiny)
+    table.cell(dash, 2, 1, "", text_size=size.tiny)
+
+    table.cell(dash, 0, 2, "REGIME", text_color=C_DLBL, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(dash, 1, 2, "", text_size=size.tiny)
+    table.cell(dash, 2, 2, regimeStr, text_color=color.new(regimeHex, 0), text_size=size.tiny, text_halign=text.align_right)
+
+    table.cell(dash, 0, 3, "CROWD", text_color=C_DLBL, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(dash, 1, 3, "", text_size=size.tiny)
+    table.cell(dash, 2, 3, crowdStr, text_color=color.new(crowdCol, 0), text_size=size.tiny, text_halign=text.align_right)
+
+    smConfStr = smIntent >= 0 ? " (" + str.tostring(smConf, "#") + "%)" : ""
+    table.cell(dash, 0, 4, "INTENT", text_color=C_DLBL, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(dash, 1, 4, "", text_size=size.tiny)
+    table.cell(dash, 2, 4, smStr + smConfStr, text_color=color.new(smCol, 0), text_size=size.tiny, text_halign=text.align_right)
+
+    table.cell(dash, 0, 5, "", text_size=size.tiny)
+    table.cell(dash, 1, 5, "", text_size=size.tiny)
+    table.cell(dash, 2, 5, "", text_size=size.tiny)
+
+    table.cell(dash, 0, 6, "PAIN", text_color=C_DLBL, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(dash, 1, 6, "", text_size=size.tiny)
+    table.cell(dash, 2, 6, painStr_, text_color=color.new(painCol, 0), text_size=size.tiny, text_halign=text.align_right)
+
+    pCol = pressure > 65 ? color.new(C_BEAR, 0) : pressure > 35 ? color.new(C_WARN, 0) : color.new(C_DIM, 0)
+    pBar = pressure > 80 ? "████" : pressure > 60 ? "███░" : pressure > 40 ? "██░░" : pressure > 20 ? "█░░░" : "░░░░"
+    table.cell(dash, 0, 7, "PRESSURE", text_color=C_DLBL, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(dash, 1, 7, pBar, text_color=pCol, text_size=size.tiny, text_halign=text.align_center)
+    table.cell(dash, 2, 7, str.tostring(pressure, "#") + "%", text_color=pCol, text_size=size.tiny, text_halign=text.align_right)
+
+    table.cell(dash, 0, 8, "", text_size=size.tiny)
+    table.cell(dash, 1, 8, "", text_size=size.tiny)
+    table.cell(dash, 2, 8, "", text_size=size.tiny)
+
+    zStr = pdPct > 75 ? "PREMIUM" : pdPct < 25 ? "DISCOUNT" : "EQUILIBRIUM"
+    zCol = pdPct > 75 ? C_BEAR : pdPct < 25 ? C_BULL : C_DIM
+    zPct = str.tostring(pdPct, "#") + "%"
+    table.cell(dash, 0, 9, "ZONE", text_color=C_DLBL, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(dash, 1, 9, zPct, text_color=color.new(zCol, 20), text_size=size.tiny, text_halign=text.align_center)
+    table.cell(dash, 2, 9, zStr, text_color=color.new(zCol, 0), text_size=size.tiny, text_halign=text.align_right)
+
+    phaseStr = switch regime
+        0 => "EARLY CYCLE"
+        1 => "BUILDING"
+        2 => "EXPANSION"
+        3 => "EXHAUSTION"
+        4 => "BREAKDOWN"
+        5 => "FLUSH"
+        6 => "RECOVERY"
+        7 => "RELOAD"
+        => "—"
+    phaseCol = regimeSev >= 2 ? C_BEAR : regimeSev == 1 ? C_WARN : C_BULL
+    table.cell(dash, 0, 10, "PHASE", text_color=C_DLBL, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(dash, 1, 10, "", text_size=size.tiny)
+    table.cell(dash, 2, 10, phaseStr, text_color=color.new(phaseCol, 10), text_size=size.tiny, text_halign=text.align_right)

@@ -1,0 +1,389 @@
+//@version=6
+indicator("Breakout Acceptance Score [BAS]", shorttitle="BAS", overlay=true, max_labels_count=200, max_lines_count=500)
+
+//==================================================================================================
+// Breakout Acceptance Score [BAS]
+//==================================================================================================
+
+//----------------------------------------
+// Inputs
+//----------------------------------------
+groupBreakout = "Breakout Logic"
+lookbackBars      = input.int(20, "Breakout lookback", minval=5, maxval=200, group=groupBreakout)
+evalBars          = input.int(6, "Evaluation bars after breakout", minval=2, maxval=20, group=groupBreakout)
+minBreakPct       = input.float(0.05, "Minimum breakout distance %", minval=0.0, step=0.01, group=groupBreakout)
+retestTolerancePc = input.float(0.10, "Retest tolerance %", minval=0.01, step=0.01, group=groupBreakout)
+
+groupScoring = "Scoring / Filters"
+atrLen               = input.int(14, "ATR length", minval=1, group=groupScoring)
+strictTrapCloses     = input.int(2, "Trap risk after closes back through level", minval=1, maxval=5, group=groupScoring)
+strongAcceptThresh   = input.int(80, "Strong acceptance threshold", minval=50, maxval=100, group=groupScoring)
+moderateAcceptThresh = input.int(60, "Moderate acceptance threshold", minval=30, maxval=99, group=groupScoring)
+
+groupDisplay = "Display"
+showLevelLine        = input.bool(true, "Show breakout level line", group=groupDisplay)
+showBreakoutLabels   = input.bool(false, "Show breakout labels", group=groupDisplay)
+showRetestLabels     = input.bool(false, "Show retest labels", group=groupDisplay)
+showSignalShapes     = input.bool(false, "Show signal shapes", group=groupDisplay)
+showDashboard        = input.bool(true, "Show dashboard", group=groupDisplay)
+shadeBackground      = input.bool(false, "Shade background by active state", group=groupDisplay)
+
+groupDashboard = "Dashboard"
+dashboardPosition = input.string("Top Right", "Dashboard position", options=[
+     "Top Left", "Top Center", "Top Right",
+     "Middle Left", "Middle Center", "Middle Right",
+     "Bottom Left", "Bottom Center", "Bottom Right"
+], group=groupDashboard)
+dashboardTextSize = input.string("Large", "Dashboard text size", options=["Tiny", "Small", "Normal", "Large"], group=groupDashboard)
+
+//----------------------------------------
+// Helpers
+//----------------------------------------
+f_clamp(val, minv, maxv) =>
+    math.max(minv, math.min(maxv, val))
+
+f_classification(score) =>
+    score >= strongAcceptThresh ? "Strong Acceptance" :
+     score >= moderateAcceptThresh ? "Moderate Acceptance" :
+     score >= 40 ? "Weak Breakout" : "Trap Risk"
+
+f_classColor(score) =>
+    score >= strongAcceptThresh ? color.lime :
+     score >= moderateAcceptThresh ? color.yellow :
+     score >= 40 ? color.orange : color.red
+
+f_closeStrengthBull(h, l, c) =>
+    rng = math.max(h - l, syminfo.mintick)
+    ((c - l) / rng) * 20.0
+
+f_closeStrengthBear(h, l, c) =>
+    rng = math.max(h - l, syminfo.mintick)
+    ((h - c) / rng) * 20.0
+
+f_oppWickBull(h, l, c) =>
+    rng = math.max(h - l, syminfo.mintick)
+    ((h - c) / rng)
+
+f_oppWickBear(h, l, c) =>
+    rng = math.max(h - l, syminfo.mintick)
+    ((c - l) / rng)
+
+f_tablePos(pos) =>
+    pos == "Top Left" ? position.top_left :
+     pos == "Top Center" ? position.top_center :
+     pos == "Top Right" ? position.top_right :
+     pos == "Middle Left" ? position.middle_left :
+     pos == "Middle Center" ? position.middle_center :
+     pos == "Middle Right" ? position.middle_right :
+     pos == "Bottom Left" ? position.bottom_left :
+     pos == "Bottom Center" ? position.bottom_center :
+     position.bottom_right
+
+f_txtSize(sz) =>
+    sz == "Tiny" ? size.tiny :
+     sz == "Small" ? size.small :
+     sz == "Large" ? size.large :
+     size.normal
+
+//----------------------------------------
+// Structural breakout levels
+//----------------------------------------
+priorHigh = ta.highest(high[1], lookbackBars)
+priorLow  = ta.lowest(low[1], lookbackBars)
+atrNow    = ta.atr(atrLen)
+
+bullBreak = barstate.isconfirmed and close > priorHigh * (1.0 + minBreakPct / 100.0)
+bearBreak = barstate.isconfirmed and close < priorLow  * (1.0 - minBreakPct / 100.0)
+
+//----------------------------------------
+// Persistent state
+//----------------------------------------
+var bool  activeBull = false
+var bool  activeBear = false
+var float breakoutLevel = na
+var int   breakoutBarIndex = na
+var float breakoutAtr = na
+var float breakoutCloseScore = na
+
+var int   holdBarsCount = 0
+var int   followBarsCount = 0
+var int   backInsideCount = 0
+var float wickPenaltyAcc = 0.0
+
+var bool  retestSeen = false
+var bool  retestSuccess = false
+var bool  retestFailure = false
+var bool  trapRisk = false
+
+var float liveScore = na
+var string liveClass = "Idle"
+
+var line  levelLine = na
+
+var bool bullBreakoutEvent = false
+var bool bearBreakoutEvent = false
+var bool strongBullAcceptEvent = false
+var bool strongBearAcceptEvent = false
+var bool bullTrapEvent = false
+var bool bearTrapEvent = false
+var bool bullRetestEvent = false
+var bool bearRetestEvent = false
+
+var string lastDashboardPosition = dashboardPosition
+var table dash = table.new(f_tablePos(dashboardPosition), 2, 7, border_width=1)
+
+if dashboardPosition != lastDashboardPosition
+    table.delete(dash)
+    dash := table.new(f_tablePos(dashboardPosition), 2, 7, border_width=1)
+    lastDashboardPosition := dashboardPosition
+
+bullBreakoutEvent := false
+bearBreakoutEvent := false
+strongBullAcceptEvent := false
+strongBearAcceptEvent := false
+bullTrapEvent := false
+bearTrapEvent := false
+bullRetestEvent := false
+bearRetestEvent := false
+
+//----------------------------------------
+// Start breakout state
+//----------------------------------------
+startBullBreakout = not activeBull and not activeBear and bullBreak
+startBearBreakout = not activeBull and not activeBear and bearBreak
+
+if startBullBreakout
+    activeBull := true
+    activeBear := false
+    breakoutLevel := priorHigh
+    breakoutBarIndex := bar_index
+    breakoutAtr := atrNow
+    breakoutCloseScore := f_clamp(f_closeStrengthBull(high, low, close), 0.0, 20.0)
+
+    holdBarsCount := 1
+    followBarsCount := 0
+    backInsideCount := 0
+    wickPenaltyAcc := 0.0
+
+    retestSeen := false
+    retestSuccess := false
+    retestFailure := false
+    trapRisk := false
+
+    liveScore := breakoutCloseScore
+    liveClass := f_classification(liveScore)
+
+    if showLevelLine
+        if not na(levelLine)
+            line.delete(levelLine)
+        levelLine := line.new(
+             x1=bar_index,
+             y1=breakoutLevel,
+             x2=bar_index + 50,
+             y2=breakoutLevel,
+             extend=extend.right,
+             color=color.new(color.lime, 0),
+             width=3
+         )
+
+    if showBreakoutLabels
+        label.new(bar_index, high, "BO", style=label.style_label_up, textcolor=color.white, color=color.new(color.lime, 35), size=size.tiny)
+
+    bullBreakoutEvent := true
+
+if startBearBreakout
+    activeBull := false
+    activeBear := true
+    breakoutLevel := priorLow
+    breakoutBarIndex := bar_index
+    breakoutAtr := atrNow
+    breakoutCloseScore := f_clamp(f_closeStrengthBear(high, low, close), 0.0, 20.0)
+
+    holdBarsCount := 1
+    followBarsCount := 0
+    backInsideCount := 0
+    wickPenaltyAcc := 0.0
+
+    retestSeen := false
+    retestSuccess := false
+    retestFailure := false
+    trapRisk := false
+
+    liveScore := breakoutCloseScore
+    liveClass := f_classification(liveScore)
+
+    if showLevelLine
+        if not na(levelLine)
+            line.delete(levelLine)
+        levelLine := line.new(
+             x1=bar_index,
+             y1=breakoutLevel,
+             x2=bar_index + 50,
+             y2=breakoutLevel,
+             extend=extend.right,
+             color=color.new(color.red, 0),
+             width=3
+         )
+
+    if showBreakoutLabels
+        label.new(bar_index, low, "BO", style=label.style_label_down, textcolor=color.white, color=color.new(color.red, 35), size=size.tiny)
+
+    bearBreakoutEvent := true
+
+//----------------------------------------
+// Update active breakout
+//----------------------------------------
+barsSinceBreakout = na(breakoutBarIndex) ? na : bar_index - breakoutBarIndex
+retestTolerance = na(breakoutLevel) ? na : breakoutLevel * (retestTolerancePc / 100.0)
+
+if activeBull and barstate.isconfirmed
+    if barsSinceBreakout > 0
+        if close > breakoutLevel
+            holdBarsCount += 1
+
+        if close > close[1]
+            followBarsCount += 1
+
+        wickPenaltyAcc += f_oppWickBull(high, low, close) * 4.0
+
+        nearRetest = low <= breakoutLevel + retestTolerance and low >= breakoutLevel - retestTolerance
+        if nearRetest and not retestSeen
+            retestSeen := true
+            if close > breakoutLevel
+                retestSuccess := true
+                if showRetestLabels
+                    label.new(bar_index, low, "RT", style=label.style_label_up, textcolor=color.white, color=color.new(color.green, 45), size=size.tiny)
+                bullRetestEvent := true
+
+        if close <= breakoutLevel
+            backInsideCount += 1
+
+        if close < breakoutLevel - retestTolerance
+            retestFailure := true
+
+        trapRisk := retestFailure or backInsideCount >= strictTrapCloses
+
+    holdScore    = f_clamp((holdBarsCount / evalBars) * 20.0, 0.0, 20.0)
+    followScore  = f_clamp((followBarsCount / evalBars) * 20.0, 0.0, 20.0)
+    retestScore  = retestSuccess ? 20.0 : retestSeen ? 10.0 : 0.0
+    penaltyScore = f_clamp((backInsideCount * 6.0) + wickPenaltyAcc, 0.0, 20.0)
+
+    liveScore := f_clamp(breakoutCloseScore + holdScore + followScore + retestScore + (20.0 - penaltyScore), 0.0, 100.0)
+    liveClass := trapRisk ? "Trap Risk" : f_classification(liveScore)
+
+    strongBullAcceptEvent := barsSinceBreakout > 0 and liveScore >= strongAcceptThresh and not trapRisk
+    bullTrapEvent := trapRisk
+
+    if barsSinceBreakout >= evalBars or trapRisk
+        activeBull := false
+
+if activeBear and barstate.isconfirmed
+    if barsSinceBreakout > 0
+        if close < breakoutLevel
+            holdBarsCount += 1
+
+        if close < close[1]
+            followBarsCount += 1
+
+        wickPenaltyAcc += f_oppWickBear(high, low, close) * 4.0
+
+        nearRetest = high >= breakoutLevel - retestTolerance and high <= breakoutLevel + retestTolerance
+        if nearRetest and not retestSeen
+            retestSeen := true
+            if close < breakoutLevel
+                retestSuccess := true
+                if showRetestLabels
+                    label.new(bar_index, high, "RT", style=label.style_label_down, textcolor=color.white, color=color.new(color.maroon, 45), size=size.tiny)
+                bearRetestEvent := true
+
+        if close >= breakoutLevel
+            backInsideCount += 1
+
+        if close > breakoutLevel + retestTolerance
+            retestFailure := true
+
+        trapRisk := retestFailure or backInsideCount >= strictTrapCloses
+
+    holdScore    = f_clamp((holdBarsCount / evalBars) * 20.0, 0.0, 20.0)
+    followScore  = f_clamp((followBarsCount / evalBars) * 20.0, 0.0, 20.0)
+    retestScore  = retestSuccess ? 20.0 : retestSeen ? 10.0 : 0.0
+    penaltyScore = f_clamp((backInsideCount * 6.0) + wickPenaltyAcc, 0.0, 20.0)
+
+    liveScore := f_clamp(breakoutCloseScore + holdScore + followScore + retestScore + (20.0 - penaltyScore), 0.0, 100.0)
+    liveClass := trapRisk ? "Trap Risk" : f_classification(liveScore)
+
+    strongBearAcceptEvent := barsSinceBreakout > 0 and liveScore >= strongAcceptThresh and not trapRisk
+    bearTrapEvent := trapRisk
+
+    if barsSinceBreakout >= evalBars or trapRisk
+        activeBear := false
+
+//----------------------------------------
+// Visuals
+//----------------------------------------
+scoreColor = f_classColor(nz(liveScore, 0))
+
+bgcolor(
+     shadeBackground ?
+     activeBull ? color.new(color.lime, 92) :
+     activeBear ? color.new(color.red, 92) : na
+     : na
+)
+
+plotshape(showSignalShapes and bullBreakoutEvent, title="Bull Breakout", style=shape.triangleup, location=location.belowbar, color=color.lime, size=size.tiny)
+plotshape(showSignalShapes and bearBreakoutEvent, title="Bear Breakout", style=shape.triangledown, location=location.abovebar, color=color.red, size=size.tiny)
+plotshape(showSignalShapes and strongBullAcceptEvent, title="Strong Bull Acceptance", style=shape.circle, location=location.belowbar, color=color.new(color.green, 0), size=size.tiny)
+plotshape(showSignalShapes and strongBearAcceptEvent, title="Strong Bear Acceptance", style=shape.circle, location=location.abovebar, color=color.new(color.maroon, 0), size=size.tiny)
+plotshape(showSignalShapes and bullTrapEvent and not activeBull, title="Bull Trap Risk", style=shape.xcross, location=location.abovebar, color=color.orange, size=size.tiny)
+plotshape(showSignalShapes and bearTrapEvent and not activeBear, title="Bear Trap Risk", style=shape.xcross, location=location.belowbar, color=color.orange, size=size.tiny)
+
+//----------------------------------------
+// Dashboard
+//----------------------------------------
+if showDashboard and barstate.islast
+    sideTxt = activeBull ? "Bullish" : activeBear ? "Bearish" : "Idle"
+    lvlTxt  = na(breakoutLevel) ? "-" : str.tostring(breakoutLevel, format.mintick)
+    scrTxt  = na(liveScore) ? "-" : str.tostring(math.round(liveScore))
+    retTxt  = retestSuccess ? "Successful" : retestSeen ? "Seen / Unconfirmed" : "Not Seen"
+    trapTxt = trapRisk ? "High" : "Low"
+    txtSz   = f_txtSize(dashboardTextSize)
+
+    headerBg = color.rgb(10, 12, 18)
+    leftBg   = color.rgb(22, 26, 34)
+    rightBg  = color.rgb(14, 17, 24)
+
+    frameTxt = color.rgb(255, 255, 255)
+    softTxt  = color.rgb(255, 255, 255)
+
+    table.cell(dash, 0, 0, "BAS",  text_color=color.white, text_size=txtSz, bgcolor=headerBg)
+    table.cell(dash, 1, 0, "LIVE", text_color=color.white, text_size=txtSz, bgcolor=headerBg)
+
+    table.cell(dash, 0, 1, "Side",  text_color=frameTxt, text_size=txtSz, bgcolor=leftBg)
+    table.cell(dash, 1, 1, sideTxt, text_color=color.white, text_size=txtSz, bgcolor=activeBull ? color.new(color.green, 45) : activeBear ? color.new(color.red, 45) : rightBg)
+
+    table.cell(dash, 0, 2, "Level", text_color=frameTxt, text_size=txtSz, bgcolor=leftBg)
+    table.cell(dash, 1, 2, lvlTxt,  text_color=softTxt,  text_size=txtSz, bgcolor=rightBg)
+
+    table.cell(dash, 0, 3, "Score", text_color=frameTxt, text_size=txtSz, bgcolor=leftBg)
+    table.cell(dash, 1, 3, scrTxt,  text_color=color.black, text_size=txtSz, bgcolor=color.new(scoreColor, 20))
+
+    table.cell(dash, 0, 4, "Class", text_color=frameTxt, text_size=txtSz, bgcolor=leftBg)
+    table.cell(dash, 1, 4, liveClass, text_color=color.black, text_size=txtSz, bgcolor=color.new(scoreColor, 25))
+
+    table.cell(dash, 0, 5, "Retest", text_color=frameTxt, text_size=txtSz, bgcolor=leftBg)
+    table.cell(dash, 1, 5, retTxt,  text_color=softTxt,  text_size=txtSz, bgcolor=rightBg)
+
+    table.cell(dash, 0, 6, "Trap Risk", text_color=frameTxt, text_size=txtSz, bgcolor=leftBg)
+    table.cell(dash, 1, 6, trapTxt, text_color=color.black, text_size=txtSz, bgcolor=trapRisk ? color.new(color.red, 20) : color.new(color.green, 20))
+
+//----------------------------------------
+// Alerts
+//----------------------------------------
+alertcondition(bullBreakoutEvent, title="BAS Bullish Breakout", message="BAS: Bullish breakout detected.")
+alertcondition(bearBreakoutEvent, title="BAS Bearish Breakout", message="BAS: Bearish breakout detected.")
+alertcondition(strongBullAcceptEvent, title="BAS Strong Bull Acceptance", message="BAS: Strong bullish acceptance detected.")
+alertcondition(strongBearAcceptEvent, title="BAS Strong Bear Acceptance", message="BAS: Strong bearish acceptance detected.")
+alertcondition(bullTrapEvent, title="BAS Bull Trap Risk", message="BAS: Bullish breakout shows trap risk.")
+alertcondition(bearTrapEvent, title="BAS Bear Trap Risk", message="BAS: Bearish breakout shows trap risk.")
+alertcondition(bullRetestEvent, title="BAS Bull Retest Successful", message="BAS: Bullish retest accepted.")
+alertcondition(bearRetestEvent, title="BAS Bear Retest Successful", message="BAS: Bearish retest accepted.")

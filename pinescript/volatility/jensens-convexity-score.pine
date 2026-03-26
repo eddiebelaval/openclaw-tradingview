@@ -1,0 +1,357 @@
+//@version=6
+//By yours and only, Henrique Centieiro :p
+indicator("Jensen's Convexity Score", shorttitle="JCS", overlay=false)
+
+// ═════════════════════════════════════════════════════════════════════════
+// INPUTS
+// ═════════════════════════════════════════════════════════════════════════
+
+period_short = input.int(50, "Short Period", minval=20, maxval=100, group="Calculation", tooltip="Responsive period (2-3 months). Optimal: 40-50 bars")
+period_long = input.int(120, "Long Period", minval=50, maxval=300, group="Calculation", tooltip="Structural period (6 months). Optimal: 100-120 bars")
+min_samples = input.int(30, "Minimum Sample Size", minval=10, maxval=50, group="Calculation")
+
+enable_comparison = input.bool(true, "Enable Comparison", group="Comparison")
+comparison_symbol = input.symbol("SPY", "Comparison Symbol", group="Comparison")
+show_difference = input.bool(true, "Show Difference Score", group="Comparison")
+
+show_histogram = input.bool(true, "Show Histogram Background", group="Display")
+show_long_period = input.bool(true, "Show 100-bar Line", group="Display")
+show_table = input.bool(true, "Show Statistics Table", group="Display")
+table_position = input.string("top_right", "Table Position", options=["top_right", "top_left", "bottom_right", "bottom_left"], group="Display")
+table_font_size = input.string("small", "Table Font Size", options=["tiny", "small", "normal", "large"], group="Display")
+
+threshold_strong_convex = input.float(30, "Strong Convex Threshold", group="Thresholds")
+threshold_mild_convex = input.float(10, "Mild Convex Threshold", group="Thresholds")
+threshold_mild_concave = input.float(-10, "Mild Concave Threshold", group="Thresholds")
+threshold_strong_concave = input.float(-30, "Strong Concave Threshold", group="Thresholds")
+
+alert_buy_threshold = input.float(25, "Buy Alert Threshold", group="Alerts")
+alert_sell_threshold = input.float(-25, "Sell Alert Threshold", group="Alerts")
+
+// ═════════════════════════════════════════════════════════════════════════
+// FUNCTIONS
+// ═════════════════════════════════════════════════════════════════════════
+
+calc_convexity_score(src, length) =>
+    var float[] upside_returns = array.new<float>()
+    var float[] downside_returns = array.new<float>()
+    var float[] all_returns = array.new<float>()
+
+    array.clear(upside_returns)
+    array.clear(downside_returns)
+    array.clear(all_returns)
+
+    if bar_index >= length
+        for i = 0 to length - 1
+            log_return = math.log(src[i] / src[i + 1])
+            array.push(all_returns, log_return)
+
+            if log_return > 0
+                array.push(upside_returns, log_return)
+            else if log_return < 0
+                array.push(downside_returns, log_return)
+
+    upside_count = array.size(upside_returns)
+    downside_count = array.size(downside_returns)
+    valid_data = upside_count >= (min_samples / 2) and downside_count >= (min_samples / 2)
+
+    upside_vol = valid_data and upside_count > 1 ? array.stdev(upside_returns) : na
+    downside_vol = valid_data and downside_count > 1 ? array.stdev(downside_returns) : na
+    total_vol = array.size(all_returns) > 1 ? array.stdev(all_returns) : na
+
+    convexity_score = na(upside_vol) or na(downside_vol) or na(total_vol) or total_vol == 0 ? na : (math.pow(upside_vol, 2) - math.pow(downside_vol, 2)) / math.pow(total_vol, 2) * 100
+
+    [convexity_score, upside_vol, downside_vol, total_vol, upside_count, downside_count, valid_data]
+
+calc_percentile(score, lookback) =>
+    result = float(na)
+    if bar_index >= lookback and not na(score)
+        count_below = 0
+        valid_count = 0
+        for i = 0 to lookback - 1
+            historical_score = score[i]
+            if not na(historical_score)
+                valid_count += 1
+                if historical_score < score
+                    count_below += 1
+        result := valid_count > 0 ? (count_below / valid_count) * 100 : na
+    result
+
+calc_momentum(score, lookback) =>
+    result = float(na)
+    if bar_index >= lookback and not na(score) and not na(score[lookback])
+        sum_x = 0.0
+        sum_y = 0.0
+        sum_xy = 0.0
+        sum_xx = 0.0
+        n = 0.0
+
+        for i = 0 to lookback - 1
+            if not na(score[i])
+                x = float(i)
+                y = score[i]
+                sum_x += x
+                sum_y += y
+                sum_xy += x * y
+                sum_xx += x * x
+                n += 1
+
+        if n > 1
+            slope = (n * sum_xy - sum_x * sum_y) / (n * sum_xx - sum_x * sum_x)
+            result := slope
+    result
+
+get_color(score) =>
+    color_result = color.gray
+    if not na(score)
+        if score >= threshold_strong_convex
+            color_result := color.new(#00ff00, 0)
+        else if score >= threshold_mild_convex
+            color_result := color.new(#7fff00, 0)
+        else if score > threshold_mild_concave
+            color_result := color.new(color.gray, 0)
+        else if score > threshold_strong_concave
+            color_result := color.new(color.orange, 0)
+        else
+            color_result := color.new(color.red, 0)
+    else
+        color_result := color.new(color.gray, 50)
+    color_result
+
+get_signal(score) =>
+    if na(score)
+        "N/A"
+    else if score >= threshold_strong_convex
+        "STRONG BUY (Upside >> Downside)"
+    else if score >= threshold_mild_convex
+        "BUY (Upside > Downside)"
+    else if score > threshold_mild_concave
+        "NEUTRAL (Balanced)"
+    else if score > threshold_strong_concave
+        "CAUTION (Downside > Upside)"
+    else
+        "AVOID (Downside >> Upside)"
+
+get_strength(score) =>
+    if na(score)
+        "N/A"
+    else if math.abs(score) >= 40
+        if score > 0
+            math.abs(score) >= 50 ? "Very Strong Convexity" : "Strong Convexity"
+        else
+            math.abs(score) >= 50 ? "Very Strong Concavity" : "Strong Concavity"
+    else if math.abs(score) >= 20
+        score > 0 ? "Moderate Convexity" : "Moderate Concavity"
+    else if math.abs(score) >= 10
+        score > 0 ? "Weak Convexity" : "Weak Concavity"
+    else
+        "Neutral (Symmetric)"
+
+get_trend(score, momentum) =>
+    if na(momentum)
+        "Stable"
+    else if momentum > 0.5
+        "Improving ↑↑"
+    else if momentum > 0
+        "Improving ↑"
+    else if momentum < -0.5
+        "Deteriorating ↓↓"
+    else if momentum < 0
+        "Deteriorating ↓"
+    else
+        "Stable"
+
+get_font_size(size_str) =>
+    size_str == "tiny" ? size.tiny : size_str == "small" ? size.small : size_str == "normal" ? size.normal : size_str == "large" ? size.large : size.small
+
+// ═════════════════════════════════════════════════════════════════════════
+// CALCULATIONS
+// ═════════════════════════════════════════════════════════════════════════
+
+[score_50, up_vol_50, down_vol_50, total_vol_50, up_count_50, down_count_50, valid_50] = calc_convexity_score(close, period_short)
+[score_100, up_vol_100, down_vol_100, total_vol_100, up_count_100, down_count_100, valid_100] = calc_convexity_score(close, period_long)
+
+// Comparison calculations
+comp_close = enable_comparison ? request.security(comparison_symbol, timeframe.period, close, barmerge.gaps_off, barmerge.lookahead_off) : na
+
+comp_score_50 = float(na)
+comp_up_vol_50 = float(na)
+comp_down_vol_50 = float(na)
+comp_total_vol_50 = float(na)
+comp_up_count_50 = int(na)
+comp_down_count_50 = int(na)
+comp_valid_50 = false
+
+comp_score_100 = float(na)
+
+if enable_comparison and not na(comp_close)
+    [cs50, cuv50, cdv50, ctv50, cuc50, cdc50, cv50] = calc_convexity_score(comp_close, period_short)
+    comp_score_50 := cs50
+    comp_up_vol_50 := cuv50
+    comp_down_vol_50 := cdv50
+    comp_total_vol_50 := ctv50
+    comp_up_count_50 := cuc50
+    comp_down_count_50 := cdc50
+    comp_valid_50 := cv50
+
+    [cs100, cuv100, cdv100, ctv100, cuc100, cdc100, cv100] = calc_convexity_score(comp_close, period_long)
+    comp_score_100 := cs100
+
+diff_score_50 = enable_comparison and show_difference and not na(score_50) and not na(comp_score_50) ? score_50 - comp_score_50 : na
+
+percentile_50 = calc_percentile(score_50, 252)
+percentile_100 = calc_percentile(score_100, 252)
+
+momentum_50 = calc_momentum(score_50, 20)
+
+signal_50 = get_signal(score_50)
+signal_100 = get_signal(score_100)
+strength_50 = get_strength(score_50)
+trend_50 = get_trend(score_50, momentum_50)
+
+// ═════════════════════════════════════════════════════════════════════════
+// VISUALIZATION
+// ═════════════════════════════════════════════════════════════════════════
+
+// Histogram background - only at extreme values for cleaner look
+hist_color = show_histogram and not na(score_50) ? get_color(score_50) : color.gray
+hist_transp = show_histogram and not na(score_50) and math.abs(score_50) > 15 ? int(math.max(85, 98 - math.abs(score_50) * 0.25)) : 100
+bgcolor(show_histogram ? color.new(hist_color, hist_transp) : na)
+
+// Main oscillator line (primary)
+plot(score_50, "Convexity Score", color=get_color(score_50), linewidth=2)
+
+// 100-bar line (optional, subtle)
+plot(show_long_period ? score_100 : na, "100-bar", color=color.new(get_color(score_100), 60), linewidth=1, style=plot.style_line)
+
+// Threshold lines - simplified
+zero_line = hline(0, "Zero", color=color.new(color.white, 30), linewidth=1)
+strong_convex_line = hline(threshold_strong_convex, "Buy Zone", color=color.new(color.green, 60), linestyle=hline.style_dashed)
+strong_concave_line = hline(threshold_strong_concave, "Avoid Zone", color=color.new(color.red, 60), linestyle=hline.style_dashed)
+
+// Additional reference lines with labels
+buy_line = hline(25, "Strong Convex", color=color.new(color.green, 70), linestyle=hline.style_dotted)
+hedge_line = hline(-30, "Hedge Timing", color=color.new(color.red, 70), linestyle=hline.style_dotted)
+
+// Subtle zone fills
+fill(strong_convex_line, zero_line, color=color.new(color.green, 97))
+fill(zero_line, strong_concave_line, color=color.new(color.red, 97))
+
+// Labels for key levels
+if barstate.islast
+    label.new(bar_index, 25, "Strong Convex (Buy)", style=label.style_none, textcolor=color.new(color.green, 0), size=size.small, xloc=xloc.bar_index, yloc=yloc.price)
+    label.new(bar_index, -30, "Strong Concave (Hedge Timing)", style=label.style_none, textcolor=color.new(color.red, 0), size=size.small, xloc=xloc.bar_index, yloc=yloc.price)
+
+// Alert triggers only (for internal use)
+crossed_above_zero = ta.crossover(score_50, 0)
+crossed_below_zero = ta.crossunder(score_50, 0)
+
+// ═════════════════════════════════════════════════════════════════════════
+// TABLE
+// ═════════════════════════════════════════════════════════════════════════
+
+if show_table and barstate.islast
+    tbl_pos = table_position == "top_right" ? position.top_right : table_position == "top_left" ? position.top_left : table_position == "bottom_right" ? position.bottom_right : position.bottom_left
+    tbl_font = get_font_size(table_font_size)
+
+    var table info_table = table.new(tbl_pos, 3, 15, bgcolor=color.new(#1a1a1a, 5), border_width=2, border_color=color.new(#404040, 30), frame_width=1, frame_color=color.new(#606060, 50))
+
+    // Header - dark yellow background
+    table.cell(info_table, 0, 0, "Jensen Convexity Score", bgcolor=color.new(#ccaa00, 20), text_color=color.white, text_size=size.normal, text_halign=text.align_center)
+    table.merge_cells(info_table, 0, 0, 2, 0)
+
+    // Asset header
+    table.cell(info_table, 0, 1, "━━━ " + syminfo.ticker + " ━━━", bgcolor=color.new(#2a2a2a, 30), text_color=color.white, text_size=tbl_font, text_halign=text.align_center)
+    table.merge_cells(info_table, 0, 1, 2, 1)
+
+    // 50-bar score
+    table.cell(info_table, 0, 2, "50-bar Score", text_color=color.silver, text_size=tbl_font)
+    score_50_text = na(score_50) ? "N/A" : str.tostring(score_50, "#.##")
+    table.cell(info_table, 1, 2, score_50_text, text_color=get_color(score_50), text_size=tbl_font, text_halign=text.align_right)
+    percentile_text = na(percentile_50) ? "" : str.tostring(percentile_50, "#.") + "%ile"
+    table.cell(info_table, 2, 2, percentile_text, text_color=color.new(color.yellow, 30), text_size=tbl_font, text_halign=text.align_right)
+
+    // 100-bar score
+    table.cell(info_table, 0, 3, "100-bar Score", text_color=color.silver, text_size=tbl_font)
+    score_100_text = na(score_100) ? "N/A" : str.tostring(score_100, "#.##")
+    table.cell(info_table, 1, 3, score_100_text, text_color=get_color(score_100), text_size=tbl_font, text_halign=text.align_right)
+    percentile_100_text = na(percentile_100) ? "" : str.tostring(percentile_100, "#.") + "%ile"
+    table.cell(info_table, 2, 3, percentile_100_text, text_color=color.new(color.yellow, 30), text_size=tbl_font, text_halign=text.align_right)
+
+    // Upside volatility
+    table.cell(info_table, 0, 4, "Upside Vol", text_color=color.silver, text_size=tbl_font)
+    upside_vol_annual = na(up_vol_50) ? na : up_vol_50 * 100 * math.sqrt(252)
+    upside_text = na(upside_vol_annual) ? "N/A" : str.tostring(upside_vol_annual, "#.##") + "%"
+    table.cell(info_table, 1, 4, upside_text, text_color=color.new(color.green, 20), text_size=tbl_font, text_halign=text.align_right)
+    table.cell(info_table, 2, 4, str.tostring(up_count_50, "#") + " days", text_color=color.new(color.silver, 30), text_size=tbl_font, text_halign=text.align_right)
+
+    // Downside volatility
+    table.cell(info_table, 0, 5, "Downside Vol", text_color=color.silver, text_size=tbl_font)
+    downside_vol_annual = na(down_vol_50) ? na : down_vol_50 * 100 * math.sqrt(252)
+    downside_text = na(downside_vol_annual) ? "N/A" : str.tostring(downside_vol_annual, "#.##") + "%"
+    table.cell(info_table, 1, 5, downside_text, text_color=color.new(color.red, 20), text_size=tbl_font, text_halign=text.align_right)
+    table.cell(info_table, 2, 5, str.tostring(down_count_50, "#") + " days", text_color=color.new(color.silver, 30), text_size=tbl_font, text_halign=text.align_right)
+
+    // Signal
+    table.cell(info_table, 0, 6, "Signal", text_color=color.silver, text_size=tbl_font)
+    signal_color = str.contains(signal_50, "BUY") ? color.new(color.green, 20) : str.contains(signal_50, "AVOID") or str.contains(signal_50, "CAUTION") ? color.new(color.red, 20) : color.new(color.gray, 30)
+    table.cell(info_table, 1, 6, signal_50, text_color=signal_color, text_size=tbl_font, text_halign=text.align_right)
+    table.merge_cells(info_table, 1, 6, 2, 6)
+
+    // Strength
+    table.cell(info_table, 0, 7, "Strength", text_color=color.silver, text_size=tbl_font)
+    strength_color = na(score_50) ? color.gray : math.abs(score_50) >= 30 ? get_color(score_50) : color.new(color.gray, 30)
+    table.cell(info_table, 1, 7, strength_50, text_color=strength_color, text_size=tbl_font, text_halign=text.align_right)
+    table.merge_cells(info_table, 1, 7, 2, 7)
+
+    // Trend
+    table.cell(info_table, 0, 8, "Trend", text_color=color.silver, text_size=tbl_font)
+    trend_color = na(momentum_50) ? color.gray : momentum_50 > 0 ? color.green : color.red
+    table.cell(info_table, 1, 8, trend_50, text_color=trend_color, text_size=tbl_font, text_halign=text.align_right)
+    table.merge_cells(info_table, 1, 8, 2, 8)
+
+    // Comparison section
+    if enable_comparison
+        table.cell(info_table, 0, 9, "━━━ vs " + comparison_symbol + " ━━━", bgcolor=color.new(#2a2a2a, 30), text_color=color.white, text_size=tbl_font, text_halign=text.align_center)
+        table.merge_cells(info_table, 0, 9, 2, 9)
+
+        table.cell(info_table, 0, 10, comparison_symbol + " Score", text_color=color.silver, text_size=tbl_font)
+        comp_score_text = na(comp_score_50) ? "N/A" : str.tostring(comp_score_50, "#.##")
+        table.cell(info_table, 1, 10, comp_score_text, text_color=get_color(comp_score_50), text_size=tbl_font, text_halign=text.align_right)
+        table.merge_cells(info_table, 1, 10, 2, 10)
+
+        if show_difference
+            table.cell(info_table, 0, 11, "Difference", text_color=color.silver, text_size=tbl_font)
+            diff_display_color = na(diff_score_50) ? color.gray : diff_score_50 > 10 ? color.new(color.green, 20) : diff_score_50 < -10 ? color.new(color.red, 20) : color.yellow
+            diff_text = na(diff_score_50) ? "N/A" : (diff_score_50 > 0 ? "+" : "") + str.tostring(diff_score_50, "#.##")
+            table.cell(info_table, 1, 11, diff_text, text_color=diff_display_color, text_size=tbl_font, text_halign=text.align_right)
+
+            interpretation = na(diff_score_50) ? "" : diff_score_50 > 20 ? "Much Better" : diff_score_50 > 10 ? "Better" : diff_score_50 < -20 ? "Much Worse" : diff_score_50 < -10 ? "Worse" : "Similar"
+            interp_color = na(diff_score_50) ? color.gray : diff_score_50 > 10 ? color.green : diff_score_50 < -10 ? color.red : color.gray
+            table.cell(info_table, 2, 11, interpretation, text_color=color.new(interp_color, 30), text_size=tbl_font, text_halign=text.align_right)
+
+    // Warning
+    warning_row = enable_comparison ? 12 : 9
+    if not valid_50 or not valid_100
+        table.cell(info_table, 0, warning_row, "⚠ Insufficient data", bgcolor=color.new(color.yellow, 60), text_color=color.orange, text_size=tbl_font, text_halign=text.align_center)
+        table.merge_cells(info_table, 0, warning_row, 2, warning_row)
+
+// ═════════════════════════════════════════════════════════════════════════
+// ALERTS
+// ═════════════════════════════════════════════════════════════════════════
+
+alertcondition(not na(score_50) and score_50 > alert_buy_threshold and score_50[1] <= alert_buy_threshold, "Strong Convexity", "{{ticker}}: Strong BUY signal - Convexity positive")
+
+alertcondition(not na(score_50) and score_50 < alert_sell_threshold and score_50[1] >= alert_sell_threshold, "Negative Convexity", "{{ticker}}: SELL/HEDGE signal - Convexity negative")
+
+alertcondition(not na(score_50) and score_50 > 50, "Extreme Convexity", "{{ticker}}: EXTREME convexity >50")
+
+alertcondition(not na(score_50) and score_50 < -50, "Extreme Concavity", "{{ticker}}: EXTREME concavity <-50")
+
+alertcondition(crossed_above_zero, "Convexity Positive", "{{ticker}}: Convexity crossed above zero")
+
+alertcondition(crossed_below_zero, "Convexity Negative", "{{ticker}}: Convexity crossed below zero")
+
+alertcondition(enable_comparison and not na(diff_score_50) and diff_score_50 > 20, "Much Better Than Comparison", "{{ticker}}: 20+ points better than comparison")
+
+alertcondition(enable_comparison and not na(diff_score_50) and diff_score_50 < -20, "Much Worse Than Comparison", "{{ticker}}: 20+ points worse than comparison")

@@ -1,0 +1,540 @@
+// This Pine Script™ code is subject to the terms of the Mozilla Public License 2.0
+// https://mozilla.org/MPL/2.0/
+
+//@version=6
+indicator("Range Trade Alerts", overlay=true, max_lines_count=2, max_labels_count=500)
+
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// INPUTS
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+// Channel
+i_lookback     = input.int(30,    "Lookback Bars",         minval=20,  maxval=500,  group="Channel",         tooltip="How far left the trend lines extend. 200 ≈ 6-8 weeks on 1H.")
+i_autoPivot    = input.bool(true, "Auto Pivot Strength",                            group="Channel",         tooltip="Adjust pivot sensitivity per timeframe automatically.")
+i_pivotLen     = input.int(20,    "Manual Pivot Strength",  minval=2,  maxval=20,   group="Channel",         tooltip="Bars each side to confirm a swing. Used when Auto is off.")
+i_lineWidth    = input.int(2,     "Line Width",             minval=1,  maxval=5,    group="Channel")
+i_maxPivotAge  = input.int(300,   "Max Pivot Age (bars)",    minval=50, maxval=1000, group="Channel",         tooltip="If the two pivots defining a line are more than this many bars apart, the channel is considered stale and signals are suppressed.")
+
+// Alerts
+i_alertMode    = input.string("Both", "Alert Mode",        options=["Bull Only", "Bear Only", "Both"],       group="Alerts",          tooltip="Bull = buy bottom line. Bear = sell top line.")
+i_atrLen       = input.int(14,    "ATR Length",             minval=1,  maxval=100,  group="Alerts")
+i_minWidth     = input.float(3.0, "Min Channel Width (×ATR)", minval=0.5, maxval=10.0, step=0.1,            group="Alerts",          tooltip="Minimum channel width in ATR multiples to allow signals.")
+i_touchZone    = input.float(0.15,"Touch Zone (×ATR)",      minval=0.01, maxval=1.0, step=0.01,             group="Alerts",          tooltip="Proximity to line that counts as a touch. Full buffer on the approach side, 1/3 on the penetration side to reject breakdowns.")
+i_minRR        = input.float(2.0, "Min Reward:Risk",        minval=0.5, maxval=10.0, step=0.1,              group="Alerts",          tooltip="Suppress signals below this R:R ratio.")
+i_cooldown     = input.int(5,     "Cooldown (bars)",         minval=1,  maxval=100,  group="Alerts",          tooltip="Bars of silence after a signal fires. 5 = 5 hours on 1H.")
+
+// Stop Placement
+i_tightStop    = input.bool(false,"Tight Stop (trend line)",                         group="Stop Placement",  tooltip="OFF = stop below the earlier pivot that started the channel pattern (wider, true structural invalidation). ON = stop one tick past the trend line (tighter, more prone to stop-outs on wicks).")
+i_maxStopATR   = input.float(4.0, "Max Stop Distance (×ATR)", minval=1.0, maxval=20.0, step=0.5, group="Stop Placement", tooltip="Cap the stop distance at this many ATRs from entry. Prevents absurdly wide stops when the structural pivot is far away.")
+
+// Visuals
+i_showMarkers  = input.bool(true, "Show Signal Markers",                             group="Visuals")
+i_showTags     = input.bool(true, "Show Price Tags",                                 group="Visuals",         tooltip="Black tags on chart for Stop Loss, PT1, PT2, PT3.")
+i_tagSize      = input.string("Small", "Tag Size", options=["Tiny", "Small", "Normal", "Large"], group="Visuals")
+i_bullColor    = input.color(color.green, "Bull Color",                              group="Visuals")
+i_bearColor    = input.color(color.red,   "Bear Color",                              group="Visuals")
+
+// Position Calculator
+i_showTable    = input.bool(true,     "Show Position Calculator",                    group="Position Calculator")
+i_equity       = input.float(2800,    "Account Equity ($)",  minval=1,               group="Position Calculator")
+i_riskPct      = input.float(2.0,     "Risk Per Trade (%)",  minval=0.1, maxval=100, step=0.1, group="Position Calculator")
+i_tableSize    = input.string("Large","Table Size",          options=["Small", "Medium", "Large"],            group="Position Calculator")
+
+// Partial Profits
+i_tp1Pct       = input.float(50.0, "TP1 (% of range)", minval=5, maxval=95, step=5, group="Partial Profits")
+i_tp2Pct       = input.float(75.0, "TP2 (% of range)", minval=5, maxval=95, step=5, group="Partial Profits")
+
+// Momentum Dashboard
+i_showDash     = input.bool(true,     "Show Momentum Dashboard",                     group="Momentum Dashboard")
+i_dashSize     = input.string("normal","Dashboard Text Size", options=["tiny", "small", "normal", "large", "huge"], group="Momentum Dashboard")
+
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// AUTO PIVOT STRENGTH
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+autoCalcPivotLen() =>
+    float m = timeframe.isseconds ? timeframe.multiplier / 60.0 :
+              timeframe.isminutes ? timeframe.multiplier         :
+              timeframe.isdaily   ? timeframe.multiplier * 1440  :
+              timeframe.isweekly  ? timeframe.multiplier * 10080 :
+              timeframe.ismonthly ? timeframe.multiplier * 43200 :
+              60.0
+    m <= 5 ? 3 : m <= 15 ? 5 : m <= 30 ? 6 : m <= 60 ? 8 : m <= 240 ? 10 : m <= 1440 ? 12 : 14
+
+pivotLen = i_autoPivot ? autoCalcPivotLen() : i_pivotLen
+
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// PIVOT DETECTION & TRACKING
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+ph = ta.pivothigh(high, pivotLen, pivotLen)
+pl = ta.pivotlow(low,   pivotLen, pivotLen)
+
+var float ph1 = na
+var int   ph1b = na
+var float ph2 = na
+var int   ph2b = na
+var float pl1 = na
+var int   pl1b = na
+var float pl2 = na
+var int   pl2b = na
+
+if not na(ph)
+    ph2  := ph1
+    ph2b := ph1b
+    ph1  := ph
+    ph1b := bar_index - pivotLen
+
+if not na(pl)
+    pl2  := pl1
+    pl2b := pl1b
+    pl1  := pl
+    pl1b := bar_index - pivotLen
+
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// TREND LINE PROJECTION
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+float upperVal = na
+float slopeHi  = na
+float lowerVal = na
+float slopeLo  = na
+
+if not na(ph2) and not na(ph1) and ph1b != ph2b
+    slopeHi  := (ph1 - ph2) / (ph1b - ph2b)
+    upperVal := ph1 + slopeHi * (bar_index - ph1b)
+
+if not na(pl2) and not na(pl1) and pl1b != pl2b
+    slopeLo  := (pl1 - pl2) / (pl1b - pl2b)
+    lowerVal := pl1 + slopeLo * (bar_index - pl1b)
+
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// FILTERS
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+atrVal       = ta.atr(i_atrLen)
+channelWidth = not na(upperVal) and not na(lowerVal) ? upperVal - lowerVal : na
+isWideEnough = not na(channelWidth) and not na(atrVal) and channelWidth >= i_minWidth * atrVal
+
+// Touch detection — asymmetric buffer
+touchBuf      = not na(atrVal) ? i_touchZone * atrVal : na
+touchBufTight = not na(touchBuf) ? touchBuf * 0.33 : na
+hitsBottom    = not na(lowerVal) and not na(touchBuf) and not na(touchBufTight) and low <= lowerVal + touchBuf and low >= lowerVal - touchBufTight
+hitsTop       = not na(upperVal) and not na(touchBuf) and not na(touchBufTight) and high >= upperVal - touchBuf and high <= upperVal + touchBufTight
+
+slopeUpOk   = not na(slopeLo) and slopeLo > 0
+slopeDownOk = not na(slopeHi) and slopeHi < 0
+
+// Pivot age
+pivotsHiFresh = not na(ph1b) and not na(ph2b) and (ph1b - ph2b) <= i_maxPivotAge
+pivotsLoFresh = not na(pl1b) and not na(pl2b) and (pl1b - pl2b) <= i_maxPivotAge
+
+// Stop prices — structural pivot (default) or trend-line (tight)
+tick          = syminfo.mintick
+bullStopRaw   = i_tightStop ? (not na(lowerVal) ? lowerVal - tick : na) : (not na(pl2) ? pl2 - tick : na)
+bearStopRaw   = i_tightStop ? (not na(upperVal) ? upperVal + tick : na) : (not na(ph2) ? ph2 + tick : na)
+
+// Cap stop distance
+maxStopDist   = not na(atrVal) ? i_maxStopATR * atrVal : na
+bullStopPrice = not na(bullStopRaw) and not na(maxStopDist) ? math.max(bullStopRaw, close - maxStopDist) : bullStopRaw
+bearStopPrice = not na(bearStopRaw) and not na(maxStopDist) ? math.min(bearStopRaw, close + maxStopDist) : bearStopRaw
+
+// Reward:Risk
+bullRisk   = not na(bullStopPrice) ? close - bullStopPrice : na
+bullReward = not na(upperVal)      ? upperVal - close      : na
+bullRR     = bullRisk > 0 and not na(bullReward) ? bullReward / bullRisk : na
+
+bearRisk   = not na(bearStopPrice) ? bearStopPrice - close : na
+bearReward = not na(lowerVal)      ? close - lowerVal      : na
+bearRR     = bearRisk > 0 and not na(bearReward) ? bearReward / bearRisk : na
+
+bullRROk = not na(bullRR) and bullRR >= i_minRR
+bearRROk = not na(bearRR) and bearRR >= i_minRR
+
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// SIGNAL LOGIC & COOLDOWN
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+bullMode = i_alertMode == "Bull Only" or i_alertMode == "Both"
+bearMode = i_alertMode == "Bear Only" or i_alertMode == "Both"
+
+bullRaw = hitsBottom and slopeUpOk   and isWideEnough and bullRROk and pivotsLoFresh and bullMode
+bearRaw = hitsTop    and slopeDownOk and isWideEnough and bearRROk and pivotsHiFresh and bearMode
+
+var int lastBullBar = na
+var int lastBearBar = na
+
+bullSignal = bullRaw and (na(lastBullBar) or bar_index - lastBullBar >= i_cooldown)
+bearSignal = bearRaw and (na(lastBearBar) or bar_index - lastBearBar >= i_cooldown)
+
+if bullSignal
+    lastBullBar := bar_index
+if bearSignal
+    lastBearBar := bar_index
+
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// ALERTS
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+alertcondition(bullSignal,              title="Bull Range Trade", message="Bull Range Trade — price at rising support")
+alertcondition(bearSignal,              title="Bear Range Trade", message="Bear Range Trade — price at falling resistance")
+alertcondition(bullSignal or bearSignal, title="Any Range Trade",  message="Range Trade signal triggered")
+
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// SIGNAL MARKERS
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+if bullSignal and i_showMarkers
+    label.new(bar_index, low, style=label.style_triangleup, color=i_bullColor, size=size.small, yloc=yloc.belowbar)
+
+if bearSignal and i_showMarkers
+    label.new(bar_index, high, style=label.style_triangledown, color=i_bearColor, size=size.small, yloc=yloc.abovebar)
+
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// MOMENTUM DASHBOARD — Williams Alligator Trend + 12 Momentum Indicators
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+// Alligator trend function
+get_alligator_trend() =>
+    jaw   = ta.rma(close, 13)
+    teeth = ta.rma(close, 8)
+    lips  = ta.rma(close, 5)
+    lips > teeth and teeth > jaw ? 1 : (lips < teeth and teeth < jaw ? -1 : 0)
+
+// Momentum indicator functions
+calc_rsi() =>
+    val = ta.rsi(close, 14)
+    val > 50 ? 1 : (val < 50 ? -1 : 0)
+
+calc_macd() =>
+    [macdLine, signalLine, _] = ta.macd(close, 12, 26, 9)
+    macdLine > signalLine ? 1 : -1
+
+calc_ao() =>
+    ao = ta.sma(hl2, 5) - ta.sma(hl2, 34)
+    ao > 0 and ao > ao[1] ? 1 : (ao < 0 and ao < ao[1] ? -1 : 0)
+
+calc_stoch() =>
+    k = ta.sma(ta.stoch(close, high, low, 14), 3)
+    d = ta.sma(k, 3)
+    k > d ? 1 : -1
+
+calc_mfi() =>
+    val = ta.mfi(close, 14)
+    val > 50 ? 1 : -1
+
+calc_cci() =>
+    val = ta.cci(close, 20)
+    val > 0 ? 1 : -1
+
+calc_adx() =>
+    [diplus, diminus, _] = ta.dmi(14, 14)
+    diplus > diminus ? 1 : -1
+
+calc_wpr() =>
+    val = ta.wpr(14)
+    val > -50 ? 1 : -1
+
+calc_vortex() =>
+    vplus  = math.sum(math.abs(high - low[1]), 14)
+    vminus = math.sum(math.abs(low - high[1]), 14)
+    tr     = math.sum(ta.tr, 14)
+    vplus / tr > vminus / tr ? 1 : -1
+
+calc_fisher() =>
+    high_ = ta.highest(hl2, 9)
+    low_  = ta.lowest(hl2, 9)
+    var float v1 = 0.0
+    v1 := 0.66 * ((hl2 - low_) / math.max(high_ - low_, 0.001) - 0.5) + 0.67 * nz(v1[1])
+    v2 = math.max(math.min(v1, 0.999), -0.999)
+    var float fish = 0.0
+    fish := 0.5 * math.log((1 + v2) / (1 - v2)) + 0.5 * nz(fish[1])
+    fish > 0 ? 1 : -1
+
+calc_roc() =>
+    val = ta.roc(close, 14)
+    val > 0 ? 1 : -1
+
+calc_trix() =>
+    ema1 = ta.ema(close, 18)
+    ema2 = ta.ema(ema1, 18)
+    ema3 = ta.ema(ema2, 18)
+    trix = (ema3 - nz(ema3[1])) / math.max(nz(ema3[1]), 0.001) * 10000
+    trix > 0 ? 1 : -1
+
+// Multi-timeframe trend data
+tf_w   = request.security(syminfo.tickerid, "W",   get_alligator_trend())
+tf_d   = request.security(syminfo.tickerid, "D",   get_alligator_trend())
+tf_240 = request.security(syminfo.tickerid, "240", get_alligator_trend())
+tf_60  = request.security(syminfo.tickerid, "60",  get_alligator_trend())
+tf_30  = request.security(syminfo.tickerid, "30",  get_alligator_trend())
+tf_5   = request.security(syminfo.tickerid, "5",   get_alligator_trend())
+tf_1   = request.security(syminfo.tickerid, "1",   get_alligator_trend())
+
+// Momentum data
+m_rsi    = calc_rsi()
+m_macd   = calc_macd()
+m_ao     = calc_ao()
+m_stoch  = calc_stoch()
+m_mfi    = calc_mfi()
+m_cci    = calc_cci()
+m_adx    = calc_adx()
+m_wpr    = calc_wpr()
+m_vortex = calc_vortex()
+m_fisher = calc_fisher()
+m_roc    = calc_roc()
+m_trix   = calc_trix()
+
+// Dashboard table — top right
+if i_showDash and barstate.islast
+    dSize = i_dashSize == "tiny" ? size.tiny : i_dashSize == "small" ? size.small : i_dashSize == "normal" ? size.normal : i_dashSize == "large" ? size.large : size.huge
+
+    color c_bull    = color.green
+    color c_bear    = color.red
+    color c_neutral = color.white
+    color c_section = color.new(#e0e0e0, 0)
+    color c_header  = color.new(#1a237e, 0)
+    color c_dark    = color.black
+    color c_light   = color.white
+
+    var table dash = table.new(position.top_right, 2, 22, border_width=1, border_color=color.gray, frame_width=1, frame_color=color.gray)
+
+    // ── TREND section ──
+    table.cell(dash, 0, 0, "TREND", bgcolor=c_section, text_color=c_dark, text_size=dSize, text_halign=text.align_left)
+    table.merge_cells(dash, 0, 0, 1, 0)
+
+    t_labels = array.from("Weekly Trend", "Daily Trend", "4 Hour Trend", "1 Hour Trend", "30 Min Trend", "5 Min Trend", "1 Min Trend")
+    t_values = array.from(tf_w, tf_d, tf_240, tf_60, tf_30, tf_5, tf_1)
+
+    for i = 0 to 6
+        val = array.get(t_values, i)
+        bg  = val == 1 ? c_bull : (val == -1 ? c_bear : c_neutral)
+        table.cell(dash, 0, i + 1, array.get(t_labels, i), text_color=c_dark, text_size=dSize, text_halign=text.align_left)
+        table.cell(dash, 1, i + 1, "", bgcolor=bg)
+
+    // ── MOMENTUM section ──
+    table.cell(dash, 0, 8, "MOMENTUM", bgcolor=c_section, text_color=c_dark, text_size=dSize, text_halign=text.align_left)
+    table.merge_cells(dash, 0, 8, 1, 8)
+
+    m_labels = array.from("Relative Strength Index", "MACD Convergence/Divergence", "Awesome Oscillator", "Stochastic Oscillator", "Money Flow Index", "Commodity Channel Index", "Average Directional Index", "Williams Percent Range", "Vortex Indicator", "Fisher Transform", "Rate of Change", "Triple EMA Oscillator (TRIX)")
+    m_values = array.from(int(m_rsi), int(m_macd), int(m_ao), int(m_stoch), int(m_mfi), int(m_cci), int(m_adx), int(m_wpr), int(m_vortex), int(m_fisher), int(m_roc), int(m_trix))
+
+    for i = 0 to 11
+        val = array.get(m_values, i)
+        bg  = val == 1 ? c_bull : (val == -1 ? c_bear : c_neutral)
+        table.cell(dash, 0, 9 + i, array.get(m_labels, i), text_color=c_dark, text_size=dSize, text_halign=text.align_left)
+        table.cell(dash, 1, 9 + i, "", bgcolor=bg)
+
+    // ── Footer ──
+    table.cell(dash, 0, 21, "© TradingHabits.com", bgcolor=c_header, text_color=c_light, text_size=size.small)
+    table.merge_cells(dash, 0, 21, 1, 21)
+
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// POSITION CALCULATOR TABLE
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+fmtPrice(v) => not na(v) ? str.tostring(v, format.mintick) : "—"
+fmtDollar(v) => not na(v) ? "$" + str.tostring(v, "#.##") : "—"
+
+if i_showTable and barstate.islast
+    tSize = i_tableSize == "Large" ? size.large : i_tableSize == "Medium" ? size.normal : size.small
+    var table t = table.new(position.bottom_right, 2, 12, bgcolor=color.white, border_color=color.gray, border_width=1, frame_color=color.black, frame_width=2)
+
+    // ── Determine trade direction ──
+    float entry   = close
+    float stop    = na
+    float target  = na
+    float t1      = na
+    float t2      = na
+    float rr      = na
+    string dir    = "No Setup"
+
+    bool bOk = not na(lowerVal) and not na(upperVal) and slopeUpOk   and isWideEnough and bullRROk and pivotsLoFresh and bullMode
+    bool sOk = not na(upperVal) and not na(lowerVal) and slopeDownOk and isWideEnough and bearRROk and pivotsHiFresh and bearMode
+
+    float dL = not na(lowerVal) ? math.abs(close - lowerVal) : na
+    float dU = not na(upperVal) ? math.abs(close - upperVal) : na
+
+    if bOk and sOk
+        if not na(dL) and not na(dU)
+            if dL <= dU
+                dir    := "BULL"
+                stop   := bullStopPrice
+                target := upperVal
+                rr     := bullRR
+                t1     := entry + (upperVal - entry) * (i_tp1Pct / 100)
+                t2     := entry + (upperVal - entry) * (i_tp2Pct / 100)
+            else
+                dir    := "BEAR"
+                stop   := bearStopPrice
+                target := lowerVal
+                rr     := bearRR
+                t1     := entry - (entry - lowerVal) * (i_tp1Pct / 100)
+                t2     := entry - (entry - lowerVal) * (i_tp2Pct / 100)
+    else if bOk
+        dir    := "BULL"
+        stop   := bullStopPrice
+        target := upperVal
+        rr     := bullRR
+        t1     := entry + (upperVal - entry) * (i_tp1Pct / 100)
+        t2     := entry + (upperVal - entry) * (i_tp2Pct / 100)
+    else if sOk
+        dir    := "BEAR"
+        stop   := bearStopPrice
+        target := lowerVal
+        rr     := bearRR
+        t1     := entry - (entry - lowerVal) * (i_tp1Pct / 100)
+        t2     := entry - (entry - lowerVal) * (i_tp2Pct / 100)
+
+    // ── Position math ──
+    float riskPer    = not na(stop) ? math.abs(entry - stop) : na
+    float rewFull    = not na(target) ? math.abs(target - entry) : na
+    float riskDollar = i_equity * (i_riskPct / 100)
+    int   shares     = riskPer > 0 ? math.floor(riskDollar / riskPer) : na
+    float pFull      = not na(shares) and shares > 0 ? shares * rewFull : na
+    float pTP1       = not na(shares) and shares > 0 and not na(t1) ? shares * math.abs(t1 - entry) : na
+    float pTP2       = not na(shares) and shares > 0 and not na(t2) ? shares * math.abs(t2 - entry) : na
+    string stopLbl   = i_tightStop ? "Stop (tight)" : "Stop (structural)"
+
+    // ── Populate table ──
+    dirClr = dir == "BULL" ? i_bullColor : dir == "BEAR" ? i_bearColor : color.gray
+
+    table.cell(t, 0, 0,  "Position Calculator",                        text_color=color.black, text_size=tSize, text_halign=text.align_left)
+    table.cell(t, 1, 0,  dir,                                          text_color=dirClr,      text_size=tSize, text_halign=text.align_right)
+    table.cell(t, 0, 1,  "Entry",                                      text_color=color.gray,  text_size=tSize, text_halign=text.align_left)
+    table.cell(t, 1, 1,  fmtPrice(entry),                              text_color=color.black, text_size=tSize, text_halign=text.align_right)
+    table.cell(t, 0, 2,  stopLbl,                                      text_color=color.gray,  text_size=tSize, text_halign=text.align_left)
+    table.cell(t, 1, 2,  fmtPrice(stop),                               text_color=color.red,   text_size=tSize, text_halign=text.align_right)
+    table.cell(t, 0, 3,  "TP1 (" + str.tostring(i_tp1Pct, "#") + "%)", text_color=color.gray,  text_size=tSize, text_halign=text.align_left)
+    table.cell(t, 1, 3,  fmtPrice(t1),                                 text_color=color.green,  text_size=tSize, text_halign=text.align_right)
+    table.cell(t, 0, 4,  "TP2 (" + str.tostring(i_tp2Pct, "#") + "%)", text_color=color.gray,  text_size=tSize, text_halign=text.align_left)
+    table.cell(t, 1, 4,  fmtPrice(t2),                                 text_color=color.green,  text_size=tSize, text_halign=text.align_right)
+    table.cell(t, 0, 5,  "Full Target",                                text_color=color.gray,  text_size=tSize, text_halign=text.align_left)
+    table.cell(t, 1, 5,  fmtPrice(target),                             text_color=color.green,  text_size=tSize, text_halign=text.align_right)
+    table.cell(t, 0, 6,  "Shares",                                     text_color=color.gray,  text_size=tSize, text_halign=text.align_left)
+    table.cell(t, 1, 6,  not na(shares) and shares > 0 ? str.tostring(shares) : "—", text_color=color.black, text_size=tSize, text_halign=text.align_right)
+    table.cell(t, 0, 7,  "Risk ($)",                                   text_color=color.gray,  text_size=tSize, text_halign=text.align_left)
+    table.cell(t, 1, 7,  not na(shares) and shares > 0 and not na(riskPer) ? fmtDollar(shares * riskPer) : "—", text_color=color.red, text_size=tSize, text_halign=text.align_right)
+    table.cell(t, 0, 8,  "Profit @ TP1",                               text_color=color.gray,  text_size=tSize, text_halign=text.align_left)
+    table.cell(t, 1, 8,  fmtDollar(pTP1),                              text_color=color.green,  text_size=tSize, text_halign=text.align_right)
+    table.cell(t, 0, 9,  "Profit @ TP2",                               text_color=color.gray,  text_size=tSize, text_halign=text.align_left)
+    table.cell(t, 1, 9,  fmtDollar(pTP2),                              text_color=color.green,  text_size=tSize, text_halign=text.align_right)
+    table.cell(t, 0, 10, "Profit @ Full",                              text_color=color.gray,  text_size=tSize, text_halign=text.align_left)
+    rrStr = not na(rr) ? "  (1:" + str.tostring(rr, "#.##") + ")" : ""
+    table.cell(t, 1, 10, (not na(pFull) ? fmtDollar(pFull) : "—") + rrStr, text_color=color.green, text_size=tSize, text_halign=text.align_right)
+    table.cell(t, 0, 11, str.tostring(i_riskPct, "#.#") + "% of $" + str.tostring(i_equity, "#"), text_color=color.gray, text_size=tSize, text_halign=text.align_left)
+    table.cell(t, 1, 11, fmtDollar(riskDollar),                        text_color=color.black, text_size=tSize, text_halign=text.align_right)
+
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// CHANNEL LINES
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+var line lineHi = na
+var line lineLo = na
+
+if barstate.islast
+    if not na(upperVal) and not na(slopeHi)
+        int   lB = math.max(0, bar_index - i_lookback)
+        float lP = ph2 + slopeHi * (lB - ph2b)
+        int   rB = bar_index + 20
+        float rP = upperVal + slopeHi * 20
+        line.delete(lineHi)
+        lineHi := line.new(lB, lP, rB, rP, color=color.black, width=i_lineWidth, style=line.style_solid)
+
+    if not na(lowerVal) and not na(slopeLo)
+        int   lB = math.max(0, bar_index - i_lookback)
+        float lP = pl2 + slopeLo * (lB - pl2b)
+        int   rB = bar_index + 20
+        float rP = lowerVal + slopeLo * 20
+        line.delete(lineLo)
+        lineLo := line.new(lB, lP, rB, rP, color=color.black, width=i_lineWidth, style=line.style_solid)
+
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// PRICE TAGS — Stop Loss, Profit Target 1, Profit Target 2, Profit Target 3
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+var label tagStop = na
+var label tagPT1  = na
+var label tagPT2  = na
+var label tagPT3  = na
+
+if i_showTags and barstate.islast
+    // Clean up previous tags
+    label.delete(tagStop)
+    label.delete(tagPT1)
+    label.delete(tagPT2)
+    label.delete(tagPT3)
+
+    tagSz = i_tagSize == "Tiny" ? size.tiny : i_tagSize == "Small" ? size.small : i_tagSize == "Normal" ? size.normal : size.large
+
+    // Determine trade direction (mirrors position calculator logic)
+    float tagEntry  = close
+    float tagStop_  = na
+    float tagTarget = na
+    float tagTP1    = na
+    float tagTP2    = na
+    string tagDir   = "none"
+    int   stopBar   = na
+
+    bool tagBullOk = not na(lowerVal) and not na(upperVal) and slopeUpOk and isWideEnough and bullRROk and pivotsLoFresh and bullMode
+    bool tagBearOk = not na(upperVal) and not na(lowerVal) and slopeDownOk and isWideEnough and bearRROk and pivotsHiFresh and bearMode
+
+    float tagDL = not na(lowerVal) ? math.abs(close - lowerVal) : na
+    float tagDU = not na(upperVal) ? math.abs(close - upperVal) : na
+
+    if tagBullOk and tagBearOk
+        if not na(tagDL) and not na(tagDU)
+            if tagDL <= tagDU
+                tagDir    := "BULL"
+                tagStop_  := bullStopPrice
+                tagTarget := upperVal
+                tagTP1    := tagEntry + (upperVal - tagEntry) * (i_tp1Pct / 100)
+                tagTP2    := tagEntry + (upperVal - tagEntry) * (i_tp2Pct / 100)
+                stopBar   := not na(pl2b) ? pl2b : bar_index
+            else
+                tagDir    := "BEAR"
+                tagStop_  := bearStopPrice
+                tagTarget := lowerVal
+                tagTP1    := tagEntry - (tagEntry - lowerVal) * (i_tp1Pct / 100)
+                tagTP2    := tagEntry - (tagEntry - lowerVal) * (i_tp2Pct / 100)
+                stopBar   := not na(ph2b) ? ph2b : bar_index
+    else if tagBullOk
+        tagDir    := "BULL"
+        tagStop_  := bullStopPrice
+        tagTarget := upperVal
+        tagTP1    := tagEntry + (upperVal - tagEntry) * (i_tp1Pct / 100)
+        tagTP2    := tagEntry + (upperVal - tagEntry) * (i_tp2Pct / 100)
+        stopBar   := not na(pl2b) ? pl2b : bar_index
+    else if tagBearOk
+        tagDir    := "BEAR"
+        tagStop_  := bearStopPrice
+        tagTarget := lowerVal
+        tagTP1    := tagEntry - (tagEntry - lowerVal) * (i_tp1Pct / 100)
+        tagTP2    := tagEntry - (tagEntry - lowerVal) * (i_tp2Pct / 100)
+        stopBar   := not na(ph2b) ? ph2b : bar_index
+
+    if tagDir != "none" and not na(tagStop_) and not na(tagTarget)
+        // Stop Loss — anchored at the pivot bar so user sees why
+        stopStyle = tagDir == "BULL" ? label.style_label_up : label.style_label_down
+        tagStop := label.new(stopBar, tagStop_, text="Stop Loss  " + str.tostring(tagStop_, format.mintick), style=stopStyle, color=color.black, textcolor=color.white, size=tagSz)
+
+        // Profit targets — offset to the right of the current bar
+        int ptOffset = 5
+        pt1Style = tagDir == "BULL" ? label.style_label_down : label.style_label_up
+        pt3Style = tagDir == "BULL" ? label.style_label_down : label.style_label_up
+
+        tagPT1 := label.new(bar_index + ptOffset, tagTP1, text="Profit Target 1  " + str.tostring(tagTP1, format.mintick), style=pt1Style, color=color.black, textcolor=color.white, size=tagSz)
+        tagPT2 := label.new(bar_index + ptOffset, tagTP2, text="Profit Target 2  " + str.tostring(tagTP2, format.mintick), style=pt1Style, color=color.black, textcolor=color.white, size=tagSz)
+        tagPT3 := label.new(bar_index + ptOffset, tagTarget, text="Profit Target 3  " + str.tostring(tagTarget, format.mintick), style=pt3Style, color=color.black, textcolor=color.white, size=tagSz)

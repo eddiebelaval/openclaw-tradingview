@@ -1,0 +1,311 @@
+//@version=6
+indicator("Initial Balance Pro [IB 60min]", overlay=true, max_lines_count=500, max_labels_count=200, max_boxes_count=100)
+
+// ─────────────────────────────────────────────
+// INPUTS
+// ─────────────────────────────────────────────
+grp1 = "⏰ Sesión IB"
+ib_start_hour   = input.int(9,  "Hora inicio IB",  minval=0, maxval=23, group=grp1)
+ib_start_min    = input.int(30, "Minuto inicio IB", minval=0, maxval=59, group=grp1)
+ib_end_hour     = input.int(10, "Hora fin IB",     minval=0, maxval=23, group=grp1)
+ib_end_min      = input.int(30, "Minuto fin IB",   minval=0, maxval=59, group=grp1)
+timezone_input  = input.string("America/New_York", "Zona horaria", group=grp1)
+
+grp2 = "🎨 Colores y Estilo"
+col_box         = input.color(color.new(color.blue, 80),   "Relleno caja IB",       group=grp2)
+col_box_border  = input.color(color.new(color.blue, 20),   "Borde caja IB",         group=grp2)
+col_high        = input.color(color.new(color.teal, 0),    "Línea IB High",         group=grp2)
+col_low         = input.color(color.new(color.red, 0),     "Línea IB Low",          group=grp2)
+col_mid         = input.color(color.new(color.orange, 0),  "Línea IB Mid (50%)",    group=grp2)
+line_width      = input.int(2, "Grosor líneas", minval=1, maxval=4, group=grp2)
+
+grp3 = "📐 Extensiones de Niveles"
+show_ext        = input.bool(true,  "Mostrar extensiones",       group=grp3)
+show_ib_ext     = input.bool(true,  "Mostrar 1x IB ext (±100%)", group=grp3)
+show_ib_ext2    = input.bool(false, "Mostrar 2x IB ext (±200%)", group=grp3)
+col_ext_up      = input.color(color.new(color.green, 40), "Color extensión arriba", group=grp3)
+col_ext_dn      = input.color(color.new(color.red, 40),   "Color extensión abajo",  group=grp3)
+
+grp4 = "📊 Filtros de Entrada"
+show_mid_signal = input.bool(true,  "Señal al 50% del IB",           group=grp4)
+min_ib_points   = input.float(5.0, "Rango mínimo IB (puntos/pips)", minval=0.0, group=grp4)
+show_vwap       = input.bool(true,  "Mostrar VWAP de sesión",         group=grp4)
+show_labels     = input.bool(true,  "Mostrar etiquetas",              group=grp4)
+
+// ─────────────────────────────────────────────
+// FUNCIONES AUXILIARES
+// ─────────────────────────────────────────────
+is_in_ib_session() =>
+    h   = hour(time, timezone_input)
+    m   = minute(time, timezone_input)
+    cur = h * 60 + m
+    s_t = ib_start_hour * 60 + ib_start_min
+    e_t = ib_end_hour   * 60 + ib_end_min
+    cur >= s_t and cur < e_t
+
+is_ib_end() =>
+    h = hour(time, timezone_input)
+    m = minute(time, timezone_input)
+    h == ib_end_hour and m == ib_end_min
+
+is_regular_session() =>
+    h   = hour(time, timezone_input)
+    m   = minute(time, timezone_input)
+    cur = h * 60 + m
+    cur >= (9 * 60 + 30) and cur < (16 * 60 + 0)
+
+// ─────────────────────────────────────────────
+// VARIABLES PERSISTENTES
+// ─────────────────────────────────────────────
+var float ib_high      = na
+var float ib_low       = na
+var float ib_mid       = na
+var bool  ib_formed    = false
+var int   ib_start_bar = na
+var int   last_day     = na
+
+// ── UN SOLO FLAG para el primer toque del día ──
+var bool  signal_fired = false
+
+var float vwap_sum = 0.0
+var float vwap_vol = 0.0
+var float vwap_val = na
+
+var line  ln_high    = na
+var line  ln_low     = na
+var line  ln_mid     = na
+var line  ln_ext_up1 = na
+var line  ln_ext_dn1 = na
+var line  ln_ext_up2 = na
+var line  ln_ext_dn2 = na
+var box   ib_box     = na
+var label lbl_high   = na
+var label lbl_low    = na
+var label lbl_mid    = na
+var label lbl_ext_u1 = na
+var label lbl_ext_d1 = na
+
+// ─────────────────────────────────────────────
+// NUEVO DÍA — reset todo
+// ─────────────────────────────────────────────
+cur_day = dayofmonth(time, timezone_input)
+new_day = ta.change(cur_day) != 0
+
+if new_day
+    ib_high       := na
+    ib_low        := na
+    ib_mid        := na
+    ib_formed     := false
+    ib_start_bar  := na
+    vwap_sum      := 0.0
+    vwap_vol      := 0.0
+    vwap_val      := na
+    last_day      := cur_day
+    signal_fired  := false
+
+// ─────────────────────────────────────────────
+// CONSTRUCCIÓN DEL IB
+// ─────────────────────────────────────────────
+in_ib = is_in_ib_session()
+
+if in_ib
+    if na(ib_start_bar)
+        ib_start_bar := bar_index
+    ib_high := na(ib_high) ? high : math.max(ib_high, high)
+    ib_low  := na(ib_low)  ? low  : math.min(ib_low,  low)
+
+ib_just_formed = is_ib_end() and not na(ib_high) and not ib_formed
+
+if ib_just_formed
+    ib_formed     := true
+    ib_mid        := (ib_high + ib_low) / 2.0
+    signal_fired  := false
+    ib_range       = ib_high - ib_low
+    ext_up1        = ib_high + ib_range
+    ext_dn1        = ib_low  - ib_range
+    ext_up2        = ib_high + ib_range * 2
+    ext_dn2        = ib_low  - ib_range * 2
+
+    if ib_range >= min_ib_points
+        x1 = ib_start_bar
+        x2 = bar_index + 50
+
+        if not na(ib_box)
+            box.delete(ib_box)
+        ib_box := box.new(x1, ib_high, x2, ib_low,
+             border_color = col_box_border,
+             bgcolor      = col_box,
+             border_width = 1,
+             extend       = extend.right)
+
+        if not na(ln_high)
+            line.delete(ln_high)
+            line.delete(ln_low)
+            line.delete(ln_mid)
+        ln_high := line.new(x1, ib_high, x2, ib_high,
+             color=col_high, width=line_width, style=line.style_solid, extend=extend.right)
+        ln_low  := line.new(x1, ib_low,  x2, ib_low,
+             color=col_low,  width=line_width, style=line.style_solid, extend=extend.right)
+        ln_mid  := line.new(x1, ib_mid,  x2, ib_mid,
+             color=col_mid,  width=line_width, style=line.style_dashed, extend=extend.right)
+
+        if show_ext and show_ib_ext
+            if not na(ln_ext_up1)
+                line.delete(ln_ext_up1)
+                line.delete(ln_ext_dn1)
+            ln_ext_up1 := line.new(bar_index, ext_up1, x2, ext_up1,
+                 color=col_ext_up, width=1, style=line.style_dotted, extend=extend.right)
+            ln_ext_dn1 := line.new(bar_index, ext_dn1, x2, ext_dn1,
+                 color=col_ext_dn, width=1, style=line.style_dotted, extend=extend.right)
+
+        if show_ext and show_ib_ext2
+            if not na(ln_ext_up2)
+                line.delete(ln_ext_up2)
+                line.delete(ln_ext_dn2)
+            ln_ext_up2 := line.new(bar_index, ext_up2, x2, ext_up2,
+                 color=col_ext_up, width=1, style=line.style_dotted, extend=extend.right)
+            ln_ext_dn2 := line.new(bar_index, ext_dn2, x2, ext_dn2,
+                 color=col_ext_dn, width=1, style=line.style_dotted, extend=extend.right)
+
+        if show_labels
+            if not na(lbl_high)
+                label.delete(lbl_high)
+                label.delete(lbl_low)
+                label.delete(lbl_mid)
+            ib_pct = str.tostring(ib_range, "#.##")
+            lbl_high := label.new(bar_index + 2, ib_high,
+                 "IB High: " + str.tostring(ib_high, "#.##"),
+                 color=col_high, textcolor=color.white,
+                 style=label.style_label_left, size=size.small)
+            lbl_low  := label.new(bar_index + 2, ib_low,
+                 "IB Low: " + str.tostring(ib_low, "#.##"),
+                 color=col_low, textcolor=color.white,
+                 style=label.style_label_left, size=size.small)
+            lbl_mid  := label.new(bar_index + 2, ib_mid,
+                 "IB Mid (50%): " + str.tostring(ib_mid, "#.##") + "  |  Rango: " + ib_pct,
+                 color=col_mid, textcolor=color.white,
+                 style=label.style_label_left, size=size.small)
+            if show_ext and show_ib_ext
+                if not na(lbl_ext_u1)
+                    label.delete(lbl_ext_u1)
+                    label.delete(lbl_ext_d1)
+                lbl_ext_u1 := label.new(bar_index + 2, ext_up1,
+                     "IB +100%: " + str.tostring(ext_up1, "#.##"),
+                     color=col_ext_up, textcolor=color.white,
+                     style=label.style_label_left, size=size.tiny)
+                lbl_ext_d1 := label.new(bar_index + 2, ext_dn1,
+                     "IB -100%: " + str.tostring(ext_dn1, "#.##"),
+                     color=col_ext_dn, textcolor=color.white,
+                     style=label.style_label_left, size=size.tiny)
+
+// ─────────────────────────────────────────────
+// VWAP DE SESIÓN
+// ─────────────────────────────────────────────
+session_start = is_regular_session() and
+     (hour(time, timezone_input) * 60 + minute(time, timezone_input)) == (9 * 60 + 30)
+in_session = is_regular_session()
+
+if session_start
+    vwap_sum := 0.0
+    vwap_vol := 0.0
+
+if in_session and show_vwap
+    typical   = (high + low + close) / 3.0
+    vwap_sum := vwap_sum + typical * volume
+    vwap_vol := vwap_vol + volume
+    vwap_val := vwap_vol > 0 ? vwap_sum / vwap_vol : na
+
+vwap_plot = in_session and show_vwap ? vwap_val : na
+plot(vwap_plot, "VWAP Sesión", color=color.new(color.yellow, 20), linewidth=2)
+
+// ─────────────────────────────────────────────
+// SEÑALES — SOLO EL PRIMER TOQUE DEL DÍA
+// sea long o short, el que llegue primero
+// ─────────────────────────────────────────────
+was_above_mid = ib_formed and not na(ib_mid) and close[1] > ib_mid
+was_below_mid = ib_formed and not na(ib_mid) and close[1] < ib_mid
+
+long_condition = show_mid_signal and ib_formed and not na(ib_mid) and
+     was_above_mid and
+     low  <= ib_mid and
+     close > ib_mid and
+     close < ib_high and
+     is_regular_session() and not in_ib and
+     not signal_fired
+
+short_condition = show_mid_signal and ib_formed and not na(ib_mid) and
+     was_below_mid and
+     high >= ib_mid and
+     close < ib_mid and
+     close > ib_low and
+     is_regular_session() and not in_ib and
+     not signal_fired
+
+// El primero que se dispare bloquea al otro para el resto del día
+if long_condition or short_condition
+    signal_fired := true
+
+plotshape(long_condition,  "Long IB Mid",  shape.triangleup,   location.belowbar,
+     color.new(color.lime, 0), size=size.normal, text="IB 50%\nLONG")
+plotshape(short_condition, "Short IB Mid", shape.triangledown,  location.abovebar,
+     color.new(color.red,  0), size=size.normal, text="IB 50%\nSHORT")
+
+// ─────────────────────────────────────────────
+// FONDO SESIÓN IB
+// ─────────────────────────────────────────────
+bgcolor(in_ib ? color.new(color.blue, 92) : na, title="Fondo sesión IB")
+
+// ─────────────────────────────────────────────
+// TABLA INFO EN TIEMPO REAL
+// ─────────────────────────────────────────────
+var table info_table = table.new(position.top_right, 2, 6,
+     bgcolor=color.new(color.black, 70),
+     border_color=color.gray, border_width=1,
+     frame_color=color.gray,  frame_width=1)
+
+if barstate.islast
+    ib_range_live = ib_formed and not na(ib_high) and not na(ib_low) ? ib_high - ib_low : na
+    dist_to_mid   = ib_formed and not na(ib_mid) ? close - ib_mid : na
+
+    table.cell(info_table, 0, 0, "IB MONITOR",
+         text_color=color.white, text_size=size.small, bgcolor=color.new(color.blue, 50))
+    table.cell(info_table, 1, 0, barstate.isrealtime ? "LIVE" : "HIST",
+         text_color=color.lime,  text_size=size.small, bgcolor=color.new(color.blue, 50))
+
+    table.cell(info_table, 0, 1, "IB High",
+         text_color=color.teal, text_size=size.tiny)
+    table.cell(info_table, 1, 1, ib_formed ? str.tostring(ib_high, "#.##") : "---",
+         text_color=color.white, text_size=size.tiny)
+
+    table.cell(info_table, 0, 2, "IB Low",
+         text_color=color.red, text_size=size.tiny)
+    table.cell(info_table, 1, 2, ib_formed ? str.tostring(ib_low, "#.##") : "---",
+         text_color=color.white, text_size=size.tiny)
+
+    table.cell(info_table, 0, 3, "IB Mid 50%",
+         text_color=color.orange, text_size=size.tiny)
+    table.cell(info_table, 1, 3, ib_formed ? str.tostring(ib_mid, "#.##") : "---",
+         text_color=color.white, text_size=size.tiny)
+
+    table.cell(info_table, 0, 4, "Rango IB",
+         text_color=color.yellow, text_size=size.tiny)
+    table.cell(info_table, 1, 4,
+         not na(ib_range_live) ? str.tostring(ib_range_live, "#.##") : "---",
+         text_color=color.white, text_size=size.tiny)
+
+    table.cell(info_table, 0, 5, "Dist. al Mid",
+         text_color=color.purple, text_size=size.tiny)
+    dist_str = not na(dist_to_mid) ?
+         (dist_to_mid > 0 ? "+" : "") + str.tostring(dist_to_mid, "#.##") : "---"
+    dist_col = not na(dist_to_mid) ?
+         (dist_to_mid > 0 ? color.lime : color.red) : color.gray
+    table.cell(info_table, 1, 5, dist_str, text_color=dist_col, text_size=size.tiny)
+
+// ─────────────────────────────────────────────
+// ALERTAS
+// ─────────────────────────────────────────────
+alertcondition(ib_just_formed,  "IB Formado",   "Initial Balance formado.")
+alertcondition(long_condition,  "LONG IB 50%",  "Primer toque al 50% del IB desde arriba.")
+alertcondition(short_condition, "SHORT IB 50%", "Primer toque al 50% del IB desde abajo.")
+alertcondition(ib_formed and not na(ib_high) and high >= ib_high, "Ruptura IB High", "Precio rompio el IB High.")
+alertcondition(ib_formed and not na(ib_low)  and low  <= ib_low,  "Ruptura IB Low",  "Precio rompio el IB Low.")

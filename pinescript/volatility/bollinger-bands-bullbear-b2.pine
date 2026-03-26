@@ -1,0 +1,403 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © MasterTonyTA
+
+//@version=6
+indicator(shorttitle = 'BB^2', title = 'Bollinger Bands Bull/Bear', overlay = true)
+length = input.int(20, minval = 1)
+maType = input.string('SMA', 'Basis MA Type', options = ['SMA', 'EMA', 'SMMA (RMA)', 'WMA', 'VWMA'])
+src = input(close, title = 'Source')
+mult = input.float(2.0, minval = 0.001, maxval = 50, title = 'StdDev')
+bbwpLookback = input.int(100, "BBWP Lookback", group="Squeeze Settings")
+showSqueezeFills = input.bool(true, "Show Squeeze Fills", group="Squeeze Settings")
+
+// Add toggles for Bollinger Bands and Special Fill
+bool showBBFills = input.bool(true, title = 'Show Bollinger Bands 🟢🔴', tooltip = 'Toggle to show/hide Bollinger Band gradient fills.', group = 'Bollinger Band Settings')
+bool showSpecialFill = input.bool(true, title = 'Show Special Fill 🟢🔴', tooltip = 'Toggle to show/hide the special basis-to-band fill.', group = 'Bollinger Band Settings')
+
+// Add table inputs
+bool showFillZoneDuration = input.bool(false, "Show Fill Zone Duration Table 📊", group="Display Settings")
+string fillZoneStatsView = input.string("Current Fill", "Fill Zone Stats View", options=["Current Fill", "Bull Fills", "Bear Fills"], group="Display Settings", tooltip="Choose which fill zone stats to display")
+
+ma(source, length, _type) =>
+    switch _type
+        'SMA' => ta.sma(source, length)
+        'EMA' => ta.ema(source, length)
+        'SMMA (RMA)' => ta.rma(source, length)
+        'WMA' => ta.wma(source, length)
+        'VWMA' => ta.vwma(source, length)
+
+basis = ma(src, length, maType)
+dev = mult * ta.stdev(src, length)
+upper = basis + dev
+lower = basis - dev
+offset = input.int(0, 'Offset', minval = -500, maxval = 500, display = display.data_window)
+
+// Basis color: green increasing, red decreasing
+color basis_color = basis > basis[1] ? color.green : color.red
+
+plot(basis, 'Basis', color = na(basis[1]) ? color.gray : basis_color, offset = offset)
+p1 = plot(upper, 'Upper', color = #ffffff00, offset = offset)
+p2 = plot(lower, 'Lower', color = #ffffff00, offset = offset)
+
+// --- BBWP Calculation ---
+var array<float> a_rawValues = array.new_float()
+var array<float> a_sortedValues = array.new_float()
+float bbw = 2 * ta.stdev(src, length) / basis
+float bbwp = na
+if bar_index >= length
+    int totalCount = array.binary_search_rightmost(a_sortedValues, bbw)
+    bbwp := totalCount * 100.0 / array.size(a_sortedValues)
+    array.push(a_rawValues, bbw)
+    array.insert(a_sortedValues, array.binary_search_rightmost(a_sortedValues, bbw), bbw)
+    if array.size(a_rawValues) > bbwpLookback
+        float oldValue = array.shift(a_rawValues)
+        int pos = array.binary_search_rightmost(a_sortedValues, oldValue)
+        array.remove(a_sortedValues, pos)
+
+// Squeeze based on BBWP
+bool squeeze = bbwp <= 25 and not na(bbwp)
+bool tight_squeeze = bbwp < 15 and not na(bbwp)
+
+// --- Enhanced Bollinger Bands from Visual Prowess ---
+
+// Calculate distance from src to bands
+float dist_to_upper = math.abs(src - upper)
+float dist_to_lower = math.abs(src - lower)
+float band_width = upper - lower
+
+// Normalize distances
+float upper_proximity = 1 - (dist_to_upper / band_width)
+float lower_proximity = 1 - (dist_to_lower / band_width)
+
+// Determine which band is closer and calculate strength
+bool near_upper = dist_to_upper < dist_to_lower
+float band_strength = near_upper ? upper_proximity : lower_proximity
+band_strength := math.max(0, math.min(1, band_strength))
+
+// Bull/bear state based on src vs basis with smoothing and hysteresis
+float src_basis_diff = src - basis
+float smoothed_diff = ta.ema(src_basis_diff, 3)
+
+// Hysteresis threshold
+float hysteresis_threshold = band_width * 0.05
+
+// Track previous state
+var bool prev_bullish = false
+
+// Determine new state
+bool bullish = false
+bool bearish = false
+
+if prev_bullish
+    bullish := smoothed_diff > -hysteresis_threshold
+    bearish := not bullish
+else
+    bearish := smoothed_diff < hysteresis_threshold
+    bullish := not bearish
+
+// Update state tracker
+prev_bullish := bullish
+
+// Band width expansion/contraction
+float prev_band_width = band_width[1]
+bool bands_expanding = band_width > prev_band_width
+float expansion_rate = (band_width - prev_band_width) / prev_band_width
+float expansion_boost = bands_expanding ? math.min(30, expansion_rate * 1000) : 0
+
+// Special condition fill (Basis to Active Band)
+var bool bull_fill_active = false
+var bool bear_fill_active = false
+
+// Very close to bands
+bool very_close_upper = upper_proximity > 0.85
+bool very_close_lower = lower_proximity > 0.85
+
+// Activation
+bool activate_bull_fill = bullish and very_close_upper
+bool activate_bear_fill = bearish and very_close_lower
+
+// Deactivation on zone change
+bool zone_changed_to_bear = bearish and bull_fill_active
+bool zone_changed_to_bull = bullish and bear_fill_active
+
+// Update states
+if activate_bull_fill
+    bull_fill_active := true
+if activate_bear_fill
+    bear_fill_active := true
+
+if zone_changed_to_bear
+    bull_fill_active := false
+if zone_changed_to_bull
+    bear_fill_active := false
+
+// Dynamic fill transparency
+float fill_transparency = 100 - (band_strength * 100)
+fill_transparency := math.max(0, fill_transparency)
+
+// Define offset for fill boundaries
+float band_offset = na
+if bull_fill_active or bear_fill_active
+    band_offset := band_width * 0.035
+else
+    band_offset := band_width * 0.01
+
+// Create boundary values
+float upper_outer = upper + band_offset
+float upper_inner = upper - band_offset
+float lower_outer = lower - band_offset
+float lower_inner = lower + band_offset
+
+// Plot invisible boundaries
+p_upper_outer = plot(upper_outer, color = na, display = display.none, title='Upper Outer Boundary')
+p_upper_inner = plot(upper_inner, color = na, display = display.none, title='Upper Inner Boundary')
+p_lower_outer = plot(lower_outer, color = na, display = display.none, title='Lower Outer Boundary')
+p_lower_inner = plot(lower_inner, color = na, display = display.none, title='Lower Inner Boundary')
+
+// Color selection for band fills
+color bb_upper_band_fill = na
+color bb_lower_band_fill = na
+
+if showBBFills
+    if bullish
+        bb_upper_band_fill := color.new(#3fff7c, int(fill_transparency))
+        bb_lower_band_fill := color.new(#3fff7c, int(fill_transparency))
+    else
+        bb_upper_band_fill := color.new(#ff0000, int(fill_transparency))
+        bb_lower_band_fill := color.new(#ff0000, int(fill_transparency))
+
+    // Special emphasis when touching bands
+    if near_upper and upper_proximity > 0.95
+        bb_upper_band_fill := bullish ? color.new(#3fff7c, 0) : color.new(#ff0000, 0)
+    else if not near_upper and lower_proximity > 0.95
+        bb_lower_band_fill := bullish ? color.new(#3fff7c, 0) : color.new(#ff0000, 0)
+
+// Fill the band areas
+fill(p_upper_outer, p_upper_inner, title = 'Upper BB Band Fill', color = bb_upper_band_fill)
+fill(p_lower_outer, p_lower_inner, title = 'Lower BB Band Fill', color = bb_lower_band_fill)
+
+// Plot basis invisible for fill reference
+p_basis = plot(basis, color=na, display=display.none, title='BB Basis')
+
+// Light fill color for special basis to band fill
+color bull_basis_fill = (bull_fill_active and showSpecialFill) ? color.new(#a5f4b1, 82) : na
+color bear_basis_fill = (bear_fill_active and showSpecialFill) ? color.new(#ff6b6b, 68) : na
+
+// Apply the basis fills
+fill(p_basis, p_upper_inner, title='Bull Basis Fill', color = bull_basis_fill)
+fill(p_basis, p_lower_inner, title='Bear Basis Fill', color = bear_basis_fill)
+
+// Squeeze fill with two shades of orange
+int squeeze_transparency = 67
+if squeeze
+    if tight_squeeze
+        squeeze_transparency := 70  // brighter for tighter squeeze
+    else
+        squeeze_transparency := 87
+
+color squeeze_fill_color = showSqueezeFills and squeeze ? color.new(color.orange, squeeze_transparency) : na
+
+// Plot invisible upper/lower for squeeze fill
+p_bb_upper = plot(upper, color=na, display=display.none)
+p_bb_lower = plot(lower, color=na, display=display.none)
+
+// Apply squeeze fill between upper and lower
+fill(p_bb_upper, p_bb_lower, title = 'Background', color = squeeze_fill_color)
+
+// === FILL ZONE DURATION TRACKING ===
+
+// Bull fill tracking (green fill zones)
+var int bullFillStartBar = na
+var float bullFillStartPrice = na
+var int currentBullFillBars = 0
+var float bullFillMaxHigh = na
+var array<int> bullFillDurations = array.new_int(0)
+var array<float> bullFillMoves = array.new_float(0)
+
+// Bear fill tracking (red fill zones)
+var int bearFillStartBar = na
+var float bearFillStartPrice = na
+var int currentBearFillBars = 0
+var float bearFillMinLow = na
+var array<int> bearFillDurations = array.new_int(0)
+var array<float> bearFillMoves = array.new_float(0)
+
+// Detect entries and exits
+bool enteredBullFill = bull_fill_active and not bull_fill_active[1]
+bool exitedBullFill = not bull_fill_active and bull_fill_active[1]
+bool enteredBearFill = bear_fill_active and not bear_fill_active[1]
+bool exitedBearFill = not bear_fill_active and bear_fill_active[1]
+
+// Bull fill logic
+if exitedBullFill
+    if currentBullFillBars > 0
+        float pctMove = ((bullFillMaxHigh - bullFillStartPrice) / bullFillStartPrice) * 100.0
+        array.push(bullFillDurations, currentBullFillBars)
+        array.push(bullFillMoves, pctMove)
+        if array.size(bullFillDurations) > 20
+            array.shift(bullFillDurations)
+            array.shift(bullFillMoves)
+    bullFillStartBar := na
+    bullFillStartPrice := na
+    currentBullFillBars := 0
+    bullFillMaxHigh := na
+
+if enteredBullFill
+    bullFillStartBar := bar_index
+    bullFillStartPrice := close
+    currentBullFillBars := 1
+    bullFillMaxHigh := high
+else if bull_fill_active
+    currentBullFillBars += 1
+    if high > bullFillMaxHigh
+        bullFillMaxHigh := high
+
+// Bear fill logic
+if exitedBearFill
+    if currentBearFillBars > 0
+        float pctMove = ((bearFillMinLow - bearFillStartPrice) / bearFillStartPrice) * 100.0
+        array.push(bearFillDurations, currentBearFillBars)
+        array.push(bearFillMoves, pctMove)
+        if array.size(bearFillDurations) > 20
+            array.shift(bearFillDurations)
+            array.shift(bearFillMoves)
+    bearFillStartBar := na
+    bearFillStartPrice := na
+    currentBearFillBars := 0
+    bearFillMinLow := na
+
+if enteredBearFill
+    bearFillStartBar := bar_index
+    bearFillStartPrice := close
+    currentBearFillBars := 1
+    bearFillMinLow := low
+else if bear_fill_active
+    currentBearFillBars += 1
+    if low < bearFillMinLow
+        bearFillMinLow := low
+
+// Current stats
+float currentBullPctMove = bull_fill_active ? ((bullFillMaxHigh - bullFillStartPrice) / bullFillStartPrice) * 100.0 : na
+float currentBearPctMove = bear_fill_active ? ((bearFillMinLow - bearFillStartPrice) / bearFillStartPrice) * 100.0 : na
+
+// Historical averages and extremes
+float avgBullDuration = array.size(bullFillDurations) > 0 ? array.avg(bullFillDurations) : na
+float avgBearDuration = array.size(bearFillDurations) > 0 ? array.avg(bearFillDurations) : na
+float avgBullMove = array.size(bullFillMoves) > 0 ? array.avg(bullFillMoves) : na
+float avgBearMove = array.size(bearFillMoves) > 0 ? array.avg(bearFillMoves) : na
+
+float minBullDuration = array.size(bullFillDurations) > 0 ? array.min(bullFillDurations) : na
+float maxBullDuration = array.size(bullFillDurations) > 0 ? array.max(bullFillDurations) : na
+float minBearDuration = array.size(bearFillDurations) > 0 ? array.min(bearFillDurations) : na
+float maxBearDuration = array.size(bearFillDurations) > 0 ? array.max(bearFillDurations) : na
+
+float minBullMove = array.size(bullFillMoves) > 0 ? array.min(bullFillMoves) : na
+float maxBullMove = array.size(bullFillMoves) > 0 ? array.max(bullFillMoves) : na
+float minBearMove = array.size(bearFillMoves) > 0 ? array.min(bearFillMoves) : na
+float maxBearMove = array.size(bearFillMoves) > 0 ? array.max(bearFillMoves) : na
+
+// Render the Fill Zone Duration Table
+var table fillZoneTable = table.new(position.top_right, columns = 4, rows = 6, bgcolor = color.new(#1a1a1a, 10), border_width = 1)
+
+if showFillZoneDuration and barstate.islast
+    table.clear(fillZoneTable, 0, 0, 3, 5)
+    bool showingBull = fillZoneStatsView == "Bull Fills" or (fillZoneStatsView == "Current Fill" and bull_fill_active)
+    bool showingBear = fillZoneStatsView == "Bear Fills" or (fillZoneStatsView == "Current Fill" and bear_fill_active)
+    
+    string displayZoneType = showingBull ? "BULL FILL ZONE" : "BEAR FILL ZONE"
+    color displayZoneColor = showingBull ? color.new(#00ff00, 0) : color.new(#ff0000, 0)
+    
+    string displayCurrentBars = na
+    string displayAvgDuration = "N/A"
+    string displayMinMaxDuration = "N/A"
+    string displayCurrentMove = "N/A"
+    string displayAvgMove = "N/A"
+    string displayMinMaxMove = "N/A"
+    string displayProgress = "N/A"
+    color displayCurrentMoveColor = color.gray
+    color displayAvgMoveColor = color.gray
+    color displayProgressColor = color.gray
+    int displaySampleSize = 0
+    
+    if showingBull
+        if fillZoneStatsView == "Current Fill" and bull_fill_active
+            displayCurrentBars := str.tostring(currentBullFillBars)
+            displayCurrentMove := na(currentBullPctMove) ? "N/A" : str.tostring(currentBullPctMove, "#.##") + "%"
+            displayCurrentMoveColor := na(currentBullPctMove) ? color.gray : (currentBullPctMove >= 0 ? color.new(#00ff00, 0) : color.new(#ff0000, 0))
+            
+            if not na(avgBullDuration) and avgBullDuration > 0
+                float ratio = currentBullFillBars / avgBullDuration
+                displayProgress := str.tostring(math.round(ratio * 100)) + "%"
+                displayProgressColor := ratio > 1.2 ? color.orange : (ratio > 0.8 ? color.white : color.gray)
+        else
+            displayCurrentBars := "-"
+        
+        if not na(avgBullDuration)
+            displayAvgDuration := str.tostring(math.round(avgBullDuration))
+            displayMinMaxDuration := str.tostring(math.round(minBullDuration)) + " / " + str.tostring(math.round(maxBullDuration))
+        
+        if not na(avgBullMove)
+            displayAvgMove := str.tostring(avgBullMove, "#.##") + "%"
+            displayAvgMoveColor := avgBullMove >= 0 ? color.new(#00ff00, 0) : color.new(#ff0000, 0)
+            displayMinMaxMove := str.tostring(minBullMove, "#.##") + "% / " + str.tostring(maxBullMove, "#.##") + "%"
+        
+        displaySampleSize := array.size(bullFillDurations)
+    else
+        if fillZoneStatsView == "Current Fill" and bear_fill_active
+            displayCurrentBars := str.tostring(currentBearFillBars)
+            displayCurrentMove := na(currentBearPctMove) ? "N/A" : str.tostring(currentBearPctMove, "#.##") + "%"
+            displayCurrentMoveColor := na(currentBearPctMove) ? color.gray : (currentBearPctMove >= 0 ? color.new(#00ff00, 0) : color.new(#ff0000, 0))
+            
+            if not na(avgBearDuration) and avgBearDuration > 0
+                float ratio = currentBearFillBars / avgBearDuration
+                displayProgress := str.tostring(math.round(ratio * 100)) + "%"
+                displayProgressColor := ratio > 1.2 ? color.orange : (ratio > 0.8 ? color.white : color.gray)
+        else
+            displayCurrentBars := "-"
+        
+        if not na(avgBearDuration)
+            displayAvgDuration := str.tostring(math.round(avgBearDuration))
+            displayMinMaxDuration := str.tostring(math.round(minBearDuration)) + " / " + str.tostring(math.round(maxBearDuration))
+        
+        if not na(avgBearMove)
+            displayAvgMove := str.tostring(avgBearMove, "#.##") + "%"
+            displayAvgMoveColor := avgBearMove >= 0 ? color.new(#00ff00, 0) : color.new(#ff0000, 0)
+            displayMinMaxMove := str.tostring(minBearMove, "#.##") + "% / " + str.tostring(maxBearMove, "#.##") + "%"
+        
+        displaySampleSize := array.size(bearFillDurations)
+    
+    // Header
+    table.cell(fillZoneTable, 0, 0, "Fill Zone Stats", text_color = color.white, text_size = size.large, bgcolor = color.new(#333333, 0), text_halign = text.align_center)
+    table.cell(fillZoneTable, 1, 0, "Current", text_color = color.white, text_size = size.large, bgcolor = color.new(#333333, 0), text_halign = text.align_center)
+    table.cell(fillZoneTable, 2, 0, "Avg", text_color = color.white, text_size = size.large, bgcolor = color.new(#333333, 0), text_halign = text.align_center)
+    table.cell(fillZoneTable, 3, 0, "Low / High", text_color = color.white, text_size = size.large, bgcolor = color.new(#333333, 0), text_halign = text.align_center)
+    
+    // Zone type
+    table.cell(fillZoneTable, 0, 1, "Zone Type", text_color = color.white, text_size = size.normal, text_halign = text.align_left)
+    table.cell(fillZoneTable, 1, 1, displayZoneType, text_color = displayZoneColor, text_size = size.normal, text_halign = text.align_center)
+    table.cell(fillZoneTable, 2, 1, "-", text_color = color.gray, text_size = size.normal, text_halign = text.align_center)
+    table.cell(fillZoneTable, 3, 1, "-", text_color = color.gray, text_size = size.normal, text_halign = text.align_center)
+    
+    // Duration in bars
+    table.cell(fillZoneTable, 0, 2, "Duration (Bars)", text_color = color.white, text_size = size.normal, text_halign = text.align_left)
+    table.cell(fillZoneTable, 1, 2, displayCurrentBars, text_color = color.white, text_size = size.normal, text_halign = text.align_center)
+    table.cell(fillZoneTable, 2, 2, displayAvgDuration, text_color = color.gray, text_size = size.normal, text_halign = text.align_center)
+    table.cell(fillZoneTable, 3, 2, displayMinMaxDuration, text_color = color.gray, text_size = size.normal, text_halign = text.align_center)
+    
+    // Percentage move
+    table.cell(fillZoneTable, 0, 3, "% Move", text_color = color.white, text_size = size.normal, text_halign = text.align_left)
+    table.cell(fillZoneTable, 1, 3, displayCurrentMove, text_color = displayCurrentMoveColor, text_size = size.normal, text_halign = text.align_center)
+    table.cell(fillZoneTable, 2, 3, displayAvgMove, text_color = displayAvgMoveColor, text_size = size.normal, text_halign = text.align_center)
+    table.cell(fillZoneTable, 3, 3, displayMinMaxMove, text_color = color.gray, text_size = size.normal, text_halign = text.align_center)
+    
+    // Progress vs Average
+    table.cell(fillZoneTable, 0, 4, "vs Average", text_color = color.white, text_size = size.normal, text_halign = text.align_left)
+    table.cell(fillZoneTable, 1, 4, displayProgress, text_color = displayProgressColor, text_size = size.normal, text_halign = text.align_center)
+    table.cell(fillZoneTable, 2, 4, "100%", text_color = color.gray, text_size = size.normal, text_halign = text.align_center)
+    table.cell(fillZoneTable, 3, 4, "-", text_color = color.gray, text_size = size.normal, text_halign = text.align_center)
+    
+    // Sample size
+    table.cell(fillZoneTable, 0, 5, "Sample Size", text_color = color.white, text_size = size.normal, text_halign = text.align_left)
+    table.cell(fillZoneTable, 1, 5, "-", text_color = color.gray, text_size = size.normal, text_halign = text.align_center)
+    table.cell(fillZoneTable, 2, 5, str.tostring(displaySampleSize) + " zones", text_color = color.gray, text_size = size.normal, text_halign = text.align_center)
+    table.cell(fillZoneTable, 3, 5, "-", text_color = color.gray, text_size = size.normal, text_halign = text.align_center)

@@ -1,0 +1,484 @@
+//@version=6
+indicator("₿itcoin Volatility off DVOL", overlay=true, max_lines_count=500, max_labels_count=500)
+
+// ═══════════════════════════════════════════════════════════
+// ─── DISPLAY SETTINGS ────────────────────────────────────
+// ═══════════════════════════════════════════════════════════
+show_midline     = input.bool(true,  "Show Weekly Open Line",            group="Display")
+show_weekly      = input.bool(true,  "Show Weekly Bands (IV + HV14)",    group="Display")
+show_monthly     = input.bool(true,  "Show Monthly Bands (IV + HV30)",   group="Display")
+show_hv7_daily   = input.bool(true,  "Show HV7 Today (daily rotating)",  group="Display")
+show_iv_daily    = input.bool(true,  "Show IV Today (daily rotating)",   group="Display")
+label_proximity  = input.float(200.0, "Label Proximity Gate ($)", minval=100, step=100, group="Display", tooltip="Hide daily labels when within this $ of a weekly or monthly level. Lines still draw.")
+
+iv_weekly_color  = input.color(#FFFFFF, "IV Weekly Color",    group="Display")
+hv14_color       = input.color(#FF9800, "HV14 Weekly Color",  group="Display")
+iv_monthly_color = input.color(#FFFFFF, "IV Monthly Color",   group="Display")
+hv30_color       = input.color(#FF6B35, "HV30 Monthly Color", group="Display")
+hv7_daily_color  = input.color(#FFF9C4, "HV7 Today Color",    group="Display")
+mid_color        = input.color(#82B1FF, "Weekly Open Color",   group="Display")
+
+// ═══════════════════════════════════════════════════════════
+// ─── FATS TRENDLINE SETTINGS ────────────────────────────
+// ═══════════════════════════════════════════════════════════
+// Adapted from "Fibonacci Auto Trend Scouter" by sirkriz (MPL 2.0)
+// Dual-period rolling bag system — no validation gate, no classification lag.
+tl_short_period = input.int(10, "Short Period", minval=2, maxval=55, group="Trend Lines", tooltip="Bars for short pivot detection. 10 on 30m = 5 hours each side.")
+tl_long_period  = input.int(16, "Long Period",  minval=2, maxval=89, group="Trend Lines", tooltip="Bars for long pivot detection. 16 on 30m = 8 hours each side.")
+show_tl_short   = input.bool(true, "Show Short TrendLines", group="Trend Lines")
+show_tl_long    = input.bool(true, "Show Long TrendLines",  group="Trend Lines")
+tl_short_width  = input.int(2, "Short Line Width", minval=1, maxval=4, group="Trend Lines")
+tl_long_width   = input.int(3, "Long Line Width",  minval=1, maxval=4, group="Trend Lines")
+tl_up_color     = input.color(#4CAF50, "Up Channel Color",   group="Trend Lines")
+tl_dn_color     = input.color(#F44336, "Down Channel Color", group="Trend Lines")
+
+// ═══════════════════════════════════════════════════════════
+// ─── VOLATILITY SETTINGS ────────────────────────────────
+// ═══════════════════════════════════════════════════════════
+hv14_length = input.int(14, "HV14 Lookback (days)", minval=2, maxval=60, group="Volatility")
+hv30_length = input.int(30, "HV30 Lookback (days)", minval=2, maxval=90, group="Volatility")
+hv7_length  = input.int(7,  "HV7 Lookback (days)",  minval=2, maxval=60, group="Volatility")
+
+// ═══════════════════════════════════════════════════════════
+// ─── DATA FEEDS ─────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════
+btc_daily_open  = request.security("COINBASE:BTCUSD", "D", open, lookahead=barmerge.lookahead_on)
+dvol_daily_open = request.security("DERIBIT:DVOL",    "D", open, lookahead=barmerge.lookahead_on)
+
+// ═══════════════════════════════════════════════════════════
+// ─── WEEKLY ANCHOR (LOCKS ON SATURDAY) ──────────────────
+// ═══════════════════════════════════════════════════════════
+is_saturday = dayofweek(time) == dayofweek.saturday and dayofweek(time[1]) != dayofweek.saturday
+
+var float btc_weekly_open  = na
+var float dvol_weekly_open = na
+
+if is_saturday
+    if not na(btc_daily_open)
+        btc_weekly_open  := btc_daily_open
+    if not na(dvol_daily_open) and dvol_daily_open > 0
+        dvol_weekly_open := dvol_daily_open
+
+if na(btc_weekly_open) and not na(btc_daily_open)
+    btc_weekly_open  := btc_daily_open
+if na(dvol_weekly_open) and not na(dvol_daily_open) and dvol_daily_open > 0
+    dvol_weekly_open := dvol_daily_open
+
+// ═══════════════════════════════════════════════════════════
+// ─── MONTHLY ANCHOR (LOCKS ON 1ST OF EACH MONTH) ────────
+// ═══════════════════════════════════════════════════════════
+is_new_month = ta.change(month(time)) != 0
+
+var float btc_monthly_open  = na
+var float dvol_monthly_open = na
+
+if is_new_month
+    if not na(btc_daily_open)
+        btc_monthly_open  := btc_daily_open
+    if not na(dvol_daily_open) and dvol_daily_open > 0
+        dvol_monthly_open := dvol_daily_open
+
+if na(btc_monthly_open) and not na(btc_daily_open)
+    btc_monthly_open  := btc_daily_open
+if na(dvol_monthly_open) and not na(dvol_daily_open) and dvol_daily_open > 0
+    dvol_monthly_open := dvol_daily_open
+
+// ═══════════════════════════════════════════════════════════
+// ─── DAILY ANCHOR (RESETS 00:00 UTC EACH DAY) ───────────
+// ═══════════════════════════════════════════════════════════
+is_new_day = ta.change(dayofmonth(time)) != 0
+
+var float btc_daily_anchor  = na
+var float dvol_daily_anchor = na
+
+if is_new_day
+    if not na(btc_daily_open)
+        btc_daily_anchor := btc_daily_open
+    if not na(dvol_daily_open) and dvol_daily_open > 0
+        dvol_daily_anchor := dvol_daily_open
+
+if na(btc_daily_anchor) and not na(btc_daily_open)
+    btc_daily_anchor := btc_daily_open
+if na(dvol_daily_anchor) and not na(dvol_daily_open) and dvol_daily_open > 0
+    dvol_daily_anchor := dvol_daily_open
+
+// ═══════════════════════════════════════════════════════════
+// ─── REALIZED VOLATILITY ────────────────────────────────
+// ═══════════════════════════════════════════════════════════
+// HV14 — weekly band basis
+pop_stdev_14         = request.security("COINBASE:BTCUSD", "D", ta.stdev(math.log(close[1] / close[2]), hv14_length), lookahead=barmerge.lookahead_on)
+sample_correction_14 = math.sqrt(hv14_length / (hv14_length - 1.0))
+hv14_live            = pop_stdev_14 * sample_correction_14 * math.sqrt(365.0) * 100.0
+
+// HV30 — monthly band basis
+pop_stdev_30         = request.security("COINBASE:BTCUSD", "D", ta.stdev(math.log(close[1] / close[2]), hv30_length), lookahead=barmerge.lookahead_on)
+sample_correction_30 = math.sqrt(hv30_length / (hv30_length - 1.0))
+hv30_live            = pop_stdev_30 * sample_correction_30 * math.sqrt(365.0) * 100.0
+
+// HV7 — daily band basis (live, not latched)
+pop_stdev_7         = request.security("COINBASE:BTCUSD", "D", ta.stdev(math.log(close[1] / close[2]), hv7_length), lookahead=barmerge.lookahead_on)
+sample_correction_7 = math.sqrt(hv7_length / (hv7_length - 1.0))
+hv7_live            = pop_stdev_7 * sample_correction_7 * math.sqrt(365.0) * 100.0
+
+// HV14: latch on Saturday — holds the full week
+var float hv14_weekly = na
+if is_saturday
+    if not na(hv14_live)
+        hv14_weekly := hv14_live
+if na(hv14_weekly) and not na(hv14_live)
+    hv14_weekly := hv14_live
+
+// HV30: latch on 1st of month — holds the full calendar month
+var float hv30_monthly = na
+if is_new_month
+    if not na(hv30_live)
+        hv30_monthly := hv30_live
+if na(hv30_monthly) and not na(hv30_live)
+    hv30_monthly := hv30_live
+
+// RV as % of IV (weekly basis — info table)
+rv_pct_of_iv = (hv14_weekly / dvol_weekly_open) * 100.0
+
+// ═══════════════════════════════════════════════════════════
+// ─── RANGE CALCULATIONS ─────────────────────────────────
+// ═══════════════════════════════════════════════════════════
+daily_factor   = math.sqrt(1.0  / 365.0)
+weekly_factor  = math.sqrt(7.0  / 365.0)
+monthly_factor = math.sqrt(30.0 / 365.0)
+
+// ── Weekly (anchored to Saturday open) ──
+iv_weekly_move  = btc_weekly_open * (dvol_weekly_open / 100.0) * weekly_factor
+iv_weekly_upper = btc_weekly_open + iv_weekly_move
+iv_weekly_lower = btc_weekly_open - iv_weekly_move
+
+hv14_move  = btc_weekly_open * (hv14_weekly / 100.0) * weekly_factor
+hv14_upper = btc_weekly_open + hv14_move
+hv14_lower = btc_weekly_open - hv14_move
+
+// ── Monthly (anchored to 1st-of-month open) ──
+iv_monthly_move  = btc_monthly_open * (dvol_monthly_open / 100.0) * monthly_factor
+iv_monthly_upper = btc_monthly_open + iv_monthly_move
+iv_monthly_lower = btc_monthly_open - iv_monthly_move
+
+hv30_monthly_move  = btc_monthly_open * (hv30_monthly / 100.0) * monthly_factor
+hv30_monthly_upper = btc_monthly_open + hv30_monthly_move
+hv30_monthly_lower = btc_monthly_open - hv30_monthly_move
+
+// ── Daily (anchored to today's open, resets each day) ──
+hv7_daily_move_today  = btc_daily_anchor * (hv7_live  / 100.0) * daily_factor
+hv7_daily_upper_today = btc_daily_anchor + hv7_daily_move_today
+hv7_daily_lower_today = btc_daily_anchor - hv7_daily_move_today
+
+iv_daily_move_today  = btc_daily_anchor * (dvol_daily_anchor / 100.0) * daily_factor
+iv_daily_upper_today = btc_daily_anchor + iv_daily_move_today
+iv_daily_lower_today = btc_daily_anchor - iv_daily_move_today
+
+// ═══════════════════════════════════════════════════════════
+// ─── CURRENT WEEK FILTER (SAT–SAT) ─────────────────────
+// ═══════════════════════════════════════════════════════════
+ms_offset    = 2 * 86400 * 1000
+current_week = weekofyear(timenow + ms_offset)
+current_year = year(timenow + ms_offset)
+bar_week     = weekofyear(time + ms_offset)
+bar_year     = year(time + ms_offset)
+show         = timeframe.isintraday and bar_week == current_week and bar_year == current_year
+
+///////////////////////////////////////////////////////////
+//                                                       //
+//    FATS TRENDLINE ENGINE                              //
+//    Rolling bag pivot system — dual period             //
+//    Adapted from sirkriz "Fibonacci Auto Trend         //
+//    Scouter" (MPL 2.0)                                 //
+//                                                       //
+///////////////////////////////////////////////////////////
+
+// ═══════════════════════════════════════════════════════════
+// ─── BAG FUNCTIONS ──────────────────────────────────────
+// ═══════════════════════════════════════════════════════════
+f_bag_add(float[] bag, float val, float bi) =>
+    array.unshift(bag, bi)
+    array.unshift(bag, val)
+    if array.size(bag) > 14
+        array.pop(bag)
+        array.pop(bag)
+    0
+
+f_bag_update(float[] bag, float val, float bi, int dir) =>
+    if array.size(bag) == 0
+        f_bag_add(bag, val, bi)
+    else
+        if (dir == 1 and val > array.get(bag, 0)) or (dir == -1 and val < array.get(bag, 0))
+            array.set(bag, 0, val)
+            array.set(bag, 1, bi)
+    0
+
+// ═══════════════════════════════════════════════════════════
+// ─── SHORT PERIOD PIVOT DETECTION ───────────────────────
+// ═══════════════════════════════════════════════════════════
+var int sm_dir = 0
+var float[] sm_bag = array.new_float(0)
+
+if is_new_month
+    array.clear(sm_bag)
+    sm_dir := 0
+
+float sm_hi = ta.highestbars(high, tl_short_period) == 0 ? high : na
+float sm_lo = ta.lowestbars(low,  tl_short_period) == 0 ? low  : na
+
+bool sm_is_hi = not na(sm_hi) and na(sm_lo)
+bool sm_is_lo = not na(sm_lo) and na(sm_hi)
+sm_dir := sm_is_hi ? 1 : sm_is_lo ? -1 : sm_dir
+
+bool sm_dir_changed = ta.change(sm_dir) != 0
+if sm_dir_changed
+    float sm_new_val = sm_dir == 1 ? sm_hi : sm_lo
+    if not na(sm_new_val)
+        f_bag_add(sm_bag, sm_new_val, float(bar_index))
+else
+    float sm_upd_val = sm_dir == 1 ? sm_hi : sm_lo
+    if not na(sm_upd_val)
+        f_bag_update(sm_bag, sm_upd_val, float(bar_index), sm_dir)
+
+bool sm_ready = array.size(sm_bag) >= 8
+
+// ═══════════════════════════════════════════════════════════
+// ─── LONG PERIOD PIVOT DETECTION ────────────────────────
+// ═══════════════════════════════════════════════════════════
+var int lg_dir = 0
+var float[] lg_bag = array.new_float(0)
+
+if is_new_month
+    array.clear(lg_bag)
+    lg_dir := 0
+
+float lg_hi = ta.highestbars(high, tl_long_period) == 0 ? high : na
+float lg_lo = ta.lowestbars(low,  tl_long_period) == 0 ? low  : na
+
+bool lg_is_hi = not na(lg_hi) and na(lg_lo)
+bool lg_is_lo = not na(lg_lo) and na(lg_hi)
+lg_dir := lg_is_hi ? 1 : lg_is_lo ? -1 : lg_dir
+
+bool lg_dir_changed = ta.change(lg_dir) != 0
+if lg_dir_changed
+    float lg_new_val = lg_dir == 1 ? lg_hi : lg_lo
+    if not na(lg_new_val)
+        f_bag_add(lg_bag, lg_new_val, float(bar_index))
+else
+    float lg_upd_val = lg_dir == 1 ? lg_hi : lg_lo
+    if not na(lg_upd_val)
+        f_bag_update(lg_bag, lg_upd_val, float(bar_index), lg_dir)
+
+bool lg_ready = array.size(lg_bag) >= 8
+
+// ═══════════════════════════════════════════════════════════
+// ─── ANCHOR SELECTION ───────────────────────────────────
+// ═══════════════════════════════════════════════════════════
+// ─── Short anchors ───
+float sm_b1_v = sm_ready ? array.get(sm_bag, 0) : na
+int   sm_b1_i = sm_ready ? int(array.get(sm_bag, 1)) : 0
+float sm_b2_v = sm_ready ? array.get(sm_bag, 2) : na
+int   sm_b2_i = sm_ready ? int(array.get(sm_bag, 3)) : 0
+float sm_b3_v = sm_ready ? array.get(sm_bag, 4) : na
+int   sm_b3_i = sm_ready ? int(array.get(sm_bag, 5)) : 0
+float sm_b4_v = sm_ready ? array.get(sm_bag, 6) : na
+int   sm_b4_i = sm_ready ? int(array.get(sm_bag, 7)) : 0
+
+float sm_from_top_v = sm_ready ? (sm_dir == 1 ? sm_b3_v : sm_b4_v) : na
+int   sm_from_top_i = sm_ready ? (sm_dir == 1 ? sm_b3_i : sm_b4_i) : 0
+float sm_to_top_v   = sm_ready ? (sm_dir == 1 ? sm_b1_v : sm_b2_v) : na
+int   sm_to_top_i   = sm_ready ? (sm_dir == 1 ? sm_b1_i : sm_b2_i) : 0
+
+float sm_from_bot_v = sm_ready ? (sm_dir == 1 ? sm_b4_v : sm_b3_v) : na
+int   sm_from_bot_i = sm_ready ? (sm_dir == 1 ? sm_b4_i : sm_b3_i) : 0
+float sm_to_bot_v   = sm_ready ? (sm_dir == 1 ? sm_b2_v : sm_b1_v) : na
+int   sm_to_bot_i   = sm_ready ? (sm_dir == 1 ? sm_b2_i : sm_b1_i) : 0
+
+int sm_top_dir = sm_ready and sm_to_top_i != sm_from_top_i ? (sm_to_top_v > sm_from_top_v ? 1 : -1) : 0
+int sm_bot_dir = sm_ready and sm_to_bot_i != sm_from_bot_i ? (sm_to_bot_v > sm_from_bot_v ? 1 : -1) : 0
+
+// ─── Long anchors ───
+float lg_b1_v = lg_ready ? array.get(lg_bag, 0) : na
+int   lg_b1_i = lg_ready ? int(array.get(lg_bag, 1)) : 0
+float lg_b2_v = lg_ready ? array.get(lg_bag, 2) : na
+int   lg_b2_i = lg_ready ? int(array.get(lg_bag, 3)) : 0
+float lg_b3_v = lg_ready ? array.get(lg_bag, 4) : na
+int   lg_b3_i = lg_ready ? int(array.get(lg_bag, 5)) : 0
+float lg_b4_v = lg_ready ? array.get(lg_bag, 6) : na
+int   lg_b4_i = lg_ready ? int(array.get(lg_bag, 7)) : 0
+
+float lg_from_top_v = lg_ready ? (lg_dir == 1 ? lg_b3_v : lg_b4_v) : na
+int   lg_from_top_i = lg_ready ? (lg_dir == 1 ? lg_b3_i : lg_b4_i) : 0
+float lg_to_top_v   = lg_ready ? (lg_dir == 1 ? lg_b1_v : lg_b2_v) : na
+int   lg_to_top_i   = lg_ready ? (lg_dir == 1 ? lg_b1_i : lg_b2_i) : 0
+
+float lg_from_bot_v = lg_ready ? (lg_dir == 1 ? lg_b4_v : lg_b3_v) : na
+int   lg_from_bot_i = lg_ready ? (lg_dir == 1 ? lg_b4_i : lg_b3_i) : 0
+float lg_to_bot_v   = lg_ready ? (lg_dir == 1 ? lg_b2_v : lg_b1_v) : na
+int   lg_to_bot_i   = lg_ready ? (lg_dir == 1 ? lg_b2_i : lg_b1_i) : 0
+
+int lg_top_dir = lg_ready and lg_to_top_i != lg_from_top_i ? (lg_to_top_v > lg_from_top_v ? 1 : -1) : 0
+int lg_bot_dir = lg_ready and lg_to_bot_i != lg_from_bot_i ? (lg_to_bot_v > lg_from_bot_v ? 1 : -1) : 0
+
+// ═══════════════════════════════════════════════════════════
+// ─── TRENDLINE VISUAL LINES ─────────────────────────────
+// ═══════════════════════════════════════════════════════════
+var line l_sm_bot = na, var line l_sm_top = na
+var line l_lg_bot = na, var line l_lg_top = na
+
+line.delete(l_sm_bot), line.delete(l_sm_top)
+line.delete(l_lg_bot), line.delete(l_lg_top)
+
+color sm_top_color = color.new(sm_top_dir == 1 ? tl_up_color : tl_dn_color, 50)
+color sm_bot_color = color.new(sm_bot_dir == 1 ? tl_up_color : tl_dn_color, 50)
+color lg_top_color = color.new(lg_top_dir == 1 ? tl_up_color : tl_dn_color, 50)
+color lg_bot_color = color.new(lg_bot_dir == 1 ? tl_up_color : tl_dn_color, 50)
+
+if sm_ready and show_tl_short
+    l_sm_bot := line.new(sm_from_bot_i, sm_from_bot_v, sm_to_bot_i, sm_to_bot_v, color=sm_bot_color, style=line.style_dashed, width=tl_short_width, extend=extend.right)
+    l_sm_top := line.new(sm_from_top_i, sm_from_top_v, sm_to_top_i, sm_to_top_v, color=sm_top_color, style=line.style_dashed, width=tl_short_width, extend=extend.right)
+
+if lg_ready and show_tl_long
+    l_lg_bot := line.new(lg_from_bot_i, lg_from_bot_v, lg_to_bot_i, lg_to_bot_v, color=lg_bot_color, style=line.style_solid, width=tl_long_width, extend=extend.right)
+    l_lg_top := line.new(lg_from_top_i, lg_from_top_v, lg_to_top_i, lg_to_top_v, color=lg_top_color, style=line.style_solid, width=tl_long_width, extend=extend.right)
+
+// ═══════════════════════════════════════════════════════════
+// ─── WEEK SEPARATOR LINES ───────────────────────────────
+// ═══════════════════════════════════════════════════════════
+if is_saturday
+    line.new(bar_index, iv_weekly_upper + iv_weekly_move * 0.5, bar_index, iv_weekly_lower - iv_weekly_move * 0.5,
+         color=color.new(color.gray, 50), style=line.style_dotted, width=1)
+    label.new(bar_index, iv_weekly_upper + iv_weekly_move * 0.5,
+         str.tostring(month(time)) + "/" + str.tostring(dayofmonth(time)),
+         color=color.new(na, 100), textcolor=color.gray, style=label.style_label_down, size=size.small)
+
+// ═══════════════════════════════════════════════════════════
+// ─── FORWARD PROJECTION LINES ───────────────────────────
+// ═══════════════════════════════════════════════════════════
+ms_per_bar     = timeframe.in_seconds() * 1000
+ms_in_week     = 7 * 86400 * 1000
+days_since_sat = (dayofweek(timenow) + 1) % 7
+time_of_day_ms = timenow % (86400 * 1000)
+ms_into_week   = days_since_sat * 86400 * 1000 + time_of_day_ms
+ms_remaining   = ms_in_week - ms_into_week
+bars_remaining = math.ceil(ms_remaining / ms_per_bar)
+
+// ─── Line vars ───
+var line l_mid           = na
+var line l_iv_w_iu       = na, var line l_iv_w_il      = na
+var line l_hv14_iu       = na, var line l_hv14_il      = na
+var line l_iv_m_iu       = na, var line l_iv_m_il      = na
+var line l_hv30_iu       = na, var line l_hv30_il      = na
+var line l_hv7_today_iu  = na, var line l_hv7_today_il = na
+var line l_iv_today_iu   = na, var line l_iv_today_il  = na
+
+// ─── Label vars ───
+var label lbl_mid           = na
+var label lbl_iv_w_iu       = na, var label lbl_iv_w_il      = na
+var label lbl_hv14_iu       = na, var label lbl_hv14_il      = na
+var label lbl_iv_m_iu       = na, var label lbl_iv_m_il      = na
+var label lbl_hv30_iu       = na, var label lbl_hv30_il      = na
+var label lbl_hv7_today_iu  = na, var label lbl_hv7_today_il = na
+var label lbl_iv_today_iu   = na, var label lbl_iv_today_il  = na
+
+if barstate.islast and show
+    line.delete(l_mid)
+    line.delete(l_iv_w_iu),      line.delete(l_iv_w_il)
+    line.delete(l_hv14_iu),      line.delete(l_hv14_il)
+    line.delete(l_iv_m_iu),      line.delete(l_iv_m_il)
+    line.delete(l_hv30_iu),      line.delete(l_hv30_il)
+    line.delete(l_hv7_today_iu), line.delete(l_hv7_today_il)
+    line.delete(l_iv_today_iu),  line.delete(l_iv_today_il)
+
+    label.delete(lbl_mid)
+    label.delete(lbl_iv_w_iu),      label.delete(lbl_iv_w_il)
+    label.delete(lbl_hv14_iu),      label.delete(lbl_hv14_il)
+    label.delete(lbl_iv_m_iu),      label.delete(lbl_iv_m_il)
+    label.delete(lbl_hv30_iu),      label.delete(lbl_hv30_il)
+    label.delete(lbl_hv7_today_iu), label.delete(lbl_hv7_today_il)
+    label.delete(lbl_iv_today_iu),  label.delete(lbl_iv_today_il)
+
+    int proj_bars = math.max(bars_remaining, 5)
+    int ext_bars  = math.min(math.round(proj_bars * 1.0), 480)
+
+    // ── Weekly open midline ──
+    if show_midline
+        l_mid   := line.new(bar_index, btc_weekly_open, bar_index + ext_bars, btc_weekly_open, color=color.new(mid_color, 50), style=line.style_solid, width=1)
+        lbl_mid := label.new(bar_index + ext_bars + 3, btc_weekly_open, "⚓ Sat Open", color=color.new(na, 100), textcolor=color.new(mid_color, 50), style=label.style_label_left, size=size.normal)
+
+    // ── Weekly bands: IV Weekly + HV14 (both always visible together) ──
+    if show_weekly
+        l_iv_w_iu   := line.new(bar_index, iv_weekly_upper, bar_index + ext_bars, iv_weekly_upper, color=iv_weekly_color, style=line.style_solid, width=1)
+        l_iv_w_il   := line.new(bar_index, iv_weekly_lower, bar_index + ext_bars, iv_weekly_lower, color=iv_weekly_color, style=line.style_solid, width=1)
+        lbl_iv_w_iu := label.new(bar_index + ext_bars + 3, iv_weekly_upper, "IV Weekly (" + str.tostring(dvol_weekly_open, "#.#") + "%)", color=color.new(na, 100), textcolor=iv_weekly_color, style=label.style_label_left, size=size.normal)
+        lbl_iv_w_il := label.new(bar_index + ext_bars + 3, iv_weekly_lower, "IV Weekly (" + str.tostring(dvol_weekly_open, "#.#") + "%)", color=color.new(na, 100), textcolor=iv_weekly_color, style=label.style_label_left, size=size.normal)
+
+        l_hv14_iu   := line.new(bar_index, hv14_upper, bar_index + ext_bars, hv14_upper, color=hv14_color, style=line.style_solid, width=1)
+        l_hv14_il   := line.new(bar_index, hv14_lower, bar_index + ext_bars, hv14_lower, color=hv14_color, style=line.style_solid, width=1)
+        lbl_hv14_iu := label.new(bar_index + ext_bars + 3, hv14_upper, "HV14 Weekly (" + str.tostring(hv14_weekly, "#.#") + "%)", color=color.new(na, 100), textcolor=hv14_color, style=label.style_label_left, size=size.normal)
+        lbl_hv14_il := label.new(bar_index + ext_bars + 3, hv14_lower, "HV14 Weekly (" + str.tostring(hv14_weekly, "#.#") + "%)", color=color.new(na, 100), textcolor=hv14_color, style=label.style_label_left, size=size.normal)
+
+    // ── Monthly bands: IV Monthly + HV30 (both always visible together) ──
+    // Locked to 1st of month open — holds the full calendar month
+    if show_monthly
+        l_iv_m_iu   := line.new(bar_index, iv_monthly_upper, bar_index + ext_bars, iv_monthly_upper, color=iv_monthly_color, style=line.style_solid, width=2)
+        l_iv_m_il   := line.new(bar_index, iv_monthly_lower, bar_index + ext_bars, iv_monthly_lower, color=iv_monthly_color, style=line.style_solid, width=2)
+        lbl_iv_m_iu := label.new(bar_index + ext_bars + 3, iv_monthly_upper, "IV Monthly (" + str.tostring(dvol_monthly_open, "#.#") + "%)", color=color.new(na, 100), textcolor=iv_monthly_color, style=label.style_label_left, size=size.normal)
+        lbl_iv_m_il := label.new(bar_index + ext_bars + 3, iv_monthly_lower, "IV Monthly (" + str.tostring(dvol_monthly_open, "#.#") + "%)", color=color.new(na, 100), textcolor=iv_monthly_color, style=label.style_label_left, size=size.normal)
+
+        l_hv30_iu   := line.new(bar_index, hv30_monthly_upper, bar_index + ext_bars, hv30_monthly_upper, color=hv30_color, style=line.style_solid, width=2)
+        l_hv30_il   := line.new(bar_index, hv30_monthly_lower, bar_index + ext_bars, hv30_monthly_lower, color=hv30_color, style=line.style_solid, width=2)
+        lbl_hv30_iu := label.new(bar_index + ext_bars + 3, hv30_monthly_upper, "HV30 Monthly (" + str.tostring(hv30_monthly, "#.#") + "%)", color=color.new(na, 100), textcolor=hv30_color, style=label.style_label_left, size=size.normal)
+        lbl_hv30_il := label.new(bar_index + ext_bars + 3, hv30_monthly_lower, "HV30 Monthly (" + str.tostring(hv30_monthly, "#.#") + "%)", color=color.new(na, 100), textcolor=hv30_color, style=label.style_label_left, size=size.normal)
+
+    // ── HV7 Today (daily rotating — anchored to today's open) ──
+    if show_hv7_daily
+        l_hv7_today_iu := line.new(bar_index, hv7_daily_upper_today, bar_index + ext_bars, hv7_daily_upper_today, color=hv7_daily_color, style=line.style_solid, width=1)
+        l_hv7_today_il := line.new(bar_index, hv7_daily_lower_today, bar_index + ext_bars, hv7_daily_lower_today, color=hv7_daily_color, style=line.style_solid, width=1)
+        bool hv7u_ok = math.abs(hv7_daily_upper_today - iv_weekly_upper) > label_proximity and math.abs(hv7_daily_upper_today - iv_weekly_lower) > label_proximity and math.abs(hv7_daily_upper_today - hv14_upper) > label_proximity and math.abs(hv7_daily_upper_today - hv14_lower) > label_proximity and math.abs(hv7_daily_upper_today - iv_monthly_upper) > label_proximity and math.abs(hv7_daily_upper_today - iv_monthly_lower) > label_proximity and math.abs(hv7_daily_upper_today - hv30_monthly_upper) > label_proximity and math.abs(hv7_daily_upper_today - hv30_monthly_lower) > label_proximity and math.abs(hv7_daily_upper_today - btc_weekly_open) > label_proximity
+        if hv7u_ok
+            lbl_hv7_today_iu := label.new(bar_index + ext_bars + 3, hv7_daily_upper_today, "HV7 Today (" + str.tostring(hv7_live, "#.#") + "%)", color=color.new(na, 100), textcolor=hv7_daily_color, style=label.style_label_left, size=size.normal)
+        bool hv7l_ok = math.abs(hv7_daily_lower_today - iv_weekly_upper) > label_proximity and math.abs(hv7_daily_lower_today - iv_weekly_lower) > label_proximity and math.abs(hv7_daily_lower_today - hv14_upper) > label_proximity and math.abs(hv7_daily_lower_today - hv14_lower) > label_proximity and math.abs(hv7_daily_lower_today - iv_monthly_upper) > label_proximity and math.abs(hv7_daily_lower_today - iv_monthly_lower) > label_proximity and math.abs(hv7_daily_lower_today - hv30_monthly_upper) > label_proximity and math.abs(hv7_daily_lower_today - hv30_monthly_lower) > label_proximity and math.abs(hv7_daily_lower_today - btc_weekly_open) > label_proximity
+        if hv7l_ok
+            lbl_hv7_today_il := label.new(bar_index + ext_bars + 3, hv7_daily_lower_today, "HV7 Today (" + str.tostring(hv7_live, "#.#") + "%)", color=color.new(na, 100), textcolor=hv7_daily_color, style=label.style_label_left, size=size.normal)
+
+    // ── IV Today (daily rotating — anchored to today's open) ──
+    if show_iv_daily
+        daily_iv_color = color.new(iv_weekly_color, 40)
+        l_iv_today_iu  := line.new(bar_index, iv_daily_upper_today, bar_index + ext_bars, iv_daily_upper_today, color=daily_iv_color, style=line.style_solid, width=1)
+        l_iv_today_il  := line.new(bar_index, iv_daily_lower_today, bar_index + ext_bars, iv_daily_lower_today, color=daily_iv_color, style=line.style_solid, width=1)
+        bool ivu_ok = math.abs(iv_daily_upper_today - iv_weekly_upper) > label_proximity and math.abs(iv_daily_upper_today - iv_weekly_lower) > label_proximity and math.abs(iv_daily_upper_today - hv14_upper) > label_proximity and math.abs(iv_daily_upper_today - hv14_lower) > label_proximity and math.abs(iv_daily_upper_today - iv_monthly_upper) > label_proximity and math.abs(iv_daily_upper_today - iv_monthly_lower) > label_proximity and math.abs(iv_daily_upper_today - hv30_monthly_upper) > label_proximity and math.abs(iv_daily_upper_today - hv30_monthly_lower) > label_proximity and math.abs(iv_daily_upper_today - btc_weekly_open) > label_proximity
+        if ivu_ok
+            lbl_iv_today_iu := label.new(bar_index + ext_bars + 3, iv_daily_upper_today, "IV Today (" + str.tostring(dvol_daily_anchor, "#.#") + "%)", color=color.new(na, 100), textcolor=daily_iv_color, style=label.style_label_left, size=size.normal)
+        bool ivl_ok = math.abs(iv_daily_lower_today - iv_weekly_upper) > label_proximity and math.abs(iv_daily_lower_today - iv_weekly_lower) > label_proximity and math.abs(iv_daily_lower_today - hv14_upper) > label_proximity and math.abs(iv_daily_lower_today - hv14_lower) > label_proximity and math.abs(iv_daily_lower_today - iv_monthly_upper) > label_proximity and math.abs(iv_daily_lower_today - iv_monthly_lower) > label_proximity and math.abs(iv_daily_lower_today - hv30_monthly_upper) > label_proximity and math.abs(iv_daily_lower_today - hv30_monthly_lower) > label_proximity and math.abs(iv_daily_lower_today - btc_weekly_open) > label_proximity
+        if ivl_ok
+            lbl_iv_today_il := label.new(bar_index + ext_bars + 3, iv_daily_lower_today, "IV Today (" + str.tostring(dvol_daily_anchor, "#.#") + "%)", color=color.new(na, 100), textcolor=daily_iv_color, style=label.style_label_left, size=size.normal)
+
+// ═══════════════════════════════════════════════════════════
+// ─── INFO TABLE (TOP LEFT) ──────────────────────────────
+// ═══════════════════════════════════════════════════════════
+var table info = table.new(position.top_left, 3, 4, bgcolor=color.new(#0a0e27, 85), border_width=1, border_color=color.new(#FF9800, 50), frame_width=1, frame_color=color.new(#FF9800, 50))
+
+if barstate.islast
+    table.cell(info, 0, 0, "", text_size=size.small)
+    table.cell(info, 1, 0, "", text_size=size.small)
+    table.cell(info, 2, 0, "", text_size=size.small)
+    table.cell(info, 0, 1, "", text_size=size.small)
+    table.cell(info, 1, 1, "", text_size=size.small)
+    table.cell(info, 2, 1, "", text_size=size.small)
+
+    float btc_daily_change     = close - btc_daily_anchor
+    float btc_daily_change_pct = (btc_daily_change / btc_daily_anchor) * 100.0
+    string change_sign         = btc_daily_change >= 0 ? "+" : ""
+    color  change_color        = btc_daily_change >= 0 ? #4CAF50 : #F44336
+
+    string iv_emoji    = dvol_weekly_open > 60 ? "🔥" : dvol_weekly_open < 40 ? "❄️" : "⚡"
+    string ratio_emoji = rv_pct_of_iv < 95.0 ? "✅" : "⚠️"
+
+    table.cell(info, 0, 2, iv_emoji + " IV "  + str.tostring(dvol_weekly_open, "#.#") + "%",         text_color=#FFFFFF,                    text_size=size.small, text_font_family=font.family_monospace)
+    table.cell(info, 1, 2, "🎲 HV14 "         + str.tostring(hv14_weekly, "#.#")      + "%",         text_color=#CC6600,                    text_size=size.small)
+    table.cell(info, 2, 2, ratio_emoji + " "  + str.tostring(rv_pct_of_iv, "#")       + "% HV14/IV", text_color=color.new(color.white, 40), text_size=size.small)
+
+    string change_emoji = btc_daily_change >= 0 ? "📈" : "📉"
+    table.cell(info, 0, 3, change_emoji + " " + change_sign + str.tostring(btc_daily_change_pct, "#.##") + "%", text_color=change_color,                    text_size=size.small)
+    table.cell(info, 1, 3, "$" + str.tostring(math.abs(btc_daily_change), "#,###"),                             text_color=change_color,                    text_size=size.small)
+    table.cell(info, 2, 3, str.tostring(month(timenow)) + "/" + str.tostring(dayofmonth(timenow)),              text_color=color.new(color.white, 50),        text_size=size.small)

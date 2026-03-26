@@ -1,0 +1,279 @@
+// ─────────────────────────────────────────────────────────────────
+//
+//  ██╗   ██╗██╗██╗  ██╗
+//  ██║   ██║██║╚██╗██╔╝
+//  ██║   ██║██║ ╚███╔╝
+//  ╚██╗ ██╔╝██║ ██╔██╗
+//   ╚████╔╝ ██║██╔╝ ██╗
+//    ╚═══╝  ╚═╝╚═╝  ╚═╝
+//  ██████╗ ███████╗ ██████╗ ██╗███╗   ███╗███████╗
+//  ██╔══██╗██╔════╝██╔════╝ ██║████╗ ████║██╔════╝
+//  ██████╔╝█████╗  ██║  ███╗██║██╔████╔██║█████╗
+//  ██╔══██╗██╔══╝  ██║   ██║██║██║╚██╔╝██║██╔══╝
+//  ██║  ██║███████╗╚██████╔╝██║██║ ╚═╝ ██║███████╗
+//  ╚═╝  ╚═╝╚══════╝ ╚═════╝ ╚═╝╚═╝     ╚═╝╚══════╝
+//
+//  v1.1 — Volatility Truth Filter
+//  by blazethatish
+//
+//  Confirms Risk-On / Risk-Off regimes using
+//  NYSE internals + VIX term structure + TRIN
+//  Run on CBOE:VIX or TVC:VIX (intraday)
+//
+// ─────────────────────────────────────────────────────────────────
+//@version=5
+indicator("VIX Regime Confirmation v1.1", shorttitle="VIX Regime", overlay=true)
+
+// ─── Groups ──────────────────────────────────────────────────────
+GRP_VIX   = "VIX Direction"
+GRP_INT   = "Internal Confirmation"
+GRP_TERM  = "Term Structure"
+GRP_SCORE = "Score & Output"
+GRP_VIS   = "Display"
+
+// ─── Inputs ──────────────────────────────────────────────────────
+vixMode        = input.string("Trend", "VIX Direction Mode", options=["Trend", "Session", "Intraday"], group=GRP_VIX, tooltip="Trend: EMA slope over lookback (recommended). Session: close vs today's open. Intraday: close vs prior close.")
+vixTrendLen    = input.int(20, "Trend Lookback (bars)", minval=5, maxval=100, group=GRP_VIX, tooltip="EMA length for Trend mode direction detection")
+vixSpikeThresh = input.float(10.0, "Spike Threshold (%)", minval=2.0, maxval=50.0, step=1.0, group=GRP_VIX, tooltip="Session % change above this = SPIKE (vs DRIFT). Measured from daily open.")
+
+addThreshold   = input.int(1000,  "ADD Strong Threshold (±)", minval=100, step=100, group=GRP_INT, tooltip="ADD beyond ± this level = strong confirmation (2 points instead of 1)")
+tickLookback   = input.int(20,    "TICK Bias Lookback (bars)", minval=5,  maxval=100, group=GRP_INT, tooltip="Number of bars to measure TICK bias direction")
+cumtickSlope   = input.int(10,    "CUMTICK Slope Length (bars)", minval=3, maxval=50, group=GRP_INT, tooltip="Bars to measure CUMTICK slope via linear regression")
+trinOverbought = input.float(1.5, "TRIN Risk-Off Threshold", minval=1.1, maxval=3.0, step=0.1, group=GRP_INT, tooltip="TRIN above this = heavy selling pressure (risk-off)")
+trinOversold   = input.float(0.7, "TRIN Risk-On Threshold",  minval=0.1, maxval=0.9, step=0.1, group=GRP_INT, tooltip="TRIN below this = heavy buying pressure (risk-on)")
+
+termSpreadThresh = input.float(0.0, "Term Structure Threshold", minval=-5.0, maxval=5.0, step=0.5, group=GRP_TERM, tooltip="VIX - VIX3M spread above 0 = backwardation (fear). Default 0 = any backwardation counts.")
+
+confirmThresh  = input.int(4,     "Confirmation Threshold", minval=1, maxval=8, group=GRP_SCORE, tooltip="Minimum score for confirmed regime (max 8 with strong ADD + all internals)")
+
+showBG         = input.bool(true, "Background Tint", group=GRP_VIS, tooltip="Light background color when regime is confirmed")
+showTable      = input.bool(true, "Show Status Table", group=GRP_VIS)
+tablePos       = input.string("Bottom Right", "Table Position", options=["Top Right", "Top Center", "Top Left", "Middle Right", "Middle Center", "Middle Left", "Bottom Right", "Bottom Center", "Bottom Left"], group=GRP_VIS)
+
+// ─── Table Position ──────────────────────────────────────────────
+_tblPos = switch tablePos
+    "Top Right"      => position.top_right
+    "Top Center"     => position.top_center
+    "Top Left"       => position.top_left
+    "Middle Right"   => position.middle_right
+    "Middle Center"  => position.middle_center
+    "Middle Left"    => position.middle_left
+    "Bottom Center"  => position.bottom_center
+    "Bottom Left"    => position.bottom_left
+    => position.bottom_right
+
+// ─── NYSE RTH Detection ─────────────────────────────────────────
+//  Internals (ADD, TICK, VOLD, TRIN) only update 9:30 AM - 4:00 PM ET
+//  VIX + VIX3M disseminate from ~3:00 AM - 4:15 PM ET
+//  Outside RTH, internals are STALE — flag it
+bool isNYSE_RTH = not na(time(timeframe.period, "0930-1600", "America/New_York"))
+
+// ─── Step 1: VIX Direction ───────────────────────────────────────
+float dailyOpen = request.security(syminfo.tickerid, "D", open, lookahead=barmerge.lookahead_on)
+float vixEma    = ta.ema(close, vixTrendLen)
+float vixSlope  = ta.sma(vixEma - vixEma[1], math.max(1, math.round(vixTrendLen / 2)))
+
+bool vixUp   = vixMode == "Trend" ? vixSlope > 0 : vixMode == "Session" ? close > dailyOpen : close > close[1]
+bool vixDown = vixMode == "Trend" ? vixSlope < 0 : vixMode == "Session" ? close < dailyOpen : close < close[1]
+
+// ─── VIX Spike Detection ────────────────────────────────────────
+//  Measures session % change from daily open
+//  SPIKE = large fast move, DRIFT = gradual
+float vixSessionPct = dailyOpen > 0 ? (close - dailyOpen) / dailyOpen * 100.0 : 0.0
+bool  isSpike       = math.abs(vixSessionPct) >= vixSpikeThresh
+
+// ─── Fetch Internals (with graceful fallback) ────────────────────
+float addRaw  = request.security("USI:ADD",     timeframe.period, close, ignore_invalid_symbol=true)
+float tickRaw = request.security("USI:TICK",    timeframe.period, close, ignore_invalid_symbol=true)
+float voldRaw = request.security("USI:VOLD",    timeframe.period, close, ignore_invalid_symbol=true)
+float trinRaw = request.security("USI:TRIN.NY", timeframe.period, close, ignore_invalid_symbol=true)
+
+// ─── Fetch Term Structure ────────────────────────────────────────
+//  VIX3M = CBOE 3-month volatility index
+//  Backwardation (VIX > VIX3M) = fear / risk-off
+//  Contango (VIX < VIX3M) = complacency / risk-on
+float vix3mRaw = request.security("CBOE:VIX3M", timeframe.period, close, ignore_invalid_symbol=true)
+float termSpread = not na(vix3mRaw) ? close - vix3mRaw : na
+
+// Gate internals by RTH — outside NYSE hours these values are stale
+float addVal  = isNYSE_RTH ? addRaw  : na
+float tickVal = isNYSE_RTH ? tickRaw : na
+float voldVal = isNYSE_RTH ? voldRaw : na
+float trinVal = isNYSE_RTH ? trinRaw : na
+
+// For TICK lookback/CUMTICK we need the raw value even to accumulate
+float tickForCalc = nz(tickRaw, 0.0)
+
+// ─── Step 2a: ADD Confirmation ───────────────────────────────────
+//  Risk-Off: ADD < 0           → +1 point
+//  Strong:   ADD < -threshold  → +2 points
+//  Risk-On:  ADD > 0           → -1 point
+//  Strong:   ADD > +threshold  → -2 points
+int addConf = na(addVal) ? 0 : addVal < -addThreshold ? +2 : addVal < 0 ? +1 : addVal > addThreshold ? -2 : addVal > 0 ? -1 : 0
+
+// ─── Step 2b: TICK Bias Confirmation ─────────────────────────────
+int tickBelow = 0
+int tickAbove = 0
+for i = 0 to tickLookback - 1
+    float tv = nz(tickRaw[i])
+    if tv < 0
+        tickBelow += 1
+    else if tv > 0
+        tickAbove += 1
+
+float tickAvg = ta.sma(tickRaw, tickLookback)
+
+int tickConf = not isNYSE_RTH ? 0 : (tickBelow > tickAbove and tickAvg < 0) ? +1 : (tickAbove > tickBelow and tickAvg > 0) ? -1 : 0
+
+// ─── Step 2c: CUMTICK (Intraday Cumulative TICK) ─────────────────
+var float cumTick = 0.0
+bool newSession = ta.change(time("D")) != 0
+cumTick := newSession ? tickForCalc : cumTick + tickForCalc
+
+float cumSlopeVal = ta.linreg(cumTick, cumtickSlope, 0) - ta.linreg(cumTick, cumtickSlope, 1)
+
+int cumConf = not isNYSE_RTH ? 0 : cumSlopeVal < 0 ? +1 : cumSlopeVal > 0 ? -1 : 0
+
+// ─── Step 2d: VOLD Confirmation ──────────────────────────────────
+int voldConf = na(voldVal) ? 0 : voldVal < 0 ? +1 : voldVal > 0 ? -1 : 0
+
+// ─── Step 2e: TRIN Confirmation ──────────────────────────────────
+//  TRIN > trinOverbought = heavy selling (risk-off)
+//  TRIN < trinOversold   = heavy buying (risk-on)
+//  Between = neutral
+int trinConf = na(trinVal) ? 0 : trinVal > trinOverbought ? +1 : trinVal < trinOversold ? -1 : 0
+
+// ─── Step 2f: Term Structure Confirmation ────────────────────────
+//  Backwardation (VIX > VIX3M + threshold) = risk-off
+//  Contango (VIX < VIX3M - threshold) = risk-on
+//  Works outside RTH since both VIX and VIX3M update from 3 AM ET
+int termConf = na(termSpread) ? 0 : termSpread > termSpreadThresh ? +1 : termSpread < -termSpreadThresh ? -1 : 0
+
+// ─── Step 3: Score System ────────────────────────────────────────
+//  6 components: ADD(2), TICK(1), CUMTICK(1), VOLD(1), TRIN(1), TERM(1)
+//  ADD can contribute 2 points (strong) — max score = 7
+//  Outside RTH: NYSE internals = 0, but term structure still active
+
+int score = 0
+int maxScore = 7  // 2 (ADD strong) + 1 (TICK) + 1 (CUMTICK) + 1 (VOLD) + 1 (TRIN) + 1 (TERM)
+
+if vixUp
+    score := math.max(0, addConf) + (tickConf == 1 ? 1 : 0) + (cumConf == 1 ? 1 : 0) + (voldConf == 1 ? 1 : 0) + (trinConf == 1 ? 1 : 0) + (termConf == 1 ? 1 : 0)
+else if vixDown
+    score := math.max(0, -addConf) + (tickConf == -1 ? 1 : 0) + (cumConf == -1 ? 1 : 0) + (voldConf == -1 ? 1 : 0) + (trinConf == -1 ? 1 : 0) + (termConf == -1 ? 1 : 0)
+
+// ─── Step 4: Final State ─────────────────────────────────────────
+string state = "MIXED"
+color  stateCol = color.new(#FFD54F, 0)  // yellow
+
+if vixUp and score >= confirmThresh
+    state    := "RISK-OFF"
+    stateCol := color.new(#EF5350, 0)    // red
+else if vixDown and score >= confirmThresh
+    state    := "RISK-ON"
+    stateCol := color.new(#66BB6A, 0)    // green
+
+// ─── Regime Duration ─────────────────────────────────────────────
+//  Count consecutive bars in current state
+var int regimeBars = 0
+regimeBars := state == state[1] ? regimeBars + 1 : 1
+
+// ─── Background Tint ─────────────────────────────────────────────
+color bgCol = na
+if showBG
+    if state == "RISK-OFF"
+        bgCol := color.new(#EF5350, 88)
+    else if state == "RISK-ON"
+        bgCol := color.new(#66BB6A, 88)
+
+bgcolor(bgCol)
+
+// ─── Status Table ────────────────────────────────────────────────
+if showTable and barstate.islast
+    var table panel = table.new(_tblPos, 2, 10, bgcolor=color.new(#1E222D, 5), border_width=1, border_color=color.new(#363A45, 0), frame_width=1, frame_color=color.new(#363A45, 0))
+
+    // Colors
+    _hdr  = color.new(#B0BEC5, 0)
+    _dim  = color.new(#8B949E, 0)
+    _cell = color.new(#1E222D, 5)
+    _sz   = size.small
+
+    int row = 0
+
+    // Header
+    table.cell(panel, 0, row, "VIX REGIME", text_color=_hdr, text_size=size.normal, bgcolor=color.new(#131722, 0), text_halign=text.align_left)
+    table.cell(panel, 1, row, "v1.1",       text_color=_dim, text_size=size.tiny,   bgcolor=color.new(#131722, 0), text_halign=text.align_right)
+    row += 1
+
+    // Row: VIX Direction + Spike/Drift
+    string dirText = vixUp ? "UP" : vixDown ? "DOWN" : "FLAT"
+    string magText = isSpike ? " SPIKE" : " DRIFT"
+    color  dirCol  = vixUp ? #EF5350 : vixDown ? #66BB6A : _dim
+    color  magCol  = isSpike ? #FF7043 : _dim
+    table.cell(panel, 0, row, "  Direction", text_color=_dim, text_size=_sz, bgcolor=_cell, text_halign=text.align_left)
+    table.cell(panel, 1, row, dirText + magText + "  ", text_color=dirCol, text_size=_sz, bgcolor=_cell, text_halign=text.align_right)
+    row += 1
+
+    // Row: Score
+    color scoreCol = score >= confirmThresh ? stateCol : score >= 2 ? #FFD54F : _dim
+    table.cell(panel, 0, row, "  Score", text_color=_dim, text_size=_sz, bgcolor=_cell, text_halign=text.align_left)
+    table.cell(panel, 1, row, str.tostring(score) + " / " + str.tostring(maxScore) + "  ", text_color=scoreCol, text_size=_sz, bgcolor=_cell, text_halign=text.align_right)
+    row += 1
+
+    // Row: State + Duration
+    string durText = str.tostring(regimeBars) + " bars"
+    table.cell(panel, 0, row, "  State", text_color=_dim, text_size=_sz, bgcolor=_cell, text_halign=text.align_left)
+    table.cell(panel, 1, row, state + "  ", text_color=stateCol, text_size=_sz, bgcolor=_cell, text_halign=text.align_right)
+    row += 1
+
+    // Row: Duration
+    color durCol = regimeBars >= 20 ? stateCol : regimeBars >= 5 ? #FFD54F : _dim
+    table.cell(panel, 0, row, "  Duration", text_color=_dim, text_size=_sz, bgcolor=_cell, text_halign=text.align_left)
+    table.cell(panel, 1, row, durText + "  ", text_color=durCol, text_size=_sz, bgcolor=_cell, text_halign=text.align_right)
+    row += 1
+
+    // Row: Term Structure
+    string termText = na(termSpread) ? "N/A" : (termSpread > 0 ? "BACKWRDN" : "CONTANGO")
+    string termVal  = na(termSpread) ? "" : " (" + str.tostring(termSpread, "#.##") + ")"
+    color  termCol  = na(termSpread) ? _dim : termSpread > 0 ? #EF5350 : #66BB6A
+    table.cell(panel, 0, row, "  Term Str", text_color=_dim, text_size=_sz, bgcolor=_cell, text_halign=text.align_left)
+    table.cell(panel, 1, row, termText + termVal + "  ", text_color=termCol, text_size=_sz, bgcolor=_cell, text_halign=text.align_right)
+    row += 1
+
+    // Row: Session % change
+    string pctSign = vixSessionPct >= 0 ? "+" : ""
+    string pctText = pctSign + str.tostring(vixSessionPct, "#.#") + "%"
+    color  pctCol  = isSpike ? #FF7043 : _dim
+    table.cell(panel, 0, row, "  Session %", text_color=_dim, text_size=_sz, bgcolor=_cell, text_halign=text.align_left)
+    table.cell(panel, 1, row, pctText + "  ", text_color=pctCol, text_size=_sz, bgcolor=_cell, text_halign=text.align_right)
+    row += 1
+
+    // Row: Internals breakdown  A T C V R S
+    string addStr  = na(addVal)  ? "?" : (addConf > 0 ? "+" : addConf < 0 ? "-" : "0")
+    string tickStr = na(tickVal) ? "?" : (tickConf > 0 ? "+" : tickConf < 0 ? "-" : "0")
+    string cumStr  = not isNYSE_RTH ? "?" : (cumConf > 0 ? "+" : cumConf < 0 ? "-" : "0")
+    string voldStr = na(voldVal) ? "?" : (voldConf > 0 ? "+" : voldConf < 0 ? "-" : "0")
+    string trinStr = na(trinVal) ? "?" : (trinConf > 0 ? "+" : trinConf < 0 ? "-" : "0")
+    string termStr = na(termSpread) ? "?" : (termConf > 0 ? "+" : termConf < 0 ? "-" : "0")
+    string intText = addStr + "A " + tickStr + "T " + cumStr + "C " + voldStr + "V " + trinStr + "R " + termStr + "S"
+    table.cell(panel, 0, row, "  Internals", text_color=_dim, text_size=_sz, bgcolor=_cell, text_halign=text.align_left)
+    table.cell(panel, 1, row, intText + "  ", text_color=color.new(#B0BEC5, 0), text_size=_sz, bgcolor=_cell, text_halign=text.align_right)
+    row += 1
+
+    // Row: RTH warning (only shown outside NYSE hours)
+    if not isNYSE_RTH
+        table.cell(panel, 0, row, "  DATA", text_color=#FFD54F, text_size=size.tiny, bgcolor=_cell, text_halign=text.align_left)
+        table.cell(panel, 1, row, "STALE (term OK)  ", text_color=#FFD54F, text_size=size.tiny, bgcolor=_cell, text_halign=text.align_right)
+    else
+        table.cell(panel, 0, row, "", text_color=_dim, text_size=size.tiny, bgcolor=_cell)
+        table.cell(panel, 1, row, "", text_color=_dim, text_size=size.tiny, bgcolor=_cell)
+
+// ─── Alerts ──────────────────────────────────────────────────────
+alertcondition(state == "RISK-OFF" and state[1] != "RISK-OFF", title="Confirmed Risk-Off",       message="VIX Regime: Confirmed RISK-OFF on {{ticker}} — volatility expansion confirmed by internals")
+alertcondition(state == "RISK-ON"  and state[1] != "RISK-ON",  title="Confirmed Risk-On",        message="VIX Regime: Confirmed RISK-ON on {{ticker}} — volatility compression confirmed by internals")
+alertcondition(state == "MIXED"    and state[1] != "MIXED",    title="Regime Mixed",              message="VIX Regime: State shifted to MIXED on {{ticker}} — internals not confirming VIX direction")
+alertcondition(isSpike and not isSpike[1],                      title="VIX Spike Detected",        message="VIX SPIKE on {{ticker}} — session move exceeds threshold")
+alertcondition(not na(termSpread) and termSpread > 0 and termSpread[1] <= 0, title="Backwardation Entry", message="VIX term structure flipped to BACKWARDATION on {{ticker}} — fear regime")
+alertcondition(not na(termSpread) and termSpread < 0 and termSpread[1] >= 0, title="Contango Entry",      message="VIX term structure flipped to CONTANGO on {{ticker}} — complacency regime")
+
+// ─── END VIX Regime Confirmation v1.1 ────────────────────────────

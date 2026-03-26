@@ -1,0 +1,136 @@
+//@version=6
+indicator("Modern Real-Time ADR & Session Hub V2", "ADR Session Hub V2", overlay = true, max_lines_count = 500)
+
+// --- Groups ---
+string G_MAC  = "Daily Range (ADR)"
+string G_SES  = "Session Range (ASR)"
+string G_VIS  = "Style & Appearance"
+
+// --- Inputs ---
+showADRInput      = input.bool(true, "Show Daily Range (ADR)", group = G_MAC)
+adrPeriodInput    = input.int(5, "ADR Lookback (Days)", minval = 1, group = G_MAC)
+
+showASRInput      = input.bool(true, "Show Session Range (ASR)", group = G_SES)
+sessionTimeInput  = input.session("0930-1600", "ASR Session Time", group = G_SES)
+asrPeriodInput    = input.int(5, "ASR Lookback (Days)", minval = 1, group = G_SES)
+asrMultInput      = input.float(1.0, "ASR Multiplier", minval = 0.1, step = 0.1, group = G_SES)
+asrProjectionType = input.string("From Session Open", "ASR Projection Mode", options = ["From Session Open", "From Current Extremes"], group = G_SES)
+
+showShadingInput  = input.bool(true, "Enable ADR Sentiment Shading", group = G_VIS)
+showASRFill       = input.bool(true, "Enable ASR Boundary Fill", group = G_VIS)
+extLengthInput    = input.int(25, "Extension Length", minval = 5, group = G_VIS)
+bullColorInput    = input.color(#089981, "Bullish Sentiment", group = G_VIS)
+bearColorInput    = input.color(#f23645, "Bearish Sentiment", group = G_VIS)
+adrColorInput     = input.color(#ffeb3b, "ADR Border Color", group = G_VIS)
+asrColorInput     = input.color(#5b9cf6, "ASR Border Color", group = G_VIS)
+midColorInput     = input.color(#787b86, "Midpoint Color", group = G_VIS)
+
+// --- Weighted Logic Helper ---
+get_hist_session_range(sess, lookback) =>
+    t = time("D", sess)
+    var float hi = na
+    var float lo = na
+    var float[] ranges = array.new_float(0)
+    
+    if ta.change(t) != 0
+        if not na(hi) and not na(lo)
+            array.unshift(ranges, hi - lo)
+            if array.size(ranges) > lookback
+                array.pop(ranges)
+        hi := high, lo := low
+    else if not na(t)
+        hi := math.max(high, nz(hi, high))
+        lo := math.min(low, nz(lo, low))
+    
+    size = array.size(ranges)
+    res = 0.0
+    if size > 0
+        wSum = 0.0, valSum = 0.0
+        for i = 0 to size - 1
+            w = size - i
+            valSum += array.get(ranges, i) * w
+            wSum += w
+        res := valSum / wSum
+    res
+
+// --- Calculations ---
+avgDailyRange = request.security(syminfo.tickerid, "D", ta.wma(high - low, adrPeriodInput)[1], lookahead = barmerge.lookahead_off)
+
+bool inSess = not na(time(timeframe.period, sessionTimeInput, syminfo.timezone))
+var float dHi = na, var float dLo = na
+var float sHi = na, var float sLo = na, var float sOpen = na
+
+if ta.change(time("D")) != 0 or barstate.isfirst
+    dHi := high, dLo := low
+else
+    dHi := math.max(high, nz(dHi, high)), dLo := math.min(low, nz(dLo, low))
+
+if inSess and not inSess[1]
+    sHi := high, sLo := low, sOpen := open
+else if inSess
+    sHi := math.max(high, nz(sHi, high)), sLo := math.min(low, nz(sLo, low))
+
+avgSessRangeRaw = get_hist_session_range(sessionTimeInput, asrPeriodInput)
+avgSessRange    = (na(avgSessRangeRaw) or avgSessRangeRaw == 0 ? avgDailyRange * 0.6 : avgSessRangeRaw) * asrMultInput
+
+// --- Levels ---
+adrHigh = math.round_to_mintick(dLo + avgDailyRange)
+adrLow  = math.round_to_mintick(dHi - avgDailyRange)
+adrMid  = math.round_to_mintick((dHi + dLo) / 2)
+
+float asrHigh = na
+float asrLow  = na
+if inSess
+    if asrProjectionType == "From Session Open"
+        asrHigh := math.round_to_mintick(sOpen + (avgSessRange / 2))
+        asrLow  := math.round_to_mintick(sOpen - (avgSessRange / 2))
+    else
+        asrHigh := math.round_to_mintick(sLo + avgSessRange)
+        asrLow  := math.round_to_mintick(sHi - avgSessRange)
+
+dailyUsed   = ((dHi - dLo) / avgDailyRange) * 100
+sessionUsed = inSess ? ((sHi - sLo) / avgSessRange) * 100 : 0
+isExhausted = dailyUsed >= 100 or sessionUsed >= 100
+
+// --- Visuals: Plots ---
+p_adrHigh = plot(showADRInput ? adrHigh : na, "ADR High", adrColorInput, 1, style = plot.style_linebr)
+p_adrMid  = plot(showADRInput ? adrMid : na, "ADR Midpoint", midColorInput, 1, style = plot.style_linebr)
+p_adrLow  = plot(showADRInput ? adrLow : na, "ADR Low", adrColorInput, 1, style = plot.style_linebr)
+
+p_asrHigh = plot(showASRInput ? asrHigh : na, "ASR High", asrColorInput, 1, style = plot.style_linebr)
+p_asrLow  = plot(showASRInput ? asrLow : na, "ASR Low", asrColorInput, 1, style = plot.style_linebr)
+
+// Fills
+fill(p_adrMid, p_adrHigh, adrHigh, adrMid, showShadingInput and close > adrMid ? color.new(bullColorInput, 85) : color.new(bullColorInput, 100), color.new(bullColorInput, 100), "Upper Daily")
+fill(p_adrMid, p_adrLow, adrMid, adrLow, color.new(bearColorInput, 100), showShadingInput and close < adrMid ? color.new(bearColorInput, 85) : color.new(bearColorInput, 100), "Lower Daily")
+fill(p_asrHigh, p_asrLow, color.new(asrColorInput, showASRFill ? 95 : 100), "ASR Zone Fill")
+
+bgcolor(isExhausted ? color.new(bearColorInput, 96) : na, title = "Exhaustion Signal")
+
+// --- Extensions ---
+draw_ext(price, col, txt, offset) =>
+    var line l = na
+    var label lb = na
+    if barstate.islast and not na(price)
+        line.delete(l), label.delete(lb)
+        l := line.new(bar_index, price, bar_index + offset, price, color = col, style = line.style_dotted, width = 1)
+        lb := label.new(bar_index + offset, price, txt + ": " + str.tostring(price, "###.##"), color = #00000000, textcolor = col, style = label.style_label_left, size = size.small)
+
+if showADRInput
+    draw_ext(adrHigh, adrColorInput, "ADR HI", extLengthInput)
+    draw_ext(adrMid,  midColorInput,  "MID",    extLengthInput)
+    draw_ext(adrLow,  adrColorInput, "ADR LO", extLengthInput)
+if showASRInput and inSess
+    draw_ext(asrHigh, asrColorInput, "ASR HI", extLengthInput)
+    draw_ext(asrLow,  asrColorInput, "ASR LO", extLengthInput)
+
+// HUD
+var label hudLabel = na
+if barstate.islast
+    label.delete(hudLabel)
+    string hudText = "RANGE HUB V2 (WEIGHTED)\n━━━━━━━━━━━━━━━━━━━━━━\n" +
+                     "DAILY USED: " + str.tostring(dailyUsed, "0.1") + "%\n" +
+                     (inSess ? "SESS. USED:  " + str.tostring(sessionUsed, "0.1") + "%\n" : "") +
+                     "━━━━━━━━━━━━━━━━━━━━━━\n" +
+                     "STATUS: " + (isExhausted ? "⚠️ EXHAUSTED" : "✅ ACTIVE")
+    hudLabel := label.new(bar_index + extLengthInput + 15, adrMid, hudText, color = #00000000, textcolor = chart.fg_color, style = label.style_label_left, size = size.small, textalign = text.align_left)

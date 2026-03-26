@@ -1,0 +1,272 @@
+//@version=6
+indicator("Crypto Derivatives Dashboard v1", overlay=false, format=format.price, precision=2)
+
+// ════════════════════════════════════════════════════════════════════════════
+// CRYPTO DERIVATIVES DASHBOARD v1
+//
+// Panel de datos de derivados para complementar estrategias de trading crypto.
+// Muestra: Open Interest, Premium Index (proxy funding), OI-Price Divergence,
+// y señales de régimen basadas en posicionamiento del mercado.
+//
+// DATOS DISPONIBLES EN TRADINGVIEW:
+//   ✅ Open Interest  → ticker _OI (directo, intraday)
+//   ✅ Premium Index   → ticker _PREMIUM (proxy para funding rate)
+//   ❌ Funding Rate    → solo via Request Library o Financials tab
+//   ❌ L/S Ratio       → solo via Request Library o Financials tab
+//   ❌ Liquidaciones   → solo via Request Library o Financials tab
+//   ❌ Taker Buy/Sell  → no disponible en TradingView
+//
+// SEÑALES DE RÉGIMEN:
+//   🟢 OI↑ + Precio↑ = Trend saludable (demanda genuina)
+//   🟡 OI↓ + Precio↑ = Short covering / exhaustion → CAUCIÓN
+//   🔴 OI↑ + Precio↓ = Shorts acumulando → EVITAR LONGS
+//   🟠 OI↓ + Precio↓ = Liquidaciones de longs → ESPERAR
+//
+// ASSETS: BTC, ETH, SOL, BNB, XRP, PEPE (Binance Perpetuals)
+// TIMEFRAME: Optimizado para D1, funciona en cualquier TF
+// ════════════════════════════════════════════════════════════════════════════
+
+// ═══════════════════════════════ INPUTS ════════════════════════════════════
+
+// --- Asset Selection ---
+string ASSET = input.string("BTC", "Asset", options=["BTC", "ETH", "SOL", "BNB", "XRP", "PEPE"], group="Asset")
+
+// --- Open Interest ---
+int    oi_len      = input.int(14, "OI Change Lookback", minval=2, maxval=100, group="Open Interest")
+int    oi_sma_len  = input.int(20, "OI SMA Length", minval=5, maxval=100, group="Open Interest")
+float  oi_div_thr  = input.float(1.5, "Divergence Z-Score Threshold", minval=0.5, maxval=4.0, step=0.1, group="Open Interest")
+
+// --- Premium / Funding ---
+int    prem_len    = input.int(50, "Premium Z-Score Lookback", minval=10, maxval=200, group="Premium / Funding")
+float  prem_high   = input.float(2.0, "Premium Extreme High (Z)", minval=1.0, maxval=4.0, step=0.1, group="Premium / Funding")
+float  prem_low    = input.float(-2.0, "Premium Extreme Low (Z)", maxval=-1.0, minval=-4.0, step=0.1, group="Premium / Funding")
+
+// --- Display ---
+bool   show_table  = input.bool(true, "Show Info Table", group="Display")
+bool   show_bg     = input.bool(true, "Show Regime Background", group="Display")
+bool   show_divs   = input.bool(true, "Show Divergence Markers", group="Display")
+
+// ═══════════════════════════════ TICKERS ═══════════════════════════════════
+
+// Construir tickers dinámicamente según el asset seleccionado
+// Formato confirmado: BINANCE:{ASSET}USDT.P_OI para OI
+// Formato confirmado: BINANCE:{ASSET}USDT_PREMIUM para Premium Index
+// Nota: PEPE puede ser 1000PEPEUSDT en algunos exchanges
+
+string perpTicker = ASSET == "PEPE" ? "BINANCE:1000PEPEUSDT.P" : "BINANCE:" + ASSET + "USDT.P"
+string oiTicker   = ASSET == "PEPE" ? "BINANCE:1000PEPEUSDT.P_OI" : "BINANCE:" + ASSET + "USDT.P_OI"
+string premTicker = ASSET == "PEPE" ? "BINANCE:1000PEPEUSDT_PREMIUM" : "BINANCE:" + ASSET + "USDT_PREMIUM"
+
+// ════════════════════════════ DATA REQUESTS ════════════════════════════════
+
+// --- Precio del perpetual ---
+float perpPrice = request.security(perpTicker, timeframe.period, close, ignore_invalid_symbol=true)
+
+// --- Open Interest ---
+float oiClose = request.security(oiTicker, timeframe.period, close, ignore_invalid_symbol=true)
+float oiOpen  = request.security(oiTicker, timeframe.period, open, ignore_invalid_symbol=true)
+float oiHigh  = request.security(oiTicker, timeframe.period, high, ignore_invalid_symbol=true)
+float oiLow   = request.security(oiTicker, timeframe.period, low, ignore_invalid_symbol=true)
+
+// --- Premium Index (proxy para funding rate) ---
+// Premium = (Perp Price - Spot Price) / Spot Price
+// Disponible en TF bajo; pedimos en 1h y usamos último valor
+float premRaw = request.security(premTicker, "60", close, ignore_invalid_symbol=true)
+
+// ══════════════════════════ OI CALCULATIONS ═══════════════════════════════
+
+// OI Change (porcentual)
+float oiPrev    = oiClose[1]
+float oiChgPct  = oiPrev != 0 ? ((oiClose - oiPrev) / oiPrev) * 100 : 0.0
+
+// OI SMA y desviación
+float oiSma     = ta.sma(oiClose, oi_sma_len)
+float oiStd     = ta.stdev(oiClose, oi_sma_len)
+float oiZscore  = oiStd != 0 ? (oiClose - oiSma) / oiStd : 0.0
+
+// OI rate of change (N periodos)
+float oiRoc     = oiClose[oi_len] != 0 ? ((oiClose - oiClose[oi_len]) / oiClose[oi_len]) * 100 : 0.0
+
+// Precio rate of change (misma ventana)
+float priceRoc  = perpPrice[oi_len] != 0 ? ((perpPrice - perpPrice[oi_len]) / perpPrice[oi_len]) * 100 : 0.0
+
+// ═══════════════════════ OI-PRICE DIVERGENCE ══════════════════════════════
+
+// Normalizar ambos ROCs a Z-score para comparar
+float oiRocSma    = ta.sma(oiRoc, oi_sma_len)
+float oiRocStd    = ta.stdev(oiRoc, oi_sma_len)
+float oiRocZ      = oiRocStd != 0 ? (oiRoc - oiRocSma) / oiRocStd : 0.0
+
+float priceRocSma = ta.sma(priceRoc, oi_sma_len)
+float priceRocStd = ta.stdev(priceRoc, oi_sma_len)
+float priceRocZ   = priceRocStd != 0 ? (priceRoc - priceRocSma) / priceRocStd : 0.0
+
+// Divergencia = precio sube pero OI no acompaña (o viceversa)
+float divScore    = priceRocZ - oiRocZ
+
+// Señales de divergencia
+bool bearishDiv = divScore > oi_div_thr   // Precio sube mucho más que OI → exhaustion
+bool bullishDiv = divScore < -oi_div_thr  // OI sube mucho más que precio → acumulación
+
+// ══════════════════════ PREMIUM / FUNDING CALC ════════════════════════════
+
+// Premium como porcentaje (ya viene como ratio, multiplicar x100)
+float premPct   = premRaw * 100
+
+// Z-score del premium
+float premSma   = ta.sma(premPct, prem_len)
+float premStd   = ta.stdev(premPct, prem_len)
+float premZ     = premStd != 0 ? (premPct - premSma) / premStd : 0.0
+
+// Extremos de funding
+bool  fundingHot  = premZ > prem_high   // Demasiados longs → contrarian warning
+bool  fundingCold = premZ < prem_low    // Demasiados shorts → potential squeeze
+
+// ═══════════════════════ REGIME CLASSIFICATION ════════════════════════════
+
+// Clasificar régimen basado en OI vs Precio
+// Usamos SMA de OI change y Price change para suavizar
+float oiTrend    = ta.sma(oiChgPct, 5)
+float priceTrend = ta.ema(perpPrice, 10) - ta.ema(perpPrice, 20)
+
+bool oiRising    = oiTrend > 0.1
+bool oiFalling   = oiTrend < -0.1
+bool priceRising = priceTrend > 0
+bool priceFalling= priceTrend < 0
+
+// Regímenes
+int regime = 0
+if oiRising and priceRising
+    regime := 1   // 🟢 Healthy trend — GO
+else if oiFalling and priceRising
+    regime := 2   // 🟡 Short covering / exhaustion — CAUTION
+else if oiRising and priceFalling
+    regime := 3   // 🔴 Shorts building — AVOID LONGS
+else if oiFalling and priceFalling
+    regime := 4   // 🟠 Long liquidations — WAIT
+else
+    regime := 0   // ⚪ Neutral
+
+// Composite score: positivo = favorable para longs, negativo = desfavorable
+float compositeScore = oiRocZ + (fundingCold ? 1.0 : fundingHot ? -1.0 : 0.0) - (bearishDiv ? 1.5 : 0.0) + (bullishDiv ? 1.0 : 0.0)
+
+// ══════════════════════════════ PLOTS ══════════════════════════════════════
+
+// --- Panel 1: OI Change % ---
+color oiColor = oiChgPct > 0 ? color.new(color.teal, 30) : color.new(color.red, 30)
+plot(oiChgPct, "OI Daily Change %", color=oiColor, style=plot.style_columns, linewidth=2)
+hline(0, "Zero", color=color.gray, linestyle=hline.style_dotted)
+
+// --- Panel 2: OI Z-Score ---
+plot(oiZscore, "OI Z-Score", color=color.new(color.blue, 20), linewidth=2)
+hline(2.0, "OI High", color=color.new(color.red, 60), linestyle=hline.style_dashed)
+hline(-2.0, "OI Low", color=color.new(color.green, 60), linestyle=hline.style_dashed)
+
+// --- Panel 3: Premium Z-Score ---
+plot(premZ, "Premium Z-Score", color=color.new(color.orange, 20), linewidth=2)
+hline(prem_high, "Fund Hot", color=color.new(color.red, 70), linestyle=hline.style_dotted)
+hline(prem_low, "Fund Cold", color=color.new(color.green, 70), linestyle=hline.style_dotted)
+
+// --- Divergence Score ---
+plot(divScore, "Divergence Score", color=color.new(color.purple, 40), linewidth=1, style=plot.style_stepline)
+
+// --- Background Regime ---
+color bgColor = na
+if show_bg
+    if regime == 1
+        bgColor := color.new(color.green, 92)
+    else if regime == 2
+        bgColor := color.new(color.yellow, 92)
+    else if regime == 3
+        bgColor := color.new(color.red, 92)
+    else if regime == 4
+        bgColor := color.new(color.orange, 92)
+bgcolor(bgColor, title="Regime Background")
+
+// --- Divergence Markers ---
+plotshape(show_divs and bearishDiv ? oiChgPct : na, "Bearish Div", shape.triangledown, location.top, color.new(color.red, 20), size=size.small)
+plotshape(show_divs and bullishDiv ? oiChgPct : na, "Bullish Div", shape.triangleup, location.bottom, color.new(color.green, 20), size=size.small)
+
+// --- Funding Extreme Markers ---
+plotshape(fundingHot ? premZ : na, "Funding HOT", shape.xcross, location.top, color.new(color.red, 0), size=size.tiny)
+plotshape(fundingCold ? premZ : na, "Funding COLD", shape.diamond, location.bottom, color.new(color.lime, 0), size=size.tiny)
+
+// ═══════════════════════════ INFO TABLE ════════════════════════════════════
+
+if show_table and barstate.islast
+    var table dash = table.new(position.top_right, 2, 9, bgcolor=color.new(color.black, 15), border_width=1, border_color=color.new(color.gray, 60))
+
+    // Header
+    table.cell(dash, 0, 0, "📊 " + ASSET + " Derivatives", text_color=color.white, text_size=size.normal, text_halign=text.align_left, bgcolor=color.new(color.blue, 60))
+    table.cell(dash, 1, 0, timeframe.period, text_color=color.white, text_size=size.normal, text_halign=text.align_right, bgcolor=color.new(color.blue, 60))
+
+    // OI
+    table.cell(dash, 0, 1, "Open Interest", text_color=color.gray, text_size=size.small, text_halign=text.align_left)
+    string oiStr = na(oiClose) ? "N/A" : str.tostring(oiClose, "#,###")
+    table.cell(dash, 1, 1, oiStr, text_color=color.white, text_size=size.small, text_halign=text.align_right)
+
+    // OI Change
+    table.cell(dash, 0, 2, "OI Change", text_color=color.gray, text_size=size.small, text_halign=text.align_left)
+    string oiChgStr = na(oiChgPct) ? "N/A" : str.tostring(oiChgPct, "#.##") + "%"
+    color oiChgCol = oiChgPct > 0 ? color.green : color.red
+    table.cell(dash, 1, 2, oiChgStr, text_color=oiChgCol, text_size=size.small, text_halign=text.align_right)
+
+    // OI Z-Score
+    table.cell(dash, 0, 3, "OI Z-Score", text_color=color.gray, text_size=size.small, text_halign=text.align_left)
+    string oiZStr = na(oiZscore) ? "N/A" : str.tostring(oiZscore, "#.##")
+    color oiZCol = math.abs(oiZscore) > 2 ? color.orange : color.white
+    table.cell(dash, 1, 3, oiZStr, text_color=oiZCol, text_size=size.small, text_halign=text.align_right)
+
+    // Premium
+    table.cell(dash, 0, 4, "Premium Z", text_color=color.gray, text_size=size.small, text_halign=text.align_left)
+    string premStr = na(premZ) ? "N/A" : str.tostring(premZ, "#.##")
+    color premCol = fundingHot ? color.red : fundingCold ? color.lime : color.white
+    table.cell(dash, 1, 4, premStr, text_color=premCol, text_size=size.small, text_halign=text.align_right)
+
+    // Divergence
+    table.cell(dash, 0, 5, "Divergence", text_color=color.gray, text_size=size.small, text_halign=text.align_left)
+    string divStr = bearishDiv ? "⚠ BEARISH" : bullishDiv ? "✅ BULLISH" : "—"
+    color divCol = bearishDiv ? color.red : bullishDiv ? color.green : color.gray
+    table.cell(dash, 1, 5, divStr, text_color=divCol, text_size=size.small, text_halign=text.align_right)
+
+    // Regime
+    table.cell(dash, 0, 6, "Régimen", text_color=color.gray, text_size=size.small, text_halign=text.align_left)
+    string regStr = regime == 1 ? "🟢 TREND" : regime == 2 ? "🟡 EXHAUST" : regime == 3 ? "🔴 SHORTS" : regime == 4 ? "🟠 LIQLONG" : "⚪ NEUTRAL"
+    color regCol = regime == 1 ? color.green : regime == 2 ? color.yellow : regime == 3 ? color.red : regime == 4 ? color.orange : color.gray
+    table.cell(dash, 1, 6, regStr, text_color=regCol, text_size=size.small, text_halign=text.align_right)
+
+    // Composite
+    table.cell(dash, 0, 7, "Composite", text_color=color.gray, text_size=size.small, text_halign=text.align_left)
+    string compStr = str.tostring(compositeScore, "#.##")
+    color compCol = compositeScore > 0.5 ? color.green : compositeScore < -0.5 ? color.red : color.gray
+    table.cell(dash, 1, 7, compStr, text_color=compCol, text_size=size.small, text_halign=text.align_right)
+
+    // Signal
+    table.cell(dash, 0, 8, "Señal Long", text_color=color.gray, text_size=size.small, text_halign=text.align_left)
+    bool longOk = regime == 1 and not fundingHot and not bearishDiv
+    string sigStr = longOk ? "✅ GO" : "❌ WAIT"
+    color sigCol = longOk ? color.green : color.red
+    table.cell(dash, 1, 8, sigStr, text_color=sigCol, text_size=size.small, text_halign=text.align_right)
+
+// ══════════════════════════ ALERT CONDITIONS ══════════════════════════════
+
+// Alerta: Régimen cambió a desfavorable
+alertcondition(ta.change(regime) != 0 and (regime == 3 or regime == 4), "Regime Bearish", "{{ticker}} derivados: régimen cambió a DESFAVORABLE (shorts/liquidaciones)")
+
+// Alerta: Divergencia bearish detectada
+alertcondition(bearishDiv and not bearishDiv[1], "Bearish OI Divergence", "{{ticker}} derivados: DIVERGENCIA BEARISH — precio sube pero OI no acompaña")
+
+// Alerta: Divergencia bullish detectada
+alertcondition(bullishDiv and not bullishDiv[1], "Bullish OI Divergence", "{{ticker}} derivados: DIVERGENCIA BULLISH — OI sube más que precio (acumulación)")
+
+// Alerta: Funding extremo (overcrowded longs)
+alertcondition(fundingHot and not fundingHot[1], "Funding Hot", "{{ticker}} derivados: FUNDING EXTREMO ALTO — overcrowded longs, riesgo de corrección")
+
+// Alerta: Funding extremo bajo (potential squeeze)
+alertcondition(fundingCold and not fundingCold[1], "Funding Cold", "{{ticker}} derivados: FUNDING EXTREMO BAJO — potential short squeeze")
+
+// Alerta: Señal GO (régimen favorable + sin warnings)
+bool longSignal = regime == 1 and not fundingHot and not bearishDiv
+alertcondition(longSignal and not longSignal[1], "Derivatives GO", "{{ticker}} derivados: SEÑAL GO — trend saludable, funding normal, sin divergencias")
+
+// ══════════════════════════════ FIN ════════════════════════════════════════

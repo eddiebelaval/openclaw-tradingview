@@ -1,0 +1,928 @@
+//@version=5
+indicator("FX Setup Scanner — Currency Strength & Divergence", shorttitle="FX Scanner", overlay=false, max_lines_count=500, max_labels_count=500, max_boxes_count=200)
+
+// ═══════════════════════════════════════════════════════════════
+//   INPUTS
+// ═══════════════════════════════════════════════════════════════
+
+var string GRP1 = "Timeframe & Lookback"
+tf_fast = input.string("10", "Fast lookback (minutes)", options=["5","10","15","30"], group=GRP1)
+tf_slow = input.string("60", "Slow lookback (minutes)", options=["30","60","120","240"], group=GRP1)
+
+var string GRP2 = "Thresholds"
+strength_gap = input.float(0.05, "Min strength gap (fast, both TFs must agree)", minval=0.01, maxval=0.5, step=0.01, group=GRP2)
+corr_thresh = input.float(-0.65, "Correlation threshold (negative)", minval=-1.0, maxval=0.0, step=0.05, group=GRP2)
+diverge_bars = input.int(5, "Divergence confirmation bars", minval=2, maxval=20, group=GRP2)
+
+var string GRP3 = "Display"
+show_bottom_bar = input.bool(true, "Show bottom bar", group=GRP3)
+
+var string GRP4 = "ATR Trail Scanner"
+i_atrLen        = input.int(10, "ATR Period", minval=1, group=GRP4)
+i_atrMult       = input.float(3.0, "ATR Multiplier", minval=0.1, step=0.1, group=GRP4)
+i_reachR        = input.float(1.0, "Reach X Ratio", minval=0.1, step=0.1, group=GRP4)
+i_days          = input.int(10, "Look Back Days", minval=1, group=GRP4)
+i_startH        = input.int(15, "Session Start Hour", minval=0, maxval=23, group=GRP4)
+i_startM        = input.int(0, "Session Start Minute", minval=0, maxval=59, group=GRP4)
+i_endH          = input.int(18, "Session End Hour", minval=0, maxval=23, group=GRP4)
+i_endM          = input.int(59, "Session End Minute", minval=0, maxval=59, group=GRP4)
+i_trailSrcLong  = input.string("Close", "ATR Trail Source Long", options=["Open","High","Low","Close","HL2","HLC3"], group=GRP4)
+i_trailSrcShort = input.string("Close", "ATR Trail Source Short", options=["Open","High","Low","Close","HL2","HLC3"], group=GRP4)
+i_dir           = input.string("Both", "Signal Direction", options=["Both","Long Only","Short Only"], group=GRP4)
+i_atrRows       = input.int(10, "Rows to show (top N by Avg R)", minval=1, maxval=12, group=GRP4)
+
+// ═══════════════════════════════════════════════════════════════
+//   SESSION DETECTION (UTC)
+// ═══════════════════════════════════════════════════════════════
+
+h = hour(time, "UTC")
+m = minute(time, "UTC")
+hm = h * 100 + m
+in_sydney = hm >= 2100 or hm < 600
+in_tokyo = hm >= 0 and hm < 900
+in_london = hm >= 700 and hm < 1600
+in_new_york = hm >= 1200 and hm < 2100
+london_ny_overlap = in_london and in_new_york
+tokyo_london_overlap = in_tokyo and in_london
+sess_base = london_ny_overlap ? 4 : tokyo_london_overlap ? 3 : in_london ? 3 : in_new_york ? 3 : in_tokyo ? 2 : in_sydney ? 1 : 0
+session_name = london_ny_overlap ? "London / NY Overlap" : in_london ? "London" : in_new_york ? "New York" : in_tokyo ? "Tokyo" : in_sydney ? "Sydney" : "Off-hours"
+
+// Volume proxy — ratio of current volume to 20-bar MA, clamped 0.5–2.0
+vol_ma = ta.sma(volume, 20)
+vol_ratio = vol_ma > 0 ? math.max(0.5, math.min(2.0, volume / vol_ma)) : 1.0
+
+// Volume-weighted liquidity: session base × vol ratio, rounded and clamped 0–4
+liq_score_raw = sess_base * vol_ratio
+liq_score = math.min(4, math.max(0, math.round(liq_score_raw)))
+
+// ── SESSION LIQUIDITY HISTORY TRACKING ──────────────────────────
+// Track peak vol-weighted liq score seen during each session window
+// Uses var to persist across bars
+
+var float syd_peak  = 0.0
+var float tok_peak  = 0.0
+var float lon_peak  = 0.0
+var float ny_peak   = 0.0
+var float ov_peak   = 0.0
+
+var bool was_syd  = false
+var bool was_tok  = false
+var bool was_lon  = false
+var bool was_ny   = false
+var bool was_ov   = false
+
+// Reset accumulators on session open
+if in_sydney and not was_syd
+    syd_peak := 0.0
+if in_tokyo and not was_tok
+    tok_peak := 0.0
+if in_london and not was_lon
+    lon_peak := 0.0
+if in_new_york and not was_ny
+    ny_peak := 0.0
+if london_ny_overlap and not was_ov
+    ov_peak := 0.0
+
+// Accumulate peak score within each session
+if in_sydney
+    syd_peak := math.max(syd_peak, liq_score_raw)
+if in_tokyo
+    tok_peak := math.max(tok_peak, liq_score_raw)
+if in_london
+    lon_peak := math.max(lon_peak, liq_score_raw)
+if in_new_york
+    ny_peak := math.max(ny_peak, liq_score_raw)
+if london_ny_overlap
+    ov_peak := math.max(ov_peak, liq_score_raw)
+
+was_syd := in_sydney
+was_tok := in_tokyo
+was_lon := in_london
+was_ny  := in_new_york
+was_ov  := london_ny_overlap
+
+// Convert raw peak score to display label + colour
+liq_label(v) =>
+    v >= 3.5 ? "PEAK" : v >= 2.5 ? "HIGH" : v >= 1.5 ? "MEDIUM" : v > 0.0 ? "LOW" : "—"
+
+liq_hist_col(v) =>
+    v >= 3.5 ? color.new(#26a69a, 0) : v >= 2.5 ? color.new(#8bc34a, 0) : v >= 1.5 ? color.new(#ff9800, 0) : v > 0.0 ? color.new(#ef5350, 0) : color.new(color.gray, 50)
+
+// ═══════════════════════════════════════════════════════════════
+//   PAIR DATA
+// ═══════════════════════════════════════════════════════════════
+
+c_EURUSD = request.security("EURUSD", timeframe.period, close)
+c_GBPUSD = request.security("GBPUSD", timeframe.period, close)
+c_USDJPY = request.security("USDJPY", timeframe.period, close)
+c_USDCHF = request.security("USDCHF", timeframe.period, close)
+c_USDCAD = request.security("USDCAD", timeframe.period, close)
+c_AUDUSD = request.security("AUDUSD", timeframe.period, close)
+c_NZDUSD = request.security("NZDUSD", timeframe.period, close)
+c_EURGBP = request.security("EURGBP", timeframe.period, close)
+c_EURJPY = request.security("EURJPY", timeframe.period, close)
+c_EURCHF = request.security("EURCHF", timeframe.period, close)
+c_EURCAD = request.security("EURCAD", timeframe.period, close)
+c_EURAUD = request.security("EURAUD", timeframe.period, close)
+c_EURNZD = request.security("EURNZD", timeframe.period, close)
+c_GBPJPY = request.security("GBPJPY", timeframe.period, close)
+c_GBPCHF = request.security("GBPCHF", timeframe.period, close)
+c_GBPCAD = request.security("GBPCAD", timeframe.period, close)
+c_GBPAUD = request.security("GBPAUD", timeframe.period, close)
+c_GBPNZD = request.security("GBPNZD", timeframe.period, close)
+c_CHFJPY = request.security("CHFJPY", timeframe.period, close)
+c_CADJPY = request.security("CADJPY", timeframe.period, close)
+c_AUDJPY = request.security("AUDJPY", timeframe.period, close)
+c_NZDJPY = request.security("NZDJPY", timeframe.period, close)
+c_AUDCAD = request.security("AUDCAD", timeframe.period, close)
+c_AUDCHF = request.security("AUDCHF", timeframe.period, close)
+c_AUDNZD = request.security("AUDNZD", timeframe.period, close)
+c_NZDCAD = request.security("NZDCAD", timeframe.period, close)
+c_NZDCHF = request.security("NZDCHF", timeframe.period, close)
+c_CADCHF = request.security("CADCHF", timeframe.period, close)
+
+// ═══════════════════════════════════════════════════════════════
+//   CURRENCY STRENGTH ENGINE
+// ═══════════════════════════════════════════════════════════════
+
+fast_bars = tf_fast == "5" ? 5 : tf_fast == "10" ? 10 : tf_fast == "15" ? 15 : 30
+slow_bars = tf_slow == "30" ? 30 : tf_slow == "60" ? 60 : tf_slow == "120" ? 120 : 240
+pct(src, n) => (src - src[n]) / src[n] * 100
+
+f_EURUSD = pct(c_EURUSD, fast_bars)
+f_GBPUSD = pct(c_GBPUSD, fast_bars)
+f_USDJPY = pct(c_USDJPY, fast_bars)
+f_USDCHF = pct(c_USDCHF, fast_bars)
+f_USDCAD = pct(c_USDCAD, fast_bars)
+f_AUDUSD = pct(c_AUDUSD, fast_bars)
+f_NZDUSD = pct(c_NZDUSD, fast_bars)
+f_EURGBP = pct(c_EURGBP, fast_bars)
+f_EURJPY = pct(c_EURJPY, fast_bars)
+f_EURCHF = pct(c_EURCHF, fast_bars)
+f_EURCAD = pct(c_EURCAD, fast_bars)
+f_EURAUD = pct(c_EURAUD, fast_bars)
+f_EURNZD = pct(c_EURNZD, fast_bars)
+f_GBPJPY = pct(c_GBPJPY, fast_bars)
+f_GBPCHF = pct(c_GBPCHF, fast_bars)
+f_GBPCAD = pct(c_GBPCAD, fast_bars)
+f_GBPAUD = pct(c_GBPAUD, fast_bars)
+f_GBPNZD = pct(c_GBPNZD, fast_bars)
+f_CHFJPY = pct(c_CHFJPY, fast_bars)
+f_CADJPY = pct(c_CADJPY, fast_bars)
+f_AUDJPY = pct(c_AUDJPY, fast_bars)
+f_NZDJPY = pct(c_NZDJPY, fast_bars)
+f_AUDCAD = pct(c_AUDCAD, fast_bars)
+f_AUDCHF = pct(c_AUDCHF, fast_bars)
+f_AUDNZD = pct(c_AUDNZD, fast_bars)
+f_NZDCAD = pct(c_NZDCAD, fast_bars)
+f_NZDCHF = pct(c_NZDCHF, fast_bars)
+f_CADCHF = pct(c_CADCHF, fast_bars)
+
+str_USD_f = (-f_EURUSD - f_GBPUSD + f_USDJPY + f_USDCHF + f_USDCAD - f_AUDUSD - f_NZDUSD) / 7
+str_EUR_f = (f_EURUSD + f_EURGBP + f_EURJPY + f_EURCHF + f_EURCAD + f_EURAUD + f_EURNZD) / 7
+str_GBP_f = (f_GBPUSD - f_EURGBP + f_GBPJPY + f_GBPCHF + f_GBPCAD + f_GBPAUD + f_GBPNZD) / 7
+str_JPY_f = (-f_USDJPY - f_EURJPY - f_GBPJPY - f_CHFJPY - f_CADJPY - f_AUDJPY - f_NZDJPY) / 7
+str_CHF_f = (-f_USDCHF - f_EURCHF - f_GBPCHF + f_CHFJPY - f_AUDCHF - f_NZDCHF - f_CADCHF) / 7
+str_CAD_f = (-f_USDCAD - f_EURCAD - f_GBPCAD + f_CADJPY - f_AUDCAD - f_NZDCAD - f_CADCHF) / 7
+str_AUD_f = (f_AUDUSD - f_EURAUD - f_GBPAUD + f_AUDJPY + f_AUDCAD + f_AUDCHF + f_AUDNZD) / 7
+str_NZD_f = (f_NZDUSD - f_EURNZD - f_GBPNZD + f_NZDJPY + f_NZDCAD + f_NZDCHF - f_AUDNZD) / 7
+
+s_EURUSD = pct(c_EURUSD, slow_bars)
+s_GBPUSD = pct(c_GBPUSD, slow_bars)
+s_USDJPY = pct(c_USDJPY, slow_bars)
+s_USDCHF = pct(c_USDCHF, slow_bars)
+s_USDCAD = pct(c_USDCAD, slow_bars)
+s_AUDUSD = pct(c_AUDUSD, slow_bars)
+s_NZDUSD = pct(c_NZDUSD, slow_bars)
+s_EURGBP = pct(c_EURGBP, slow_bars)
+s_EURJPY = pct(c_EURJPY, slow_bars)
+s_EURCHF = pct(c_EURCHF, slow_bars)
+s_EURCAD = pct(c_EURCAD, slow_bars)
+s_EURAUD = pct(c_EURAUD, slow_bars)
+s_EURNZD = pct(c_EURNZD, slow_bars)
+s_GBPJPY = pct(c_GBPJPY, slow_bars)
+s_GBPCHF = pct(c_GBPCHF, slow_bars)
+s_GBPCAD = pct(c_GBPCAD, slow_bars)
+s_GBPAUD = pct(c_GBPAUD, slow_bars)
+s_GBPNZD = pct(c_GBPNZD, slow_bars)
+s_CHFJPY = pct(c_CHFJPY, slow_bars)
+s_CADJPY = pct(c_CADJPY, slow_bars)
+s_AUDJPY = pct(c_AUDJPY, slow_bars)
+s_NZDJPY = pct(c_NZDJPY, slow_bars)
+s_AUDCAD = pct(c_AUDCAD, slow_bars)
+s_AUDCHF = pct(c_AUDCHF, slow_bars)
+s_AUDNZD = pct(c_AUDNZD, slow_bars)
+s_NZDCAD = pct(c_NZDCAD, slow_bars)
+s_NZDCHF = pct(c_NZDCHF, slow_bars)
+s_CADCHF = pct(c_CADCHF, slow_bars)
+
+str_USD_s = (-s_EURUSD - s_GBPUSD + s_USDJPY + s_USDCHF + s_USDCAD - s_AUDUSD - s_NZDUSD) / 7
+str_EUR_s = (s_EURUSD + s_EURGBP + s_EURJPY + s_EURCHF + s_EURCAD + s_EURAUD + s_EURNZD) / 7
+str_GBP_s = (s_GBPUSD - s_EURGBP + s_GBPJPY + s_GBPCHF + s_GBPCAD + s_GBPAUD + s_GBPNZD) / 7
+str_JPY_s = (-s_USDJPY - s_EURJPY - s_GBPJPY - s_CHFJPY - s_CADJPY - s_AUDJPY - s_NZDJPY) / 7
+str_CHF_s = (-s_USDCHF - s_EURCHF - s_GBPCHF + s_CHFJPY - s_AUDCHF - s_NZDCHF - s_CADCHF) / 7
+str_CAD_s = (-s_USDCAD - s_EURCAD - s_GBPCAD + s_CADJPY - s_AUDCAD - s_NZDCAD - s_CADCHF) / 7
+str_AUD_s = (s_AUDUSD - s_EURAUD - s_GBPAUD + s_AUDJPY + s_AUDCAD + s_AUDCHF + s_AUDNZD) / 7
+str_NZD_s = (s_NZDUSD - s_EURNZD - s_GBPNZD + s_NZDJPY + s_NZDCAD + s_NZDCHF - s_AUDNZD) / 7
+
+// ═══════════════════════════════════════════════════════════════
+//   CORRELATION ENGINE
+// ═══════════════════════════════════════════════════════════════
+
+corr_len = 20
+pearson(a, b, n) =>
+    ma = ta.sma(a, n)
+    mb = ta.sma(b, n)
+    num = ta.sma((a - ma) * (b - mb), n)
+    denom = math.sqrt(ta.sma(math.pow(a - ma, 2), n) * ta.sma(math.pow(b - mb, 2), n))
+    denom != 0 ? num / denom : 0
+
+// Per-pair correlation: base currency strength vs quote currency strength
+// Negative = diverging (base rising while quote falling = tradeable)
+p_EURUSD = pearson(str_EUR_f, str_USD_f, corr_len)
+p_GBPUSD = pearson(str_GBP_f, str_USD_f, corr_len)
+p_USDJPY = pearson(str_USD_f, str_JPY_f, corr_len)
+p_USDCHF = pearson(str_USD_f, str_CHF_f, corr_len)
+p_USDCAD = pearson(str_USD_f, str_CAD_f, corr_len)
+p_AUDUSD = pearson(str_AUD_f, str_USD_f, corr_len)
+p_NZDUSD = pearson(str_NZD_f, str_USD_f, corr_len)
+p_EURGBP = pearson(str_EUR_f, str_GBP_f, corr_len)
+p_EURJPY = pearson(str_EUR_f, str_JPY_f, corr_len)
+p_EURCHF = pearson(str_EUR_f, str_CHF_f, corr_len)
+p_EURCAD = pearson(str_EUR_f, str_CAD_f, corr_len)
+p_EURAUD = pearson(str_EUR_f, str_AUD_f, corr_len)
+p_EURNZD = pearson(str_EUR_f, str_NZD_f, corr_len)
+p_GBPJPY = pearson(str_GBP_f, str_JPY_f, corr_len)
+p_GBPCHF = pearson(str_GBP_f, str_CHF_f, corr_len)
+p_GBPCAD = pearson(str_GBP_f, str_CAD_f, corr_len)
+p_GBPAUD = pearson(str_GBP_f, str_AUD_f, corr_len)
+p_GBPNZD = pearson(str_GBP_f, str_NZD_f, corr_len)
+p_CHFJPY = pearson(str_CHF_f, str_JPY_f, corr_len)
+p_CADJPY = pearson(str_CAD_f, str_JPY_f, corr_len)
+p_AUDJPY = pearson(str_AUD_f, str_JPY_f, corr_len)
+p_NZDJPY = pearson(str_NZD_f, str_JPY_f, corr_len)
+p_AUDCAD = pearson(str_AUD_f, str_CAD_f, corr_len)
+p_AUDCHF = pearson(str_AUD_f, str_CHF_f, corr_len)
+p_AUDNZD = pearson(str_AUD_f, str_NZD_f, corr_len)
+p_NZDCAD = pearson(str_NZD_f, str_CAD_f, corr_len)
+p_NZDCHF = pearson(str_NZD_f, str_CHF_f, corr_len)
+p_CADCHF = pearson(str_CAD_f, str_CHF_f, corr_len)
+
+// ═══════════════════════════════════════════════════════════════
+//   ATR TRAIL SCANNER — calcStats function
+// ═══════════════════════════════════════════════════════════════
+
+atr_startMins = i_startH * 60 + i_startM
+atr_endMins   = i_endH   * 60 + i_endM
+
+calcStats() =>
+    atrRaw = ta.atr(i_atrLen)
+    srcLong = switch i_trailSrcLong
+        "Open"  => open
+        "High"  => high
+        "Low"   => low
+        "HL2"   => hl2
+        "HLC3"  => hlc3
+        =>         close
+    srcShort = switch i_trailSrcShort
+        "Open"  => open
+        "High"  => high
+        "Low"   => low
+        "HL2"   => hl2
+        "HLC3"  => hlc3
+        =>         close
+    pipSize = syminfo.mintick * 10
+    atrVal = math.ceil(i_atrMult * atrRaw / pipSize) * pipSize
+    upStop   = srcLong  - atrVal
+    downStop = srcShort + atrVal
+    var float ts     = na
+    var int   tr     = 1
+    var float exitTs = na
+    prevTr = tr
+    if na(ts)
+        ts     := upStop
+        tr     := 1
+        exitTs := upStop
+    else
+        exitTs := ts
+        if tr == 1
+            ts := math.max(upStop, ts)
+            if low < ts
+                exitTs := ts
+                tr     := -1
+                ts     := high + atrVal
+        else
+            ts := math.min(downStop, ts)
+            if high > ts
+                exitTs := ts
+                tr     := 1
+                ts     := low - atrVal
+    trendChanged = tr != prevTr
+    var float ep          = na
+    var float sd          = na
+    var int   tt          = 1
+    var float bp          = na
+    var bool  tradeOpen   = false
+    var int   entryTimeMs = 0
+    var array<float> aDist      = array.new_float(0)
+    var array<float> aMax       = array.new_float(0)
+    var array<int>   aEntryTime = array.new_int(0)
+    var array<int>   dayList    = array.new_int(0)
+    dayMs = int(math.floor(time / 86400000) * 86400000)
+    dayListSize = array.size(dayList)
+    isNewDay = dayListSize == 0 ? true : array.get(dayList, dayListSize - 1) != dayMs
+    if isNewDay
+        array.push(dayList, dayMs)
+    if tradeOpen
+        bp := tt == 1 ? math.max(bp, high) : math.min(bp, low)
+    if trendChanged
+        if tradeOpen and not na(ep) and not na(sd) and sd > 0
+            exitP  = nz(exitTs, close)
+            scored = tt == 1 ? (exitP - ep) / sd : (ep - exitP) / sd
+            maxR   = tt == 1 ? (bp - ep) / sd : (ep - bp) / sd
+            array.push(aDist, scored)
+            array.push(aMax, maxR)
+            array.push(aEntryTime, entryTimeMs)
+            tradeOpen := false
+        barMins = hour(time, "UTC") * 60 + minute(time, "UTC")
+        inWin   = barMins >= atr_startMins and barMins <= atr_endMins
+        dirAllowed = switch i_dir
+            "Long Only"  => tr == 1
+            "Short Only" => tr == -1
+            =>              true
+        if inWin and not na(exitTs) and dirAllowed
+            ep           := exitTs
+            sd           := atrVal
+            tt           := tr
+            bp           := exitTs
+            tradeOpen    := true
+            entryTimeMs  := int(time)
+    nDays    = array.size(dayList)
+    cutoffMs = nDays >= i_days ? array.get(dayList, nDays - i_days) : (nDays > 0 ? array.first(dayList) : 0)
+    float sumD = 0.0
+    float sumM = 0.0
+    int   cnt  = 0
+    int   rcnt = 0
+    n = array.size(aDist)
+    if n > 0
+        for i = 0 to n - 1
+            if array.get(aEntryTime, i) >= cutoffMs
+                d = array.get(aDist, i)
+                m = array.get(aMax, i)
+                sumD += d
+                sumM += m
+                cnt  += 1
+                if m >= i_reachR
+                    rcnt += 1
+    if tradeOpen and not na(ep) and not na(sd) and sd > 0 and entryTimeMs >= cutoffMs
+        liveMax = tt == 1 ? (math.max(bp, close) - ep) / sd : (ep - math.min(bp, close)) / sd
+        sumD += tt == 1 ? (close - ep) / sd : (ep - close) / sd
+        sumM += liveMax
+        cnt  += 1
+        if liveMax >= i_reachR
+            rcnt += 1
+    avgD = cnt > 0 ? sumD / cnt : 0.0
+    avgM = cnt > 0 ? sumM / cnt : 0.0
+    rPct = cnt > 0 ? rcnt / cnt * 100.0 : 0.0
+    [avgD, avgM, rPct, cnt]
+
+[atr_avgD1,  atr_avgM1,  atr_rPct1,  atr_cnt1 ] = request.security("EURUSD", timeframe.period, calcStats())
+[atr_avgD2,  atr_avgM2,  atr_rPct2,  atr_cnt2 ] = request.security("GBPUSD", timeframe.period, calcStats())
+[atr_avgD3,  atr_avgM3,  atr_rPct3,  atr_cnt3 ] = request.security("USDJPY", timeframe.period, calcStats())
+[atr_avgD4,  atr_avgM4,  atr_rPct4,  atr_cnt4 ] = request.security("USDCAD", timeframe.period, calcStats())
+[atr_avgD5,  atr_avgM5,  atr_rPct5,  atr_cnt5 ] = request.security("AUDUSD", timeframe.period, calcStats())
+[atr_avgD6,  atr_avgM6,  atr_rPct6,  atr_cnt6 ] = request.security("EURJPY", timeframe.period, calcStats())
+[atr_avgD7,  atr_avgM7,  atr_rPct7,  atr_cnt7 ] = request.security("GBPJPY", timeframe.period, calcStats())
+[atr_avgD8,  atr_avgM8,  atr_rPct8,  atr_cnt8 ] = request.security("GBPAUD", timeframe.period, calcStats())
+[atr_avgD9,  atr_avgM9,  atr_rPct9,  atr_cnt9 ] = request.security("GBPNZD", timeframe.period, calcStats())
+[atr_avgD10, atr_avgM10, atr_rPct10, atr_cnt10] = request.security("CADJPY", timeframe.period, calcStats())
+[atr_avgD11, atr_avgM11, atr_rPct11, atr_cnt11] = request.security("AUDJPY", timeframe.period, calcStats())
+[atr_avgD12, atr_avgM12, atr_rPct12, atr_cnt12] = request.security("CHFJPY", timeframe.period, calcStats())
+
+// ═══════════════════════════════════════════════════════════════
+//   DIVERGENCE
+// ═══════════════════════════════════════════════════════════════
+//   SETUP SCORER — fixed condition logic
+//
+//   cond1: strength gap — both TF agree base is stronger than quote
+//          uses absolute gap on the fast series, compared to a
+//          sensible threshold scaled to the % change values
+//   cond2: session liquidity >= 3 (London / NY / Overlap)
+//   cond3: correlation of the actual pair price series (rolling
+//          Pearson of the pair close vs its inverse pair proxy)
+//          — replaced with a simpler momentum divergence check:
+//          base strength trending up while quote trending down
+//          over the slow lookback window
+//   cond4: divergence confirmed over diverge_bars — base_f is
+//          rising (positive and increasing) while quote_f is
+//          falling (negative and decreasing)
+// ═══════════════════════════════════════════════════════════════
+
+score_pair(base_f, quote_f, base_s, quote_s) =>
+    gap_f = base_f - quote_f
+    gap_s = base_s - quote_s
+
+    // Cond 1: meaningful strength gap on fast TF, directional agreement on slow TF
+    // threshold scaled down to match typical % change magnitudes (0.03–0.15)
+    cond1 = math.abs(gap_f) >= strength_gap and math.sign(gap_f) == math.sign(gap_s)
+
+    // Cond 2: session liquidity
+    cond2 = liq_score >= 3
+
+    // Cond 3: the two currency strengths are moving in opposite directions
+    // base trending up (positive slow strength), quote trending down (negative slow strength)
+    cond3 = (base_s > 0 and quote_s < 0) or (base_s < 0 and quote_s > 0)
+
+    // Cond 4: divergence — base slow strength higher than N bars ago AND quote lower than N bars ago
+    cond4 = base_s > base_s[diverge_bars] and quote_s < quote_s[diverge_bars]
+
+    sc = (cond1 ? 1 : 0) + (cond2 ? 1 : 0) + (cond3 ? 1 : 0) + (cond4 ? 1 : 0)
+    [sc, gap_f, cond1, cond2, cond3, cond4]
+
+[sc_EURUSD, gap_EURUSD, c1_EURUSD, c2_EURUSD, c3_EURUSD, c4_EURUSD] = score_pair(str_EUR_f, str_USD_f, str_EUR_s, str_USD_s)
+[sc_GBPUSD, gap_GBPUSD, c1_GBPUSD, c2_GBPUSD, c3_GBPUSD, c4_GBPUSD] = score_pair(str_GBP_f, str_USD_f, str_GBP_s, str_USD_s)
+[sc_USDJPY, gap_USDJPY, c1_USDJPY, c2_USDJPY, c3_USDJPY, c4_USDJPY] = score_pair(str_USD_f, str_JPY_f, str_USD_s, str_JPY_s)
+[sc_USDCHF, gap_USDCHF, c1_USDCHF, c2_USDCHF, c3_USDCHF, c4_USDCHF] = score_pair(str_USD_f, str_CHF_f, str_USD_s, str_CHF_s)
+[sc_USDCAD, gap_USDCAD, c1_USDCAD, c2_USDCAD, c3_USDCAD, c4_USDCAD] = score_pair(str_USD_f, str_CAD_f, str_USD_s, str_CAD_s)
+[sc_AUDUSD, gap_AUDUSD, c1_AUDUSD, c2_AUDUSD, c3_AUDUSD, c4_AUDUSD] = score_pair(str_AUD_f, str_USD_f, str_AUD_s, str_USD_s)
+[sc_NZDUSD, gap_NZDUSD, c1_NZDUSD, c2_NZDUSD, c3_NZDUSD, c4_NZDUSD] = score_pair(str_NZD_f, str_USD_f, str_NZD_s, str_USD_s)
+[sc_EURGBP, gap_EURGBP, c1_EURGBP, c2_EURGBP, c3_EURGBP, c4_EURGBP] = score_pair(str_EUR_f, str_GBP_f, str_EUR_s, str_GBP_s)
+[sc_EURJPY, gap_EURJPY, c1_EURJPY, c2_EURJPY, c3_EURJPY, c4_EURJPY] = score_pair(str_EUR_f, str_JPY_f, str_EUR_s, str_JPY_s)
+[sc_EURCHF, gap_EURCHF, c1_EURCHF, c2_EURCHF, c3_EURCHF, c4_EURCHF] = score_pair(str_EUR_f, str_CHF_f, str_EUR_s, str_CHF_s)
+[sc_EURCAD, gap_EURCAD, c1_EURCAD, c2_EURCAD, c3_EURCAD, c4_EURCAD] = score_pair(str_EUR_f, str_CAD_f, str_EUR_s, str_CAD_s)
+[sc_EURAUD, gap_EURAUD, c1_EURAUD, c2_EURAUD, c3_EURAUD, c4_EURAUD] = score_pair(str_EUR_f, str_AUD_f, str_EUR_s, str_AUD_s)
+[sc_EURNZD, gap_EURNZD, c1_EURNZD, c2_EURNZD, c3_EURNZD, c4_EURNZD] = score_pair(str_EUR_f, str_NZD_f, str_EUR_s, str_NZD_s)
+[sc_GBPJPY, gap_GBPJPY, c1_GBPJPY, c2_GBPJPY, c3_GBPJPY, c4_GBPJPY] = score_pair(str_GBP_f, str_JPY_f, str_GBP_s, str_JPY_s)
+[sc_GBPCHF, gap_GBPCHF, c1_GBPCHF, c2_GBPCHF, c3_GBPCHF, c4_GBPCHF] = score_pair(str_GBP_f, str_CHF_f, str_GBP_s, str_CHF_s)
+[sc_GBPCAD, gap_GBPCAD, c1_GBPCAD, c2_GBPCAD, c3_GBPCAD, c4_GBPCAD] = score_pair(str_GBP_f, str_CAD_f, str_GBP_s, str_CAD_s)
+[sc_GBPAUD, gap_GBPAUD, c1_GBPAUD, c2_GBPAUD, c3_GBPAUD, c4_GBPAUD] = score_pair(str_GBP_f, str_AUD_f, str_GBP_s, str_AUD_s)
+[sc_GBPNZD, gap_GBPNZD, c1_GBPNZD, c2_GBPNZD, c3_GBPNZD, c4_GBPNZD] = score_pair(str_GBP_f, str_NZD_f, str_GBP_s, str_NZD_s)
+[sc_CHFJPY, gap_CHFJPY, c1_CHFJPY, c2_CHFJPY, c3_CHFJPY, c4_CHFJPY] = score_pair(str_CHF_f, str_JPY_f, str_CHF_s, str_JPY_s)
+[sc_CADJPY, gap_CADJPY, c1_CADJPY, c2_CADJPY, c3_CADJPY, c4_CADJPY] = score_pair(str_CAD_f, str_JPY_f, str_CAD_s, str_JPY_s)
+[sc_AUDJPY, gap_AUDJPY, c1_AUDJPY, c2_AUDJPY, c3_AUDJPY, c4_AUDJPY] = score_pair(str_AUD_f, str_JPY_f, str_AUD_s, str_JPY_s)
+[sc_NZDJPY, gap_NZDJPY, c1_NZDJPY, c2_NZDJPY, c3_NZDJPY, c4_NZDJPY] = score_pair(str_NZD_f, str_JPY_f, str_NZD_s, str_JPY_s)
+[sc_AUDCAD, gap_AUDCAD, c1_AUDCAD, c2_AUDCAD, c3_AUDCAD, c4_AUDCAD] = score_pair(str_AUD_f, str_CAD_f, str_AUD_s, str_CAD_s)
+[sc_AUDCHF, gap_AUDCHF, c1_AUDCHF, c2_AUDCHF, c3_AUDCHF, c4_AUDCHF] = score_pair(str_AUD_f, str_CHF_f, str_AUD_s, str_CHF_s)
+[sc_AUDNZD, gap_AUDNZD, c1_AUDNZD, c2_AUDNZD, c3_AUDNZD, c4_AUDNZD] = score_pair(str_AUD_f, str_NZD_f, str_AUD_s, str_NZD_s)
+[sc_NZDCAD, gap_NZDCAD, c1_NZDCAD, c2_NZDCAD, c3_NZDCAD, c4_NZDCAD] = score_pair(str_NZD_f, str_CAD_f, str_NZD_s, str_CAD_s)
+[sc_NZDCHF, gap_NZDCHF, c1_NZDCHF, c2_NZDCHF, c3_NZDCHF, c4_NZDCHF] = score_pair(str_NZD_f, str_CHF_f, str_NZD_s, str_CHF_s)
+[sc_CADCHF, gap_CADCHF, c1_CADCHF, c2_CADCHF, c3_CADCHF, c4_CADCHF] = score_pair(str_CAD_f, str_CHF_f, str_CAD_s, str_CHF_s)
+
+// ═══════════════════════════════════════════════════════════════
+//   FIND BEST PAIR
+// ═══════════════════════════════════════════════════════════════
+
+var string[] pair_names = array.from("EURUSD","GBPUSD","USDJPY","USDCHF","USDCAD","AUDUSD","NZDUSD","EURGBP","EURJPY","EURCHF","EURCAD","EURAUD","EURNZD","GBPJPY","GBPCHF","GBPCAD","GBPAUD","GBPNZD","CHFJPY","CADJPY","AUDJPY","NZDJPY","AUDCAD","AUDCHF","AUDNZD","NZDCAD","NZDCHF","CADCHF")
+scores_arr = array.from(sc_EURUSD, sc_GBPUSD, sc_USDJPY, sc_USDCHF, sc_USDCAD, sc_AUDUSD, sc_NZDUSD, sc_EURGBP, sc_EURJPY, sc_EURCHF, sc_EURCAD, sc_EURAUD, sc_EURNZD, sc_GBPJPY, sc_GBPCHF, sc_GBPCAD, sc_GBPAUD, sc_GBPNZD, sc_CHFJPY, sc_CADJPY, sc_AUDJPY, sc_NZDJPY, sc_AUDCAD, sc_AUDCHF, sc_AUDNZD, sc_NZDCAD, sc_NZDCHF, sc_CADCHF)
+gaps_arr = array.from(gap_EURUSD, gap_GBPUSD, gap_USDJPY, gap_USDCHF, gap_USDCAD, gap_AUDUSD, gap_NZDUSD, gap_EURGBP, gap_EURJPY, gap_EURCHF, gap_EURCAD, gap_EURAUD, gap_EURNZD, gap_GBPJPY, gap_GBPCHF, gap_GBPCAD, gap_GBPAUD, gap_GBPNZD, gap_CHFJPY, gap_CADJPY, gap_AUDJPY, gap_NZDJPY, gap_AUDCAD, gap_AUDCHF, gap_AUDNZD, gap_NZDCAD, gap_NZDCHF, gap_CADCHF)
+
+best_score = array.max(scores_arr)
+best_idx = array.indexof(scores_arr, best_score)
+best_pair = array.get(pair_names, best_idx)
+best_gap = array.get(gaps_arr, best_idx)
+best_dir = best_gap > 0 ? "LONG" : "SHORT"
+
+second_score = 0
+second_pair = "—"
+second_dir = ""
+for i = 0 to array.size(scores_arr) - 1
+    s = array.get(scores_arr, i)
+    if s > second_score and i != best_idx
+        second_score := s
+        second_pair := array.get(pair_names, i)
+        second_dir := array.get(gaps_arr, i) > 0 ? "LONG" : "SHORT"
+
+// ═══════════════════════════════════════════════════════════════
+//   SIGNAL COUNTER — tracks how many bars each pair held 4/4
+//   Resets daily. Displayed as a leaderboard sorted by count.
+// ═══════════════════════════════════════════════════════════════
+
+var int[] sig_counts  = array.new_int(28, 0)
+var int   sig_day     = 0
+var int   bars_today  = 0
+
+cur_day = dayofmonth(time)
+if cur_day != sig_day
+    sig_day    := cur_day
+    bars_today := 0
+    for i = 0 to 27
+        array.set(sig_counts, i, 0)
+
+bars_today := bars_today + 1
+
+bar_mins_now = hour(time, "UTC") * 60 + minute(time, "UTC")
+in_sig_window = bar_mins_now >= atr_startMins and bar_mins_now <= atr_endMins
+
+for i = 0 to 27
+    if array.get(scores_arr, i) == 4 and in_sig_window
+        array.set(sig_counts, i, array.get(sig_counts, i) + 1)
+
+// ═══════════════════════════════════════════════════════════════
+//   PLOTS
+// ═══════════════════════════════════════════════════════════════
+
+plot(str_USD_f, "USD (fast)", color=#2196F3, linewidth=2)
+plot(str_EUR_f, "EUR (fast)", color=#4CAF50, linewidth=2)
+plot(str_GBP_f, "GBP (fast)", color=#9C27B0, linewidth=2)
+plot(str_JPY_f, "JPY (fast)", color=#FF9800, linewidth=2)
+plot(str_CHF_f, "CHF (fast)", color=#F44336, linewidth=2)
+plot(str_CAD_f, "CAD (fast)", color=#795548, linewidth=2)
+plot(str_AUD_f, "AUD (fast)", color=#00BCD4, linewidth=2)
+plot(str_NZD_f, "NZD (fast)", color=#E91E63, linewidth=2)
+plot(str_USD_s, "USD (slow)", color=color.new(#2196F3, 60), linewidth=1)
+plot(str_EUR_s, "EUR (slow)", color=color.new(#4CAF50, 60), linewidth=1)
+plot(str_GBP_s, "GBP (slow)", color=color.new(#9C27B0, 60), linewidth=1)
+plot(str_JPY_s, "JPY (slow)", color=color.new(#FF9800, 60), linewidth=1)
+plot(str_CHF_s, "CHF (slow)", color=color.new(#F44336, 60), linewidth=1)
+plot(str_CAD_s, "CAD (slow)", color=color.new(#795548, 60), linewidth=1)
+plot(str_AUD_s, "AUD (slow)", color=color.new(#00BCD4, 60), linewidth=1)
+plot(str_NZD_s, "NZD (slow)", color=color.new(#E91E63, 60), linewidth=1)
+hline(0, "Zero", color=color.new(color.gray, 60), linestyle=hline.style_dashed)
+
+// ═══════════════════════════════════════════════════════════════
+//   HELPERS
+// ═══════════════════════════════════════════════════════════════
+
+str_color(v) => v > 0.1 ? color.new(#26a69a, 0) : v < -0.1 ? color.new(#ef5350, 0) : color.new(color.gray, 0)
+hdr = color.new(color.gray, 70)
+blk = color.new(color.black, 10)
+gry = color.new(color.gray, 60)
+div_bg = color.new(color.gray, 80)
+div_tx = color.new(color.gray, 60)
+
+// ═══════════════════════════════════════════════════════════════
+//   SINGLE BOTTOM BAR — 19 columns, all panels in one table
+//
+//   Col 0-3   : CCY Strength (CCY | fast | slow | bias)
+//   Col 4     : divider
+//   Col 5-7   : Correlation Matrix (pair | corr | signal)
+//   Col 8     : divider
+//   Col 9-10  : Best Setup
+//   Col 11    : divider
+//   Col 12-15 : Liquidity (session | status | liq | trade)
+//   Col 16    : divider
+//   Col 17-23 : Pairs Scored (pair | score | dir | gap | str | liq | div)
+//   Col 24    : divider
+//   Col 25-29 : ATR Trail (pair | avg R | max R | hit% | trades)
+//   Col 30    : divider
+//   Col 31-33 : Signal Leaderboard (pair | count | bar%)
+// ═══════════════════════════════════════════════════════════════
+
+bar = table.new(position.bottom_center, 34, 12, bgcolor=blk, border_width=1, border_color=gry, frame_width=1, frame_color=gry)
+
+if show_bottom_bar and barstate.islast
+
+    // ── SECTION HEADER ROW ──────────────────────────────────────
+    // CCY Strength headers
+    table.cell(bar, 0, 0, "CCY", text_color=color.silver, text_size=size.small, bgcolor=hdr)
+    table.cell(bar, 1, 0, tf_fast + "m", text_color=color.silver, text_size=size.small, bgcolor=hdr)
+    table.cell(bar, 2, 0, tf_slow + "m", text_color=color.silver, text_size=size.small, bgcolor=hdr)
+    table.cell(bar, 3, 0, "Bias", text_color=color.silver, text_size=size.small, bgcolor=hdr)
+    // divider
+    table.cell(bar, 4, 0, "", bgcolor=div_bg, text_color=div_tx, text_size=size.small)
+    // Corr headers
+    table.cell(bar, 5, 0, "Pair", text_color=color.silver, text_size=size.small, bgcolor=hdr)
+    table.cell(bar, 6, 0, "Corr", text_color=color.silver, text_size=size.small, bgcolor=hdr)
+    table.cell(bar, 7, 0, "Divergence", text_color=color.silver, text_size=size.small, bgcolor=hdr)
+    // divider
+    table.cell(bar, 8, 0, "", bgcolor=div_bg, text_color=div_tx, text_size=size.small)
+    // Setup headers
+    table.cell(bar, 9, 0, "Best Setup", text_color=color.silver, text_size=size.small, bgcolor=hdr)
+    table.cell(bar, 10, 0, "", text_color=color.silver, text_size=size.small, bgcolor=hdr)
+    // divider
+    table.cell(bar, 11, 0, "", bgcolor=div_bg, text_color=div_tx, text_size=size.small)
+    // Liquidity headers
+    table.cell(bar, 12, 0, "Session", text_color=color.silver, text_size=size.small, bgcolor=hdr)
+    table.cell(bar, 13, 0, "Status", text_color=color.silver, text_size=size.small, bgcolor=hdr)
+    table.cell(bar, 14, 0, "Liq", text_color=color.silver, text_size=size.small, bgcolor=hdr)
+    table.cell(bar, 15, 0, "Trade?", text_color=color.silver, text_size=size.small, bgcolor=hdr)
+    // divider
+    table.cell(bar, 16, 0, "", bgcolor=div_bg, text_color=div_tx, text_size=size.small)
+    // Pairs headers
+    table.cell(bar, 17, 0, "Pair", text_color=color.silver, text_size=size.small, bgcolor=hdr)
+    table.cell(bar, 18, 0, "Score", text_color=color.silver, text_size=size.small, bgcolor=hdr)
+    table.cell(bar, 19, 0, "Dir", text_color=color.silver, text_size=size.small, bgcolor=hdr)
+    table.cell(bar, 20, 0, "Gap(f)", text_color=color.silver, text_size=size.small, bgcolor=hdr)
+    table.cell(bar, 21, 0, "Str", text_color=color.silver, text_size=size.small, bgcolor=hdr)
+    table.cell(bar, 22, 0, "Liq", text_color=color.silver, text_size=size.small, bgcolor=hdr)
+    table.cell(bar, 23, 0, "Div", text_color=color.silver, text_size=size.small, bgcolor=hdr)
+    // divider
+    table.cell(bar, 24, 0, "", bgcolor=div_bg, text_color=div_tx, text_size=size.small)
+    // ATR Trail headers
+    table.cell(bar, 25, 0, "Pair", text_color=color.silver, text_size=size.small, bgcolor=hdr)
+    table.cell(bar, 26, 0, "Avg R", text_color=color.silver, text_size=size.small, bgcolor=hdr)
+    table.cell(bar, 27, 0, "Max R", text_color=color.silver, text_size=size.small, bgcolor=hdr)
+    table.cell(bar, 28, 0, "Hit %", text_color=color.silver, text_size=size.small, bgcolor=hdr)
+    table.cell(bar, 29, 0, "Trades", text_color=color.silver, text_size=size.small, bgcolor=hdr)
+    // divider
+    table.cell(bar, 30, 0, "", bgcolor=div_bg, text_color=div_tx, text_size=size.small)
+    // Signal leaderboard headers
+    table.cell(bar, 31, 0, "Pair", text_color=color.silver, text_size=size.small, bgcolor=hdr)
+    table.cell(bar, 32, 0, "Sigs", text_color=color.silver, text_size=size.small, bgcolor=hdr)
+    table.cell(bar, 33, 0, "Share", text_color=color.silver, text_size=size.small, bgcolor=hdr)
+
+    // ── CCY STRENGTH (rows 1-8) ──────────────────────────────────
+    ccys = array.from("USD","EUR","GBP","JPY","CHF","CAD","AUD","NZD")
+    ccy_colors = array.from(color.new(#2196F3,0), color.new(#4CAF50,0), color.new(#9C27B0,0), color.new(#FF9800,0), color.new(#F44336,0), color.new(#795548,0), color.new(#00BCD4,0), color.new(#E91E63,0))
+    fast_s = array.from(str_USD_f, str_EUR_f, str_GBP_f, str_JPY_f, str_CHF_f, str_CAD_f, str_AUD_f, str_NZD_f)
+    slow_s = array.from(str_USD_s, str_EUR_s, str_GBP_s, str_JPY_s, str_CHF_s, str_CAD_s, str_AUD_s, str_NZD_s)
+    for i = 0 to 7
+        fs = array.get(fast_s, i)
+        ss = array.get(slow_s, i)
+        bias = fs > 0.05 and ss > 0.05 ? "STRONG" : fs < -0.05 and ss < -0.05 ? "WEAK" : "NEUTRAL"
+        bias_col = bias == "STRONG" ? color.new(#26a69a, 0) : bias == "WEAK" ? color.new(#ef5350, 0) : color.silver
+        table.cell(bar, 0, i + 1, array.get(ccys, i), text_color=array.get(ccy_colors, i), text_size=size.small)
+        table.cell(bar, 1, i + 1, str.tostring(fs, "#.##"), text_color=str_color(fs), text_size=size.small)
+        table.cell(bar, 2, i + 1, str.tostring(ss, "#.##"), text_color=str_color(ss), text_size=size.small)
+        table.cell(bar, 3, i + 1, bias, text_color=bias_col, text_size=size.small)
+        table.cell(bar, 4, i + 1, "", bgcolor=div_bg, text_color=div_tx, text_size=size.small)
+
+    // blank rows 9-10 for CCY section (pads to match pairs height)
+    for r = 9 to 10
+        table.cell(bar, 0, r, "", text_color=color.silver, text_size=size.small)
+        table.cell(bar, 1, r, "", text_color=color.silver, text_size=size.small)
+        table.cell(bar, 2, r, "", text_color=color.silver, text_size=size.small)
+        table.cell(bar, 3, r, "", text_color=color.silver, text_size=size.small)
+        table.cell(bar, 4, r, "", bgcolor=div_bg, text_color=div_tx, text_size=size.small)
+
+    // ── CORRELATION MATRIX — dynamic, shows only DIVERGE pairs ───
+    // Build arrays of all 28 pair correlations and filter to diverging only
+    all_p_names = array.from("EURUSD","GBPUSD","USDJPY","USDCHF","USDCAD","AUDUSD","NZDUSD","EURGBP","EURJPY","EURCHF","EURCAD","EURAUD","EURNZD","GBPJPY","GBPCHF","GBPCAD","GBPAUD","GBPNZD","CHFJPY","CADJPY","AUDJPY","NZDJPY","AUDCAD","AUDCHF","AUDNZD","NZDCAD","NZDCHF","CADCHF")
+    all_p_vals = array.from(p_EURUSD, p_GBPUSD, p_USDJPY, p_USDCHF, p_USDCAD, p_AUDUSD, p_NZDUSD, p_EURGBP, p_EURJPY, p_EURCHF, p_EURCAD, p_EURAUD, p_EURNZD, p_GBPJPY, p_GBPCHF, p_GBPCAD, p_GBPAUD, p_GBPNZD, p_CHFJPY, p_CADJPY, p_AUDJPY, p_NZDJPY, p_AUDCAD, p_AUDCHF, p_AUDNZD, p_NZDCAD, p_NZDCHF, p_CADCHF)
+
+    div_names = array.new_string()
+    div_vals  = array.new_float()
+    for i = 0 to 27
+        cv = array.get(all_p_vals, i)
+        if cv <= corr_thresh
+            array.push(div_names, array.get(all_p_names, i))
+            array.push(div_vals, cv)
+
+    div_count = array.size(div_names)
+
+    // Sort by most negative correlation first — only if 2+ pairs
+    if div_count >= 2
+        for i = 0 to div_count - 2
+            for j = 0 to div_count - 2 - i
+                if array.get(div_vals, j) > array.get(div_vals, j + 1)
+                    tmp_v = array.get(div_vals, j)
+                    tmp_n = array.get(div_names, j)
+                    array.set(div_vals, j, array.get(div_vals, j + 1))
+                    array.set(div_names, j, array.get(div_names, j + 1))
+                    array.set(div_vals, j + 1, tmp_v)
+                    array.set(div_names, j + 1, tmp_n)
+
+    if div_count == 0
+        table.cell(bar, 5, 1, "No diverging", text_color=color.silver, text_size=size.small)
+        table.cell(bar, 6, 1, "pairs", text_color=color.silver, text_size=size.small)
+        table.cell(bar, 7, 1, "right now", text_color=color.silver, text_size=size.small)
+        table.cell(bar, 8, 1, "", bgcolor=div_bg, text_color=div_tx, text_size=size.small)
+        for r = 2 to 10
+            table.cell(bar, 5, r, "", text_color=color.silver, text_size=size.small)
+            table.cell(bar, 6, r, "", text_color=color.silver, text_size=size.small)
+            table.cell(bar, 7, r, "", text_color=color.silver, text_size=size.small)
+            table.cell(bar, 8, r, "", bgcolor=div_bg, text_color=div_tx, text_size=size.small)
+    else
+        max_rows = math.min(div_count, 10)
+        for i = 0 to max_rows - 1
+            cv = array.get(div_vals, i)
+            pname = array.get(div_names, i)
+            cell_bg = cv <= -0.8 ? color.new(#7f0000, 0) : cv <= -0.5 ? color.new(#c62828, 0) : color.new(color.gray, 40)
+            str_lbl = cv <= -0.8 ? "STRONG" : cv <= -0.65 ? "DIVERGE" : "WEAK DIV"
+            sig_col = cv <= -0.8 ? color.new(#26a69a, 0) : cv <= -0.65 ? color.new(#8bc34a, 0) : color.new(#ff9800, 0)
+            table.cell(bar, 5, i + 1, pname, text_color=color.white, text_size=size.small)
+            table.cell(bar, 6, i + 1, str.tostring(cv, "#.##"), text_color=color.white, text_size=size.small, bgcolor=cell_bg)
+            table.cell(bar, 7, i + 1, str_lbl, text_color=sig_col, text_size=size.small)
+            table.cell(bar, 8, i + 1, "", bgcolor=div_bg, text_color=div_tx, text_size=size.small)
+        for r = max_rows + 1 to 10
+            table.cell(bar, 5, r, "", text_color=color.silver, text_size=size.small)
+            table.cell(bar, 6, r, "", text_color=color.silver, text_size=size.small)
+            table.cell(bar, 7, r, "", text_color=color.silver, text_size=size.small)
+            table.cell(bar, 8, r, "", bgcolor=div_bg, text_color=div_tx, text_size=size.small)
+
+    // ── BEST SETUP (rows 1-9) ────────────────────────────────────
+    liq_col = liq_score == 4 ? color.new(#26a69a, 0) : liq_score == 3 ? color.new(#8bc34a, 0) : liq_score == 2 ? color.new(#ff9800, 0) : color.new(#ef5350, 0)
+    no_setup = best_score < 4
+    setup_txt = no_setup ? "NO SETUP" : best_pair + " " + best_dir
+    setup_col = no_setup ? color.silver : best_gap > 0 ? color.new(#26a69a, 0) : color.new(#ef5350, 0)
+    no_second = second_score < 4
+    second_txt = no_second ? "—" : second_pair + " " + second_dir
+    second_col = no_second ? color.silver : array.get(gaps_arr, array.indexof(scores_arr, second_score)) > 0 ? color.new(#26a69a, 0) : color.new(#ef5350, 0)
+
+    table.cell(bar, 9, 1, "Session", text_color=color.silver, text_size=size.small, bgcolor=hdr)
+    table.cell(bar, 10, 1, session_name, text_color=liq_col, text_size=size.small)
+    table.cell(bar, 9, 2, "Liquidity", text_color=color.silver, text_size=size.small)
+    table.cell(bar, 10, 2, str.tostring(liq_score) + "/4  vol:" + str.tostring(vol_ratio, "#.##") + "x", text_color=liq_col, text_size=size.small)
+    table.cell(bar, 9, 3, "─────", text_color=div_tx, text_size=size.small)
+    table.cell(bar, 10, 3, "─────", text_color=div_tx, text_size=size.small)
+    table.cell(bar, 9, 4, "#1 Setup", text_color=color.silver, text_size=size.small, bgcolor=hdr)
+    table.cell(bar, 10, 4, setup_txt, text_color=setup_col, text_size=size.normal)
+    table.cell(bar, 9, 5, "Score", text_color=color.silver, text_size=size.small)
+    table.cell(bar, 10, 5, no_setup ? "Waiting for 4/4" : "4/4 met", text_color=no_setup ? color.silver : color.new(#26a69a, 0), text_size=size.small)
+    table.cell(bar, 9, 6, "#2 Setup", text_color=color.silver, text_size=size.small)
+    table.cell(bar, 10, 6, second_txt, text_color=second_col, text_size=size.small)
+    table.cell(bar, 9, 7, "Score", text_color=color.silver, text_size=size.small)
+    table.cell(bar, 10, 7, no_second ? "Waiting for 4/4" : "4/4 met", text_color=color.silver, text_size=size.small)
+    table.cell(bar, 9, 8, "Bars", text_color=color.silver, text_size=size.tiny)
+    table.cell(bar, 10, 8, tf_fast + "m / " + tf_slow + "m", text_color=color.silver, text_size=size.tiny)
+    table.cell(bar, 9, 9, "", text_color=color.silver, text_size=size.small)
+    table.cell(bar, 10, 9, "", text_color=color.silver, text_size=size.small)
+    table.cell(bar, 9, 10, "", text_color=color.silver, text_size=size.small)
+    table.cell(bar, 10, 10, "", text_color=color.silver, text_size=size.small)
+
+    for r = 1 to 11
+        table.cell(bar, 11, r, "", bgcolor=div_bg, text_color=div_tx, text_size=size.small)
+
+    // ── LIQUIDITY SCANNER (rows 1-6) ─────────────────────────────
+    syd_col = in_sydney ? color.new(#ff9800, 0) : color.new(color.gray, 40)
+    table.cell(bar, 12, 1, "Sydney", text_color=color.white, text_size=size.small)
+    table.cell(bar, 13, 1, in_sydney ? "OPEN" : "closed", text_color=syd_col, text_size=size.small)
+    table.cell(bar, 14, 1, "1/4", text_color=color.new(#ef5350, 0), text_size=size.small)
+    table.cell(bar, 15, 1, "No", text_color=color.new(#ef5350, 0), text_size=size.small)
+
+    tok_col = in_tokyo ? color.new(#ff9800, 0) : color.new(color.gray, 40)
+    table.cell(bar, 12, 2, "Tokyo", text_color=color.white, text_size=size.small)
+    table.cell(bar, 13, 2, in_tokyo ? "OPEN" : "closed", text_color=tok_col, text_size=size.small)
+    table.cell(bar, 14, 2, "2/4", text_color=color.new(#ff9800, 0), text_size=size.small)
+    table.cell(bar, 15, 2, "No", text_color=color.new(#ef5350, 0), text_size=size.small)
+
+    lon_col = in_london ? color.new(#26a69a, 0) : color.new(color.gray, 40)
+    lon_status = london_ny_overlap ? "OVERLAP" : in_london ? "OPEN" : "closed"
+    table.cell(bar, 12, 3, "London", text_color=color.white, text_size=size.small)
+    table.cell(bar, 13, 3, lon_status, text_color=lon_col, text_size=size.small)
+    table.cell(bar, 14, 3, "3/4", text_color=color.new(#8bc34a, 0), text_size=size.small)
+    table.cell(bar, 15, 3, "Yes", text_color=color.new(#26a69a, 0), text_size=size.small)
+
+    ny_col = in_new_york ? color.new(#26a69a, 0) : color.new(color.gray, 40)
+    ny_status = london_ny_overlap ? "OVERLAP" : in_new_york ? "OPEN" : "closed"
+    table.cell(bar, 12, 4, "New York", text_color=color.white, text_size=size.small)
+    table.cell(bar, 13, 4, ny_status, text_color=ny_col, text_size=size.small)
+    table.cell(bar, 14, 4, "3/4", text_color=color.new(#8bc34a, 0), text_size=size.small)
+    table.cell(bar, 15, 4, "Yes", text_color=color.new(#26a69a, 0), text_size=size.small)
+
+    ov_col = london_ny_overlap ? color.new(#26a69a, 0) : color.new(color.gray, 40)
+    table.cell(bar, 12, 5, "Ldn/NY OVL", text_color=color.white, text_size=size.small)
+    table.cell(bar, 13, 5, london_ny_overlap ? "ACTIVE" : "inactive", text_color=ov_col, text_size=size.small)
+    table.cell(bar, 14, 5, "4/4", text_color=color.new(#26a69a, 0), text_size=size.small)
+    table.cell(bar, 15, 5, "Best", text_color=color.new(#26a69a, 0), text_size=size.small)
+
+    cur_ok = liq_score >= 3
+    cur_col = cur_ok ? color.new(#26a69a, 0) : color.new(#ef5350, 0)
+    table.cell(bar, 12, 6, "NOW: " + session_name, text_color=color.white, text_size=size.small, bgcolor=hdr)
+    table.cell(bar, 13, 6, str.tostring(liq_score) + "/4 (" + str.tostring(vol_ratio, "#.##") + "x)", text_color=cur_col, text_size=size.small, bgcolor=hdr)
+    table.cell(bar, 14, 6, cur_ok ? "TRADEABLE" : "AVOID", text_color=cur_col, text_size=size.small, bgcolor=hdr)
+    table.cell(bar, 15, 6, cur_ok ? "YES" : "NO", text_color=cur_col, text_size=size.small, bgcolor=hdr)
+
+    // session liquidity history rows 7-10
+    table.cell(bar, 12, 7, "Session History", text_color=color.silver, text_size=size.small, bgcolor=hdr)
+    table.cell(bar, 13, 7, "Peak Score", text_color=color.silver, text_size=size.small, bgcolor=hdr)
+    table.cell(bar, 14, 7, "Level", text_color=color.silver, text_size=size.small, bgcolor=hdr)
+    table.cell(bar, 15, 7, "Vol", text_color=color.silver, text_size=size.small, bgcolor=hdr)
+
+    syd_lbl = liq_label(syd_peak)
+    table.cell(bar, 12, 8, "Sydney", text_color=color.new(color.gray, 20), text_size=size.small)
+    table.cell(bar, 13, 8, str.tostring(math.round(syd_peak * 10) / 10, "#.#") + "/4", text_color=liq_hist_col(syd_peak), text_size=size.small)
+    table.cell(bar, 14, 8, syd_lbl, text_color=liq_hist_col(syd_peak), text_size=size.small)
+    table.cell(bar, 15, 8, in_sydney ? "live" : "done", text_color=color.new(color.gray, 40), text_size=size.small)
+
+    tok_lbl = liq_label(tok_peak)
+    table.cell(bar, 12, 9, "Tokyo", text_color=color.new(color.gray, 20), text_size=size.small)
+    table.cell(bar, 13, 9, str.tostring(math.round(tok_peak * 10) / 10, "#.#") + "/4", text_color=liq_hist_col(tok_peak), text_size=size.small)
+    table.cell(bar, 14, 9, tok_lbl, text_color=liq_hist_col(tok_peak), text_size=size.small)
+    table.cell(bar, 15, 9, in_tokyo ? "live" : "done", text_color=color.new(color.gray, 40), text_size=size.small)
+
+    lon_lbl = liq_label(lon_peak)
+    table.cell(bar, 12, 10, "London", text_color=color.new(color.gray, 20), text_size=size.small)
+    table.cell(bar, 13, 10, str.tostring(math.round(lon_peak * 10) / 10, "#.#") + "/4", text_color=liq_hist_col(lon_peak), text_size=size.small)
+    table.cell(bar, 14, 10, lon_lbl, text_color=liq_hist_col(lon_peak), text_size=size.small)
+    table.cell(bar, 15, 10, in_london ? "live" : "done", text_color=color.new(color.gray, 40), text_size=size.small)
+
+    for r = 1 to 11
+        table.cell(bar, 16, r, "", bgcolor=div_bg, text_color=div_tx, text_size=size.small)
+
+    // ── PAIRS SCORED (rows 1-10) ──────────────────────────────────
+    sorted_scores = array.copy(scores_arr)
+    sorted_idx = array.new_int(28)
+    for i = 0 to 27
+        array.set(sorted_idx, i, i)
+    for i = 0 to 26
+        for j = 0 to 26 - i
+            if array.get(sorted_scores, j) < array.get(sorted_scores, j + 1)
+                tmp_s = array.get(sorted_scores, j)
+                tmp_i = array.get(sorted_idx, j)
+                array.set(sorted_scores, j, array.get(sorted_scores, j + 1))
+                array.set(sorted_idx, j, array.get(sorted_idx, j + 1))
+                array.set(sorted_scores, j + 1, tmp_s)
+                array.set(sorted_idx, j + 1, tmp_i)
+    for row = 1 to 10
+        idx = array.get(sorted_idx, row - 1)
+        sc = array.get(sorted_scores, row - 1)
+        pair = array.get(pair_names, idx)
+        gap = array.get(gaps_arr, idx)
+        dir = gap > 0 ? "L" : "S"
+        dir_col = gap > 0 ? color.new(#26a69a, 0) : color.new(#ef5350, 0)
+        score_col = sc == 4 ? color.new(#26a69a, 0) : sc == 3 ? color.new(#8bc34a, 0) : sc == 2 ? color.new(#ff9800, 0) : color.new(#ef5350, 0)
+        c1_ok = math.abs(gap) >= strength_gap ? "+" : "-"
+        c2_ok = liq_score >= 3 ? "+" : "-"
+        c4_ok = sc >= 1 ? "+" : "-"
+        table.cell(bar, 17, row, pair, text_color=color.white, text_size=size.small)
+        table.cell(bar, 18, row, str.tostring(sc) + "/4", text_color=score_col, text_size=size.small)
+        table.cell(bar, 19, row, dir, text_color=dir_col, text_size=size.small)
+        table.cell(bar, 20, row, str.tostring(gap, "#.##"), text_color=str_color(gap), text_size=size.small)
+        table.cell(bar, 21, row, c1_ok, text_color=c1_ok == "+" ? color.new(#26a69a, 0) : color.new(#ef5350, 0), text_size=size.small)
+        table.cell(bar, 22, row, c2_ok, text_color=c2_ok == "+" ? color.new(#26a69a, 0) : color.new(#ef5350, 0), text_size=size.small)
+        table.cell(bar, 23, row, c4_ok, text_color=c4_ok == "+" ? color.new(#26a69a, 0) : color.new(#ef5350, 0), text_size=size.small)
+
+// ═══════════════════════════════════════════════════════════════
+//   ATR TABLE SECTION — rendered inside the main bottom bar
+// ═══════════════════════════════════════════════════════════════
+
+if show_bottom_bar and barstate.islast
+    // fill divider col 24
+    for r = 1 to 11
+        table.cell(bar, 24, r, "", bgcolor=div_bg, text_color=div_tx, text_size=size.small)
+
+    // all 28 pairs — sort by Avg R descending, show top i_atrRows
+    atr_symArr  = array.from("EURUSD","GBPUSD","USDJPY","USDCAD","AUDUSD","EURJPY","GBPJPY","GBPAUD","GBPNZD","CADJPY","AUDJPY","CHFJPY")
+    atr_avgDArr = array.from(atr_avgD1,atr_avgD2,atr_avgD3,atr_avgD4,atr_avgD5,atr_avgD6,atr_avgD7,atr_avgD8,atr_avgD9,atr_avgD10,atr_avgD11,atr_avgD12)
+    atr_avgMArr = array.from(atr_avgM1,atr_avgM2,atr_avgM3,atr_avgM4,atr_avgM5,atr_avgM6,atr_avgM7,atr_avgM8,atr_avgM9,atr_avgM10,atr_avgM11,atr_avgM12)
+    atr_rPctArr = array.from(atr_rPct1,atr_rPct2,atr_rPct3,atr_rPct4,atr_rPct5,atr_rPct6,atr_rPct7,atr_rPct8,atr_rPct9,atr_rPct10,atr_rPct11,atr_rPct12)
+    atr_cntArr  = array.from(float(atr_cnt1),float(atr_cnt2),float(atr_cnt3),float(atr_cnt4),float(atr_cnt5),float(atr_cnt6),float(atr_cnt7),float(atr_cnt8),float(atr_cnt9),float(atr_cnt10),float(atr_cnt11),float(atr_cnt12))
+
+    // sort key: negate Avg R so highest comes first
+    atr_sortKey = array.new_float(12, 0.0)
+    for i = 0 to 11
+        array.set(atr_sortKey, i, -array.get(atr_avgDArr, i))
+    atr_idxArr = array.sort_indices(atr_sortKey, order.ascending)
+
+    max_rows = math.min(i_atrRows, 10)
+    for r = 0 to max_rows - 1
+        idx  = array.get(atr_idxArr, r)
+        row  = r + 1
+        sym  = array.get(atr_symArr, idx)
+        avgD = array.get(atr_avgDArr, idx)
+        avgM = array.get(atr_avgMArr, idx)
+        rPct = array.get(atr_rPctArr, idx)
+        cnt  = int(array.get(atr_cntArr, idx))
+        dCol = avgD >= 0 ? color.new(#26a69a, 0) : color.new(#ef5350, 0)
+        mCol = avgM >= i_reachR ? color.new(#26a69a, 0) : color.new(#ff9800, 0)
+        hCol = rPct >= 50.0 ? color.new(#26a69a, 0) : color.new(#ff9800, 0)
+        table.cell(bar, 25, row, sym,                                     text_color=color.white,  text_size=size.small)
+        table.cell(bar, 26, row, str.tostring(math.round(avgD, 2)) + "R", text_color=dCol,         text_size=size.small)
+        table.cell(bar, 27, row, str.tostring(math.round(avgM, 2)) + "R", text_color=mCol,         text_size=size.small)
+        table.cell(bar, 28, row, str.tostring(math.round(rPct, 1)) + "%", text_color=hCol,         text_size=size.small)
+        table.cell(bar, 29, row, str.tostring(cnt),                       text_color=color.silver, text_size=size.small)
+
+    // blank out any unused rows below max_rows
+    if max_rows < 10
+        for r = max_rows + 1 to 10
+            table.cell(bar, 25, r, "", text_color=color.silver, text_size=size.small)
+            table.cell(bar, 26, r, "", text_color=color.silver, text_size=size.small)
+            table.cell(bar, 27, r, "", text_color=color.silver, text_size=size.small)
+            table.cell(bar, 28, r, "", text_color=color.silver, text_size=size.small)
+            table.cell(bar, 29, r, "", text_color=color.silver, text_size=size.small)
+
+// ═══════════════════════════════════════════════════════════════
+//   SIGNAL LEADERBOARD RENDERING
+// ═══════════════════════════════════════════════════════════════
+
+if show_bottom_bar and barstate.islast
+    // divider col 30
+    for r = 1 to 11
+        table.cell(bar, 30, r, "", bgcolor=div_bg, text_color=div_tx, text_size=size.small)
+
+    // sort pairs by signal count descending
+    sig_sort_key = array.new_float(28, 0.0)
+    for i = 0 to 27
+        array.set(sig_sort_key, i, -float(array.get(sig_counts, i)))
+    sig_idx = array.sort_indices(sig_sort_key, order.ascending)
+
+    // sum all signals across all 28 pairs for share calculation
+    total_sigs = 0
+    for i = 0 to 27
+        total_sigs := total_sigs + array.get(sig_counts, i)
+
+    for r = 0 to 10
+        idx   = array.get(sig_idx, r)
+        cnt   = array.get(sig_counts, idx)
+        pname = array.get(pair_names, idx)
+        pct   = total_sigs > 0 ? math.round(cnt / total_sigs * 1000) / 10 : 0.0
+        cnt_col = cnt >= 10 ? color.new(#26a69a, 0) : cnt >= 5 ? color.new(#8bc34a, 0) : cnt >= 1 ? color.new(#ff9800, 0) : color.new(color.gray, 40)
+        pct_col = pct >= 20.0 ? color.new(#26a69a, 0) : pct >= 10.0 ? color.new(#8bc34a, 0) : pct >= 5.0 ? color.new(#ff9800, 0) : color.new(color.gray, 40)
+        table.cell(bar, 31, r + 1, pname,                          text_color=cnt > 0 ? color.white : color.new(color.gray, 50), text_size=size.small)
+        table.cell(bar, 32, r + 1, str.tostring(cnt),              text_color=cnt_col, text_size=size.small)
+        table.cell(bar, 33, r + 1, str.tostring(pct, "#.#") + "%", text_color=pct_col, text_size=size.small)
+
+// ═══════════════════════════════════════════════════════════════
+//   ALERTS
+// ═══════════════════════════════════════════════════════════════
+
+if barstate.islast
+    if best_score == 4
+        alert("FX Scanner — PERFECT SETUP (4/4): " + best_pair + " | Direction: " + best_dir + " | Session: " + session_name, alert.freq_once_per_bar_close)
+    if london_ny_overlap and best_score == 4
+        alert("FX Scanner — PRIME ENTRY: Peak liquidity + 4/4 setup on " + best_pair + " " + best_dir, alert.freq_once_per_bar_close)
+
+alertcondition(best_score == 4, title="Perfect Setup 4/4", message="FX Scanner: 4/4 conditions met - check panel for pair and direction")
+alertcondition(london_ny_overlap, title="London NY Overlap open", message="FX Scanner: Peak liquidity window is now active")
+alertcondition(london_ny_overlap and best_score == 4, title="Prime Entry Window", message="FX Scanner: Peak liquidity AND 4/4 setup active - check panel now")

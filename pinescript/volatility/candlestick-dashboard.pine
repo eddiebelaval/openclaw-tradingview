@@ -1,0 +1,315 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © hellablades
+
+//@version=6
+indicator("Candlestick Dashboard", overlay = true, max_labels_count = 10, max_bars_back = 5000)
+
+// ── ATR Inputs ──────────────────────────────────────────────────────────────
+
+showATR       = input.bool(true, "Show ATR Section", group = "ATR", display = display.none)
+atrLength     = input.int(14, "ATR Length", minval = 1, group = "ATR", display = display.none)
+atrMult       = input.float(1.5, "ATR Multiplier", minval = 0.1, step = 0.1,
+     group = "ATR", tooltip = "Multiplied by ATR to calculate stop distance.", display = display.none)
+atrTimeframe  = input.timeframe("", "ATR Timeframe",
+     group = "ATR", tooltip = "Set to 'Chart' to use current timeframe, or pick a specific timeframe to lock ATR calculation.")
+atrLockTF     = atrTimeframe != ""
+showStopDist  = input.bool(true, "Show Stop Distance", group = "ATR", display = display.none)
+showLongStop  = input.bool(true, "Show Long Stop Price", group = "ATR",
+     tooltip = "Also controls the Long SL line on chart.", display = display.none)
+showShortStop = input.bool(true, "Show Short Stop Price", group = "ATR",
+     tooltip = "Also controls the Short SL line on chart.", display = display.none)
+lineStyle     = input.string("dashed", "Line Style",
+     options = ["solid", "dashed", "dotted"], group = "ATR Lines", display = display.none)
+lineWidth     = input.int(1, "Line Width", minval = 1, maxval = 4,
+     group = "ATR Lines", display = display.none)
+lineExtend    = input.int(20, "Line Length (bars)", minval = 1, maxval = 100,
+     group = "ATR Lines", tooltip = "How many bars the SL line extends to the right.",
+     display = display.none)
+lineLookback  = input.int(2000, "Line Lookback (bars)", minval = 100, maxval = 5000,
+     group = "ATR Lines", tooltip = "How many bars to scan left for last price hit.",
+     display = display.none)
+atrColor      = input.color(#FFA726, "ATR Color", group = "ATR", display = display.none)
+longStopColor = input.color(#00C853, "Long Stop Color", group = "ATR", display = display.none)
+shortStopColor = input.color(#FF1744, "Short Stop Color", group = "ATR", display = display.none)
+
+// ── Volume Inputs ───────────────────────────────────────────────────────────
+
+showVolume    = input.bool(true, "Show Volume Section", group = "Volume", display = display.none)
+showContracts = input.bool(true, "Show Contracts", group = "Volume", display = display.none)
+showPercent   = input.bool(true, "Show Percentages", group = "Volume", display = display.none)
+buyColor      = input.color(#00C853, "Buy Color",  group = "Volume", display = display.none)
+sellColor     = input.color(#FF1744, "Sell Color", group = "Volume", display = display.none)
+
+// ── General Inputs ──────────────────────────────────────────────────────────
+
+textSize      = input.string("normal", "Text Size",
+     options = ["tiny", "small", "normal", "large", "huge"], group = "General", display = display.none)
+colWidth      = input.int(8, "Column Width (chars)", minval = 4, maxval = 20,
+     group = "General", tooltip = "Pads columns to equal character width.", display = display.none)
+barWidth      = input.int(20, "Bar Width (blocks)", minval = 6, maxval = 40,
+     group = "General", tooltip = "Total block characters in the ratio bar.", display = display.none)
+textColor     = input.color(color.white, "Text Color", group = "General", display = display.none)
+barBgColor    = input.color(color.new(color.black, 30), "Bar Background", group = "General", display = display.none)
+tableBgColor  = input.color(color.new(color.black, 30), "Table Background", group = "General", display = display.none)
+
+yPos = input.string("bottom", "Vertical Position",
+     options = ["top", "middle", "bottom"], group = "General", display = display.none)
+xPos = input.string("right", "Horizontal Position",
+     options = ["left", "center", "right"], group = "General", display = display.none)
+
+// ── Helpers ─────────────────────────────────────────────────────────────────
+
+sizeMap(s) =>
+    switch s
+        "tiny"   => size.tiny
+        "small"  => size.small
+        "normal" => size.normal
+        "large"  => size.large
+        "huge"   => size.huge
+
+positionMap(y, x) =>
+    if y == "top" and x == "left"
+        position.top_left
+    else if y == "top" and x == "center"
+        position.top_center
+    else if y == "top" and x == "right"
+        position.top_right
+    else if y == "middle" and x == "left"
+        position.middle_left
+    else if y == "middle" and x == "center"
+        position.middle_center
+    else if y == "middle" and x == "right"
+        position.middle_right
+    else if y == "bottom" and x == "left"
+        position.bottom_left
+    else if y == "bottom" and x == "center"
+        position.bottom_center
+    else
+        position.bottom_right
+
+padCenter(src, targetLen) =>
+    int gap   = math.max(0, targetLen - str.length(src))
+    int left  = math.floor(gap / 2)
+    int right = gap - left
+    str.repeat(" ", left) + src + str.repeat(" ", right)
+
+// Readable timeframe label from a timeframe string.
+tfLabel(tf) =>
+    if tf == ""
+        "Ch"
+    else
+        timeframe.in_seconds(tf) < 60         ? tf + "s" :
+         timeframe.in_seconds(tf) < 3600       ? str.tostring(timeframe.in_seconds(tf) / 60) + "m" :
+         timeframe.in_seconds(tf) < 86400      ? str.tostring(timeframe.in_seconds(tf) / 3600) + "H" :
+         tf == "D" or tf == "1D"               ? "D" :
+         tf == "W" or tf == "1W"               ? "W" :
+         tf == "M" or tf == "1M"               ? "M" :
+         tf
+
+// ── ATR calculation ─────────────────────────────────────────────────────────
+
+atrLocal  = ta.atr(atrLength)
+atrHTF    = request.security(syminfo.tickerid, atrTimeframe, ta.atr(atrLength))
+atrVal    = atrLockTF ? atrHTF : atrLocal
+stopDist  = atrVal * atrMult
+longStop  = close - stopDist
+shortStop = close + stopDist
+
+// ── Line style helper ───────────────────────────────────────────────────────
+
+lineStyleMap(s) =>
+    switch s
+        "solid"  => line.style_solid
+        "dashed" => line.style_dashed
+        "dotted" => line.style_dotted
+
+// ── ATR Stop Loss lines + labels ────────────────────────────────────────────
+
+string priceFmtLine = syminfo.mintick < 0.01 ? "#.####" : syminfo.mintick < 0.1 ? "#.##" : "#.##"
+
+// Find how many bars back a price level was last inside (or very near) a candle's range.
+// Uses a small tolerance to catch gaps where price falls just outside a wick.
+// Returns 0 (current bar) if no hit is found within maxLookback.
+findHitBar(float price, int maxLookback, float tolerance) =>
+    int limit  = math.min(maxLookback, bar_index)
+    int result = 0
+    for i = 1 to limit
+        if price >= (low[i] - tolerance) and price <= (high[i] + tolerance)
+            result := i
+            break
+    result
+
+var line  longLine  = na
+var label longLbl   = na
+var line  shortLine = na
+var label shortLbl  = na
+
+if barstate.islast
+    // Clean up previous drawings
+    if not na(longLine)
+        line.delete(longLine)
+    if not na(longLbl)
+        label.delete(longLbl)
+    if not na(shortLine)
+        line.delete(shortLine)
+    if not na(shortLbl)
+        label.delete(shortLbl)
+
+    lstyle = lineStyleMap(lineStyle)
+    float hitTol = atrVal * 0.05  // 5% of ATR catches gap near-misses
+
+    if showATR and showLongStop
+        int longHit = findHitBar(longStop, lineLookback, hitTol)
+        int longStart = longHit > 0 ? bar_index - longHit : bar_index
+        longLine := line.new(longStart, longStop, bar_index + lineExtend, longStop,
+             color = longStopColor, style = lstyle, width = lineWidth)
+        longLbl  := label.new(bar_index + lineExtend, longStop,
+             "Long SL: " + str.tostring(longStop, priceFmtLine),
+             color = color.new(color.black, 100), textcolor = longStopColor,
+             style = label.style_label_left, size = size.small)
+
+    if showATR and showShortStop
+        int shortHit = findHitBar(shortStop, lineLookback, hitTol)
+        int shortStart = shortHit > 0 ? bar_index - shortHit : bar_index
+        shortLine := line.new(shortStart, shortStop, bar_index + lineExtend, shortStop,
+             color = shortStopColor, style = lstyle, width = lineWidth)
+        shortLbl  := label.new(bar_index + lineExtend, shortStop,
+             "Short SL: " + str.tostring(shortStop, priceFmtLine),
+             color = color.new(color.black, 100), textcolor = shortStopColor,
+             style = label.style_label_left, size = size.small)
+
+// ── Volume calculation ──────────────────────────────────────────────────────
+
+spread   = high - low
+buyVol   = spread > 0 ? volume * (close - low) / spread  : volume * 0.5
+sellVol  = spread > 0 ? volume * (high - close) / spread : volume * 0.5
+totalVol = buyVol + sellVol
+
+buyPct   = totalVol > 0 ? buyVol  / totalVol * 100 : 50.0
+sellPct  = totalVol > 0 ? sellVol / totalVol * 100 : 50.0
+
+// ── Count rows needed ───────────────────────────────────────────────────────
+
+int atrRows = showATR ? 1 + (showStopDist ? 1 : 0) + (showLongStop ? 1 : 0) + (showShortStop ? 1 : 0) : 0
+int volRows = showVolume ? 1 + (showContracts ? 1 : 0) + (showPercent ? 1 : 0) + 1 : 0
+int totalRows = atrRows + volRows
+
+// ── Build table ─────────────────────────────────────────────────────────────
+
+var table panel = table.new(positionMap(yPos, xPos), columns = 3, rows = 10,
+     bgcolor = tableBgColor, border_width = 1,
+     border_color = color.new(color.gray, 60), frame_width = 2,
+     frame_color = color.new(color.gray, 40))
+
+if barstate.islast
+    tSize = sizeMap(textSize)
+    int w = colWidth
+    int row = 0
+
+    // Format helper for price precision
+    string priceFmt = syminfo.mintick < 0.01 ? "#.####" : syminfo.mintick < 0.1 ? "#.##" : "#.##"
+
+    // ══════════════════════════════════════════════════════════════════════
+    //  ATR SECTION
+    // ══════════════════════════════════════════════════════════════════════
+    if showATR
+        // ATR value row
+        string atrLabel = " ATR(" + tfLabel(atrTimeframe) + ") "
+        table.cell(panel, 0, row, atrLabel, text_color = atrColor, text_size = tSize,
+             text_font_family = font.family_monospace)
+        table.cell(panel, 1, row, "", text_size = tSize)
+        table.cell(panel, 2, row, "", text_size = tSize)
+        table.merge_cells(panel, 1, row, 2, row)
+        table.cell(panel, 1, row, padCenter(str.tostring(atrVal, priceFmt), w * 2),
+             text_color = atrColor, text_size = tSize,
+             text_font_family = font.family_monospace)
+        row += 1
+
+        // Stop distance row
+        if showStopDist
+            string multLabel = str.tostring(atrMult, "#.0#") + "x"
+            table.cell(panel, 0, row, " " + multLabel + " ", text_color = textColor, text_size = tSize,
+                 text_font_family = font.family_monospace)
+            table.cell(panel, 1, row, "", text_size = tSize)
+            table.cell(panel, 2, row, "", text_size = tSize)
+            table.merge_cells(panel, 1, row, 2, row)
+            table.cell(panel, 1, row, padCenter(str.tostring(stopDist, priceFmt), w * 2),
+                 text_color = textColor, text_size = tSize,
+                 text_font_family = font.family_monospace)
+            row += 1
+
+        // Long stop price row
+        if showLongStop
+            table.cell(panel, 0, row, " L SL ", text_color = longStopColor, text_size = tSize,
+                 text_font_family = font.family_monospace)
+            table.cell(panel, 1, row, "", text_size = tSize)
+            table.cell(panel, 2, row, "", text_size = tSize)
+            table.merge_cells(panel, 1, row, 2, row)
+            table.cell(panel, 1, row, padCenter(str.tostring(longStop, priceFmt), w * 2),
+                 text_color = longStopColor, text_size = tSize,
+                 text_font_family = font.family_monospace)
+            row += 1
+
+        // Short stop price row
+        if showShortStop
+            table.cell(panel, 0, row, " S SL ", text_color = shortStopColor, text_size = tSize,
+                 text_font_family = font.family_monospace)
+            table.cell(panel, 1, row, "", text_size = tSize)
+            table.cell(panel, 2, row, "", text_size = tSize)
+            table.merge_cells(panel, 1, row, 2, row)
+            table.cell(panel, 1, row, padCenter(str.tostring(shortStop, priceFmt), w * 2),
+                 text_color = shortStopColor, text_size = tSize,
+                 text_font_family = font.family_monospace)
+            row += 1
+
+    // ══════════════════════════════════════════════════════════════════════
+    //  VOLUME SECTION
+    // ══════════════════════════════════════════════════════════════════════
+    if showVolume
+        // Header row
+        table.cell(panel, 0, row, "  ", text_color = textColor, text_size = tSize,
+             text_font_family = font.family_monospace)
+        table.cell(panel, 1, row, padCenter("BUY", w),
+             text_color = buyColor, text_size = tSize,
+             text_font_family = font.family_monospace)
+        table.cell(panel, 2, row, padCenter("SELL", w),
+             text_color = sellColor, text_size = tSize,
+             text_font_family = font.family_monospace)
+        row += 1
+
+        // Contracts row
+        if showContracts
+            table.cell(panel, 0, row, "Vol", text_color = textColor, text_size = tSize,
+                 text_font_family = font.family_monospace)
+            table.cell(panel, 1, row, padCenter(str.tostring(buyVol, "#,###"), w),
+                 text_color = buyColor, text_size = tSize,
+                 text_font_family = font.family_monospace)
+            table.cell(panel, 2, row, padCenter(str.tostring(sellVol, "#,###"), w),
+                 text_color = sellColor, text_size = tSize,
+                 text_font_family = font.family_monospace)
+            row += 1
+
+        // Percentage row
+        if showPercent
+            table.cell(panel, 0, row, " % ", text_color = textColor, text_size = tSize,
+                 text_font_family = font.family_monospace)
+            table.cell(panel, 1, row, padCenter(str.tostring(buyPct, "#.0") + "%", w),
+                 text_color = buyColor, text_size = tSize,
+                 text_font_family = font.family_monospace)
+            table.cell(panel, 2, row, padCenter(str.tostring(sellPct, "#.0") + "%", w),
+                 text_color = sellColor, text_size = tSize,
+                 text_font_family = font.family_monospace)
+            row += 1
+
+        // Ratio bar row (merged across all 3 columns)
+        int buyBlocks  = math.round(buyPct / 100 * barWidth)
+        int sellBlocks = barWidth - buyBlocks
+        string barText = str.repeat("█", buyBlocks) + str.repeat("░", sellBlocks)
+
+        table.cell(panel, 0, row, "", text_size = tSize)
+        table.cell(panel, 1, row, "", text_size = tSize)
+        table.cell(panel, 2, row, "", text_size = tSize)
+        table.merge_cells(panel, 0, row, 2, row)
+        table.cell(panel, 0, row, barText,
+             text_color = buyColor, text_size = tSize, text_halign = text.align_center,
+             text_font_family = font.family_monospace, bgcolor = barBgColor)

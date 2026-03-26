@@ -1,0 +1,162 @@
+//@version=6
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © LuxAlgo
+
+indicator("Liquidity Sweep & POI Retracements [NQ/YM]", overlay = true, max_labels_count = 500, max_lines_count = 500, max_boxes_count = 500)
+
+// --- Groups & Inputs ---
+G_LIQ   = "Liquidity Settings"
+G_POI   = "Point of Interest (POI) & Retracement"
+G_STYLE = "Visuals"
+
+// Liquidity Inputs
+useHTF   = input.bool(true, "Use HTF (1H/4H) Liquidity", group = G_LIQ)
+pivotLen = input.int(15, "Pivot Lookback", minval = 2, group = G_LIQ)
+
+// POI Inputs
+useFVG      = input.bool(true, "Identify FVGs as POIs", group = G_POI, tooltip = "Fair Value Gaps formed after a sweep.")
+fvgMitigation = input.string("Close", "Mitigation Type", options = ["Touch", "Close", "50% Level"], group = G_POI)
+maxPOIAge   = input.int(20, "Max POI Age (Bars)", minval = 5, group = G_POI, tooltip = "How long to wait for a retracement before invalidating the POI.")
+
+// Style
+bullColor = input.color(#089981, "Bullish Color", group = G_STYLE)
+bearColor = input.color(#f23645, "Bearish Color", group = G_STYLE)
+poiColor  = input.color(color.new(#5b9cf6, 85), "POI Box Color", group = G_STYLE)
+
+// --- Types ---
+type LiquidityPool
+    float price
+    bool  isUpper
+    line  lineId
+
+type POI
+    float top
+    float bottom
+    bool  isBullish
+    int   startBar
+    box   boxId
+    bool  active = true
+
+var activeLiquidity = array.new<LiquidityPool>()
+var activePOIs      = array.new<POI>()
+
+// --- HTF Data ---
+[h1_h, h1_l] = request.security(syminfo.tickerid, "60", [high[1], low[1]], lookahead = barmerge.lookahead_on)
+[h4_h, h4_l] = request.security(syminfo.tickerid, "240", [high[1], low[1]], lookahead = barmerge.lookahead_on)
+
+// --- Liquidity Logic ---
+ph = ta.pivothigh(high, pivotLen, pivotLen)
+pl = ta.pivotlow(low, pivotLen, pivotLen)
+
+if not na(ph)
+    array.push(activeLiquidity, LiquidityPool.new(ph, true, line.new(bar_index - pivotLen, ph, bar_index, ph, color = color.new(bearColor, 80), style = line.style_dashed)))
+if not na(pl)
+    array.push(activeLiquidity, LiquidityPool.new(pl, false, line.new(bar_index - pivotLen, pl, bar_index, pl, color = color.new(bullColor, 80), style = line.style_dashed)))
+
+bool sslSwept = false
+bool bslSwept = false
+
+// Check Intraday Sweeps
+if array.size(activeLiquidity) > 0
+    for i = array.size(activeLiquidity) - 1 to 0
+        pool = array.get(activeLiquidity, i)
+        line.set_x2(pool.lineId, bar_index)
+        
+        if not pool.isUpper and low < pool.price and close > pool.price
+            sslSwept := true
+            line.delete(pool.lineId), array.remove(activeLiquidity, i)
+        else if pool.isUpper and high > pool.price and close < pool.price
+            bslSwept := true
+            line.delete(pool.lineId), array.remove(activeLiquidity, i)
+        else if (pool.isUpper and close > pool.price) or (not pool.isUpper and close < pool.price)
+            line.delete(pool.lineId), array.remove(activeLiquidity, i)
+
+// Check HTF Sweeps
+if useHTF
+    sslSwept := sslSwept or (low < h1_l and close > h1_l) or (low < h4_l and close > h4_l)
+    bslSwept := bslSwept or (high > h1_h and close < h1_h) or (high > h4_h and close < h4_h)
+
+// --- POI & FVG Detection ---
+// We track if a sweep happened recently to look for an FVG POI
+var int lastSSLSweep = -100
+var int lastBSLSweep = -100
+if sslSwept
+    lastSSLSweep := bar_index
+if bslSwept
+    lastBSLSweep := bar_index
+
+// Bullish FVG: low[0] > high[2]
+bool isBullishFVG = useFVG and low > high[2] and close > open and (bar_index - lastSSLSweep < 5)
+// Bearish FVG: high[0] < low[2]
+bool isBearishFVG = useFVG and high < low[2] and close < open and (bar_index - lastBSLSweep < 5)
+
+if isBullishFVG
+    top = low
+    bottom = high[2]
+    bx = box.new(bar_index - 2, top, bar_index, bottom, bgcolor = color.new(bullColor, 90), border_color = color.new(bullColor, 70), text = "Bullish POI", text_size = size.tiny, text_color = bullColor)
+    array.push(activePOIs, POI.new(top, bottom, true, bar_index, bx))
+    lastSSLSweep := -100 // Reset to avoid multiple POIs for one sweep
+
+if isBearishFVG
+    top = low[2]
+    bottom = high
+    bx = box.new(bar_index - 2, top, bar_index, bottom, bgcolor = color.new(bearColor, 90), border_color = color.new(bearColor, 70), text = "Bearish POI", text_size = size.tiny, text_color = bearColor)
+    array.push(activePOIs, POI.new(top, bottom, false, bar_index, bx))
+    lastBSLSweep := -100
+
+// --- Retracement Logic ---
+bool buyRetrace  = false
+bool sellRetrace = false
+
+if array.size(activePOIs) > 0
+    for i = array.size(activePOIs) - 1 to 0
+        poi = array.get(activePOIs, i)
+        box.set_right(poi.boxId, bar_index)
+        
+        // Check for age invalidation
+        if bar_index - poi.startBar > maxPOIAge
+            box.delete(poi.boxId)
+            array.remove(activePOIs, i)
+            continue
+            
+        float mid = (poi.top + poi.bottom) / 2
+        
+        if poi.isBullish
+            // Price must be above POI before retracing into it
+            if high[1] > poi.top
+                condition = fvgMitigation == "Touch" ? low <= poi.top : fvgMitigation == "Close" ? close <= poi.top and close >= poi.bottom : low <= mid
+                if condition
+                    buyRetrace := true
+                    box.set_bgcolor(poi.boxId, color.new(bullColor, 70))
+                    array.remove(activePOIs, i)
+            // Invalidate if price closes below POI
+            else if close < poi.bottom
+                box.delete(poi.boxId)
+                array.remove(activePOIs, i)
+        else
+            // Bearish retracement
+            if low[1] < poi.bottom
+                condition = fvgMitigation == "Touch" ? high >= poi.bottom : fvgMitigation == "Close" ? close >= poi.bottom and close <= poi.top : high >= mid
+                if condition
+                    sellRetrace := true
+                    box.set_bgcolor(poi.boxId, color.new(bearColor, 70))
+                    array.remove(activePOIs, i)
+            else if close > poi.top
+                box.delete(poi.boxId)
+                array.remove(activePOIs, i)
+
+// --- Visual Signals ---
+// Initial Sweep Signals
+plotshape(sslSwept, "Liquidity Sweep (Bull)", shape.circle, location.belowbar, color.new(bullColor, 50), size = size.tiny)
+plotshape(bslSwept, "Liquidity Sweep (Bear)", shape.circle, location.abovebar, color.new(bearColor, 50), size = size.tiny)
+
+// Retracement Entry Labels
+plotshape(buyRetrace, "POI Retracement Buy", shape.labelup, location.belowbar, bullColor, size = size.small, text = "POI ENTRY", textcolor = chart.bg_color)
+plotshape(sellRetrace, "POI Retracement Sell", shape.labeldown, location.abovebar, bearColor, size = size.small, text = "POI ENTRY", textcolor = chart.bg_color)
+
+// HTF Levels (Visual Reference)
+var line h1h_ln = line.new(na, na, na, na, color = color.new(chart.fg_color, 80), style = line.style_dotted)
+var line h1l_ln = line.new(na, na, na, na, color = color.new(chart.fg_color, 80), style = line.style_dotted)
+if barstate.islast and useHTF
+    line.set_xy1(h1h_ln, bar_index - 20, h1_h), line.set_xy2(h1h_ln, bar_index, h1_h)
+    line.set_xy1(h1l_ln, bar_index - 20, h1_l), line.set_xy2(h1l_ln, bar_index, h1_l)

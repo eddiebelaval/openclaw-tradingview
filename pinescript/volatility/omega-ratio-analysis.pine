@@ -1,0 +1,377 @@
+//@version=6
+//By your quant, Henrique Centieiro
+indicator("Omega Ratio Analysis", shorttitle="Ω", overlay=false, max_lines_count=500, max_labels_count=500, max_bars_back=5000)
+
+// ==========================================
+// INPUTS - DISPLAY MODE
+// ==========================================
+
+displayMode = input.string("Both", "Display Mode",
+                           options=["Time Series", "Omega Curve", "Both"],
+                           tooltip="Time Series: Omega over time | Omega Curve: Omega vs different MAR thresholds | Both: Show both views")
+
+// ==========================================
+// INPUTS - TIME SERIES MODE
+// ==========================================
+
+group_ts = "Time Series Settings"
+
+lookback = input.int(252, "Lookback Period", minval=20, maxval=1000, group=group_ts,
+                     tooltip="Number of bars for calculation. 252 = 1 year (recommended for long-term daily investing)")
+
+thresholdType = input.string("Fixed", "Threshold Type", group=group_ts,
+                              options=["Fixed", "Risk-Free Rate"],
+                              tooltip="Fixed: Set your target annual return | Risk-Free Rate: ~2.5% annual benchmark")
+
+annualThreshold = input.float(10.0, "Annual Target Return (%)", step=0.5, group=group_ts,
+                              tooltip="Your minimum acceptable annual return (e.g., 10% = historical S&P 500 long-term average)")
+
+smoothing = input.int(5, "Smoothing Period", minval=1, maxval=50, group=group_ts,
+                      tooltip="Smooth the Omega ratio to reduce noise")
+
+showZones = input.bool(true, "Show Performance Zones", group=group_ts,
+                      tooltip="Color background based on Omega value")
+
+// ==========================================
+// INPUTS - OMEGA CURVE MODE
+// ==========================================
+
+group_curve = "Omega Curve Settings"
+
+curvePeriod = input.int(252, "Curve Period", minval=20, group=group_curve,
+                        tooltip="Period for Omega curve calculation (252 = 1 year for daily charts). TIP: Use shorter periods (60-90 bars) to see more curve/asymmetry. Long periods (1000+ bars) average out to linear profiles.")
+
+curveIncrements = input.int(50, "MAR Increments", minval=10, maxval=100, step=5, group=group_curve,
+                            tooltip="Curve smoothness/resolution. Higher = smoother curve (50 recommended). Lower = faster but more angular. This controls how many data points are calculated along the curve.\n\nMAR (Minimum Acceptable Return) is YOUR return target - it separates 'wins' from 'losses'. The X-axis shows: At what return goal does this asset fail? Example: MAR=0% means any gain is good. MAR=10% means only returns above 10% count as wins.")
+
+lowRiskSecurity = input.symbol("SPX500USD", "Low-Risk Security", group=group_curve,
+                               tooltip="Used to calculate MAR range (typically S&P 500 or Treasury bonds)")
+
+marCalculation = input.string("StdDev x2", "MAR Calculation Method", group=group_curve,
+                              options=["StdDev x3", "StdDev x2", "Fixed Range", "Custom Factor"],
+                              tooltip="StdDev x2: Dynamic range based on market volatility (recommended) | Fixed Range: Set your own max MAR | IMPORTANT: Change this dropdown to use the parameters below!")
+
+fixedMarRange = input.float(30.0, "  ↳ Fixed MAR Range (Annual %)", minval=1, maxval=100, step=1, group=group_curve,
+                            tooltip="⚠️ Only active when 'Fixed Range' is selected above") / 100
+
+customMarFactor = input.float(2.0, "  ↳ Custom StdDev Factor", minval=0.5, maxval=10, step=0.5, group=group_curve,
+                              tooltip="⚠️ Only active when 'Custom Factor' is selected above")
+
+comparisonSymbol = input.symbol("QQQ", "Comparison Symbol", group=group_curve,
+                                tooltip="Compare current chart vs this symbol (e.g., QQQ, SPY, BTC). Leave blank to show only main chart.")
+
+// ==========================================
+// INPUTS - COLORS
+// ==========================================
+
+group_colors = "Visual Settings"
+
+// Using professional color scheme
+colorExcellent = input.color(color.new(#089981, 0), "Excellent (Ω > 1.5)", group=group_colors)
+colorGood = input.color(color.new(#26a69a, 0), "Good (Ω > 1.0)", group=group_colors)
+colorCaution = input.color(color.new(#ff9800, 0), "Caution (Ω > 0.7)", group=group_colors)
+colorPoor = input.color(color.new(#f23645, 0), "Poor (Ω < 0.7)", group=group_colors)
+colorCurveMain = input.color(color.new(#00e5ff, 0), "Curve - Main Symbol", group=group_colors)
+colorCurveComp = input.color(color.new(#ff1744, 0), "Curve - Comparison", group=group_colors)
+
+// ==========================================
+// TIME SERIES CALCULATIONS
+// ==========================================
+
+showTimeSeries = displayMode == "Time Series" or displayMode == "Both"
+
+// Calculate returns (log returns for better statistical properties)
+returns = math.log(close / close[1])
+
+// Convert annual threshold to per-bar (daily) threshold
+// Assuming 252 trading days per year
+barsPerYear = 252.0
+dailyThreshold = thresholdType == "Fixed" ?
+                 math.log(1 + annualThreshold / 100) / barsPerYear :
+                 0.0001  // Risk-free rate: ~2.5% annual
+
+// Calculate Omega ratio using discrete approximation
+var float totalGains = 0.0
+var float totalLosses = 0.0
+
+totalGains := 0.0
+totalLosses := 0.0
+
+// Loop through lookback period
+for i = 0 to math.min(lookback - 1, bar_index)
+    ret = returns[i]
+    if not na(ret)
+        if ret > dailyThreshold
+            totalGains := totalGains + (ret - dailyThreshold)
+        else
+            totalLosses := totalLosses + math.abs(ret - dailyThreshold)
+
+// Calculate raw Omega ratio
+rawOmega = totalLosses > 0 ? totalGains / totalLosses : na
+
+// Apply smoothing
+omega = ta.sma(rawOmega, smoothing)
+
+// Performance classification
+isExcellent = omega > 1.5
+isGood = omega > 1.0 and omega <= 1.5
+isCaution = omega > 0.7 and omega <= 1.0
+isPoor = omega <= 0.7
+
+// ==========================================
+// OMEGA CURVE CALCULATIONS
+// ==========================================
+
+showCurve = displayMode == "Omega Curve" or displayMode == "Both"
+
+// Get low-risk security data
+lrs = request.security(lowRiskSecurity, timeframe.period, close)
+lastLRS = nz(lrs[1], lrs)
+lowRiskReturn = (lrs - lastLRS) / lastLRS * 100.0
+
+// Calculate max MAR based on method (in per-bar % to match return series format)
+maxMar = switch marCalculation
+    "StdDev x3" => ta.stdev(lowRiskReturn, curvePeriod) * 3.0 * math.sqrt(curvePeriod / (curvePeriod - 1))
+    "StdDev x2" => ta.stdev(lowRiskReturn, curvePeriod) * 2.0 * math.sqrt(curvePeriod / (curvePeriod - 1))
+    "Fixed Range" => fixedMarRange * 100
+    "Custom Factor" => ta.stdev(lowRiskReturn, curvePeriod) * customMarFactor * math.sqrt(curvePeriod / (curvePeriod - 1))
+    => 10.0
+
+// Calculate returns for curve (in percentage for display)
+r1 = math.log(close / nz(close[1], close)) * 100
+
+// Get comparison symbol data if provided
+compSymClose = comparisonSymbol != "" ? request.security(comparisonSymbol, timeframe.period, close) : na
+r2 = not na(compSymClose) ? math.log(compSymClose / nz(compSymClose[1], compSymClose)) * 100 : na
+
+// Arrays for Omega curve
+var aOmega = array.new_float(curveIncrements + 1)
+var bOmega = array.new_float(curveIncrements + 1)
+var aLines = array.new_line(curveIncrements)
+var bLines = array.new_line(curveIncrements)
+var marLabels = array.new_label(curveIncrements)
+var linesInitialized = false
+
+// Function to calculate Omega across different MARs
+calculateOmegaCurve(omegaArray, returnSeries) =>
+    if barstate.islast and showCurve
+        for i = 0 to curveIncrements by 1
+            posSum = 0.0
+            negSum = 0.0
+            // currentMar stays in PERCENTAGE to match returnSeries format (which is r1 * 100)
+            currentMar = maxMar * i / curveIncrements
+
+            for j = 0 to math.min(curvePeriod - 1, bar_index) by 1
+                excess = returnSeries[j] - currentMar
+                if not na(excess)
+                    posSum := posSum + (excess > 0 ? excess : 0.0)
+                    negSum := negSum - (excess < 0 ? excess : 0.0)
+
+            array.set(omegaArray, i, negSum > 0 ? posSum / negSum : na)
+
+// Calculate curves
+if showCurve
+    calculateOmegaCurve(aOmega, r1)
+    if not na(r2)
+        calculateOmegaCurve(bOmega, r2)
+
+// ==========================================
+// PLOTTING - TIME SERIES
+// ==========================================
+
+// Color based on performance
+omegaColor = isExcellent ? colorExcellent :
+             isGood ? colorGood :
+             isCaution ? colorCaution :
+             colorPoor
+
+// Only show plot in Time Series mode
+plotValue = showTimeSeries ? omega : na
+plot(plotValue, "Omega Ratio", color=omegaColor, linewidth=2)
+
+// Reference levels (only visible in time series mode)
+hline(1.0, "Breakeven", color=showTimeSeries ? color.rgb(120, 123, 134) : na, linestyle=hline.style_solid, linewidth=2)
+hline(1.5, "Excellent", color=showTimeSeries ? color.new(colorExcellent, 70) : na, linestyle=hline.style_dashed)
+hline(0.7, "Caution", color=showTimeSeries ? color.new(colorCaution, 70) : na, linestyle=hline.style_dashed)
+
+// Background zones
+bgColor = showTimeSeries and showZones and isExcellent ? color.new(colorExcellent, 93) :
+          showTimeSeries and showZones and isGood ? color.new(colorGood, 95) :
+          showTimeSeries and showZones and isCaution ? color.new(colorCaution, 95) :
+          showTimeSeries and showZones and isPoor ? color.new(colorPoor, 95) :
+          showCurve ? color.new(#0a0e14, 20) : na
+
+bgcolor(bgColor, title="Background")
+
+// ==========================================
+// PLOTTING - OMEGA CURVE
+// ==========================================
+
+if showCurve and barstate.islast
+    // Fixed curve width approach - double the spacing for readability
+    barSpacing = 2
+    startBar = bar_index - (curveIncrements * barSpacing)
+
+    // Initialize or update lines
+    if not linesInitialized
+        for i = 0 to curveIncrements - 1
+            barIndexPos = startBar + (i * barSpacing)
+            array.set(aLines, i, line.new(barIndexPos, array.get(aOmega, i),
+                                          barIndexPos + barSpacing, array.get(aOmega, i + 1),
+                                          color=colorCurveMain, width=3))
+
+            if not na(r2)
+                array.set(bLines, i, line.new(barIndexPos, array.get(bOmega, i),
+                                              barIndexPos + barSpacing, array.get(bOmega, i + 1),
+                                              color=colorCurveComp, width=3))
+
+        // Create MAR labels (show annual %)
+        labelStep = curveIncrements > 40 ? 10 : 5
+        labelIndex = 0
+        for j = 0 to curveIncrements - 1 by labelStep
+            if labelIndex < curveIncrements
+                barPos = startBar + (j * barSpacing)
+                marValue = maxMar * j / curveIncrements
+                array.set(marLabels, labelIndex, label.new(barPos, -0.15,
+                                                  text=str.tostring(math.round(marValue, 1)) + "%",
+                                                  color=color.new(color.black, 100),
+                                                  textcolor=color.rgb(178, 181, 190),
+                                                  style=label.style_label_center,
+                                                  size=size.normal,
+                                                  textalign=text.align_center))
+                labelIndex := labelIndex + 1
+
+        linesInitialized := true
+    else
+        // Update existing lines
+        for i = 0 to curveIncrements - 1
+            barIndexPos = startBar + (i * barSpacing)
+            lineID1 = array.get(aLines, i)
+            line.set_xy1(lineID1, barIndexPos, array.get(aOmega, i))
+            line.set_xy2(lineID1, barIndexPos + barSpacing, array.get(aOmega, i + 1))
+
+            if not na(r2)
+                lineID2 = array.get(bLines, i)
+                line.set_xy1(lineID2, barIndexPos, array.get(bOmega, i))
+                line.set_xy2(lineID2, barIndexPos + barSpacing, array.get(bOmega, i + 1))
+
+        // Update MAR labels
+        labelStep = curveIncrements > 40 ? 10 : 5
+        labelIndex = 0
+        for j = 0 to curveIncrements - 1 by labelStep
+            if labelIndex < curveIncrements
+                labelID = array.get(marLabels, labelIndex)
+                barPos = startBar + (j * barSpacing)
+                label.set_x(labelID, barPos)
+                labelIndex := labelIndex + 1
+
+    // Draw axes
+    maxHeight = math.max(array.get(aOmega, 0), not na(r2) ? array.get(bOmega, 0) : array.get(aOmega, 0))
+    endBar = bar_index
+
+    var line xAxis = na
+    var line yAxis = na
+    var label xLabel = na
+    var label yLabel = na
+    var label mainLabel = na
+    var label compLabel = na
+    var label infoLabel = na
+    var array<label> yAxisLabels = array.new_label(7)
+
+    if na(xAxis)
+        xAxis := line.new(startBar, 0.0, endBar, 0.0, color=color.rgb(178, 181, 190, 30), width=2)
+        yAxis := line.new(startBar, 0.0, startBar, maxHeight * 1.2, color=color.rgb(178, 181, 190, 30), width=2)
+        xLabel := label.new(endBar, -0.18, "MAR: Minimum Acceptable Return (per bar %)",
+                           color=color.new(color.black, 100),
+                           textcolor=color.rgb(178, 181, 190),
+                           style=label.style_label_left,
+                           size=size.normal)
+        yLabel := label.new(startBar - 3, maxHeight * 1.2, "Ω Ratio",
+                           color=color.new(color.black, 100),
+                           textcolor=color.rgb(178, 181, 190),
+                           style=label.style_label_down,
+                           size=size.large)
+
+        // Y-axis value labels
+        yAxisValues = array.from(0.0, 0.25, 0.5, 0.75, 1.0, 1.25, 1.5)
+        for i = 0 to 6
+            yValue = array.get(yAxisValues, i)
+            labelColor = yValue == 1.0 ? color.rgb(255, 193, 7) : color.rgb(178, 181, 190)
+            array.set(yAxisLabels, i, label.new(startBar - 5, yValue,
+                                     text=str.tostring(yValue, "#.##"),
+                                     color=color.new(color.black, 100),
+                                     textcolor=labelColor,
+                                     style=label.style_label_right,
+                                     size=size.small))
+
+        // Symbol labels positioned on curves
+        labelPos = math.floor(curveIncrements * 0.15)
+        mainLabel := label.new(startBar + (labelPos * barSpacing), array.get(aOmega, labelPos), syminfo.ticker,
+                              color=color.new(colorCurveMain, 85),
+                              textcolor=colorCurveMain,
+                              style=label.style_label_center,
+                              size=size.large)
+        if not na(r2)
+            compLabel := label.new(startBar + (labelPos * barSpacing), array.get(bOmega, labelPos), comparisonSymbol,
+                                  color=color.new(colorCurveComp, 85),
+                                  textcolor=colorCurveComp,
+                                  style=label.style_label_center,
+                                  size=size.large)
+
+        // Info label
+        infoText = "Period: " + str.tostring(curvePeriod) + " bars | Max MAR: " + str.tostring(math.round(maxMar, 1)) + "%"
+        infoLabel := label.new(startBar, maxHeight * 1.1, infoText,
+                              color=color.new(color.black, 100),
+                              textcolor=color.rgb(120, 123, 134),
+                              style=label.style_label_right,
+                              size=size.small)
+    else
+        line.set_xy1(xAxis, startBar, 0.0)
+        line.set_xy2(xAxis, endBar, 0.0)
+        line.set_xy1(yAxis, startBar, 0.0)
+        line.set_xy2(yAxis, startBar, maxHeight * 1.2)
+        label.set_xy(xLabel, endBar, -0.18)
+        label.set_xy(yLabel, startBar - 3, maxHeight * 1.2)
+
+        labelPos = math.floor(curveIncrements * 0.15)
+        label.set_xy(mainLabel, startBar + (labelPos * barSpacing), array.get(aOmega, labelPos))
+        label.set_text(mainLabel, syminfo.ticker)
+        if not na(r2) and not na(compLabel)
+            label.set_xy(compLabel, startBar + (labelPos * barSpacing), array.get(bOmega, labelPos))
+            label.set_text(compLabel, comparisonSymbol)
+
+        infoText = "Period: " + str.tostring(curvePeriod) + " bars | Max MAR: " + str.tostring(math.round(maxMar, 1)) + "%"
+        label.set_xy(infoLabel, startBar, maxHeight * 1.1)
+        label.set_text(infoLabel, infoText)
+
+        // Update Y-axis labels positions
+        for i = 0 to 6
+            yValue = i == 0 ? 0.0 : i == 1 ? 0.25 : i == 2 ? 0.5 : i == 3 ? 0.75 : i == 4 ? 1.0 : i == 5 ? 1.25 : 1.5
+            labelID = array.get(yAxisLabels, i)
+            label.set_xy(labelID, startBar - 5, yValue)
+
+// Omega = 1 reference line for curve mode (prominent breakeven line)
+hline(1.0, "Ω = 1.0 (Breakeven)", color=showCurve ? color.rgb(255, 193, 7, 60) : na, linestyle=hline.style_solid, linewidth=2)
+
+// Additional reference lines for better Y-axis scale reading
+hline(1.5, "Ω = 1.5", color=showCurve ? color.rgb(120, 123, 134, 75) : na, linestyle=hline.style_dashed, linewidth=1)
+hline(1.25, "Ω = 1.25", color=showCurve ? color.rgb(120, 123, 134, 85) : na, linestyle=hline.style_dotted, linewidth=1)
+hline(0.75, "Ω = 0.75", color=showCurve ? color.rgb(120, 123, 134, 85) : na, linestyle=hline.style_dotted, linewidth=1)
+hline(0.5, "Ω = 0.5", color=showCurve ? color.rgb(120, 123, 134, 75) : na, linestyle=hline.style_dashed, linewidth=1)
+hline(0.25, "Ω = 0.25", color=showCurve ? color.rgb(120, 123, 134, 85) : na, linestyle=hline.style_dotted, linewidth=1)
+hline(0.0, "Ω = 0.0", color=showCurve ? color.rgb(120, 123, 134, 75) : na, linestyle=hline.style_dashed, linewidth=1)
+
+// ==========================================
+// ALERTS
+// ==========================================
+
+// Calculate crossovers at global scope for consistent execution
+bullishCross = ta.crossover(omega, 1.0)
+bearishCross = ta.crossunder(omega, 1.0)
+excellentCross = ta.crossover(omega, 1.5)
+poorCross = ta.crossunder(omega, 0.7)
+
+alertcondition(showTimeSeries and bullishCross, "Omega Bullish", "Omega ratio crossed above 1.0 - Performance improving")
+alertcondition(showTimeSeries and bearishCross, "Omega Bearish", "Omega ratio crossed below 1.0 - Performance deteriorating")
+alertcondition(showTimeSeries and excellentCross, "Omega Excellent", "Omega ratio reached excellent level (>1.5)")
+alertcondition(showTimeSeries and poorCross, "Omega Poor", "Omega ratio reached poor level (<0.7)")

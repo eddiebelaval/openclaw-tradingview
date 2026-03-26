@@ -1,0 +1,418 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © wernert95
+
+//@version=6
+indicator("Volatility Regime Classifier [QuantRegime]", shorttitle="VRC", overlay=true, max_labels_count=500, max_boxes_count=500)
+
+// ============================================================================
+// INPUTS
+// ============================================================================
+
+// --- Regime Detection Engine ---
+grp_regime = "📊 Regime Detection Engine"
+hurst_len       = input.int(100, "Hurst Estimation Lookback", minval=20, maxval=500, group=grp_regime, tooltip="Number of bars used to estimate the Hurst Exponent. Higher values = more stable estimate, more lag. Lower values = more responsive, more noise.")
+adx_len         = input.int(14, "ADX Length", minval=5, maxval=50, group=grp_regime, tooltip="Period for Average Directional Index calculation. Standard is 14.")
+adx_smooth      = input.int(14, "ADX Smoothing", minval=5, maxval=50, group=grp_regime, tooltip="Smoothing period for the ADX line itself.")
+chop_len        = input.int(14, "Choppiness Index Length", minval=5, maxval=50, group=grp_regime, tooltip="Lookback for the Choppiness Index. Standard is 14.")
+vol_len         = input.int(20, "Volatility Lookback (ATR)", minval=5, maxval=100, group=grp_regime, tooltip="ATR period for volatility regime classification.")
+vol_percentile  = input.int(100, "Volatility Percentile Lookback", minval=20, maxval=500, group=grp_regime, tooltip="How many bars to look back when calculating the volatility percentile rank.")
+
+// --- Regime Thresholds ---
+grp_thresh = "🎯 Regime Thresholds"
+adx_trend_thresh    = input.float(25.0, "ADX Trend Threshold", minval=10, maxval=50, step=1, group=grp_thresh, tooltip="ADX above this = trending market. Below = non-trending.")
+adx_strong_thresh   = input.float(40.0, "ADX Strong Trend Threshold", minval=25, maxval=60, step=1, group=grp_thresh, tooltip="ADX above this = strong trend.")
+chop_range_thresh   = input.float(61.8, "Choppiness Range Threshold", minval=50, maxval=80, step=0.1, group=grp_thresh, tooltip="CHOP above this = choppy/ranging market. The golden ratio (61.8) is a natural default.")
+hurst_trend_thresh  = input.float(0.55, "Hurst Trending Threshold", minval=0.5, maxval=0.8, step=0.01, group=grp_thresh, tooltip="Hurst exponent above this = trending/persistent behavior.")
+hurst_mr_thresh     = input.float(0.45, "Hurst Mean-Reversion Threshold", minval=0.2, maxval=0.5, step=0.01, group=grp_thresh, tooltip="Hurst exponent below this = mean-reverting behavior.")
+vol_high_pct        = input.float(80.0, "High Volatility Percentile", minval=50, maxval=99, step=1, group=grp_thresh, tooltip="ATR above this percentile = high volatility regime.")
+vol_low_pct         = input.float(20.0, "Low Volatility Percentile", minval=1, maxval=50, step=1, group=grp_thresh, tooltip="ATR below this percentile = low volatility / compression.")
+
+// --- Visual Settings ---
+grp_visual = "🎨 Visual Settings"
+show_candle_color   = input.bool(true, "Color Candles by Regime", group=grp_visual)
+show_bg_color       = input.bool(false, "Color Background by Regime", group=grp_visual)
+show_dashboard      = input.bool(true, "Show Dashboard", group=grp_visual)
+dash_position       = input.string("Top Right", "Dashboard Position", options=["Top Left", "Top Right", "Bottom Left", "Bottom Right", "Middle Right"], group=grp_visual)
+dash_size           = input.string("Normal", "Dashboard Size", options=["Small", "Normal", "Large"], group=grp_visual)
+show_regime_label   = input.bool(true, "Show Regime Change Labels", group=grp_visual)
+show_vol_bands      = input.bool(true, "Show Volatility Bands", group=grp_visual)
+band_mult           = input.float(2.0, "Volatility Band Multiplier", minval=0.5, maxval=5.0, step=0.1, group=grp_visual)
+
+// --- Colors ---
+grp_colors = "🌈 Colors"
+col_bull_trend      = input.color(color.new(#00C853, 0), "Strong Bull Trend", group=grp_colors)
+col_bull_weak       = input.color(color.new(#81C784, 0), "Weak Bull Trend", group=grp_colors)
+col_bear_trend      = input.color(color.new(#FF1744, 0), "Strong Bear Trend", group=grp_colors)
+col_bear_weak       = input.color(color.new(#E57373, 0), "Weak Bear Trend", group=grp_colors)
+col_ranging         = input.color(color.new(#FFD600, 0), "Ranging / Choppy", group=grp_colors)
+col_mean_rev        = input.color(color.new(#7C4DFF, 0), "Mean Reverting", group=grp_colors)
+col_compression     = input.color(color.new(#00BCD4, 0), "Low Vol Compression", group=grp_colors)
+
+// --- Alerts ---
+grp_alerts = "🔔 Alerts"
+alert_regime_change = input.bool(true, "Alert on Regime Change", group=grp_alerts)
+alert_vol_spike     = input.bool(true, "Alert on Volatility Spike", group=grp_alerts)
+alert_compression   = input.bool(true, "Alert on Compression (Squeeze)", group=grp_alerts)
+
+
+// ============================================================================
+// CALCULATIONS
+// ============================================================================
+
+// --- 1. Hurst Exponent Estimation (Rescaled Range Method) ---
+// The Hurst exponent tells us about the "memory" of the time series:
+//   H > 0.5 → trending/persistent (past moves predict similar future moves)
+//   H = 0.5 → random walk (no memory)
+//   H < 0.5 → mean-reverting/anti-persistent (moves tend to reverse)
+
+// Simplified R/S estimation of Hurst exponent
+f_hurst(src, len) =>
+    // Calculate log returns
+    log_ret = math.log(src / src[1])
+    
+    // Mean of returns over the window
+    mean_ret = ta.sma(log_ret, len)
+    
+    // Cumulative deviation from mean (for R calculation)
+    float max_dev = 0.0
+    float min_dev = 0.0
+    float cum_dev = 0.0
+    
+    for i = 0 to len - 1
+        cum_dev += nz(log_ret[i]) - nz(mean_ret)
+        max_dev := math.max(max_dev, cum_dev)
+        min_dev := math.min(min_dev, cum_dev)
+    
+    // Range
+    R = max_dev - min_dev
+    
+    // Standard deviation of returns
+    S = ta.stdev(log_ret, len)
+    
+    // R/S ratio
+    rs = S > 0 ? R / S : 0.0
+    
+    // Hurst = log(R/S) / log(n)
+    // We normalize to 0-1 range approximately
+    H = rs > 0 and len > 1 ? math.log(rs) / math.log(len) : 0.5
+    
+    // Clamp to valid range
+    math.max(0.0, math.min(1.0, H))
+
+hurst = f_hurst(close, hurst_len)
+hurst_smooth = ta.ema(hurst, 5)  // Light smoothing for stability
+
+// --- 2. ADX (Average Directional Index) ---
+// Measures trend STRENGTH regardless of direction
+// ADX > 25 = trending, ADX > 40 = strong trend, ADX < 20 = weak/no trend
+
+[di_plus, di_minus, adx_val] = ta.dmi(adx_len, adx_smooth)
+
+// Trend direction from DI
+trend_bullish = di_plus > di_minus
+trend_bearish = di_minus > di_plus
+
+// --- 3. Choppiness Index ---
+// Measures whether market is trending or ranging
+// High values (>61.8) = choppy/ranging, Low values (<38.2) = trending
+
+atr_chop = ta.atr(1)
+sum_atr = math.sum(atr_chop, chop_len)
+high_low_range = ta.highest(high, chop_len) - ta.lowest(low, chop_len)
+chop = high_low_range > 0 ? 100 * math.log10(sum_atr / high_low_range) / math.log10(chop_len) : 50.0
+
+// --- 4. Volatility Regime (ATR Percentile) ---
+// Classifies current volatility as high, normal, or low relative to history
+
+atr_val = ta.atr(vol_len)
+
+// Calculate percentile rank of current ATR
+f_percentile_rank(src, len) =>
+    float count = 0
+    for i = 1 to len
+        if src[i] < src
+            count += 1
+    count / len * 100
+
+vol_pct_rank = f_percentile_rank(atr_val, vol_percentile)
+
+is_high_vol     = vol_pct_rank >= vol_high_pct
+is_low_vol      = vol_pct_rank <= vol_low_pct
+is_normal_vol   = not is_high_vol and not is_low_vol
+
+// --- 5. EMA Trend Context ---
+ema_fast = ta.ema(close, 21)
+ema_slow = ta.ema(close, 55)
+ema_bullish = ema_fast > ema_slow
+ema_bearish = ema_fast < ema_slow
+
+// --- 6. Momentum (Rate of Change) ---
+roc_val = ta.roc(close, 10)
+
+
+// ============================================================================
+// REGIME CLASSIFICATION ENGINE
+// ============================================================================
+
+// Regime enum values
+REGIME_STRONG_BULL  = 6
+REGIME_BULL         = 5
+REGIME_WEAK_BULL    = 4
+REGIME_RANGING      = 3
+REGIME_MEAN_REV     = 2
+REGIME_WEAK_BEAR    = 1
+REGIME_BEAR         = 0
+REGIME_STRONG_BEAR  = -1
+REGIME_COMPRESSION  = 7
+
+// Composite scoring
+trend_score     = adx_val >= adx_strong_thresh ? 3 : adx_val >= adx_trend_thresh ? 2 : adx_val >= 15 ? 1 : 0
+chop_score      = chop >= chop_range_thresh ? -2 : chop >= 50 ? -1 : chop >= 38.2 ? 1 : 2
+hurst_score     = hurst_smooth >= hurst_trend_thresh ? 2 : hurst_smooth >= 0.5 ? 1 : hurst_smooth >= hurst_mr_thresh ? -1 : -2
+
+// Direction
+direction = ema_bullish and trend_bullish ? 1 : ema_bearish and trend_bearish ? -1 : ema_bullish or trend_bullish ? 0.5 : ema_bearish or trend_bearish ? -0.5 : 0.0
+
+// Composite regime score
+composite = trend_score + chop_score + hurst_score
+
+// Final regime classification
+var int regime = REGIME_RANGING
+
+if is_low_vol and chop >= chop_range_thresh
+    regime := REGIME_COMPRESSION
+else if hurst_smooth < hurst_mr_thresh and adx_val < adx_trend_thresh
+    regime := REGIME_MEAN_REV
+else if composite >= 5 and direction > 0
+    regime := REGIME_STRONG_BULL
+else if composite >= 3 and direction > 0
+    regime := REGIME_BULL
+else if composite >= 1 and direction > 0
+    regime := REGIME_WEAK_BULL
+else if composite >= 5 and direction < 0
+    regime := REGIME_STRONG_BEAR
+else if composite >= 3 and direction < 0
+    regime := REGIME_BEAR
+else if composite >= 1 and direction < 0
+    regime := REGIME_WEAK_BEAR
+else if chop >= chop_range_thresh or composite <= 0
+    regime := REGIME_RANGING
+else
+    regime := REGIME_RANGING
+
+// Regime change detection
+regime_changed = regime != regime[1]
+prev_regime = regime[1]
+
+
+// ============================================================================
+// VISUAL OUTPUT
+// ============================================================================
+
+// --- Regime Colors ---
+f_regime_color(r) =>
+    switch r
+        REGIME_STRONG_BULL  => col_bull_trend
+        REGIME_BULL         => col_bull_trend
+        REGIME_WEAK_BULL    => col_bull_weak
+        REGIME_WEAK_BEAR    => col_bear_weak
+        REGIME_BEAR         => col_bear_trend
+        REGIME_STRONG_BEAR  => col_bear_trend
+        REGIME_RANGING      => col_ranging
+        REGIME_MEAN_REV     => col_mean_rev
+        REGIME_COMPRESSION  => col_compression
+        => color.gray
+
+f_regime_name(r) =>
+    switch r
+        REGIME_STRONG_BULL  => "Strong Bull Trend"
+        REGIME_BULL         => "Bull Trend"
+        REGIME_WEAK_BULL    => "Weak Bull"
+        REGIME_WEAK_BEAR    => "Weak Bear"
+        REGIME_BEAR         => "Bear Trend"
+        REGIME_STRONG_BEAR  => "Strong Bear Trend"
+        REGIME_RANGING      => "Ranging"
+        REGIME_MEAN_REV     => "Mean Reverting"
+        REGIME_COMPRESSION  => "Compression"
+        => "Unknown"
+
+f_regime_emoji(r) =>
+    switch r
+        REGIME_STRONG_BULL  => "🟢🔥"
+        REGIME_BULL         => "🟢"
+        REGIME_WEAK_BULL    => "🟡🔼"
+        REGIME_WEAK_BEAR    => "🟡🔽"
+        REGIME_BEAR         => "🔴"
+        REGIME_STRONG_BEAR  => "🔴🔥"
+        REGIME_RANGING      => "🟡↔"
+        REGIME_MEAN_REV     => "🟣↩"
+        REGIME_COMPRESSION  => "🔵🔄"
+        => "⚪"
+
+regime_col = f_regime_color(regime)
+
+// --- Candle Coloring ---
+barcolor(show_candle_color ? regime_col : na)
+
+// --- Background Coloring ---
+bgcolor(show_bg_color ? color.new(regime_col, 88) : na)
+
+// --- Volatility Bands ---
+basis = ta.ema(close, 21)
+upper_band = basis + atr_val * band_mult
+lower_band = basis - atr_val * band_mult
+
+p_upper = plot(show_vol_bands ? upper_band : na, "Upper Vol Band", color=color.new(regime_col, 70), linewidth=1)
+p_lower = plot(show_vol_bands ? lower_band : na, "Lower Vol Band", color=color.new(regime_col, 70), linewidth=1)
+p_basis = plot(show_vol_bands ? basis : na, "Basis", color=color.new(regime_col, 50), linewidth=2)
+fill(p_upper, p_lower, color=color.new(regime_col, 92), title="Vol Band Fill")
+
+// --- Regime Change Labels ---
+if show_regime_label and regime_changed
+    lbl_text = f_regime_emoji(regime) + " " + f_regime_name(regime)
+    lbl_style = regime == REGIME_STRONG_BULL or regime == REGIME_BULL or regime == REGIME_WEAK_BULL ? label.style_label_up : regime == REGIME_STRONG_BEAR or regime == REGIME_BEAR or regime == REGIME_WEAK_BEAR ? label.style_label_down : label.style_label_left
+    lbl_y = regime == REGIME_STRONG_BULL or regime == REGIME_BULL or regime == REGIME_WEAK_BULL ? low : high
+    label.new(bar_index, lbl_y, lbl_text, style=lbl_style, color=color.new(regime_col, 20), textcolor=color.white, size=size.small)
+
+
+// ============================================================================
+// COMPONENT COLORS (global scope for plots + dashboard)
+// ============================================================================
+
+hurst_col = hurst_smooth >= hurst_trend_thresh ? col_bull_trend : hurst_smooth <= hurst_mr_thresh ? col_mean_rev : col_ranging
+adx_col   = adx_val >= adx_strong_thresh ? col_bull_trend : adx_val >= adx_trend_thresh ? col_bull_weak : col_ranging
+chop_col  = chop >= chop_range_thresh ? col_ranging : chop <= 38.2 ? col_bull_trend : col_bull_weak
+vol_col   = is_high_vol ? col_bear_trend : is_low_vol ? col_compression : col_bull_weak
+comp_col  = composite >= 5 ? col_bull_trend : composite >= 3 ? col_bull_weak : composite >= 0 ? col_ranging : col_mean_rev
+
+// ============================================================================
+// DASHBOARD
+// ============================================================================
+
+if show_dashboard and barstate.islast
+    // Dashboard position
+    dash_x = switch dash_position
+        "Top Left"      => label.style_label_lower_right
+        "Top Right"     => label.style_label_lower_left
+        "Bottom Left"   => label.style_label_upper_right
+        "Bottom Right"  => label.style_label_upper_left
+        "Middle Right"  => label.style_label_left
+        => label.style_label_lower_left
+    
+    // Dashboard table position
+    tbl_pos = switch dash_position
+        "Top Left"      => position.top_left
+        "Top Right"     => position.top_right
+        "Bottom Left"   => position.bottom_left
+        "Bottom Right"  => position.bottom_right
+        "Middle Right"  => position.middle_right
+        => position.top_right
+    
+    tbl_size = switch dash_size
+        "Small"  => size.small
+        "Normal" => size.normal
+        "Large"  => size.large
+        => size.normal
+    
+    var tbl = table.new(tbl_pos, 3, 10, border_width=1, border_color=color.new(color.gray, 60), frame_width=2, frame_color=color.new(color.gray, 40))
+    
+    // Header
+    table.cell(tbl, 0, 0, "📊 REGIME CLASSIFIER", text_color=color.white, bgcolor=color.new(#1a1a2e, 0), text_size=tbl_size, text_halign=text.align_center)
+    table.merge_cells(tbl, 0, 0, 2, 0)
+    
+    // Current Regime
+    table.cell(tbl, 0, 1, "REGIME", text_color=color.gray, bgcolor=color.new(#16213e, 0), text_size=tbl_size)
+    table.cell(tbl, 1, 1, f_regime_emoji(regime) + " " + f_regime_name(regime), text_color=regime_col, bgcolor=color.new(#16213e, 0), text_size=tbl_size)
+    table.merge_cells(tbl, 1, 1, 2, 1)
+    
+    // Hurst Exponent
+    hurst_text = str.tostring(hurst_smooth, "#.###")
+    hurst_label = hurst_smooth >= hurst_trend_thresh ? "Trending" : hurst_smooth <= hurst_mr_thresh ? "Mean-Rev" : "Random"
+    table.cell(tbl, 0, 2, "Hurst", text_color=color.gray, bgcolor=color.new(#0f3460, 0), text_size=tbl_size)
+    table.cell(tbl, 1, 2, hurst_text, text_color=hurst_col, bgcolor=color.new(#0f3460, 0), text_size=tbl_size)
+    table.cell(tbl, 2, 2, hurst_label, text_color=hurst_col, bgcolor=color.new(#0f3460, 0), text_size=tbl_size)
+    
+    // ADX
+    adx_text = str.tostring(adx_val, "#.#")
+    adx_label = adx_val >= adx_strong_thresh ? "Strong" : adx_val >= adx_trend_thresh ? "Trend" : "Weak"
+    table.cell(tbl, 0, 3, "ADX", text_color=color.gray, bgcolor=color.new(#16213e, 0), text_size=tbl_size)
+    table.cell(tbl, 1, 3, adx_text, text_color=adx_col, bgcolor=color.new(#16213e, 0), text_size=tbl_size)
+    table.cell(tbl, 2, 3, adx_label, text_color=adx_col, bgcolor=color.new(#16213e, 0), text_size=tbl_size)
+    
+    // Choppiness Index
+    chop_text = str.tostring(chop, "#.#")
+    chop_label = chop >= chop_range_thresh ? "Choppy" : chop <= 38.2 ? "Trending" : "Normal"
+    table.cell(tbl, 0, 4, "CHOP", text_color=color.gray, bgcolor=color.new(#0f3460, 0), text_size=tbl_size)
+    table.cell(tbl, 1, 4, chop_text, text_color=chop_col, bgcolor=color.new(#0f3460, 0), text_size=tbl_size)
+    table.cell(tbl, 2, 4, chop_label, text_color=chop_col, bgcolor=color.new(#0f3460, 0), text_size=tbl_size)
+    
+    // Volatility Regime
+    vol_text = str.tostring(vol_pct_rank, "#.#") + "%"
+    vol_label = is_high_vol ? "⚡ HIGH" : is_low_vol ? "🔵 LOW" : "Normal"
+    table.cell(tbl, 0, 5, "Vol%", text_color=color.gray, bgcolor=color.new(#16213e, 0), text_size=tbl_size)
+    table.cell(tbl, 1, 5, vol_text, text_color=vol_col, bgcolor=color.new(#16213e, 0), text_size=tbl_size)
+    table.cell(tbl, 2, 5, vol_label, text_color=vol_col, bgcolor=color.new(#16213e, 0), text_size=tbl_size)
+    
+    // Direction
+    dir_col = direction > 0 ? col_bull_trend : direction < 0 ? col_bear_trend : col_ranging
+    dir_text = direction > 0.5 ? "▲ Bullish" : direction > 0 ? "▲ Lean Bull" : direction < -0.5 ? "▼ Bearish" : direction < 0 ? "▼ Lean Bear" : "◆ Neutral"
+    table.cell(tbl, 0, 6, "Direction", text_color=color.gray, bgcolor=color.new(#0f3460, 0), text_size=tbl_size)
+    table.cell(tbl, 1, 6, dir_text, text_color=dir_col, bgcolor=color.new(#0f3460, 0), text_size=tbl_size)
+    table.merge_cells(tbl, 1, 6, 2, 6)
+    
+    // ATR Value
+    table.cell(tbl, 0, 7, "ATR", text_color=color.gray, bgcolor=color.new(#16213e, 0), text_size=tbl_size)
+    table.cell(tbl, 1, 7, str.tostring(atr_val, "#.####"), text_color=color.white, bgcolor=color.new(#16213e, 0), text_size=tbl_size)
+    table.merge_cells(tbl, 1, 7, 2, 7)
+    
+    // Composite Score
+    table.cell(tbl, 0, 8, "Score", text_color=color.gray, bgcolor=color.new(#0f3460, 0), text_size=tbl_size)
+    table.cell(tbl, 1, 8, str.tostring(composite, "#"), text_color=comp_col, bgcolor=color.new(#0f3460, 0), text_size=tbl_size)
+    table.cell(tbl, 2, 8, composite >= 5 ? "Strong" : composite >= 3 ? "Moderate" : composite >= 0 ? "Weak" : "Counter", text_color=comp_col, bgcolor=color.new(#0f3460, 0), text_size=tbl_size)
+    
+    // Strategy suggestion
+    strat_text = switch regime
+        REGIME_STRONG_BULL  => "💡 Trend follow long, trail stops"
+        REGIME_BULL         => "💡 Look for pullback longs"
+        REGIME_WEAK_BULL    => "💡 Small longs, tight stops"
+        REGIME_WEAK_BEAR    => "💡 Small shorts, tight stops"
+        REGIME_BEAR         => "💡 Look for pullback shorts"
+        REGIME_STRONG_BEAR  => "💡 Trend follow short, trail stops"
+        REGIME_RANGING      => "💡 Range trade: buy support, sell resistance"
+        REGIME_MEAN_REV     => "💡 Fade extremes, RSI reversals"
+        REGIME_COMPRESSION  => "💡 ⚠ Breakout imminent — prepare for expansion"
+        => ""
+    
+    table.cell(tbl, 0, 9, strat_text, text_color=color.new(color.white, 20), bgcolor=color.new(#1a1a2e, 0), text_size=size.small)
+    table.merge_cells(tbl, 0, 9, 2, 9)
+
+
+// ============================================================================
+// ALERTS
+// ============================================================================
+
+// Regime change alerts
+alertcondition(regime_changed and (regime == REGIME_STRONG_BULL or regime == REGIME_BULL), "Bull Regime Detected", "🟢 Market shifted to BULLISH regime on {{ticker}} {{interval}}")
+alertcondition(regime_changed and (regime == REGIME_STRONG_BEAR or regime == REGIME_BEAR), "Bear Regime Detected", "🔴 Market shifted to BEARISH regime on {{ticker}} {{interval}}")
+alertcondition(regime_changed and regime == REGIME_RANGING, "Ranging Regime Detected", "🟡 Market shifted to RANGING regime on {{ticker}} {{interval}}")
+alertcondition(regime_changed and regime == REGIME_MEAN_REV, "Mean Reversion Regime Detected", "🟣 Market shifted to MEAN-REVERTING regime on {{ticker}} {{interval}}")
+alertcondition(regime_changed and regime == REGIME_COMPRESSION, "Compression Detected", "🔵 Market entered COMPRESSION (low vol squeeze) on {{ticker}} {{interval}} — breakout imminent!")
+
+// Volatility alerts
+alertcondition(is_high_vol and not is_high_vol[1], "Volatility Spike", "⚡ Volatility spike detected on {{ticker}} {{interval}}")
+alertcondition(is_low_vol and not is_low_vol[1], "Volatility Compression", "🔵 Volatility compression detected on {{ticker}} {{interval}}")
+
+// Any regime change
+alertcondition(regime_changed, "Any Regime Change", "📊 Regime changed on {{ticker}} {{interval}}")
+
+
+// ============================================================================
+// PLOTS (for use in other indicators/strategies)
+// ============================================================================
+
+plot(hurst_smooth, "Hurst Exponent", display=display.data_window, color=hurst_col)
+plot(adx_val, "ADX", display=display.data_window, color=adx_col)
+plot(chop, "Choppiness Index", display=display.data_window, color=chop_col)
+plot(vol_pct_rank, "Volatility Percentile", display=display.data_window, color=vol_col)
+plot(composite, "Composite Score", display=display.data_window, color=comp_col)
+plot(regime, "Regime (numeric)", display=display.data_window)

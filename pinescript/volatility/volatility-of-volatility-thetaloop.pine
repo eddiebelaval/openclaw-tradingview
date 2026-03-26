@@ -1,0 +1,139 @@
+//@version=6
+indicator("Volatility of Volatility [ThetaLoop]", shorttitle="VoV", overlay=false, precision=2)
+
+// ═══════════════════════════════════════════════════════════════
+//  VOLATILITY OF VOLATILITY (VoV) OSCILLATOR
+//  by ThetaLoop Research
+//
+//  How stable is volatility itself? A calm VIX at 20 means
+//  nothing if it was at 12 last week and 28 the week before.
+//  This indicator measures the second derivative of risk:
+//  not how volatile the asset is, but how volatile the
+//  volatility is.
+// ═══════════════════════════════════════════════════════════════
+
+// ─── INPUTS ───────────────────────────────────────────────────
+grp_rv   = "Realized Volatility"
+rv_len   = input.int(20, "RV Window",  minval=5,  maxval=100, group=grp_rv,
+                     tooltip="Window for realized volatility calculation (trading days). 20 = ~1 month.")
+rv_type  = input.string("Close-to-Close", "RV Estimator", 
+                        options=["Close-to-Close", "Parkinson"], group=grp_rv,
+                        tooltip="Parkinson uses High-Low range — more efficient estimator, less noise.")
+
+grp_vov  = "VoV Settings"
+vov_len  = input.int(60, "VoV Window", minval=20, maxval=252, group=grp_vov,
+                     tooltip="Window for measuring volatility OF volatility. 60 = ~3 months.")
+
+grp_norm = "Normalization"
+norm_mode = input.string("Z-Score", "Display Mode", 
+                         options=["Z-Score", "Raw", "Percentile"], group=grp_norm,
+                         tooltip="Z-Score: deviation from mean. Percentile: rank 0-100. Raw: unnormalized stdev.")
+
+grp_lvl  = "Threshold Levels"
+upper_alert = input.float(2.0,  "Unstable (upper)", minval=0.5, step=0.25, group=grp_lvl)
+upper_warn  = input.float(1.0,  "Elevated (upper)",  minval=0.5, step=0.25, group=grp_lvl)
+lower_calm  = input.float(-1.0, "Calm (lower)",      maxval=0.0, step=0.25, group=grp_lvl)
+
+// ─── REALIZED VOLATILITY ─────────────────────────────────────
+// Close-to-Close: standard log return stdev, annualized
+float log_ret = math.log(close / close[1])
+float rv_cc = ta.stdev(log_ret, rv_len) * math.sqrt(252)
+
+// Parkinson: uses high-low range — ~5x more efficient than close-to-close
+float hl_log = math.log(high / low)
+float parkinson_var = ta.sma(hl_log * hl_log, rv_len) / (4.0 * math.log(2))
+float rv_park = math.sqrt(parkinson_var * 252)
+
+float rv = rv_type == "Parkinson" ? rv_park : rv_cc
+
+// ─── VOLATILITY OF VOLATILITY ────────────────────────────────
+float vov_raw = ta.stdev(rv, vov_len)
+float vov_mean = ta.sma(rv, vov_len)
+float vov_stdev = ta.stdev(rv, vov_len)
+
+// Coefficient of Variation as raw VoV (stdev / mean, unitless)
+float vov_cv = vov_mean != 0 ? vov_raw / vov_mean : 0.0
+
+// Z-Score of VoV
+float vov_zscore_mean = ta.sma(vov_cv, vov_len)
+float vov_zscore_std  = ta.stdev(vov_cv, vov_len)
+float vov_zscore = vov_zscore_std != 0 ? (vov_cv - vov_zscore_mean) / vov_zscore_std : 0.0
+
+// Percentile (rank over lookback)
+var array<float> vov_history = array.new_float(0)
+float vov_pct = 50.0
+
+if not na(vov_cv)
+    array.push(vov_history, vov_cv)
+    if array.size(vov_history) > 252
+        array.shift(vov_history)
+    
+    if array.size(vov_history) > 20
+        int count_below = 0
+        int total = array.size(vov_history)
+        for i = 0 to total - 1
+            if array.get(vov_history, i) < vov_cv
+                count_below += 1
+        vov_pct := (count_below / total) * 100.0
+
+// Select display mode
+float vov_display = norm_mode == "Z-Score" ? vov_zscore : norm_mode == "Percentile" ? vov_pct : vov_cv
+
+// ─── COLORS ───────────────────────────────────────────────────
+color col_unstable = color.new(color.red,    0)
+color col_elevated = color.new(color.orange, 0)
+color col_normal   = color.new(color.teal,   0)
+color col_calm     = color.new(color.green,  0)
+
+color bar_col = col_normal
+if norm_mode == "Percentile"
+    bar_col := vov_pct > 85 ? col_unstable : vov_pct > 65 ? col_elevated : vov_pct < 25 ? col_calm : col_normal
+else
+    bar_col := vov_display > upper_alert ? col_unstable : vov_display > upper_warn ? col_elevated : vov_display < lower_calm ? col_calm : col_normal
+
+// ─── PLOTS ────────────────────────────────────────────────────
+plot(vov_display, "VoV", color=bar_col, linewidth=2)
+plot(ta.ema(vov_display, 5), "Smoothed (EMA5)", color=color.new(color.white, 60), linewidth=1)
+
+// Reference lines (only for Z-Score mode)
+hline(0, "Zero", color=color.new(color.gray, 50), linewidth=1)
+
+h_alert = hline(norm_mode == "Z-Score" ? upper_alert : norm_mode == "Percentile" ? 85 : na, 
+                "Unstable", color=color.new(color.red, 50), linewidth=1, linestyle=hline.style_dashed)
+h_warn  = hline(norm_mode == "Z-Score" ? upper_warn : norm_mode == "Percentile" ? 65 : na,  
+                "Elevated", color=color.new(color.orange, 60), linewidth=1, linestyle=hline.style_dotted)
+h_calm  = hline(norm_mode == "Z-Score" ? lower_calm : norm_mode == "Percentile" ? 25 : na,  
+                "Calm",     color=color.new(color.green, 60), linewidth=1, linestyle=hline.style_dotted)
+
+// ─── INFO TABLE ───────────────────────────────────────────────
+var table t = table.new(position.top_right, 2, 5,
+     bgcolor=color.new(color.black, 70), border_width=1, border_color=color.new(color.gray, 60))
+
+string regime = "NORMAL"
+if norm_mode == "Percentile"
+    regime := vov_pct > 85 ? "UNSTABLE" : vov_pct > 65 ? "ELEVATED" : vov_pct < 25 ? "CALM" : "NORMAL"
+else
+    regime := vov_display > upper_alert ? "UNSTABLE" : vov_display > upper_warn ? "ELEVATED" : vov_display < lower_calm ? "CALM" : "NORMAL"
+
+// Theta seller guidance
+string theta_signal = regime == "CALM" ? "SELL PREMIUM" : regime == "NORMAL" ? "STANDARD" : regime == "ELEVATED" ? "REDUCE SIZE" : "STEP ASIDE"
+
+color regime_col = regime == "UNSTABLE" ? col_unstable : regime == "ELEVATED" ? col_elevated : regime == "CALM" ? col_calm : col_normal
+
+if barstate.islast
+    table.cell(t, 0, 0, "Theta",    text_color=color.gray,  text_size=size.small)
+    table.cell(t, 1, 0, theta_signal, text_color=regime_col, text_size=size.normal)
+    table.cell(t, 0, 1, "Regime",   text_color=color.gray,  text_size=size.small)
+    table.cell(t, 1, 1, regime,     text_color=regime_col,   text_size=size.small)
+    table.cell(t, 0, 2, "VoV",      text_color=color.gray,  text_size=size.small)
+    table.cell(t, 1, 2, str.tostring(vov_display, "#.##"),
+               text_color=regime_col, text_size=size.small)
+    table.cell(t, 0, 3, "RV",       text_color=color.gray,  text_size=size.small)
+    table.cell(t, 1, 3, str.tostring(rv * 100, "#.#") + "%",
+               text_color=color.white, text_size=size.small)
+    table.cell(t, 0, 4, "Estimator", text_color=color.gray, text_size=size.small)
+    table.cell(t, 1, 4, rv_type,    text_color=color.white,  text_size=size.small)
+
+// ─── ALERTS ───────────────────────────────────────────────────
+alertcondition(vov_zscore > upper_alert, "VoV Unstable",  "Volatility of Volatility is unstable — vol regime unreliable")
+alertcondition(vov_zscore < lower_calm,  "VoV Calm",      "Volatility of Volatility is calm — stable regime for premium selling")

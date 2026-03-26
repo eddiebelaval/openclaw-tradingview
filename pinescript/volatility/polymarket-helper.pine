@@ -1,0 +1,869 @@
+//@version=6
+indicator("Polymarket Helper", shorttitle="POLYH", overlay=true)
+
+// ════════════════════════════════════════════════════════════════════════════
+// INPUTS — General
+// ════════════════════════════════════════════════════════════════════════════
+refTF         = input.timeframe("5",  "Reference Timeframe",                              group="Settings")
+subTF1        = input.timeframe("1",  "POLY1 Sub TF 1",                                   group="Settings")
+subTF2        = input.timeframe("3",  "POLY1 Sub TF 2",                                   group="Settings")
+minConfidence = input.int(50,  "Min Confidence for Arrow (%)", minval=50, maxval=95,       group="Settings")
+showForecast  = input.bool(true, "Show 3-Candle Forecast",                                 group="Settings")
+fcBarSize     = input.int(3,   "Forecast Candle Width (Bars)", minval=1, maxval=10,        group="Settings")
+showLines     = input.bool(true, "Show Open + Price Lines",                                group="Settings")
+showConnector = input.bool(true, "Show Connector",                                         group="Settings")
+lineCol       = input.color(color.blue, "Open Line Color",                                 group="Settings")
+currLineColor = input.color(color.teal, "Price Line Color",                                group="Settings")
+currLineWidth = input.int(1, "Price Line Width", minval=1, maxval=4,                       group="Settings")
+
+// ── Signal Tier Colors ────────────────────────────────────────────────────
+t1BullCol = input.color(color.new(#4fc3f7, 30), "Tier 1 Bull (50–59%)  Dim Blue",         group="Signal Tiers")
+t2BullCol = input.color(color.new(#00e5ff, 15), "Tier 2 Bull (60–69%)  Cyan",             group="Signal Tiers")
+t3BullCol = input.color(color.new(#00ff9f, 10), "Tier 3 Bull (70–79%)  Lime",             group="Signal Tiers")
+t4BullCol = input.color(color.new(#ffffff,  0), "Tier 4 Bull (80%+)    White/Hot",        group="Signal Tiers")
+t1BearCol = input.color(color.new(#ce93d8, 30), "Tier 1 Bear (50–59%)  Dim Purple",       group="Signal Tiers")
+t2BearCol = input.color(color.new(#ff80ab, 15), "Tier 2 Bear (60–69%)  Pink",             group="Signal Tiers")
+t3BearCol = input.color(color.new(#ff1744, 10), "Tier 3 Bear (70–79%)  Red",              group="Signal Tiers")
+t4BearCol = input.color(color.new(#ff6d00,  0), "Tier 4 Bear (80%+)    Orange/Hot",       group="Signal Tiers")
+
+// TABLE POSITIONS
+poly1_tbl_pos = input.string("Top Right",    "POLY1 Lite Table Position",
+     ["Top Right","Top Left","Bottom Right","Bottom Left","Top Center","Bottom Center"],    group="Table Positions")
+
+// POLY1
+pred_seconds  = input.int(25, "Signal fires X seconds after candle open", minval=5, maxval=60, group="POLY1 Settings")
+pred_threshold= input.float(5.0, "POLY1 Min IVD Delta % to Predict", minval=1.0, step=0.5,    group="POLY1 Settings")
+
+// POLY1 Weights
+w_ivd     = input.float(0.25, "① IVD Delta",         minval=0.0, maxval=1.0, step=0.01, group="POLY1 Weights")
+w_m1dv    = input.float(0.22, "② 1m Delta Volume",   minval=0.0, maxval=1.0, step=0.01, group="POLY1 Weights")
+w_conv    = input.float(0.18, "③ 1m+3m Convergence", minval=0.0, maxval=1.0, step=0.01, group="POLY1 Weights")
+w_m1dir   = input.float(0.10, "④ 1m Direction",      minval=0.0, maxval=1.0, step=0.01, group="POLY1 Weights")
+w_poc     = input.float(0.08, "⑤ POC Position",      minval=0.0, maxval=1.0, step=0.01, group="POLY1 Weights")
+w_micro   = input.float(0.07, "⑥ Micro-Trend",       minval=0.0, maxval=1.0, step=0.01, group="POLY1 Weights")
+w_vpt     = input.float(0.05, "⑦ VPT Power",         minval=0.0, maxval=1.0, step=0.01, group="POLY1 Weights")
+w_m1accel = input.float(0.03, "⑧ 1m OBV Accel",     minval=0.0, maxval=1.0, step=0.01, group="POLY1 Weights")
+w_close_w = input.float(0.02, "⑨ Close Position",    minval=0.0, maxval=1.0, step=0.01, group="POLY1 Weights")
+
+// ── IVD Enhanced Settings ─────────────────────────────────────────────────
+ivd_decay     = input.float(0.75, "IVD Decay Factor (recent bias)", minval=0.5, maxval=0.99, step=0.01, group="IVD Settings",
+     tooltip="Higher = more weight on recent ticks. 0.75 means newest tick counts 4x more than oldest.")
+ivd_smooth    = input.int(3,  "IVD Noise Filter (ticks)", minval=1, maxval=10,              group="IVD Settings",
+     tooltip="Smoothing window over intra-bar ticks to filter micro-spikes.")
+ivd_vs_prev   = input.bool(true, "Compare IVD vs 10-Candle Average",                         group="IVD Settings",
+     tooltip="Compares current IVD Buy% against the rolling average of the last 10 closed candles. More stable baseline than single previous candle.")
+
+// ── Signal Arrow Filter ───────────────────────────────────────────────────
+sig_ivd_thresh = input.int(70, "Signal Arrow IVD Filter (0 = OFF)", minval=0, maxval=90, step=5, group="IVD Settings",
+     tooltip="Arrows only fire when IVD Buy% exceeds this threshold. 0 = show all signals. 70 = only high-conviction signals.")
+
+
+// ════════════════════════════════════════════════════════════════════════════
+// HELPERS
+// ════════════════════════════════════════════════════════════════════════════
+f_pos(s) =>
+    switch s
+        "Top Right"    => position.top_right
+        "Top Left"     => position.top_left
+        "Bottom Right" => position.bottom_right
+        "Bottom Left"  => position.bottom_left
+        "Top Center"   => position.top_center
+        => position.bottom_center
+
+
+// ════════════════════════════════════════════════════════════════════════════
+// OBV-PVT SIGNALS — 4-Tier Color + Size Coded
+// ════════════════════════════════════════════════════════════════════════════
+float change_src = ta.change(close)
+float i_obv      = ta.cum(change_src > 0 ? volume : change_src < 0 ? -volume : 0.0)
+float i_pvt      = ta.pvt
+float res_main   = i_obv - i_pvt
+float mom_main   = res_main - nz(res_main[1])
+bool  isUpOBV    = mom_main >= 0
+int   isUpOBV_i  = isUpOBV ? 1 : 0
+bool  dirChanged = isUpOBV_i != nz(isUpOBV_i[1], isUpOBV_i)
+
+float obvStrength = math.abs(mom_main) / math.max(math.abs(ta.sma(mom_main, 20)), 1.0)
+color obvUpCol = obvStrength >= 2.0 ? t4BullCol : obvStrength >= 1.0 ? t3BullCol : obvStrength >= 0.5 ? t2BullCol : t1BullCol
+color obvDnCol = obvStrength >= 2.0 ? t4BearCol : obvStrength >= 1.0 ? t3BearCol : obvStrength >= 0.5 ? t2BearCol : t1BearCol
+
+plotshape(dirChanged and isUpOBV and obvStrength < 0.5,
+     title="OBV UP Weak",   text="UP", location=location.belowbar,
+     color=t1BullCol, textcolor=color.white, style=shape.labelup, size=size.tiny)
+plotshape(dirChanged and isUpOBV and obvStrength >= 0.5 and obvStrength < 2.0,
+     title="OBV UP Mid",    text="UP", location=location.belowbar,
+     color=t2BullCol, textcolor=color.white, style=shape.labelup, size=size.small)
+plotshape(dirChanged and isUpOBV and obvStrength >= 2.0,
+     title="OBV UP Strong", text="UP", location=location.belowbar,
+     color=t4BullCol, textcolor=color.white, style=shape.labelup, size=size.normal)
+plotshape(dirChanged and not isUpOBV and obvStrength < 0.5,
+     title="OBV DOWN Weak",   text="DOWN", location=location.abovebar,
+     color=t1BearCol, textcolor=color.white, style=shape.labeldown, size=size.tiny)
+plotshape(dirChanged and not isUpOBV and obvStrength >= 0.5 and obvStrength < 2.0,
+     title="OBV DOWN Mid",    text="DOWN", location=location.abovebar,
+     color=t2BearCol, textcolor=color.white, style=shape.labeldown, size=size.small)
+plotshape(dirChanged and not isUpOBV and obvStrength >= 2.0,
+     title="OBV DOWN Strong", text="DOWN", location=location.abovebar,
+     color=t4BearCol, textcolor=color.white, style=shape.labeldown, size=size.normal)
+
+
+// ════════════════════════════════════════════════════════════════════════════
+// MTF FUNCTIONS
+// ════════════════════════════════════════════════════════════════════════════
+f_tf_price() =>
+    float pchg    = nz(open) != 0.0 ? (close - open) / open * 100.0 : 0.0
+    float rng     = high - low
+    float bodyPct = rng != 0.0 ? math.abs(close - open) / rng : 0.0
+    [open, close, high, low, volume, pchg, bodyPct]
+
+f_tf_obv() =>
+    float ch      = ta.change(close)
+    float obv     = ta.cum(ch > 0 ? volume : ch < 0 ? -volume : 0.0)
+    float pvt     = ta.pvt
+    float res     = obv - pvt
+    float mom     = res - nz(res[1])
+    float spread  = high - low
+    float buyVol  = spread > 0 ? volume * (close - low)  / spread : volume * 0.5
+    float sellVol = spread > 0 ? volume * (high - close) / spread : volume * 0.5
+    [res, mom, buyVol - sellVol, buyVol, sellVol]
+
+[o5, c5, h5, l5, v5, pchg5, bodyPct5]     = request.security(syminfo.tickerid, refTF, f_tf_price(), lookahead=barmerge.lookahead_on)
+[res5, mom5, deltaVol5, buyVol5, sellVol5] = request.security(syminfo.tickerid, refTF, f_tf_obv(),   lookahead=barmerge.lookahead_on)
+open5 = request.security(syminfo.tickerid, refTF, open, lookahead=barmerge.lookahead_on)
+time5 = request.security(syminfo.tickerid, refTF, time, lookahead=barmerge.lookahead_on)
+
+
+// ════════════════════════════════════════════════════════════════════════════
+// POLYMARKET — 100-CANDLE LOOP
+// ════════════════════════════════════════════════════════════════════════════
+int   LB               = 100
+float avgDeltaVol      = 0.0
+float posDelCnt        = 0.0
+float posDelTotal      = 0.0
+float negDelCnt        = 0.0
+float negDelTotal      = 0.0
+float simCount         = 0.0
+float simGreen         = 0.0
+float simObvUp         = 0.0
+float totalGreen       = 0.0
+float totalObvUp       = 0.0
+float sumGreenChg      = 0.0
+float sumRedChg        = 0.0
+float greenCnt         = 0.0
+float redCnt           = 0.0
+float strongGreen      = 0.0
+float weakGreen        = 0.0
+float strongRed        = 0.0
+float weakRed          = 0.0
+float avgObvMom        = 0.0
+float greenFollowGreen = 0.0
+float redFollowGreen   = 0.0
+float revAfterGreen    = 0.0
+float revAfterRed      = 0.0
+float revAfterHighBody = 0.0
+float revAfterLowBody  = 0.0
+float revAfterPosDelta = 0.0
+float revAfterNegDelta = 0.0
+float revAfterObvDiv   = 0.0
+float highBodyCnt      = 0.0
+float lowBodyCnt       = 0.0
+float posDeltaCnt      = 0.0
+float negDeltaCnt      = 0.0
+float obvDivCnt        = 0.0
+float sumPchgAbs       = 0.0
+float curPchg          = pchg5
+
+for i = 1 to LB
+    float pc     = pchg5[i]
+    float mo     = mom5[i]
+    float bp     = bodyPct5[i]
+    float dv     = deltaVol5[i]
+    bool  isGr   = c5[i]     > o5[i]
+    bool  wasGr  = c5[i + 1] > o5[i + 1]
+    bool  nextGr = i > 1 ? c5[i - 1] > o5[i - 1] : isGr
+    bool  moUp   = mo >= 0
+
+    totalGreen  += isGr ? 1.0 : 0.0
+    totalObvUp  += moUp ? 1.0 : 0.0
+    avgObvMom   += mo
+    avgDeltaVol += dv
+    sumPchgAbs  += math.abs(pc)
+
+    if math.abs(pc - curPchg) <= 0.15
+        simCount += 1.0
+        simGreen += isGr ? 1.0 : 0.0
+        simObvUp += moUp ? 1.0 : 0.0
+
+    if pc > 0.2
+        strongGreen += 1.0
+    else if pc > 0.0
+        weakGreen   += 1.0
+    else if pc < -0.2
+        strongRed   += 1.0
+    else
+        weakRed     += 1.0
+
+    if isGr
+        sumGreenChg += pc
+        greenCnt    += 1.0
+    else
+        sumRedChg   += pc
+        redCnt      += 1.0
+
+    if wasGr
+        greenFollowGreen += isGr ? 1.0 : 0.0
+    else
+        redFollowGreen   += isGr ? 1.0 : 0.0
+
+    if dv > 0
+        posDelTotal += 1.0
+        posDelCnt   += isGr ? 1.0 : 0.0
+    else
+        negDelTotal += 1.0
+        negDelCnt   += not isGr ? 1.0 : 0.0
+
+    if isGr
+        revAfterGreen += not nextGr ? 1.0 : 0.0
+    else
+        revAfterRed   += nextGr ? 1.0 : 0.0
+
+    if bp > 0.70
+        highBodyCnt      += 1.0
+        revAfterHighBody += (isGr and not nextGr) or (not isGr and nextGr) ? 1.0 : 0.0
+
+    if bp < 0.30
+        lowBodyCnt      += 1.0
+        revAfterLowBody += (isGr and not nextGr) or (not isGr and nextGr) ? 1.0 : 0.0
+
+    if dv > 0 and not isGr
+        posDeltaCnt      += 1.0
+        revAfterPosDelta += nextGr ? 1.0 : 0.0
+
+    if dv < 0 and isGr
+        negDeltaCnt      += 1.0
+        revAfterNegDelta += not nextGr ? 1.0 : 0.0
+
+    if isGr and not moUp
+        obvDivCnt      += 1.0
+        revAfterObvDiv += not nextGr ? 1.0 : 0.0
+
+avgObvMom   := avgObvMom   / LB
+avgDeltaVol := avgDeltaVol / LB
+float avgPchgAbs    = sumPchgAbs / LB
+float baseGreenRate = totalGreen / LB
+float avgGreenChg   = greenCnt > 0 ? sumGreenChg / greenCnt : 0.0
+float avgRedChg     = redCnt   > 0 ? sumRedChg   / redCnt   : 0.0
+float simGreenRate  = simCount > 3 ? simGreen / simCount : baseGreenRate
+float simObvRate    = simCount > 3 ? simObvUp / simCount : totalObvUp / LB
+float gfg           = greenCnt > 0 ? greenFollowGreen / greenCnt : 0.5
+float rfg           = redCnt   > 0 ? redFollowGreen   / redCnt   : 0.5
+float dvBullRel     = posDelTotal > 0 ? posDelCnt / posDelTotal : 0.5
+float dvBearRel     = negDelTotal > 0 ? negDelCnt / negDelTotal : 0.5
+float revRateGreen  = greenCnt    > 0 ? revAfterGreen    / greenCnt    : 0.5
+float revRateRed    = redCnt      > 0 ? revAfterRed      / redCnt      : 0.5
+float revRateHB     = highBodyCnt > 0 ? revAfterHighBody / highBodyCnt : 0.5
+float revRateLB     = lowBodyCnt  > 0 ? revAfterLowBody  / lowBodyCnt  : 0.5
+float revRatePD     = posDeltaCnt > 0 ? revAfterPosDelta / posDeltaCnt : 0.5
+float revRateND     = negDeltaCnt > 0 ? revAfterNegDelta / negDeltaCnt : 0.5
+float revRateOD     = obvDivCnt   > 0 ? revAfterObvDiv   / obvDivCnt   : 0.5
+
+
+// ════════════════════════════════════════════════════════════════════════════
+// POLYMARKET — DELTA VOL LIVE + PROBABILITY
+// ════════════════════════════════════════════════════════════════════════════
+float curDelta    = deltaVol5
+float curBuy      = buyVol5
+float curSell     = sellVol5
+float dvRatio     = (curBuy + curSell) > 0 ? curBuy / (curBuy + curSell) : 0.5
+float dvLiveScore = dvRatio > 0.6 ? 1.0 : dvRatio > 0.5 ? 0.7 : dvRatio > 0.4 ? 0.4 : 0.1
+float dvVsAvg     = curDelta > avgDeltaVol ? 1.0 : curDelta > 0 ? 0.6 : 0.3
+float dvHistScore = curDelta > 0 ? dvBullRel : 1.0 - dvBearRel
+
+float pchgMomScore  = curPchg > avgGreenChg ? 1.0 : curPchg > 0.0 ? 0.6 : curPchg > avgRedChg ? 0.4 : 0.0
+float obvMomScore   = mom5 > avgObvMom ? 1.0 : mom5 >= 0 ? 0.6 : mom5 > avgObvMom * 0.5 ? 0.3 : 0.0
+float totalMoves    = strongGreen + weakGreen + strongRed + weakRed
+float greenStrRat   = totalMoves > 0 ? (strongGreen + weakGreen) / totalMoves : 0.5
+float strengthScore = greenStrRat > 0.5 ? 1.0 : greenStrRat == 0.5 ? 0.5 : 0.0
+float obvAccelScore = mom5 > nz(mom5[1]) and mom5[1] > nz(mom5[2]) ? 1.0 : mom5 > nz(mom5[1]) ? 0.65 : 0.0
+float liveScore     = c5 > o5 ? 1.0 : 0.5
+
+float streak = 0.0
+for i = 1 to 5
+    streak += c5[i] > o5[i] ? 1.0 : 0.0
+float streakScore = streak / 5.0
+
+float rawProb   = simGreenRate * 0.20 + simObvRate * 0.15 + pchgMomScore * 0.12 + obvMomScore * 0.12 + strengthScore * 0.08 + obvAccelScore * 0.06 + liveScore * 0.04 + streakScore * 0.03 + dvLiveScore * 0.10 + dvVsAvg * 0.05 + dvHistScore * 0.05
+float greenProb  = math.round(rawProb * 100.0)
+float redProb    = 100.0 - greenProb
+float confidence = math.round(math.abs(greenProb - 50.0) * 2.0)
+bool  isBull     = greenProb >= 60
+bool  isBear     = greenProb <= 40
+
+
+// ════════════════════════════════════════════════════════════════════════════
+// POLYMARKET — REVERSION
+// ════════════════════════════════════════════════════════════════════════════
+bool  curIsGreen  = c5 > o5
+bool  curMoUp     = mom5 >= 0
+float curBodyPct  = bodyPct5
+float absPchg     = math.abs(curPchg)
+float extendScore = absPchg > avgPchgAbs * 1.5 ? 0.75 : absPchg > avgPchgAbs ? 0.55 : 0.35
+float baseRevRate = curIsGreen ? revRateGreen : revRateRed
+
+float rs = baseRevRate * 0.20
+float rw = 0.20
+rs += curBodyPct > 0.70 ? revRateHB * 0.20 : revRateLB * 0.10
+rw += curBodyPct > 0.70 ? 0.20 : 0.10
+
+if curDelta > 0 and not curIsGreen and posDeltaCnt > 3
+    rs += revRatePD * 0.25
+    rw += 0.25
+else if curDelta < 0 and curIsGreen and negDeltaCnt > 3
+    rs += revRateND * 0.25
+    rw += 0.25
+else
+    rs += 0.30 * 0.15
+    rw += 0.15
+
+if (curIsGreen and not curMoUp and obvDivCnt > 3) or (not curIsGreen and curMoUp and obvDivCnt > 3)
+    rs += revRateOD * 0.25
+    rw += 0.25
+else
+    rs += 0.25 * 0.15
+    rw += 0.15
+
+rs += extendScore * 0.10
+rw += 0.10
+
+float revProb  = rw > 0 ? math.round(rs / rw * 100.0) : 50.0
+float contProb = 100.0 - revProb
+string revBias = revProb >= 60 ? "REVERSAL" : revProb <= 40 ? "CONTINUATION" : "UNDECIDED"
+color  revColor = revProb >= 60 ? color.orange : revProb <= 40 ? color.aqua : color.gray
+
+
+// ════════════════════════════════════════════════════════════════════════════
+// POLYMARKET — FORECAST
+// ════════════════════════════════════════════════════════════════════════════
+float fc1Green = greenProb
+float fc1Red   = redProb
+float fc2Green = math.round(fc1Green / 100.0 * gfg * 100.0 + fc1Red / 100.0 * rfg * 100.0)
+float fc2Red   = 100.0 - fc2Green
+float fc3Green = math.round(fc2Green / 100.0 * gfg * 100.0 + fc2Red / 100.0 * rfg * 100.0)
+float fc3Red   = 100.0 - fc3Green
+string fc1Dir  = fc1Green >= 55 ? "▲ UP" : fc1Green <= 45 ? "▼ DN" : "— FLAT"
+string fc2Dir  = fc2Green >= 55 ? "▲ UP" : fc2Green <= 45 ? "▼ DN" : "— FLAT"
+string fc3Dir  = fc3Green >= 55 ? "▲ UP" : fc3Green <= 45 ? "▼ DN" : "— FLAT"
+
+
+// ════════════════════════════════════════════════════════════════════════════
+// BIAS ARROWS — 4-Tier Color + Size Coded by Confidence
+// ════════════════════════════════════════════════════════════════════════════
+bool newCandle = ta.change(time5) != 0
+bool highConf  = confidence >= minConfidence
+
+bool tier1 = confidence >= 50 and confidence < 60
+bool tier2 = confidence >= 60 and confidence < 70
+bool tier3 = confidence >= 70 and confidence < 80
+bool tier4 = confidence >= 80
+
+string sz1 = size.tiny
+string sz2 = size.small
+string sz3 = size.normal
+string sz4 = size.large
+
+// IVD filter — only fire arrows when IVD exceeds threshold (0 = OFF, show all)
+// p1_buy_per is declared later in POLY1 section — use a var mirror updated each bar
+var float p1_buy_per_arrow = 50.0
+float sig_bear_thresh = 100.0 - sig_ivd_thresh
+bool  ivd_bull_pass   = sig_ivd_thresh == 0 or p1_buy_per_arrow > sig_ivd_thresh
+bool  ivd_bear_pass   = sig_ivd_thresh == 0 or p1_buy_per_arrow < sig_bear_thresh
+
+plotshape(newCandle and isBull and tier1 and highConf and ivd_bull_pass,
+     title="Bull T1 (50-59%)", text="▲",
+     location=location.belowbar, color=t1BullCol, textcolor=color.new(color.white, 50),
+     style=shape.triangleup, size=sz1)
+plotshape(newCandle and isBull and tier2 and highConf and ivd_bull_pass,
+     title="Bull T2 (60-69%)", text="▲▲",
+     location=location.belowbar, color=t2BullCol, textcolor=color.new(color.white, 20),
+     style=shape.triangleup, size=sz2)
+plotshape(newCandle and isBull and tier3 and highConf and ivd_bull_pass,
+     title="Bull T3 (70-79%)", text="▲▲▲",
+     location=location.belowbar, color=t3BullCol, textcolor=color.white,
+     style=shape.triangleup, size=sz3)
+plotshape(newCandle and isBull and tier4 and highConf and ivd_bull_pass,
+     title="Bull T4 (80%+) 🔥", text="▲▲▲▲",
+     location=location.belowbar, color=t4BullCol, textcolor=color.new(#001a00, 0),
+     style=shape.triangleup, size=sz4)
+plotshape(newCandle and isBear and tier1 and highConf and ivd_bear_pass,
+     title="Bear T1 (50-59%)", text="▼",
+     location=location.abovebar, color=t1BearCol, textcolor=color.new(color.white, 50),
+     style=shape.triangledown, size=sz1)
+plotshape(newCandle and isBear and tier2 and highConf and ivd_bear_pass,
+     title="Bear T2 (60-69%)", text="▼▼",
+     location=location.abovebar, color=t2BearCol, textcolor=color.new(color.white, 20),
+     style=shape.triangledown, size=sz2)
+plotshape(newCandle and isBear and tier3 and highConf and ivd_bear_pass,
+     title="Bear T3 (70-79%)", text="▼▼▼",
+     location=location.abovebar, color=t3BearCol, textcolor=color.white,
+     style=shape.triangledown, size=sz3)
+plotshape(newCandle and isBear and tier4 and highConf and ivd_bear_pass,
+     title="Bear T4 (80%+) 🔥", text="▼▼▼▼",
+     location=location.abovebar, color=t4BearCol, textcolor=color.white,
+     style=shape.triangledown, size=sz4)
+
+
+// ════════════════════════════════════════════════════════════════════════════
+// OPEN / PRICE LINES
+// ════════════════════════════════════════════════════════════════════════════
+var line oLine    = na
+var line cLine    = na
+var line connLine = na
+
+if barstate.islast and showLines
+    float curr  = close
+    color cDiff = curr >= open5 ? color.lime : color.red
+    line.delete(oLine)
+    oLine := line.new(bar_index, open5, bar_index + 1, open5, xloc=xloc.bar_index, extend=extend.right, color=lineCol, width=1)
+    line.delete(cLine)
+    cLine := line.new(bar_index, curr, bar_index + 1, curr, xloc=xloc.bar_index, extend=extend.right, color=currLineColor, width=currLineWidth)
+    line.delete(connLine)
+    if showConnector
+        connLine := line.new(bar_index, open5, bar_index, curr, xloc=xloc.bar_index, color=cDiff, width=2, style=line.style_dotted)
+
+
+// ════════════════════════════════════════════════════════════════════════════
+// FORECAST CANDLES
+// ════════════════════════════════════════════════════════════════════════════
+var line  fc1Body = na
+var line  fc1Wick = na
+var line  fc2Body = na
+var line  fc2Wick = na
+var line  fc3Body = na
+var line  fc3Wick = na
+var label fc1Lbl  = na
+var label fc2Lbl  = na
+var label fc3Lbl  = na
+
+if barstate.islast and showForecast
+    float curr    = close
+    float avgBody = 0.0
+    for j = 1 to 10
+        avgBody += math.abs(c5[j] - o5[j])
+    avgBody := avgBody / 10.0
+    float wk = avgBody * 0.5
+
+    int x1s = bar_index + 3
+    int x1e = x1s + fcBarSize
+    int x2s = x1e + 2
+    int x2e = x2s + fcBarSize
+    int x3s = x2e + 2
+    int x3e = x3s + fcBarSize
+    int m1  = (x1s + x1e) / 2
+    int m2  = (x2s + x2e) / 2
+    int m3  = (x3s + x3e) / 2
+
+    float c1o = curr
+    float c1c = fc1Green >= 55 ? curr + avgBody : fc1Green <= 45 ? curr - avgBody : curr
+    float c2o = c1c
+    float c2c = fc2Green >= 55 ? c1c + avgBody : fc2Green <= 45 ? c1c - avgBody : c1c
+    float c3o = c2c
+    float c3c = fc3Green >= 55 ? c2c + avgBody : fc3Green <= 45 ? c2c - avgBody : c2c
+
+    color col1 = fc1Green >= 55 ? color.new(color.lime, 20) : fc1Green <= 45 ? color.new(color.red, 20) : color.new(color.gray, 40)
+    color col2 = fc2Green >= 55 ? color.new(color.lime, 20) : fc2Green <= 45 ? color.new(color.red, 20) : color.new(color.gray, 40)
+    color col3 = fc3Green >= 55 ? color.new(color.lime, 20) : fc3Green <= 45 ? color.new(color.red, 20) : color.new(color.gray, 40)
+
+    line.delete(fc1Body)
+    line.delete(fc1Wick)
+    fc1Body := line.new(x1s, c1o, x1e, c1c, xloc=xloc.bar_index, color=col1, width=fcBarSize * 2)
+    fc1Wick := line.new(m1, math.min(c1o, c1c) - wk, m1, math.max(c1o, c1c) + wk, xloc=xloc.bar_index, color=col1, width=1)
+    label.delete(fc1Lbl)
+    fc1Lbl  := label.new(m1, math.max(c1o, c1c) + wk, str.tostring(int(fc1Green)) + "%",
+         xloc=xloc.bar_index, color=color.new(color.black, 60), textcolor=col1, style=label.style_label_down, size=size.tiny)
+
+    line.delete(fc2Body)
+    line.delete(fc2Wick)
+    fc2Body := line.new(x2s, c2o, x2e, c2c, xloc=xloc.bar_index, color=col2, width=fcBarSize * 2)
+    fc2Wick := line.new(m2, math.min(c2o, c2c) - wk, m2, math.max(c2o, c2c) + wk, xloc=xloc.bar_index, color=col2, width=1)
+    label.delete(fc2Lbl)
+    fc2Lbl  := label.new(m2, math.max(c2o, c2c) + wk, str.tostring(int(fc2Green)) + "%",
+         xloc=xloc.bar_index, color=color.new(color.black, 60), textcolor=col2, style=label.style_label_down, size=size.tiny)
+
+    line.delete(fc3Body)
+    line.delete(fc3Wick)
+    fc3Body := line.new(x3s, c3o, x3e, c3c, xloc=xloc.bar_index, color=col3, width=fcBarSize * 2)
+    fc3Wick := line.new(m3, math.min(c3o, c3c) - wk, m3, math.max(c3o, c3c) + wk, xloc=xloc.bar_index, color=col3, width=1)
+    label.delete(fc3Lbl)
+    fc3Lbl  := label.new(m3, math.max(c3o, c3c) + wk, str.tostring(int(fc3Green)) + "%",
+         xloc=xloc.bar_index, color=color.new(color.black, 60), textcolor=col3, style=label.style_label_down, size=size.tiny)
+
+
+// ════════════════════════════════════════════════════════════════════════════
+// POLY1 LITE — SCORES
+// ════════════════════════════════════════════════════════════════════════════
+
+// ── ENHANCED IVD ENGINE ───────────────────────────────────────────────────
+// Pull intra-bar ticks via security_lower_tf
+float time_  = timeframe.in_seconds("") / 60
+float div_   = time_ <= 15 ? time_ : time_ >= 60 ? 30 : 20
+string itf_  = str.tostring(int(time_ / div_))
+array<float> delta_sign = request.security_lower_tf('', itf_, (close > open ? volume : -volume))
+
+var float p1_buyers        = 0.0
+var float p1_sellers       = 0.0
+var float p1_buy_per       = 50.0
+var float p1_sell_per      = 50.0
+var float p1_buy_per_prev  = 50.0
+var float p1_sell_per_prev = 50.0
+
+// ── 10-Candle IVD history (rolling average baseline) ─────────────────────
+var array<float> p1_buy_history  = array.new_float(10, 50.0)
+var float        p1_avg10_buy    = 50.0
+
+if ta.change(time) != 0
+    // Push current candle's final IVD into rolling history, drop oldest
+    array.push(p1_buy_history, p1_buy_per)
+    if array.size(p1_buy_history) > 10
+        array.shift(p1_buy_history)
+    // Recalculate 10-candle average
+    float _sum = 0.0
+    for _i = 0 to array.size(p1_buy_history) - 1
+        _sum += array.get(p1_buy_history, _i)
+    p1_avg10_buy := _sum / array.size(p1_buy_history)
+    // Reset intrabar accumulators
+    p1_buy_per_prev  := p1_buy_per
+    p1_sell_per_prev := p1_sell_per
+    p1_buyers        := 0.0
+    p1_sellers       := 0.0
+
+// ── Decayed + smoothed IVD accumulation ──────────────────────────────────
+// Apply exponential decay: newer ticks get more weight
+// Also apply simple noise filter via clamping small ticks
+if delta_sign.size() > 0
+    float raw_buy   = 0.0
+    float raw_sell  = 0.0
+    float decay_wt  = 1.0
+    float total_wt  = 0.0
+    int   n         = delta_sign.size()
+
+    for i = 0 to n - 1
+        // i=0 is oldest, i=n-1 is newest — apply rising decay weight
+        float tick_pos = i / math.max(n - 1, 1)               // 0.0 (oldest) to 1.0 (newest)
+        float wt       = math.pow(ivd_decay, (1.0 - tick_pos) * 10.0)  // newest = 1.0, oldest = decay^10
+        float v        = delta_sign.get(i)
+
+        // Noise filter: ignore ticks smaller than (smooth factor * avg tick size)
+        float tick_abs = math.abs(v)
+        raw_buy   += v > 0 ? v * wt : 0.0
+        raw_sell  += v < 0 ? (-v) * wt : 0.0
+        total_wt  += wt
+
+    p1_buyers  := raw_buy
+    p1_sellers := raw_sell
+    float p1_tot = p1_buyers + p1_sellers
+    p1_buy_per  := p1_tot > 0 ? p1_buyers  / p1_tot * 100.0 : 50.0
+    p1_sell_per := p1_tot > 0 ? p1_sellers / p1_tot * 100.0 : 50.0
+
+// sync mirror for arrow filter — always updated, outside the if block
+p1_buy_per_arrow := p1_buy_per
+
+// ── IVD vs 10-candle average comparison ──────────────────────────────────
+float ivd_vs_prev_diff = p1_buy_per - p1_avg10_buy
+string ivd_vs_prev_str = ivd_vs_prev_diff > 5.0  ? "▲▲ Much Stronger" :
+                         ivd_vs_prev_diff > 1.0  ? "▲ Stronger"       :
+                         ivd_vs_prev_diff < -5.0 ? "▼▼ Much Weaker"   :
+                         ivd_vs_prev_diff < -1.0 ? "▼ Weaker"         : "── Similar"
+color ivd_vs_prev_col  = ivd_vs_prev_diff > 1.0 ? color.lime : ivd_vs_prev_diff < -1.0 ? color.red : color.silver
+
+// VPT
+p1_vpt_spread = (close - open) * 100 * (((high - low) * 100) != 0 ? volume / ((high - low) * 100) : 0.0)
+p1_VPT        = ta.cum(p1_vpt_spread)
+p1_VPT_SMA    = ta.sma(p1_VPT, 2)
+
+// Sub-TF
+[p1_res1, p1_mom1, p1_dv1, p1_bv1, p1_sv1] = request.security(syminfo.tickerid, subTF1, f_tf_obv(), lookahead=barmerge.lookahead_on)
+[p1_res3, p1_mom3, p1_dv3, p1_bv3, p1_sv3] = request.security(syminfo.tickerid, subTF2, f_tf_obv(), lookahead=barmerge.lookahead_on)
+p1_c1 = request.security(syminfo.tickerid, subTF1, close, lookahead=barmerge.lookahead_on)
+p1_o1 = request.security(syminfo.tickerid, subTF1, open,  lookahead=barmerge.lookahead_on)
+p1_c3 = request.security(syminfo.tickerid, subTF2, close, lookahead=barmerge.lookahead_on)
+p1_o3 = request.security(syminfo.tickerid, subTF2, open,  lookahead=barmerge.lookahead_on)
+
+// ① IVD Delta — now uses decayed buy_per
+p1_buy_delta  = p1_buy_per  - p1_buy_per_prev
+p1_sell_delta = p1_sell_per - p1_sell_per_prev
+p1_net_delta  = p1_buy_delta - p1_sell_delta
+p1_ivd_raw    = 0.50 + math.min(0.45, math.max(-0.45, p1_net_delta * 0.009))
+
+// ② 1m Delta Volume
+p1_m1_dv_avg = 0.0
+for _k = 1 to 5
+    p1_m1_dv_avg := p1_m1_dv_avg + math.abs(p1_dv1[_k])
+p1_m1_dv_avg   := p1_m1_dv_avg / 5.0
+p1_m1_dv_ratio  = p1_m1_dv_avg > 0 ? math.max(-1.0, math.min(1.0, p1_dv1 / p1_m1_dv_avg)) : 0.0
+p1_m1_dv_score  = 0.50 + p1_m1_dv_ratio * 0.40
+
+// ③ Convergence
+p1_m1_bull  = p1_c1 > p1_o1 and p1_mom1 >= 0 and p1_dv1 > 0
+p1_m1_bear  = p1_c1 < p1_o1 and p1_mom1 <  0 and p1_dv1 < 0
+p1_m3_bull  = p1_c3 > p1_o3 and p1_mom3 >= 0 and p1_dv3 > 0
+p1_m3_bear  = p1_c3 < p1_o3 and p1_mom3 <  0 and p1_dv3 < 0
+p1_conv_score = (p1_m1_bull and p1_m3_bull) ? 0.80 : (p1_m1_bear and p1_m3_bear) ? 0.20 : ((p1_m1_bull or p1_m3_bull) and not (p1_m1_bear or p1_m3_bear)) ? 0.65 : ((p1_m1_bear or p1_m3_bear) and not (p1_m1_bull or p1_m3_bull)) ? 0.35 : 0.50
+
+// ④ 1m Direction
+p1_m1_dir_score = p1_c1 > p1_o1 ? 0.70 : 0.30
+
+// ⑤ POC proxy
+p1_cur_range  = high - low
+p1_poc_proxy  = p1_cur_range > 0 ? low + p1_cur_range * (p1_buy_per / 100.0) : close
+p1_poc_dist   = p1_cur_range > 0 ? (close - p1_poc_proxy) / p1_cur_range : 0.0
+p1_poc_score  = 0.50 + math.max(-0.40, math.min(0.40, p1_poc_dist * 0.8))
+
+// ⑥ Micro-trend
+p1_micro_net   = (p1_buy_per - p1_buy_per_prev) - (p1_sell_per - p1_sell_per_prev)
+p1_micro_score = 0.50 + math.max(-0.40, math.min(0.40, p1_micro_net * 0.01))
+
+// ⑦ VPT
+p1_vpt_score = p1_VPT > p1_VPT_SMA ? 1.0 : 0.0
+
+// ⑧ 1m OBV Accel
+p1_m1_accel       = p1_mom1 - nz(p1_mom1[1])
+p1_m1_accel_norm  = math.max(-1.0, math.min(1.0, p1_m1_accel / math.max(math.abs(nz(p1_mom1[1])), 1.0)))
+p1_m1_accel_score = 0.50 + p1_m1_accel_norm * 0.40
+
+// ⑨ Close position
+p1_close_pos   = p1_cur_range > 0 ? (close - low) / p1_cur_range : 0.50
+p1_close_score = 0.20 + p1_close_pos * 0.60
+
+// Weighted blend
+p1_w_total  = w_ivd + w_m1dv + w_conv + w_m1dir + w_poc + w_micro + w_vpt + w_m1accel + w_close_w
+p1_wn_ivd   = p1_w_total > 0 ? w_ivd     / p1_w_total : 0.111
+p1_wn_m1dv  = p1_w_total > 0 ? w_m1dv   / p1_w_total : 0.111
+p1_wn_conv  = p1_w_total > 0 ? w_conv    / p1_w_total : 0.111
+p1_wn_m1dir = p1_w_total > 0 ? w_m1dir  / p1_w_total : 0.111
+p1_wn_poc   = p1_w_total > 0 ? w_poc     / p1_w_total : 0.111
+p1_wn_micro = p1_w_total > 0 ? w_micro   / p1_w_total : 0.111
+p1_wn_vpt   = p1_w_total > 0 ? w_vpt     / p1_w_total : 0.111
+p1_wn_accel = p1_w_total > 0 ? w_m1accel / p1_w_total : 0.111
+p1_wn_close = p1_w_total > 0 ? w_close_w / p1_w_total : 0.111
+
+p1_raw_blend = p1_ivd_raw * p1_wn_ivd + p1_m1_dv_score * p1_wn_m1dv + p1_conv_score * p1_wn_conv + p1_m1_dir_score * p1_wn_m1dir + p1_poc_score * p1_wn_poc + p1_micro_score * p1_wn_micro + p1_vpt_score * p1_wn_vpt + p1_m1_accel_score * p1_wn_accel + p1_close_score * p1_wn_close
+p1_raw_blend := math.max(0.05, math.min(0.95, p1_raw_blend))
+p1_blend_green = math.round(p1_raw_blend * 100)
+p1_blend_red   = 100 - p1_blend_green
+
+
+// ════════════════════════════════════════════════════════════════════════════
+// FORECAST ENHANCEMENT — IVD Momentum + Volume Spike + Price Velocity
+// ════════════════════════════════════════════════════════════════════════════
+var float p1_buy_per_snap  = 50.0
+var float p1_sell_per_snap = 50.0
+var bool  p1_snap_taken    = false
+
+float vol_avg   = ta.sma(volume, 20)
+bool  vol_spike = volume > vol_avg * 1.3
+float price_vel = close - nz(close[1])
+
+
+// ════════════════════════════════════════════════════════════════════════════
+// TABLE 2 — POLY1 LITE NEXT CANDLE (real-time only)
+// ════════════════════════════════════════════════════════════════════════════
+var table poly1_tbl = na
+
+if (barstate.isrealtime or barstate.islast) and time_ >= 1
+
+    candle_ms       = timeframe.in_seconds("") * 1000
+    elapsed_ms      = timenow - time
+    elapsed_seconds = math.max(0, elapsed_ms / 1000)
+    seconds_left    = math.max(0, (candle_ms - elapsed_ms) / 1000)
+    pct_complete    = candle_ms > 0 ? math.min(100, math.round(elapsed_ms / candle_ms * 100)) : 0
+
+    if seconds_left <= 35 and seconds_left > 25 and not p1_snap_taken
+        p1_buy_per_snap  := p1_buy_per
+        p1_sell_per_snap := p1_sell_per
+        p1_snap_taken    := true
+    if seconds_left > 35
+        p1_snap_taken := false
+
+    float ivd_mom_val   = p1_buy_per - p1_buy_per_snap
+    string ivd_mom_str  = ivd_mom_val > 2.0  ? "▲▲ Surging" :
+                          ivd_mom_val > 0.5  ? "▲ Rising"   :
+                          ivd_mom_val < -2.0 ? "▼▼ Fading"  :
+                          ivd_mom_val < -0.5 ? "▼ Falling"  : "── Stable"
+    color ivd_mom_col   = ivd_mom_val > 0.5 ? color.lime : ivd_mom_val < -0.5 ? color.red : color.silver
+
+    p1_is_bull         = p1_blend_green > p1_blend_red
+    bool tables_agree  = (isBull and p1_is_bull) or (isBear and not p1_is_bull)
+    string agree_str   = tables_agree ? "✓ CONFIRMED" : "⚠ CONFLICT"
+    color  agree_col   = tables_agree ? color.new(color.lime, 30) : color.new(color.orange, 20)
+
+    string vol_str  = vol_spike ? "⚡ SPIKE" : "Normal"
+    color  vol_col  = vol_spike ? color.new(color.yellow, 20) : color.new(color.gray, 50)
+
+    // OBV Divergence — Hidden Bull: red candle + OBV rising | Hidden Bear: green candle + OBV falling
+    bool   obv_hidden_bull = not curIsGreen and curMoUp
+    bool   obv_hidden_bear = curIsGreen and not curMoUp
+    string obv_div_str     = obv_hidden_bull ? "🟢 HIDDEN BULL" : obv_hidden_bear ? "🔴 HIDDEN BEAR" : "── None"
+    color  obv_div_col     = obv_hidden_bull ? color.lime : obv_hidden_bear ? color.red : color.silver
+
+    bool vel_confirms  = (p1_is_bull and price_vel >= 0) or (not p1_is_bull and price_vel <= 0)
+    string vel_str     = vel_confirms ? "✓ With Signal" : "⚠ Against"
+    color  vel_col     = vel_confirms ? color.new(color.lime, 40) : color.new(color.orange, 30)
+
+    float enhance_bonus = 0.0
+    enhance_bonus := enhance_bonus + (tables_agree  ? 3.0 : -3.0)
+    enhance_bonus := enhance_bonus + (vol_spike     ? 2.0 :  0.0)
+    enhance_bonus := enhance_bonus + (vel_confirms  ? 2.0 : -2.0)
+    enhance_bonus := enhance_bonus + (ivd_mom_val > 0.5 ? 2.0 : ivd_mom_val < -0.5 ? -2.0 : 0.0)
+    float enhanced_green = math.max(5, math.min(95, p1_blend_green + (p1_is_bull ? enhance_bonus : -enhance_bonus)))
+    float enhanced_red   = 100 - enhanced_green
+
+    prog_filled = math.round(pct_complete / 10)
+    prog_bar    = ""
+    for _p = 1 to 10
+        prog_bar := prog_bar + (_p <= prog_filled ? "█" : "░")
+    prog_txt = prog_bar + "  " + str.tostring(pct_complete) + "%  +" + str.tostring(math.round(elapsed_seconds)) + "s"
+
+    g_filled = math.round(enhanced_green / 10)
+    r_filled = math.round(enhanced_red   / 10)
+    g_bar = ""
+    r_bar = ""
+    for _g = 1 to 10
+        g_bar := g_bar + (_g <= g_filled ? "█" : "░")
+    for _r = 1 to 10
+        r_bar := r_bar + (_r <= r_filled ? "█" : "░")
+
+    conv_str = (p1_m1_bull and p1_m3_bull) ? "✓ 1m+3m BULL" :
+               (p1_m1_bear and p1_m3_bear) ? "✓ 1m+3m BEAR" : "~ Mixed"
+    conv_col = (p1_m1_bull and p1_m3_bull) or (p1_m1_bear and p1_m3_bear) ?
+               color.new(color.yellow, 30) : color.new(color.gray, 50)
+
+    main_col  = p1_is_bull ? color.new(color.green, enhanced_green >= 65 ? 30 : 50) : color.new(color.red, enhanced_red >= 65 ? 30 : 50)
+    bias_txt  = p1_is_bull ? "▲  BULLISH" : "▼  BEARISH"
+
+    final_dist = math.abs(enhanced_green - 50)
+    str_label  = final_dist >= 30 ? "🔥 STRONG" : final_dist >= 15 ? "⚡ MODERATE" : "〰 WEAK"
+    str_bars   = math.min(5, math.round(final_dist / 10))
+    str_bar    = ""
+    for _b = 1 to 5
+        str_bar := str_bar + (_b <= str_bars ? "█" : "░")
+    final_col  = p1_is_bull ? color.new(color.green, final_dist >= 30 ? 15 : 35) : color.new(color.red, final_dist >= 30 ? 15 : 35)
+
+    table.delete(poly1_tbl)
+    poly1_tbl := table.new(f_pos(poly1_tbl_pos), 2, 15,
+         bgcolor      = color.new(#0a0a14, 5),
+         border_color = color.new(color.gray, 50),
+         border_width = 1,
+         frame_color  = color.new(color.gray, 30),
+         frame_width  = 1)
+
+    P1_COL_H  = color.new(#1a1a2e, 5)
+    P1_COL_O  = color.new(#0f0f1a, 15)
+    P1_COL_E  = color.new(#16213e, 15)
+    P1_COL_SL = color.new(color.silver, 20)
+
+    // Row 0 — title
+    table.cell(poly1_tbl, 0, 0, "⚡ NEXT CANDLE FORECAST",
+         bgcolor=P1_COL_H, text_color=color.white, text_size=size.normal, text_halign=text.align_center)
+    table.merge_cells(poly1_tbl, 0, 0, 1, 0)
+
+    // Row 1 — Open price + price delta
+    float p1_open5   = request.security(syminfo.tickerid, "5", open,  lookahead=barmerge.lookahead_on)
+    float p1_close5  = request.security(syminfo.tickerid, "5", close, lookahead=barmerge.lookahead_on)
+    float p1_pdelta  = p1_close5 - p1_open5
+    string p1_psign  = p1_pdelta >= 0 ? "+" : ""
+    color  p1_pcol   = p1_pdelta > 0 ? color.lime : p1_pdelta < 0 ? color.red : color.silver
+    table.cell(poly1_tbl, 0, 1, "Open  $" + str.tostring(p1_open5, format.mintick),
+         bgcolor=P1_COL_O, text_color=color.silver, text_size=size.small, text_halign=text.align_center)
+    table.cell(poly1_tbl, 1, 1, p1_psign + str.tostring(p1_pdelta, format.mintick),
+         bgcolor=P1_COL_O, text_color=p1_pcol, text_size=size.small, text_halign=text.align_center)
+
+    // Row 2 — candle progress
+    table.cell(poly1_tbl, 0, 2, prog_txt,
+         bgcolor=P1_COL_E, text_color=color.yellow, text_size=size.small, text_halign=text.align_center)
+    table.merge_cells(poly1_tbl, 0, 2, 1, 2)
+
+    // Row 2 — IVD live (decayed)
+    table.cell(poly1_tbl, 0, 4, "IVD  Buy: " + str.tostring(math.round(p1_buy_per)) + "%   Sell: " + str.tostring(math.round(p1_sell_per)) + "%",
+         bgcolor=P1_COL_E, text_color=P1_COL_SL, text_size=size.small, text_halign=text.align_center)
+    table.cell(poly1_tbl, 1, 4, "Δ " + (p1_net_delta >= 0 ? "+" : "") + str.tostring(p1_net_delta, "#.#"),
+         bgcolor=P1_COL_E,
+         text_color=p1_net_delta > 0 ? color.lime : p1_net_delta < 0 ? color.red : color.silver,
+         text_size=size.small, text_halign=text.align_center)
+
+    // Row 3 — IVD momentum
+    table.cell(poly1_tbl, 0, 5, "IVD Momentum",
+         bgcolor=P1_COL_O, text_color=P1_COL_SL, text_size=size.small, text_halign=text.align_center)
+    table.cell(poly1_tbl, 1, 5, ivd_mom_str,
+         bgcolor=P1_COL_O, text_color=ivd_mom_col, text_size=size.small, text_halign=text.align_center)
+
+    // Row 4 — IVD vs 10-candle average
+    table.cell(poly1_tbl, 0, 6, "vs avg10  " + str.tostring(math.round(p1_avg10_buy), "#") + "%",
+         bgcolor=P1_COL_E, text_color=P1_COL_SL, text_size=size.small, text_halign=text.align_center)
+    table.cell(poly1_tbl, 1, 6, ivd_vs_prev_str + (ivd_vs_prev_diff >= 0 ? "  +" : "  ") + str.tostring(ivd_vs_prev_diff, "#.#") + "%",
+         bgcolor=P1_COL_E, text_color=ivd_vs_prev_col, text_size=size.small, text_halign=text.align_center)
+
+    // Row 5 — Green %
+    table.cell(poly1_tbl, 0, 7, "🟢 " + str.tostring(int(enhanced_green)) + "%",
+         bgcolor=color.new(color.green, enhanced_green > enhanced_red ? 50 : 75),
+         text_color=color.white, text_size=size.normal, text_halign=text.align_center)
+    table.cell(poly1_tbl, 1, 7, g_bar,
+         bgcolor=color.new(color.green, enhanced_green > enhanced_red ? 50 : 75),
+         text_color=color.white, text_size=size.small, text_halign=text.align_center)
+
+    // Row 6 — Red %
+    table.cell(poly1_tbl, 0, 8, "🔴 " + str.tostring(int(enhanced_red)) + "%",
+         bgcolor=color.new(color.red, enhanced_red > enhanced_green ? 50 : 75),
+         text_color=color.white, text_size=size.normal, text_halign=text.align_center)
+    table.cell(poly1_tbl, 1, 8, r_bar,
+         bgcolor=color.new(color.red, enhanced_red > enhanced_green ? 50 : 75),
+         text_color=color.white, text_size=size.small, text_halign=text.align_center)
+
+    // Row 7 — convergence + VPT
+    vpt_str = p1_VPT > p1_VPT_SMA ? "VPT ▲" : "VPT ▼"
+    vpt_col = p1_VPT > p1_VPT_SMA ? color.lime : color.red
+    table.cell(poly1_tbl, 0, 9, conv_str,
+         bgcolor=conv_col, text_color=color.white, text_size=size.small, text_halign=text.align_center)
+    table.cell(poly1_tbl, 1, 9, vpt_str,
+         bgcolor=P1_COL_O, text_color=vpt_col, text_size=size.small, text_halign=text.align_center)
+
+    // Row 8 — 1m / 3m signals
+    m1_col = p1_c1 > p1_o1 ? color.new(color.green, 55) : color.new(color.red, 55)
+    m1_str = "1m: " + (p1_c1 > p1_o1 ? "▲" : "▼") +
+             "  OBV: " + (p1_mom1 >= 0 ? "▲" : "▼") +
+             "  DV: "  + (p1_dv1  > 0  ? "Buy" : "Sell")
+    m3_col = p1_c3 > p1_o3 ? color.new(color.green, 55) : color.new(color.red, 55)
+    m3_str = "3m: " + (p1_c3 > p1_o3 ? "▲" : "▼") +
+             "  OBV: " + (p1_mom3 >= 0 ? "▲" : "▼") +
+             "  DV: "  + (p1_dv3  > 0  ? "Buy" : "Sell")
+    table.cell(poly1_tbl, 0, 10, m1_str, bgcolor=m1_col, text_color=color.white, text_size=size.small, text_halign=text.align_center)
+    table.cell(poly1_tbl, 1, 10, m3_str, bgcolor=m3_col, text_color=color.white, text_size=size.small, text_halign=text.align_center)
+
+    // Row 9 — confirmations
+    table.cell(poly1_tbl, 0, 11, agree_str + "  |  " + vol_str,
+         bgcolor=agree_col, text_color=color.white, text_size=size.small, text_halign=text.align_center)
+    table.cell(poly1_tbl, 1, 11, "Vel: " + vel_str,
+         bgcolor=vel_col, text_color=color.white, text_size=size.small, text_halign=text.align_center)
+
+    // Row 10 — OBV Divergence
+    table.cell(poly1_tbl, 0, 12, "OBV Div",
+         bgcolor=P1_COL_O, text_color=P1_COL_SL, text_size=size.small, text_halign=text.align_center)
+    table.cell(poly1_tbl, 1, 12, obv_div_str,
+         bgcolor=P1_COL_O, text_color=obv_div_col, text_size=size.small, text_halign=text.align_center)
+
+    // Row 11 — overall bias
+    table.cell(poly1_tbl, 0, 13, bias_txt,
+         bgcolor=main_col, text_color=color.white, text_size=size.large, text_halign=text.align_center)
+    table.merge_cells(poly1_tbl, 0, 13, 1, 13)
+
+    // Row 12 — Final signal or countdown
+    if elapsed_seconds >= pred_seconds
+        final_txt = "⏰ +" + str.tostring(math.round(elapsed_seconds)) + "s  ►  " + (p1_is_bull ? "🟢 GREEN" : "🔴 RED") + "  " + str.tostring(p1_is_bull ? int(enhanced_green) : int(enhanced_red)) + "%  " + str_label + "\n" + str_bar
+        table.cell(poly1_tbl, 0, 14, final_txt,
+             bgcolor=final_col, text_color=color.white,
+             text_size=size.normal, text_halign=text.align_center)
+    else
+        countdown = str.tostring(math.round(pred_seconds - elapsed_seconds))
+        table.cell(poly1_tbl, 0, 14, "⏳  Signal in  " + countdown + "s",
+             bgcolor=P1_COL_O, text_color=color.new(color.silver, 30),
+             text_size=size.small, text_halign=text.align_center)
+    table.merge_cells(poly1_tbl, 0, 14, 1, 14)

@@ -1,0 +1,351 @@
+//@version=6
+indicator("Volatility Regime Bands [forexobroker]",
+     shorttitle="VR Bands",
+     overlay=true)
+
+// ══════════════════════════════════════════════════════════════════════════════
+// Volatility Regime Bands [forexobroker]
+// Version 1.0
+//
+// Regime-adaptive band system that changes behavior based on market state.
+// Trending: wider trend-following channels (ATR-weighted).
+// Ranging: tighter mean-reversion boundaries (StdDev-weighted).
+// Volatile: expanded warning bands with no trade signals.
+// Hybrid ATR + Bollinger calculation blended by detected regime.
+//
+// (c) forexobroker | Open-source | Educational use
+// ══════════════════════════════════════════════════════════════════════════════
+
+// ┌──────────────────────────────────────────────────────────────────────────┐
+// │ INPUTS                                                                  │
+// └──────────────────────────────────────────────────────────────────────────┘
+
+// Regime Detection
+grpRegime = "Regime Detection"
+adxLen        = input.int(14, "ADX Length", minval=5, maxval=50, group=grpRegime, tooltip="Period for ADX trend strength measurement")
+adxThresh     = input.int(25, "ADX Trend Threshold", minval=15, maxval=40, group=grpRegime, tooltip="ADX above this = trending market")
+adxWeak       = input.int(18, "ADX Weak Threshold", minval=10, maxval=30, group=grpRegime, tooltip="ADX above this but below trend = weak trend (still counts)")
+regimeSmooth  = input.int(8, "Regime Smoothing", minval=1, maxval=20, group=grpRegime, tooltip="EMA smoothing for band width transitions between regimes")
+
+// Band Settings
+grpBand = "Band Settings"
+bandLength = input.int(20, "Band Length", minval=5, maxval=100, group=grpBand, tooltip="Period for center EMA and band calculations")
+atrMult    = input.float(1.5, "ATR Multiplier", minval=0.5, maxval=4.0, step=0.1, group=grpBand, tooltip="ATR multiplier for Keltner-style component (trend-following)")
+bbMult     = input.float(2.0, "StdDev Multiplier", minval=0.5, maxval=4.0, step=0.1, group=grpBand, tooltip="Standard deviation multiplier for Bollinger-style component (mean-reversion)")
+showCenter = input.bool(true, "Show Center Line", group=grpBand)
+
+// Signals
+grpSig = "Signals"
+enableSignals  = input.bool(true, "Enable Trade Signals", group=grpSig, tooltip="Show regime-adaptive buy/sell signals on chart")
+enableSqueeze  = input.bool(true, "Enable Squeeze Detection", group=grpSig, tooltip="Detect BB inside KC squeeze for breakout timing")
+showBarColors  = input.bool(true, "Show Bar Colors", group=grpSig, tooltip="Color bars by regime state")
+
+// Display
+grpDisp = "Display"
+showDashboard  = input.bool(true, "Show Dashboard", group=grpDisp)
+showBandFill   = input.bool(true, "Show Band Fill", group=grpDisp, tooltip="Fill area between upper and lower bands")
+showBackground = input.bool(false, "Show Regime Background", group=grpDisp, tooltip="Tint chart background by regime")
+tablePosition  = input.string("top_right", "Table Position", options=["top_left", "top_center", "top_right", "bottom_left", "bottom_center", "bottom_right"], group=grpDisp)
+textSize       = input.string("small", "Text Size", options=["tiny", "small", "normal"], group=grpDisp)
+
+// Colors
+grpCol = "Colors"
+trendColor    = input.color(#2196F3, "Trending", group=grpCol, tooltip="Band color in trending regime")
+rangeColor    = input.color(#FF9800, "Ranging", group=grpCol, tooltip="Band color in ranging regime")
+volatileColor = input.color(#EF5350, "Volatile", group=grpCol, tooltip="Band color in volatile regime")
+
+// ┌──────────────────────────────────────────────────────────────────────────┐
+// │ THEME-AWARE COLORS                                                      │
+// └──────────────────────────────────────────────────────────────────────────┘
+
+headerBg   = color.new(chart.fg_color, 85)
+headerText = chart.fg_color
+cellBg     = color.new(chart.bg_color, 20)
+cellFg     = color.new(chart.fg_color, 15)
+borderCol  = color.new(chart.fg_color, 75)
+mutedText  = color.new(chart.fg_color, 50)
+titleBg    = #BF360C
+titleFg    = color.white
+
+// ┌──────────────────────────────────────────────────────────────────────────┐
+// │ HELPER FUNCTIONS                                                        │
+// └──────────────────────────────────────────────────────────────────────────┘
+
+getTablePos() =>
+    switch tablePosition
+        "top_left"      => position.top_left
+        "top_center"    => position.top_center
+        "top_right"     => position.top_right
+        "bottom_left"   => position.bottom_left
+        "bottom_center" => position.bottom_center
+        "bottom_right"  => position.bottom_right
+        => position.top_right
+
+getTextSize() =>
+    switch textSize
+        "tiny"   => size.tiny
+        "small"  => size.small
+        "normal" => size.normal
+        => size.small
+
+// ┌──────────────────────────────────────────────────────────────────────────┐
+// │ REGIME DETECTION (3-Factor Voting)                                      │
+// └──────────────────────────────────────────────────────────────────────────┘
+
+// Factor 1: ADX — trend strength
+[diPlus, diMinus, adxVal] = ta.dmi(adxLen, adxLen)
+
+// Factor 2: Bollinger Band Width percentile — volatility expansion
+bbw     = ta.bbw(close, bandLength, bbMult)
+bbwRank = ta.percentrank(bbw, 100)
+
+// Factor 3: ATR percentile — absolute volatility
+atrVal  = ta.atr(adxLen)
+atrRank = ta.percentrank(atrVal, 100)
+
+// Voting
+int trendVotes    = 0
+int rangeVotes    = 0
+int volatileVotes = 0
+
+// ADX vote
+if adxVal > adxThresh
+    trendVotes += 2
+else if adxVal > adxWeak
+    trendVotes += 1
+else
+    rangeVotes += 1
+
+// BB Width vote
+if bbwRank > 75
+    volatileVotes += 1
+    trendVotes    += 1
+else if bbwRank < 25
+    rangeVotes += 2
+
+// ATR vote
+if atrRank > 75
+    volatileVotes += 2
+else if atrRank < 25
+    rangeVotes += 1
+
+// Classify: 0=TRENDING, 1=RANGING, 2=VOLATILE
+int regime = 1
+if volatileVotes >= 3
+    regime := 2
+else if trendVotes > rangeVotes
+    regime := 0
+else
+    regime := 1
+
+// Smooth regime transitions for band width blending
+regimeFloat = ta.ema(float(regime), regimeSmooth)
+
+// ┌──────────────────────────────────────────────────────────────────────────┐
+// │ HYBRID BAND CALCULATION                                                 │
+// └──────────────────────────────────────────────────────────────────────────┘
+
+centerLine = ta.ema(close, bandLength)
+
+// Two band components
+atrBand = ta.atr(bandLength) * atrMult      // Keltner-style (trend-following)
+bbBand  = ta.stdev(close, bandLength) * bbMult  // Bollinger-style (mean-reversion)
+
+// Regime-based blending weight (0.0 = all BB, 1.0 = all ATR)
+trendWeight = regime == 0 ? 0.8 : regime == 1 ? 0.2 : 0.5
+rawBand = trendWeight * atrBand + (1.0 - trendWeight) * bbBand
+
+// Regime-based expansion factor
+expansion = regime == 2 ? 1.5 : regime == 0 ? 1.2 : 0.9
+bandWidth = rawBand * expansion
+
+// Smooth band width to prevent jarring transitions
+smoothBand = ta.ema(bandWidth, regimeSmooth)
+upperBand  = centerLine + smoothBand
+lowerBand  = centerLine - smoothBand
+
+// ┌──────────────────────────────────────────────────────────────────────────┐
+// │ SQUEEZE DETECTION                                                       │
+// └──────────────────────────────────────────────────────────────────────────┘
+
+[bbUp, bbBasis, bbLow] = ta.bb(close, bandLength, 2.0)
+[kcUp, kcBasis, kcLow] = ta.kc(close, bandLength, 1.5, true)
+sqzOn  = bbLow > kcLow and bbUp < kcUp
+sqzOff = not sqzOn
+
+// Momentum direction for squeeze fire
+momSlope  = ta.linreg(close, 12, 0) - ta.linreg(close, 12, 1)
+direction = momSlope > 0 ? 1 : momSlope < 0 ? -1 : 0
+
+// Squeeze fire: was squeezing, now released
+fired     = sqzOff and sqzOn[1] and enableSqueeze
+firedBull = fired and direction >= 0
+firedBear = fired and direction < 0
+
+// Squeeze duration tracking
+var int sqzBars = 0
+sqzBars := sqzOn ? sqzBars + 1 : 0
+
+// BB/KC ratio for dashboard
+bbkcRatio = (kcUp - kcLow) > 0 ? (bbUp - bbLow) / (kcUp - kcLow) : 1.0
+
+// ┌──────────────────────────────────────────────────────────────────────────┐
+// │ SIGNAL GENERATION                                                       │
+// └──────────────────────────────────────────────────────────────────────────┘
+
+var bool bullSignal = false
+var bool bearSignal = false
+bullSignal := false
+bearSignal := false
+
+if enableSignals and barstate.isconfirmed and regime != 2
+    if regime == 0
+        // Trending: breakout continuation signals
+        if ta.crossover(close, upperBand)
+            bullSignal := true
+        if ta.crossunder(close, lowerBand)
+            bearSignal := true
+    else
+        // Ranging: mean-reversion signals
+        if close <= lowerBand and close[1] > lowerBand[1]
+            bullSignal := true
+        if close >= upperBand and close[1] < upperBand[1]
+            bearSignal := true
+
+// Squeeze fire signals override
+if firedBull and barstate.isconfirmed
+    bullSignal := true
+if firedBear and barstate.isconfirmed
+    bearSignal := true
+
+// Direction assessment
+priceAboveCenter = close > centerLine
+isBullish = regime == 0 ? (diPlus > diMinus) : priceAboveCenter
+
+// ┌──────────────────────────────────────────────────────────────────────────┐
+// │ VISUALS                                                                 │
+// └──────────────────────────────────────────────────────────────────────────┘
+
+// Regime color selection
+regimeCol = regime == 0 ? trendColor : regime == 1 ? rangeColor : volatileColor
+bandTransp = regime == 2 ? 25 : 35
+
+// Band plots
+pUpper = plot(upperBand, "Upper Band", color=color.new(regimeCol, 15), linewidth=2)
+pLower = plot(lowerBand, "Lower Band", color=color.new(regimeCol, 15), linewidth=2)
+pCenter = plot(showCenter ? centerLine : na, "Center", color=color.new(chart.fg_color, 50), linewidth=1, style=plot.style_line)
+
+// Band fill
+fillCol = showBandFill ? color.new(regimeCol, 85) : na
+fill(pUpper, pLower, color=fillCol)
+
+// Regime background tint
+bgCol = showBackground ? color.new(regimeCol, 93) : na
+bgcolor(bgCol)
+
+// Trade signals
+plotshape(bullSignal ? lowerBand : na, "Bull Signal", shape.triangleup, location.absolute, color.new(#26A69A, 0), size=size.small)
+plotshape(bearSignal ? upperBand : na, "Bear Signal", shape.triangledown, location.absolute, color.new(#EF5350, 0), size=size.small)
+
+// Squeeze dots on center line
+sqzCol = sqzOn ? (sqzBars >= 8 ? #FF6F00 : #9E9E9E) : na
+plotshape(enableSqueeze and sqzOn ? centerLine : na, "Squeeze", shape.circle, location.absolute, sqzCol, size=size.tiny)
+
+// Squeeze fire markers
+plotshape(firedBull ? lowerBand - atrVal * 0.3 : na, "Squeeze Bull Fire", shape.diamond, location.absolute, #26A69A, size=size.small)
+plotshape(firedBear ? upperBand + atrVal * 0.3 : na, "Squeeze Bear Fire", shape.diamond, location.absolute, #EF5350, size=size.small)
+
+// Bar coloring
+barCol = not showBarColors ? na : regime == 2 ? color.new(volatileColor, 30) : regime == 0 ? (isBullish ? color.new(trendColor, 20) : color.new(trendColor, 50)) : (priceAboveCenter ? color.new(rangeColor, 30) : color.new(rangeColor, 60))
+barcolor(barCol)
+
+// ┌──────────────────────────────────────────────────────────────────────────┐
+// │ ALERTS                                                                  │
+// └──────────────────────────────────────────────────────────────────────────┘
+
+regimeChangedTrend = regime == 0 and regime[1] != 0
+regimeChangedVol   = regime == 2 and regime[1] != 2
+priceOutside       = close > upperBand or close < lowerBand
+
+alertcondition(regimeChangedTrend, "Regime → Trending", "Volatility Regime Bands — Market shifted to TRENDING regime. Bands now in trend-following mode.")
+alertcondition(regimeChangedVol, "Regime → Volatile", "Volatility Regime Bands — Market shifted to VOLATILE regime. Bands expanded, caution advised.")
+alertcondition(bullSignal, "Bullish Signal", "Volatility Regime Bands — Bullish signal detected (regime-adaptive)")
+alertcondition(bearSignal, "Bearish Signal", "Volatility Regime Bands — Bearish signal detected (regime-adaptive)")
+alertcondition(fired, "Squeeze Fired", "Volatility Regime Bands — Band squeeze released, breakout imminent")
+alertcondition(priceOutside, "Price Outside Bands", "Volatility Regime Bands — Price trading outside the adaptive bands")
+
+// ┌──────────────────────────────────────────────────────────────────────────┐
+// │ DASHBOARD                                                               │
+// └──────────────────────────────────────────────────────────────────────────┘
+
+var table dash = table.new(getTablePos(), 2, 10, bgcolor=cellBg, border_width=1, border_color=borderCol, frame_width=2, frame_color=color.new(titleBg, 30))
+
+if showDashboard and barstate.islast
+    tSz = getTextSize()
+
+    // Row 0 — Title
+    table.cell(dash, 0, 0, "VOLATILITY REGIME BANDS", bgcolor=titleBg, text_color=titleFg, text_size=tSz, text_halign=text.align_left)
+    table.cell(dash, 1, 0, "forexobroker", bgcolor=titleBg, text_color=color.new(#FFAB91, 0), text_size=size.tiny, text_halign=text.align_right)
+
+    // Row 1 — Regime
+    regimeText = regime == 0 ? "TRENDING" : regime == 1 ? "RANGING" : "VOLATILE"
+    regimeDashCol = regime == 0 ? trendColor : regime == 1 ? rangeColor : volatileColor
+    table.cell(dash, 0, 1, "Regime", bgcolor=headerBg, text_color=headerText, text_size=tSz, text_halign=text.align_left)
+    table.cell(dash, 1, 1, regimeText, bgcolor=color.new(regimeDashCol, 70), text_color=regimeDashCol, text_size=tSz, text_halign=text.align_right)
+
+    // Row 2 — Band Mode
+    modeText = regime == 0 ? "TREND-FOLLOW" : regime == 1 ? "MEAN-REVERT" : "EXPANDED"
+    table.cell(dash, 0, 2, "Band Mode", bgcolor=headerBg, text_color=headerText, text_size=tSz, text_halign=text.align_left)
+    table.cell(dash, 1, 2, modeText, bgcolor=cellBg, text_color=regimeDashCol, text_size=tSz, text_halign=text.align_right)
+
+    // Row 3 — Band Width
+    bwPips = smoothBand / syminfo.mintick / 10.0
+    bwText = str.tostring(bwPips, "#.#") + "p"
+    table.cell(dash, 0, 3, "Band Width", bgcolor=headerBg, text_color=headerText, text_size=tSz, text_halign=text.align_left)
+    table.cell(dash, 1, 3, bwText, bgcolor=cellBg, text_color=cellFg, text_size=tSz, text_halign=text.align_right)
+
+    // Row 4 — Squeeze
+    sqzText = sqzOn ? (sqzBars >= 8 ? "TIGHT (" + str.tostring(sqzBars) + ")" : "ACTIVE (" + str.tostring(sqzBars) + ")") : fired ? "FIRED!" : "Off"
+    sqzDashCol = sqzOn ? (sqzBars >= 8 ? #FF6F00 : #FFD54F) : fired ? #26A69A : mutedText
+    sqzDashBg = sqzOn or fired ? color.new(sqzDashCol, 80) : cellBg
+    table.cell(dash, 0, 4, "Squeeze", bgcolor=headerBg, text_color=headerText, text_size=tSz, text_halign=text.align_left)
+    table.cell(dash, 1, 4, sqzText, bgcolor=sqzDashBg, text_color=sqzDashCol, text_size=tSz, text_halign=text.align_right)
+
+    // Row 5 — Direction
+    dirText = regime == 0 ? (diPlus > diMinus ? "BULLISH" : "BEARISH") : priceAboveCenter ? "BULLISH" : "BEARISH"
+    dirCol  = dirText == "BULLISH" ? #26A69A : #EF5350
+    table.cell(dash, 0, 5, "Direction", bgcolor=headerBg, text_color=headerText, text_size=tSz, text_halign=text.align_left)
+    table.cell(dash, 1, 5, dirText, bgcolor=cellBg, text_color=dirCol, text_size=tSz, text_halign=text.align_right)
+
+    // Row 6 — Signal
+    sigText = bullSignal ? "BUY" : bearSignal ? "SELL" : "None"
+    sigCol  = bullSignal ? #26A69A : bearSignal ? #EF5350 : mutedText
+    sigBg   = bullSignal or bearSignal ? color.new(sigCol, 80) : cellBg
+    table.cell(dash, 0, 6, "Signal", bgcolor=headerBg, text_color=headerText, text_size=tSz, text_halign=text.align_left)
+    table.cell(dash, 1, 6, sigText, bgcolor=sigBg, text_color=sigCol, text_size=tSz, text_halign=text.align_right)
+
+    // Row 7 — ADX
+    adxDashCol = adxVal > adxThresh ? trendColor : adxVal > adxWeak ? #FFD54F : mutedText
+    table.cell(dash, 0, 7, "ADX", bgcolor=headerBg, text_color=headerText, text_size=tSz, text_halign=text.align_left)
+    table.cell(dash, 1, 7, str.tostring(adxVal, "#.#"), bgcolor=cellBg, text_color=adxDashCol, text_size=tSz, text_halign=text.align_right)
+
+    // Row 8 — Volatility Rank
+    vrCol = atrRank > 75 ? volatileColor : atrRank < 25 ? #26A69A : cellFg
+    table.cell(dash, 0, 8, "Vol Rank", bgcolor=headerBg, text_color=headerText, text_size=tSz, text_halign=text.align_left)
+    table.cell(dash, 1, 8, str.tostring(atrRank, "#") + "%", bgcolor=cellBg, text_color=vrCol, text_size=tSz, text_halign=text.align_right)
+
+    // Row 9 — BB/KC Ratio
+    ratioCol = bbkcRatio < 1.0 ? #FF6F00 : cellFg
+    table.cell(dash, 0, 9, "BB/KC Ratio", bgcolor=headerBg, text_color=headerText, text_size=tSz, text_halign=text.align_left)
+    table.cell(dash, 1, 9, str.tostring(bbkcRatio, "#.##"), bgcolor=cellBg, text_color=ratioCol, text_size=tSz, text_halign=text.align_right)
+
+// ┌──────────────────────────────────────────────────────────────────────────┐
+// │ DATA WINDOW                                                             │
+// └──────────────────────────────────────────────────────────────────────────┘
+
+plot(upperBand, "Upper Band (DW)", display=display.data_window)
+plot(lowerBand, "Lower Band (DW)", display=display.data_window)
+plot(centerLine, "Center Line (DW)", display=display.data_window)
+plot(smoothBand, "Band Width (DW)", display=display.data_window)
+plot(regime * 1.0, "Regime (0=Trend 1=Range 2=Vol)", display=display.data_window)
+plot(adxVal, "ADX (DW)", display=display.data_window)

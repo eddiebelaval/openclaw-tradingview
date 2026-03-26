@@ -1,0 +1,706 @@
+//@version=6
+indicator("GlorifiedGambler Gann Flip v9", overlay=true, max_bars_back=500)
+
+// ============================================================
+// GLORIFIEDGAMBLER — GANN FLIP MODEL v9
+// System 1 only: Gann Flip + Confluence Scoring (0-10)
+// Primary: ES 2-min | NQ + VIX as confluence
+// FVG/iFVG/Sweep/Reversal/Cont signals moved to Liq Sweep indicator
+// ============================================================
+
+// ──────────────────────────────────────────────
+// INPUTS — SESSION & BOX
+// ──────────────────────────────────────────────
+gann_hour_start = input.int(8,   "Gann Start Hour (ET)",  minval=0, maxval=23, group="⏰ Gann Session")
+gann_min_start  = input.int(0,   "Gann Start Min  (ET)",  minval=0, maxval=59, group="⏰ Gann Session")
+gann_hour_end   = input.int(9,   "Gann End Hour   (ET)",  minval=0, maxval=23, group="⏰ Gann Session")
+gann_min_end    = input.int(0,   "Gann End Min    (ET)",  minval=0, maxval=59, group="⏰ Gann Session")
+
+// ──────────────────────────────────────────────
+// INPUTS — DISPLAY TOGGLES
+// ──────────────────────────────────────────────
+show_gann_box        = input.bool(true,  "Show Gann Box",                        group="👁 Display Toggles")
+show_levels          = input.bool(true,  "Show Key Levels",                      group="👁 Display Toggles")
+show_fibs            = input.bool(true,  "Show Gann Grid (price + time levels)", group="👁 Display Toggles")
+gann_price_lbl_left  = input.bool(true,  "Gann Grid — Left Price Labels",        group="👁 Display Toggles")
+gann_price_lbl_right = input.bool(true,  "Gann Grid — Right Price Labels",       group="👁 Display Toggles")
+gann_time_lbl_top    = input.bool(false, "Gann Grid — Top Time Labels",          group="👁 Display Toggles")
+gann_time_lbl_bot    = input.bool(false, "Gann Grid — Bottom Time Labels",       group="👁 Display Toggles")
+show_gann_flip_labels= input.bool(true,  "Show Gann Flip Labels",                group="👁 Display Toggles")
+show_break_markers   = input.bool(true,  "Show Break/Wick Markers",              group="👁 Display Toggles")
+
+// ──────────────────────────────────────────────
+// INPUTS — FILTERS
+// ──────────────────────────────────────────────
+chop_threshold = input.int(3,     "Chop Filter: Max breaks before warning", minval=1, maxval=10, group="⚙️ Filters")
+vol_lookback   = input.int(20,    "Volume MA Lookback", minval=5,               group="⚙️ Filters")
+nq_sym         = input.symbol("CME_MINI:NQ1!", "NQ Symbol",                    group="⚙️ Filters")
+vix_sym        = input.symbol("CBOE:VIX",      "VIX Symbol",                   group="⚙️ Filters")
+
+// ──────────────────────────────────────────────
+// INPUTS — COLORS
+// ──────────────────────────────────────────────
+gann_box_color  = input.color(color.new(color.yellow, 85), "Gann Box Color",   group="🎨 Colors")
+gann_line_color = input.color(color.yellow,                 "Gann Line Color",  group="🎨 Colors")
+
+// ──────────────────────────────────────────────
+// INPUTS — KEY LEVEL LABEL STYLE
+// ──────────────────────────────────────────────
+lbl_size      = input.string("Tiny",  "Label Size",     options=["Tiny", "Small", "Normal", "Large"], group="🏷 Key Level Labels")
+lbl_textcolor = input.color(color.white, "Label Text Color", group="🏷 Key Level Labels")
+
+// ──────────────────────────────────────────────
+// EXTERNAL DATA
+// ──────────────────────────────────────────────
+nq_close  = request.security(nq_sym,  "2", close, lookahead=barmerge.lookahead_off)
+nq_high   = request.security(nq_sym,  "2", high,  lookahead=barmerge.lookahead_off)
+nq_low    = request.security(nq_sym,  "2", low,   lookahead=barmerge.lookahead_off)
+vix_close = request.security(vix_sym, "2", close, lookahead=barmerge.lookahead_off)
+vix_high  = request.security(vix_sym, "2", high,  lookahead=barmerge.lookahead_off)
+vix_low   = request.security(vix_sym, "2", low,   lookahead=barmerge.lookahead_off)
+
+// ──────────────────────────────────────────────
+// TIME
+// ──────────────────────────────────────────────
+et_hour = hour(time,   "America/New_York")
+et_min  = minute(time, "America/New_York")
+
+gann_start_mins = gann_hour_start * 60 + gann_min_start
+gann_end_mins   = gann_hour_end   * 60 + gann_min_end
+current_mins    = et_hour * 60 + et_min
+
+is_gann_session = current_mins >= gann_start_mins and current_mins < gann_end_mins
+is_new_day      = ta.change(time("D")) != 0
+
+// ──────────────────────────────────────────────
+// SESSION DETECTION — uses chart timeframe
+// ──────────────────────────────────────────────
+tf = timeframe.period
+
+is_asia   = not na(time(tf, "1900-2300", "America/New_York"))
+is_london = not na(time(tf, "0200-0500", "America/New_York"))
+is_ny_am  = not na(time(tf, "0800-1100", "America/New_York"))
+is_ny_pm  = not na(time(tf, "1300-1600", "America/New_York"))
+
+// ──────────────────────────────────────────────
+// VWAP
+// ──────────────────────────────────────────────
+var float vwap_num = 0.0
+var float vwap_den = 0.0
+if is_new_day
+    vwap_num := 0.0
+    vwap_den := 0.0
+vwap_num += (high + low + close) / 3 * volume
+vwap_den += volume
+vwap_val  = vwap_num / vwap_den
+
+// ──────────────────────────────────────────────
+// VOLUME + INDICATORS
+// ──────────────────────────────────────────────
+vol_ma      = ta.sma(volume, vol_lookback)
+high_volume = volume > vol_ma
+rsi_val     = ta.rsi(close, 14)
+rsi_neutral = rsi_val > 30 and rsi_val < 70
+sma20       = ta.sma(close, 20)
+above_sma   = close > sma20
+below_sma   = close < sma20
+ema9        = ta.ema(close, 9)
+above_ema   = close > ema9
+below_ema   = close < ema9
+
+// ──────────────────────────────────────────────
+// RSI DIVERGENCE
+// ──────────────────────────────────────────────
+rsi_div_lbL   = 5
+rsi_div_lbR   = 5
+rsi_div_lower = 5
+rsi_div_upper = 60
+osc           = ta.rsi(close, 14)
+plFound       = not na(ta.pivotlow(osc,  rsi_div_lbL, rsi_div_lbR))
+phFound       = not na(ta.pivothigh(osc, rsi_div_lbL, rsi_div_lbR))
+
+_inRange(cond) =>
+    bars = ta.barssince(cond == true)
+    rsi_div_lower <= bars and bars <= rsi_div_upper
+
+inRangePl = _inRange(plFound[1])
+inRangePh = _inRange(phFound[1])
+
+oscHL_div    = osc[rsi_div_lbR] > ta.valuewhen(plFound, osc[rsi_div_lbR], 1) and inRangePl
+priceLL_div  = low[rsi_div_lbR] < ta.valuewhen(plFound, low[rsi_div_lbR], 1)
+rsi_bull_div = priceLL_div and oscHL_div and plFound
+
+oscLH_div    = osc[rsi_div_lbR] < ta.valuewhen(phFound, osc[rsi_div_lbR], 1) and inRangePh
+priceHH_div  = high[rsi_div_lbR] > ta.valuewhen(phFound, high[rsi_div_lbR], 1)
+rsi_bear_div = priceHH_div and oscLH_div and phFound
+
+// ══════════════════════════════════════════════
+// KEY LEVELS: PDH, PDL, SESSION H/L
+// ══════════════════════════════════════════════
+var float pdh           = na
+var float pdl           = na
+var float prev_day_high = na
+var float prev_day_low  = na
+
+if is_new_day
+    pdh           := prev_day_high
+    pdl           := prev_day_low
+    prev_day_high := high
+    prev_day_low  := low
+else
+    prev_day_high := math.max(prev_day_high, high)
+    prev_day_low  := math.min(prev_day_low,  low)
+
+var float asia_h    = na
+var float asia_l    = na
+var bool  asia_done = false
+var float lon_h     = na
+var float lon_l     = na
+var bool  lon_done  = false
+var float nyam_h    = na
+var float nyam_l    = na
+var bool  nyam_done = false
+var float nypm_h    = na
+var float nypm_l    = na
+var bool  nypm_done = false
+
+if is_new_day
+    asia_h    := na
+    asia_l    := na
+    asia_done := false
+    lon_h     := na
+    lon_l     := na
+    lon_done  := false
+    nyam_h    := na
+    nyam_l    := na
+    nyam_done := false
+    nypm_h    := na
+    nypm_l    := na
+    nypm_done := false
+
+if is_asia and not asia_done
+    asia_h := na(asia_h) ? high : math.max(asia_h, high)
+    asia_l := na(asia_l) ? low  : math.min(asia_l, low)
+if not is_asia and not na(asia_h)
+    asia_done := true
+
+if is_london and not lon_done
+    lon_h := na(lon_h) ? high : math.max(lon_h, high)
+    lon_l := na(lon_l) ? low  : math.min(lon_l, low)
+if not is_london and not na(lon_h)
+    lon_done := true
+
+if is_ny_am and not nyam_done
+    nyam_h := na(nyam_h) ? high : math.max(nyam_h, high)
+    nyam_l := na(nyam_l) ? low  : math.min(nyam_l, low)
+if not is_ny_am and not na(nyam_h)
+    nyam_done := true
+
+if is_ny_pm and not nypm_done
+    nypm_h := na(nypm_h) ? high : math.max(nypm_h, high)
+    nypm_l := na(nypm_l) ? low  : math.min(nypm_l, low)
+if not is_ny_pm and not na(nypm_h)
+    nypm_done := true
+
+// ══════════════════════════════════════════════
+// GANN BOX BUILDER
+// ══════════════════════════════════════════════
+var float gann_high              = na
+var float gann_low               = na
+var bool  gann_locked            = false
+var int   break_count            = 0
+var int   gann_session_start_bar = na
+
+var float nq_gann_high    = na
+var float nq_gann_low     = na
+var bool  nq_gann_locked  = false
+var float vix_gann_high   = na
+var float vix_gann_low    = na
+var bool  vix_gann_locked = false
+
+if is_new_day
+    gann_high              := na
+    gann_low               := na
+    gann_locked            := false
+    break_count            := 0
+    gann_session_start_bar := na
+    nq_gann_high           := na
+    nq_gann_low            := na
+    nq_gann_locked         := false
+    vix_gann_high          := na
+    vix_gann_low           := na
+    vix_gann_locked        := false
+
+if is_gann_session and na(gann_session_start_bar)
+    gann_session_start_bar := bar_index
+
+if is_gann_session and not gann_locked
+    gann_high := na(gann_high) ? high    : math.max(gann_high, high)
+    gann_low  := na(gann_low)  ? low     : math.min(gann_low,  low)
+
+if is_gann_session and not nq_gann_locked
+    nq_gann_high := na(nq_gann_high) ? nq_high : math.max(nq_gann_high, nq_high)
+    nq_gann_low  := na(nq_gann_low)  ? nq_low  : math.min(nq_gann_low,  nq_low)
+
+if is_gann_session and not vix_gann_locked
+    vix_gann_high := na(vix_gann_high) ? vix_high : math.max(vix_gann_high, vix_high)
+    vix_gann_low  := na(vix_gann_low)  ? vix_low  : math.min(vix_gann_low,  vix_low)
+
+if not is_gann_session
+    if not na(gann_high)     and not gann_locked
+        gann_locked     := true
+    if not na(nq_gann_high)  and not nq_gann_locked
+        nq_gann_locked  := true
+    if not na(vix_gann_high) and not vix_gann_locked
+        vix_gann_locked := true
+
+// ══════════════════════════════════════════════
+// BREAK & FLIP DETECTION
+// ══════════════════════════════════════════════
+es_break_up_close   = gann_locked and close > gann_high and close[1] <= gann_high
+es_break_down_close = gann_locked and close < gann_low  and close[1] >= gann_low
+es_wick_up          = gann_locked and high > gann_high  and close <= gann_high and not es_break_up_close
+es_wick_down        = gann_locked and low  < gann_low   and close >= gann_low  and not es_break_down_close
+
+if es_break_up_close or es_break_down_close
+    break_count += 1
+
+is_choppy = break_count >= chop_threshold
+
+var bool broken_up            = false
+var bool broken_down          = false
+var bool break_was_close_up   = false
+var bool break_was_close_down = false
+
+if is_new_day
+    broken_up            := false
+    broken_down          := false
+    break_was_close_up   := false
+    break_was_close_down := false
+
+if (es_break_up_close or es_wick_up) and not broken_up
+    broken_up          := true
+    break_was_close_up := es_break_up_close
+
+if (es_break_down_close or es_wick_down) and not broken_down
+    broken_down          := true
+    break_was_close_down := es_break_down_close
+
+gann_flip_long  = broken_down and close > gann_low  and close[1] <= gann_low
+gann_flip_short = broken_up   and close < gann_high and close[1] >= gann_high
+
+// NQ confirms: is NQ currently on the same side of its Gann level as the ES flip?
+// Checks current position rather than requiring same-bar flip (fixes false NO readings)
+nq_confirms_long  = nq_gann_locked and nq_close > nq_gann_low
+nq_confirms_short = nq_gann_locked and nq_close < nq_gann_high
+nq_confirms       = (gann_flip_long and nq_confirms_long) or (gann_flip_short and nq_confirms_short)
+
+vix_flip_bull = vix_gann_locked and vix_close < vix_gann_high and vix_close[1] >= vix_gann_high
+vix_flip_bear = vix_gann_locked and vix_close > vix_gann_low  and vix_close[1] <= vix_gann_low
+
+// ES YES = price closed back through the level on the flip bar (always true by gann_flip definition)
+// ES NO would only show if somehow gann_flip fired without a close — which can't happen with current logic
+es_confirms_long  = gann_flip_long
+es_confirms_short = gann_flip_short
+
+// ══════════════════════════════════════════════
+// SCORING ENGINE
+// ══════════════════════════════════════════════
+score_long = 0
+score_long += gann_flip_long       ? 3 : 0
+score_long += break_was_close_down ? 1 : 0
+score_long += vix_flip_bull        ? 2 : 0
+score_long += nq_confirms          ? 1 : 0
+score_long += rsi_neutral          ? 1 : 0
+score_long += above_sma            ? 1 : 0
+score_long += above_ema            ? 1 : 0
+score_long += rsi_bull_div         ? 1 : 0
+score_long += (close > vwap_val or (close < vwap_val and close > gann_low)) ? 1 : 0
+score_long += high_volume          ? 1 : 0
+score_long += is_choppy            ? -2 : 0
+score_long := math.max(0, math.min(10, score_long))
+
+score_short = 0
+score_short += gann_flip_short    ? 3 : 0
+score_short += break_was_close_up ? 1 : 0
+score_short += vix_flip_bear      ? 2 : 0
+score_short += nq_confirms        ? 1 : 0
+score_short += rsi_neutral        ? 1 : 0
+score_short += below_sma          ? 1 : 0
+score_short += below_ema          ? 1 : 0
+score_short += rsi_bear_div       ? 1 : 0
+score_short += (close < vwap_val or (close > vwap_val and close < gann_high)) ? 1 : 0
+score_short += high_volume        ? 1 : 0
+score_short += is_choppy          ? -2 : 0
+score_short := math.max(0, math.min(10, score_short))
+
+f_rating(s) =>
+    s >= 9 ? "CONVICTION" : s >= 7 ? "STRONG" : s >= 5 ? "MODERATE" : "WEAK"
+
+b(v) => v ? "true" : "false"
+p(v) => str.tostring(math.round(v * 4) / 4, "#.00")
+
+// ══════════════════════════════════════════════
+// JSON ALERTS
+// ══════════════════════════════════════════════
+if gann_flip_long
+    msg = '{"type":"GANN_FLIP_LONG"' +
+         ',"score":' + str.tostring(score_long) +
+         ',"rating":"' + f_rating(score_long) + '"' +
+         ',"price":' + p(close) +
+         ',"box_low":' + p(gann_low) +
+         ',"box_high":' + p(gann_high) +
+         ',"vix":' + b(vix_flip_bull) +
+         ',"nq":' + b(nq_confirms) +
+         ',"sma20":' + b(above_sma) +
+         ',"ema9":' + b(above_ema) +
+         ',"rsi_div":' + b(rsi_bull_div) +
+         ',"clean_break":' + b(break_was_close_down) +
+         ',"high_vol":' + b(high_volume) +
+         ',"rsi_ok":' + b(rsi_neutral) +
+         ',"choppy":' + b(is_choppy) +
+         ',"breaks":' + str.tostring(break_count) +
+         '}'
+    alert(msg, alert.freq_once_per_bar)
+
+if gann_flip_short
+    msg = '{"type":"GANN_FLIP_SHORT"' +
+         ',"score":' + str.tostring(score_short) +
+         ',"rating":"' + f_rating(score_short) + '"' +
+         ',"price":' + p(close) +
+         ',"box_low":' + p(gann_low) +
+         ',"box_high":' + p(gann_high) +
+         ',"vix":' + b(vix_flip_bear) +
+         ',"nq":' + b(nq_confirms) +
+         ',"sma20":' + b(below_sma) +
+         ',"ema9":' + b(below_ema) +
+         ',"rsi_div":' + b(rsi_bear_div) +
+         ',"clean_break":' + b(break_was_close_up) +
+         ',"high_vol":' + b(high_volume) +
+         ',"rsi_ok":' + b(rsi_neutral) +
+         ',"choppy":' + b(is_choppy) +
+         ',"breaks":' + str.tostring(break_count) +
+         '}'
+    alert(msg, alert.freq_once_per_bar)
+
+if is_choppy and (gann_flip_long or gann_flip_short)
+    alert('{"type":"CHOPPY_WARNING","breaks":' + str.tostring(break_count) + '}', alert.freq_once_per_bar)
+
+// ══════════════════════════════════════════════
+// alertcondition blocks
+// ══════════════════════════════════════════════
+alertcondition(gann_flip_long,                                     "GG - Gann Flip LONG",    "GANN FLIP LONG")
+alertcondition(gann_flip_short,                                    "GG - Gann Flip SHORT",   "GANN FLIP SHORT")
+alertcondition(gann_flip_long  and score_long  >= 7,              "GG - STRONG Flip LONG",  "STRONG LONG 7+")
+alertcondition(gann_flip_short and score_short >= 7,              "GG - STRONG Flip SHORT", "STRONG SHORT 7+")
+alertcondition(gann_flip_long  and score_long  >= 9,              "GG - CONVICTION LONG",   "CONVICTION LONG 9+")
+alertcondition(gann_flip_short and score_short >= 9,              "GG - CONVICTION SHORT",  "CONVICTION SHORT 9+")
+alertcondition(is_choppy and (gann_flip_long or gann_flip_short), "GG - CHOPPY WARNING",    "CHOPPY - reduce size")
+alertcondition(es_break_up_close,                                  "GG - Break UP Close",    "ES closed above Gann High")
+alertcondition(es_break_down_close,                                "GG - Break DOWN Close",  "ES closed below Gann Low")
+
+// ══════════════════════════════════════════════
+// VISUALS
+// ══════════════════════════════════════════════
+
+// ── Gann Box (extends to 4PM ET, then locks right edge) ──
+is_after_close = current_mins >= 960  // 16:00 ET = 960 mins
+
+var box gann_box_draw = na
+var int gann_box_end_bar = na
+if is_new_day
+    gann_box_draw    := na
+    gann_box_end_bar := na
+
+if gann_locked and show_gann_box and not na(gann_session_start_bar)
+    if is_after_close and na(gann_box_end_bar)
+        gann_box_end_bar := bar_index  // freeze right edge at 4PM bar
+    if na(gann_box_draw)
+        // Draw with extend.right so it fills to screen edge; we'll freeze it at 4PM
+        gann_box_draw := box.new(
+             gann_session_start_bar, gann_high,
+             bar_index + 1, gann_low,
+             border_color=gann_line_color, border_width=2,
+             bgcolor=gann_box_color,
+             extend=na(gann_box_end_bar) ? extend.right : extend.none)
+    else if not na(gann_box_end_bar)
+        // 4PM hit — freeze: remove extend, set exact right edge
+        box.set_extend(gann_box_draw, extend.none)
+        box.set_right(gann_box_draw, gann_box_end_bar)
+
+box_right_live = na(gann_box_end_bar) ? bar_index : gann_box_end_bar
+
+plot(gann_locked and show_levels ? gann_high : na, "Gann High", color=gann_line_color, linewidth=2, style=plot.style_linebr)
+plot(gann_locked and show_levels ? gann_low  : na, "Gann Low",  color=gann_line_color, linewidth=2, style=plot.style_linebr)
+plot(sma20, "SMA 20", color=color.new(color.blue,   0), linewidth=1)
+plot(ema9,  "EMA 9",  color=color.new(color.orange, 0), linewidth=1)
+
+gann_range = gann_high - gann_low
+fib_382    = gann_low + gann_range * 0.382
+fib_50     = gann_low + gann_range * 0.50
+fib_618    = gann_low + gann_range * 0.618
+
+// ── Gann Box Internal Grid (redraws on every bar update so boundaries are always correct) ──
+var line[]  gann_grid_lines  = array.new<line>()
+var label[] gann_grid_labels = array.new<label>()
+
+gann_grid_drawn = not na(gann_session_start_bar) and gann_locked
+
+if is_new_day
+    if array.size(gann_grid_lines) > 0
+        for i = 0 to array.size(gann_grid_lines) - 1
+            line.delete(array.get(gann_grid_lines, i))
+        array.clear(gann_grid_lines)
+    if array.size(gann_grid_labels) > 0
+        for i = 0 to array.size(gann_grid_labels) - 1
+            label.delete(array.get(gann_grid_labels, i))
+        array.clear(gann_grid_labels)
+
+if show_gann_box and gann_grid_drawn and barstate.islast
+    // Clear and fully redraw every time so grid/labels always match the current box right edge
+    if array.size(gann_grid_lines) > 0
+        for i = 0 to array.size(gann_grid_lines) - 1
+            line.delete(array.get(gann_grid_lines, i))
+        array.clear(gann_grid_lines)
+    if array.size(gann_grid_labels) > 0
+        for i = 0 to array.size(gann_grid_labels) - 1
+            label.delete(array.get(gann_grid_labels, i))
+        array.clear(gann_grid_labels)
+
+    box_left  = gann_session_start_bar
+    box_right = box_right_live
+    box_width = box_right - box_left
+    gann_col  = color.new(gann_line_color, 60)
+    lbl_col   = color.new(gann_line_color, 40)
+    lbl_tc    = color.new(color.white, 0)
+
+    // Price levels — horizontal lines + left/right labels
+    all_price     = array.from(0.0, 0.25, 0.382, 0.50, 0.618, 0.75, 1.0)
+    all_price_str = array.from("0", "0.25", "0.382", "0.5", "0.618", "0.75", "1")
+
+    for i = 0 to array.size(all_price) - 1
+        pct     = array.get(all_price, i)
+        lvl     = gann_low + gann_range * pct
+        lbl_txt = array.get(all_price_str, i)
+        if pct != 0.0 and pct != 1.0
+            l = line.new(box_left, lvl, box_right, lvl, color=gann_col, width=1, style=line.style_solid, extend=extend.none)
+            array.push(gann_grid_lines, l)
+        if gann_price_lbl_left
+            lb = label.new(box_left, lvl, lbl_txt, style=label.style_label_right, color=lbl_col, textcolor=lbl_tc, size=size.tiny)
+            array.push(gann_grid_labels, lb)
+        if gann_price_lbl_right
+            rb = label.new(box_right, lvl, lbl_txt, style=label.style_label_left, color=lbl_col, textcolor=lbl_tc, size=size.tiny)
+            array.push(gann_grid_labels, rb)
+
+    // Time levels — vertical lines + top/bottom labels
+    all_time     = array.from(0.0, 0.25, 0.382, 0.50, 0.618, 0.75, 1.0)
+    all_time_str = array.from("0", "0.25", "0.382", "0.5", "0.618", "0.75", "1")
+
+    for i = 0 to array.size(all_time) - 1
+        pct     = array.get(all_time, i)
+        t       = box_left + math.round(box_width * pct)
+        lbl_txt = array.get(all_time_str, i)
+        if pct != 0.0 and pct != 1.0
+            l = line.new(t, gann_high, t, gann_low, color=gann_col, width=1, style=line.style_solid, extend=extend.none)
+            array.push(gann_grid_lines, l)
+        if gann_time_lbl_top
+            tb = label.new(t, gann_high, lbl_txt, style=label.style_label_down, color=lbl_col, textcolor=lbl_tc, size=size.tiny)
+            array.push(gann_grid_labels, tb)
+        if gann_time_lbl_bot
+            bb = label.new(t, gann_low, lbl_txt, style=label.style_label_up, color=lbl_col, textcolor=lbl_tc, size=size.tiny)
+            array.push(gann_grid_labels, bb)
+
+// ── Key Level Lines + Labels ──
+// Each level: line drawn from session-lock bar to end of day (4PM ET)
+// Label sits at right end of line, fixed, never moves
+// PDH/PDL persist all day. Session levels appear when session closes.
+
+var line  kl_pdh_line    = na
+var line  kl_pdl_line    = na
+var line  kl_asia_h_line = na
+var line  kl_asia_l_line = na
+var line  kl_lon_h_line  = na
+var line  kl_lon_l_line  = na
+var line  kl_nyam_h_line = na
+var line  kl_nyam_l_line = na
+var line  kl_nypm_h_line = na
+var line  kl_nypm_l_line = na
+var label kl_pdh_lbl     = na
+var label kl_pdl_lbl     = na
+var label kl_asia_h_lbl  = na
+var label kl_asia_l_lbl  = na
+var label kl_lon_h_lbl   = na
+var label kl_lon_l_lbl   = na
+var label kl_nyam_h_lbl  = na
+var label kl_nyam_l_lbl  = na
+var label kl_nypm_h_lbl  = na
+var label kl_nypm_l_lbl  = na
+
+// Helper values
+kl_end_bar = box_right_live
+lbl_sz = lbl_size == "Tiny" ? size.tiny : lbl_size == "Small" ? size.small : lbl_size == "Normal" ? size.normal : size.large
+
+// Reset on new day
+if is_new_day
+    line.delete(kl_pdh_line)
+    line.delete(kl_pdl_line)
+    line.delete(kl_asia_h_line)
+    line.delete(kl_asia_l_line)
+    line.delete(kl_lon_h_line)
+    line.delete(kl_lon_l_line)
+    line.delete(kl_nyam_h_line)
+    line.delete(kl_nyam_l_line)
+    line.delete(kl_nypm_h_line)
+    line.delete(kl_nypm_l_line)
+    label.delete(kl_pdh_lbl)
+    label.delete(kl_pdl_lbl)
+    label.delete(kl_asia_h_lbl)
+    label.delete(kl_asia_l_lbl)
+    label.delete(kl_lon_h_lbl)
+    label.delete(kl_lon_l_lbl)
+    label.delete(kl_nyam_h_lbl)
+    label.delete(kl_nyam_l_lbl)
+    label.delete(kl_nypm_h_lbl)
+    label.delete(kl_nypm_l_lbl)
+    kl_pdh_line    := na
+    kl_pdl_line    := na
+    kl_asia_h_line := na
+    kl_asia_l_line := na
+    kl_lon_h_line  := na
+    kl_lon_l_line  := na
+    kl_nyam_h_line := na
+    kl_nyam_l_line := na
+    kl_nypm_h_line := na
+    kl_nypm_l_line := na
+    kl_pdh_lbl     := na
+    kl_pdl_lbl     := na
+    kl_asia_h_lbl  := na
+    kl_asia_l_lbl  := na
+    kl_lon_h_lbl   := na
+    kl_lon_l_lbl   := na
+    kl_nyam_h_lbl  := na
+    kl_nyam_l_lbl  := na
+    kl_nypm_h_lbl  := na
+    kl_nypm_l_lbl  := na
+
+if show_levels
+    eob = kl_end_bar + 50  // end bar = 4PM freeze + small offset for label
+
+    // PDH / PDL — draw on first bar of new day
+    if is_new_day and not na(pdh)
+        kl_pdh_line := line.new(bar_index, pdh, eob, pdh, color=color.new(color.orange, 0), width=1, style=line.style_solid, extend=extend.none)
+        kl_pdl_line := line.new(bar_index, pdl, eob, pdl, color=color.new(color.orange, 0), width=1, style=line.style_solid, extend=extend.none)
+        kl_pdh_lbl  := label.new(eob, pdh, "PDH", style=label.style_label_left, color=color.new(color.orange, 20), textcolor=lbl_textcolor, size=lbl_sz)
+        kl_pdl_lbl  := label.new(eob, pdl, "PDL", style=label.style_label_left, color=color.new(color.orange, 20), textcolor=lbl_textcolor, size=lbl_sz)
+
+    // Asia — draw when session closes
+    if asia_done and not asia_done[1]
+        kl_asia_h_line := line.new(bar_index, asia_h, eob, asia_h, color=color.new(color.blue, 0),   width=1, style=line.style_solid, extend=extend.none)
+        kl_asia_l_line := line.new(bar_index, asia_l, eob, asia_l, color=color.new(color.blue, 0),   width=1, style=line.style_solid, extend=extend.none)
+        kl_asia_h_lbl  := label.new(eob, asia_h, "Asia H", style=label.style_label_left, color=color.new(color.blue,   20), textcolor=lbl_textcolor, size=lbl_sz)
+        kl_asia_l_lbl  := label.new(eob, asia_l, "Asia L", style=label.style_label_left, color=color.new(color.blue,   20), textcolor=lbl_textcolor, size=lbl_sz)
+
+    // London
+    if lon_done and not lon_done[1]
+        kl_lon_h_line := line.new(bar_index, lon_h, eob, lon_h, color=color.new(color.purple, 0), width=1, style=line.style_solid, extend=extend.none)
+        kl_lon_l_line := line.new(bar_index, lon_l, eob, lon_l, color=color.new(color.purple, 0), width=1, style=line.style_solid, extend=extend.none)
+        kl_lon_h_lbl  := label.new(eob, lon_h, "Lon H", style=label.style_label_left, color=color.new(color.purple, 20), textcolor=lbl_textcolor, size=lbl_sz)
+        kl_lon_l_lbl  := label.new(eob, lon_l, "Lon L", style=label.style_label_left, color=color.new(color.purple, 20), textcolor=lbl_textcolor, size=lbl_sz)
+
+    // NY AM
+    if nyam_done and not nyam_done[1]
+        kl_nyam_h_line := line.new(bar_index, nyam_h, eob, nyam_h, color=color.new(color.teal, 0), width=1, style=line.style_solid, extend=extend.none)
+        kl_nyam_l_line := line.new(bar_index, nyam_l, eob, nyam_l, color=color.new(color.teal, 0), width=1, style=line.style_solid, extend=extend.none)
+        kl_nyam_h_lbl  := label.new(eob, nyam_h, "NY AM H", style=label.style_label_left, color=color.new(color.teal,   20), textcolor=lbl_textcolor, size=lbl_sz)
+        kl_nyam_l_lbl  := label.new(eob, nyam_l, "NY AM L", style=label.style_label_left, color=color.new(color.teal,   20), textcolor=lbl_textcolor, size=lbl_sz)
+
+    // NY PM
+    if nypm_done and not nypm_done[1]
+        kl_nypm_h_line := line.new(bar_index, nypm_h, eob, nypm_h, color=color.new(color.lime, 0), width=1, style=line.style_solid, extend=extend.none)
+        kl_nypm_l_line := line.new(bar_index, nypm_l, eob, nypm_l, color=color.new(color.lime, 0), width=1, style=line.style_solid, extend=extend.none)
+        kl_nypm_h_lbl  := label.new(eob, nypm_h, "NY PM H", style=label.style_label_left, color=color.new(color.lime,   20), textcolor=lbl_textcolor, size=lbl_sz)
+        kl_nypm_l_lbl  := label.new(eob, nypm_l, "NY PM L", style=label.style_label_left, color=color.new(color.lime,   20), textcolor=lbl_textcolor, size=lbl_sz)
+
+    // While box hasn't frozen yet, keep extending line + label right edges to current bar
+    if na(gann_box_end_bar)
+        eob_live = bar_index + 50
+        if not na(kl_pdh_line)
+            line.set_x2(kl_pdh_line, eob_live)
+            line.set_x2(kl_pdl_line, eob_live)
+            label.set_x(kl_pdh_lbl,  eob_live)
+            label.set_x(kl_pdl_lbl,  eob_live)
+        if not na(kl_asia_h_line)
+            line.set_x2(kl_asia_h_line, eob_live)
+            line.set_x2(kl_asia_l_line, eob_live)
+            label.set_x(kl_asia_h_lbl,  eob_live)
+            label.set_x(kl_asia_l_lbl,  eob_live)
+        if not na(kl_lon_h_line)
+            line.set_x2(kl_lon_h_line, eob_live)
+            line.set_x2(kl_lon_l_line, eob_live)
+            label.set_x(kl_lon_h_lbl,  eob_live)
+            label.set_x(kl_lon_l_lbl,  eob_live)
+        if not na(kl_nyam_h_line)
+            line.set_x2(kl_nyam_h_line, eob_live)
+            line.set_x2(kl_nyam_l_line, eob_live)
+            label.set_x(kl_nyam_h_lbl,  eob_live)
+            label.set_x(kl_nyam_l_lbl,  eob_live)
+        if not na(kl_nypm_h_line)
+            line.set_x2(kl_nypm_h_line, eob_live)
+            line.set_x2(kl_nypm_l_line, eob_live)
+            label.set_x(kl_nypm_h_lbl,  eob_live)
+            label.set_x(kl_nypm_l_lbl,  eob_live)
+
+// ── Sweep / Signal Shapes ──
+plotshape(show_break_markers and es_break_up_close,   title="Break Up",   location=location.abovebar, style=shape.triangleup,   color=color.yellow,               size=size.small, text="B+")
+plotshape(show_break_markers and es_break_down_close, title="Break Down", location=location.belowbar, style=shape.triangledown, color=color.yellow,               size=size.small, text="B-")
+plotshape(show_break_markers and es_wick_up,          title="Wick Up",    location=location.abovebar, style=shape.triangleup,   color=color.new(color.yellow, 60), size=size.tiny,  text="w+")
+plotshape(show_break_markers and es_wick_down,        title="Wick Down",  location=location.belowbar, style=shape.triangledown, color=color.new(color.yellow, 60), size=size.tiny,  text="w-")
+
+// ── Gann Flip Shapes + Labels ──
+flip_long_color  = score_long  >= 9 ? color.red : score_long  >= 7 ? color.orange : score_long  >= 5 ? color.yellow : color.gray
+flip_short_color = score_short >= 9 ? color.red : score_short >= 7 ? color.orange : score_short >= 5 ? color.yellow : color.gray
+
+plotshape(show_gann_flip_labels and gann_flip_long,  title="Gann Flip Long",  location=location.belowbar, style=shape.labelup,   color=flip_long_color,  size=size.normal, text="GF")
+plotshape(show_gann_flip_labels and gann_flip_short, title="Gann Flip Short", location=location.abovebar, style=shape.labeldown, color=flip_short_color, size=size.normal, text="GF")
+
+if show_gann_flip_labels and gann_flip_long and not na(gann_range)
+    t1  = p(fib_382)
+    t2  = p(fib_50)
+    t3  = p(gann_high)
+    lbl = str.tostring(score_long) + "/10 " + f_rating(score_long) +
+         "\nT1:" + t1 + " T2:" + t2 + " T3:" + t3 +
+         (vix_flip_bull        ? "\nVIX:YES" : "\nVIX:NO") +
+         (nq_confirms          ? " NQ:YES"   : " NQ:NO")  +
+         (es_confirms_long     ? " ES:YES"   : " ES:NO")  +
+         (above_sma            ? " SMA:YES"  : " SMA:NO") +
+         (above_ema            ? " EMA:YES"  : " EMA:NO") +
+         (rsi_bull_div         ? " DIV:YES"  : " DIV:NO") +
+         (is_choppy            ? "\n!! CHOPPY" : "")
+    label.new(bar_index, low - gann_range * 0.08, lbl,
+         style=label.style_label_up, color=flip_long_color, textcolor=color.white, size=size.small)
+
+if show_gann_flip_labels and gann_flip_short and not na(gann_range)
+    t1  = p(fib_618)
+    t2  = p(fib_50)
+    t3  = p(gann_low)
+    lbl = str.tostring(score_short) + "/10 " + f_rating(score_short) +
+         "\nT1:" + t1 + " T2:" + t2 + " T3:" + t3 +
+         (vix_flip_bear        ? "\nVIX:YES" : "\nVIX:NO") +
+         (nq_confirms          ? " NQ:YES"   : " NQ:NO")  +
+         (es_confirms_short    ? " ES:YES"   : " ES:NO")  +
+         (below_sma            ? " SMA:YES"  : " SMA:NO") +
+         (below_ema            ? " EMA:YES"  : " EMA:NO") +
+         (rsi_bear_div         ? " DIV:YES"  : " DIV:NO") +
+         (is_choppy            ? "\n!! CHOPPY" : "")
+    label.new(bar_index, high + gann_range * 0.08, lbl,
+         style=label.style_label_down, color=flip_short_color, textcolor=color.white, size=size.small)
+
+// ── Status Table ──
+var table status_tbl = table.new(position.top_right, 1, 1, bgcolor=color.new(color.black, 10), border_width=1, border_color=color.gray)
+if barstate.islast and gann_locked
+    status = "GG v9  |  Box: " + p(gann_low) + " - " + p(gann_high) +
+         "  |  Breaks: " + str.tostring(break_count) + (is_choppy ? " !! CHOPPY" : " Clean") +
+         "  |  VWAP: " + p(vwap_val) +
+         "  |  RSI: " + str.tostring(math.round(rsi_val * 10) / 10, "#.0") +
+         "  |  Vol: " + (high_volume ? "HIGH" : "Normal")
+    table.cell(status_tbl, 0, 0, status, text_color=color.white, text_size=size.small)

@@ -1,0 +1,391 @@
+// This work is licensed under Creative Commons Attribution-NonCommercial-ShareAlike 4.0 International  
+// https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © UAlgo
+
+//@version=6
+indicator("Fair Value Gap Signals [UAlgo]", overlay = true, max_boxes_count = 500, max_labels_count = 500, max_lines_count = 500)
+
+// -----------------------------------------------------------------------------
+// CONSTANTS & INPUTS
+// -----------------------------------------------------------------------------
+string GRP_MAIN = "General Settings"
+string GRP_UI = "UI & Style"
+string GRP_FLT = "Filters"
+
+bool showSignals = input.bool(true, "Show Signals / Absorption", group = GRP_MAIN, inline = "1")
+bool showMetrics = input.bool(true, "Show VVD Metrics (Bars)", tooltip = "Velocity, Volume, Depth visualization inside the FVG", group = GRP_MAIN, inline = "1") 
+int maxVisible = input.int(3, "Max Visible FVGs", group = GRP_MAIN, minval = 1)
+string mitigationType = input.string("Close", "Mitigation Method", options = ["Close", "Wick"], group = GRP_MAIN)
+
+bool useAtrFilter = input.bool(true, "ATR Filter", tooltip = "Ignore small gaps smaller than ATR", group = GRP_FLT, inline = "2")
+int atrLength = input.int(14, "ATR Length", group = GRP_FLT, inline = "2")
+
+bool showMidline = input.bool(true, "Show FVG Midline (CE)", group = GRP_UI)
+
+// Improved UI Theme Colors
+color BULL_BG = color.new(#00BFA5, 85) // Teal
+color BEAR_BG = color.new(#FF5252, 85) // Coral
+color BULL_BORDER = color.new(#00BFA5, 50)
+color BEAR_BORDER = color.new(#FF5252, 50)
+
+color RANK_1_COLOR = color.new(#2962FF, 40) // Blue - Velocity
+color RANK_2_COLOR = color.new(#FFD600, 40) // Amber - Volume
+color RANK_3_COLOR = color.new(#AA00FF, 40) // Purple - Depth
+color TEXT_COLOR = color.new(color.white, 20)
+int GAP_LIMIT = 50 
+
+// -----------------------------------------------------------------------------
+// TYPES
+// -----------------------------------------------------------------------------
+type Gap
+    float top           
+    float bottom        
+    bool isBullish      
+    int index           
+    
+    // State Tracking
+    string status = "Fresh" 
+    bool isActive = true
+    
+    // --- METRIC TRACKING ---
+    float maxVelocity = 0.0
+    float testVolume = 0.0
+    float testStartVolume = 0.0
+    int testCount = 0
+    float maxDepth = 0.0
+    
+    // Visuals
+    box paramBox
+    box rankBox1 
+    box rankBox2 
+    box rankBox3 
+    line midLine
+    label infoLabel
+
+// -----------------------------------------------------------------------------
+// METHODS
+// -----------------------------------------------------------------------------
+
+// Constructor
+method setup(Gap g, float top, float bottom, bool isBullish, int idx, bool showMid) =>
+    g.top := top
+    g.bottom := bottom
+    g.isBullish := isBullish
+    g.index := idx
+    g.status := "Fresh"
+    
+    // Initialize metrics
+    g.maxVelocity := 0.0
+    g.testVolume := 0.0
+    g.testStartVolume := 0.0
+    g.testCount := 0
+    g.maxDepth := 0.0
+    
+    // Draw initial box
+    g.paramBox := box.new(
+         left = idx, 
+         top = top, 
+         right = bar_index + 5, 
+         bottom = bottom, 
+         border_color = isBullish ? BULL_BORDER : BEAR_BORDER, 
+         border_style = line.style_dashed,
+         bgcolor = isBullish ? BULL_BG : BEAR_BG,
+         text = "",
+         text_color = TEXT_COLOR,
+         text_size = size.tiny
+     )
+     
+    // Initialize Midline (Consequent Encroachment)
+    float midY = (top + bottom) / 2
+    g.midLine := line.new(
+         x1 = idx, 
+         y1 = midY, 
+         x2 = bar_index + 5, 
+         y2 = midY, 
+         color = showMid ? (isBullish ? BULL_BORDER : BEAR_BORDER) : na, 
+         style = line.style_dotted
+     )
+
+    // Initialize Rank Boxes 
+    float height = math.abs(top - bottom)
+    float h3 = height / 3
+    float y1 = top
+    float y2 = top - h3
+    float y3 = top - 2*h3
+
+    // Create boxes with text metrics
+    g.rankBox1 := box.new(idx, y1, idx, y1 - h3, border_color = na, bgcolor = RANK_1_COLOR, text = "Vel", text_color = color.new(color.white, 30), text_size = size.tiny, text_halign = text.align_center, text_valign = text.align_center)
+    g.rankBox2 := box.new(idx, y2, idx, y2 - h3, border_color = na, bgcolor = RANK_2_COLOR, text = "Vol", text_color = color.new(color.white, 30), text_size = size.tiny, text_halign = text.align_center, text_valign = text.align_center)
+    g.rankBox3 := box.new(idx, y3, idx, y3 - h3, border_color = na, bgcolor = RANK_3_COLOR, text = "Dpt", text_color = color.new(color.white, 30), text_size = size.tiny, text_halign = text.align_center, text_valign = text.align_center)
+
+// Update logic called on every bar
+// Returns Event Code: 0=None, 1=Testing, 2=Filled, 3=Rejected
+method update(Gap g, float volAvg, bool showSig, bool showMet, bool isVisible, string mitType, bool showMid) =>
+    int eventCode = 0
+    if g.isActive
+        g.paramBox.set_right(bar_index + 1)
+        g.midLine.set_x2(bar_index + 1)
+        
+        float gapSize = math.abs(g.top - g.bottom)
+        float h = high
+        float l = low
+        
+        // Do not count the FVG forming bar as a test, since its wick naturally forms the boundary
+        bool canTest = bar_index > g.index + 1
+        bool isInside = canTest and (h >= g.bottom and l <= g.top)
+        
+        // --- DEPTH CALCULATION ---
+        if canTest
+            float currentDepth = 0.0
+            if g.isBullish
+                if l < g.top
+                    currentDepth := g.top - l
+            else
+                if h > g.bottom
+                    currentDepth := h - g.bottom
+            
+            if currentDepth > g.maxDepth
+                g.maxDepth := currentDepth
+            
+        // --- VELOCITY CALCULATION ---
+        if isInside
+            float barRange = h - l
+            if barRange > 0
+                float bodyRatio = math.abs(close - open) / barRange
+                float directionBonus = 0.0
+                if g.isBullish and close > open
+                    directionBonus := 0.2
+                else if not g.isBullish and close < open
+                    directionBonus := 0.2
+                
+                float currentVelocity = math.min(bodyRatio + directionBonus, 1.0)
+                if currentVelocity > g.maxVelocity
+                    g.maxVelocity := currentVelocity
+        
+        // --- VOLUME CALCULATION ---
+        if isInside
+            g.testVolume += volume
+            
+            if g.status == "Fresh"
+                g.status := "Testing"
+                g.testCount := 1
+                g.testStartVolume := volume
+                eventCode := 1
+        else
+            if g.status == "Testing"
+                g.status := "Tested"
+            else if g.status == "Tested" and isInside
+                g.testCount += 1
+                g.status := "Testing"
+        
+        // --- STATE CHECKS ---
+        
+        // 1. Check FILL condition (Mitigation)
+        bool filledInverse = false
+        if canTest
+            if mitType == "Close"
+                filledInverse := g.isBullish ? (close < g.bottom) : (close > g.top)
+            else // Wick
+                filledInverse := g.isBullish ? (l < g.bottom) : (h > g.top)
+        
+        if filledInverse
+            g.status := "Filled"
+            g.isActive := false
+            eventCode := 2
+            
+            // Delete gap visuals only
+            g.paramBox.delete()
+            g.midLine.delete()
+            g.rankBox1.delete()
+            g.rankBox2.delete()
+            g.rankBox3.delete()
+        else
+            // 2. Check REJECTION signal
+            if isInside and g.testVolume > volAvg * 0.5
+                bool rejected = g.isBullish ? (l < g.top and close > g.top) : (h > g.bottom and close < g.bottom)
+                
+                if rejected
+                    g.status := "Rejected"
+                    if showSig and na(g.infoLabel)
+                        string icon = ""
+                        if g.maxVelocity > 0.6
+                            icon := g.isBullish ? "Strong Buy" : "Strong Sell"
+                        else
+                            icon := g.isBullish ? "Buy" : "Sell"
+                        
+                        float velScore = g.maxVelocity
+                        float expectedVol = volAvg * math.max(1, (bar_index - g.index) / 2)
+                        float volScore = math.min(g.testVolume / expectedVol, 1.0)
+                        float depthRatio = g.maxDepth / gapSize
+                        float safetyScore = math.max(0.0, 1.0 - depthRatio)
+                        
+                        string tipText = "Insights\n\n"
+                        tipText += "Velocity: " + str.tostring(velScore * 100, "#.#") + "%\n"
+                        tipText += "Volume: " + str.tostring(volScore * 100, "#.#") + "%\n"
+                        tipText += "Safety: " + str.tostring(safetyScore * 100, "#.#") + "%\n"
+                        tipText += "Tests: " + str.tostring(g.testCount)
+                            
+                        g.infoLabel := label.new(
+                             x = bar_index, 
+                             y = g.isBullish ? l : h, 
+                             text = icon,
+                             style = g.isBullish ? label.style_label_up : label.style_label_down,
+                             color = g.isBullish ? color.new(#00BFA5, 20) : color.new(#FF5252, 20),
+                             textcolor = color.white,
+                             size = size.small,
+                             tooltip = tipText
+                         )
+                    
+                    eventCode := 3
+
+        // --- RENDER UPDATES ---
+        if g.isActive
+            if not isVisible
+                // Hide visuals
+                g.paramBox.set_bgcolor(na)
+                g.paramBox.set_border_color(na)
+                g.paramBox.set_text("")
+                g.midLine.set_color(na)
+                g.rankBox1.set_bgcolor(na)
+                g.rankBox2.set_bgcolor(na)
+                g.rankBox3.set_bgcolor(na)
+                g.rankBox1.set_text_color(na)
+                g.rankBox2.set_text_color(na)
+                g.rankBox3.set_text_color(na)
+            else
+                // Restore and update visuals
+                g.paramBox.set_bgcolor(g.status == "Rejected" ? (g.isBullish ? color.new(#00BFA5, 70) : color.new(#FF5252, 70)) : (g.isBullish ? BULL_BG : BEAR_BG))
+                g.paramBox.set_border_color(g.isBullish ? BULL_BORDER : BEAR_BORDER)
+                g.midLine.set_color(showMid ? (g.isBullish ? BULL_BORDER : BEAR_BORDER) : na)
+                
+                if showMet
+                    if g.testCount > 0
+                        g.paramBox.set_text("Tests: " + str.tostring(g.testCount))
+                    else
+                        g.paramBox.set_text("")
+                else
+                    g.paramBox.set_text("")
+                    
+                float maxWidth = math.max(bar_index - g.index, 1)
+                
+                float velScore = g.maxVelocity
+                int len1 = int(math.max(1, maxWidth * velScore))
+                g.rankBox1.set_right(g.index + len1)
+                
+                float expectedVol = volAvg * math.max(1, (bar_index - g.index) / 2)
+                float volScore = math.min(g.testVolume / expectedVol, 1.0)
+                int len2 = int(math.max(1, maxWidth * volScore))
+                g.rankBox2.set_right(g.index + len2)
+                
+                float depthRatio = g.maxDepth / gapSize
+                float safetyScore = math.max(0.0, 1.0 - depthRatio)
+                int len3 = int(math.max(1, maxWidth * safetyScore))
+                g.rankBox3.set_right(g.index + len3)
+                
+                if showMet
+                    g.rankBox1.set_bgcolor(RANK_1_COLOR)
+                    g.rankBox2.set_bgcolor(RANK_2_COLOR)
+                    g.rankBox3.set_bgcolor(RANK_3_COLOR)
+                    g.rankBox1.set_text_color(color.new(color.white, 30))
+                    g.rankBox2.set_text_color(color.new(color.white, 30))
+                    g.rankBox3.set_text_color(color.new(color.white, 30))
+                else
+                    g.rankBox1.set_bgcolor(na)
+                    g.rankBox2.set_bgcolor(na)
+                    g.rankBox3.set_bgcolor(na)
+                    g.rankBox1.set_text_color(na)
+                    g.rankBox2.set_text_color(na)
+                    g.rankBox3.set_text_color(na)
+
+    eventCode
+
+// Garbage collection for old gaps
+method cleanup(array<Gap> gaps) =>
+    if gaps.size() > GAP_LIMIT
+        Gap g = gaps.shift()
+        g.paramBox.delete()
+        g.midLine.delete()
+        g.rankBox1.delete()
+        g.rankBox2.delete()
+        g.rankBox3.delete()
+        // infoLabel is NOT deleted - stays visible forever
+
+// -----------------------------------------------------------------------------
+// MAIN LOGIC
+// -----------------------------------------------------------------------------
+var array<Gap> gaps = array.new<Gap>()
+
+// ATR Calculation for Filter
+float atrVal = ta.atr(atrLength)
+
+// FVG Detection
+bool fvgBull = low > high[2]
+bool fvgBear = high < low[2]
+
+// Apply ATR Filter
+if useAtrFilter
+    float gapSizeBull = low - high[2]
+    float gapSizeBear = low[2] - high
+    if fvgBull and gapSizeBull < atrVal
+        fvgBull := false
+    if fvgBear and gapSizeBear < atrVal
+        fvgBear := false
+
+if fvgBull
+    Gap newGap = Gap.new()
+    newGap.setup(low, high[2], true, bar_index - 1, showMidline) 
+    gaps.push(newGap)
+
+if fvgBear
+    Gap newGap = Gap.new()
+    newGap.setup(low[2], high, false, bar_index - 1, showMidline)
+    gaps.push(newGap)
+
+// Pre-calculate averages
+float volAvg = ta.sma(volume, 20)
+
+// Update all existing gaps with Last X limitation
+int bullSeen = 0
+int bearSeen = 0
+
+// Global Event Flags for AlertCondition
+bool anyTesting = false
+bool anyFilled = false
+bool anySignal = false
+
+// Iterate BACKWARDS to find the most recent ones first
+if gaps.size() > 0
+    for i = gaps.size() - 1 to 0
+        Gap g = gaps.get(i)
+        
+        bool visible = false
+        // Only count valid (not filled) gaps
+        if g.status != "Filled"
+            if g.isBullish
+                if bullSeen < maxVisible
+                    visible := true
+                    bullSeen += 1
+            else
+                if bearSeen < maxVisible
+                    visible := true
+                    bearSeen += 1
+                    
+        int code = g.update(volAvg, showSignals, showMetrics, visible, mitigationType, showMidline)
+        if code == 1
+            anyTesting := true
+        if code == 2
+            anyFilled := true
+        if code == 3
+            anySignal := true
+
+// Limit array size strictly
+if gaps.size() > GAP_LIMIT
+    gaps.cleanup()
+
+// -----------------------------------------------------------------------------
+// ALERT CONDITIONS
+// -----------------------------------------------------------------------------
+alertcondition(fvgBull or fvgBear, "New FVG Formed", "New Fair Value Gap Detected")
+alertcondition(anyTesting, "FVG Testing", "Price has entered a Gap (Test)")
+alertcondition(anyFilled, "FVG Filled", "Gap has been filled/invalidated")
+alertcondition(anySignal, "FVG Rejection Signal", "Price rejected from FVG (Potential Reversal)")

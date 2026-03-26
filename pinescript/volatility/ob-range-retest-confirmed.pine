@@ -1,0 +1,676 @@
+// This Pine Script™ code is subject to the terms of the Mozilla Public License 2.0
+//@version=6
+indicator("OB Range Retest [Confirmed]", overlay=true,
+     max_boxes_count=500, max_lines_count=500,
+     max_labels_count=500, max_bars_back=500)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  OB RANGE RETEST [Confirmed]
+//  3-STATE MACHINE:
+//  WAITING  → price must LEAVE the OB zone after BOS
+//  ARMED    → price left, watching for retest back into OB
+//  ACTIVE   → retest confirmed, trade live, EVERYTHING draws at once
+//
+//  DESIGN RULE: NOTHING draws until retest confirms. Zero clutter.
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// ─────────────────────────────────────────────────────────────────────────────
+// INPUTS
+// ─────────────────────────────────────────────────────────────────────────────
+grp_str = "Structure Detection"
+grp_tm  = "Trade Management"
+grp_vis = "Visuals"
+
+swingLen    = input.int(5,     "Swing Length",               minval=2,    maxval=50,   group=grp_str)
+bosLookback = input.int(50,    "BOS Lookback (bars)",        minval=10,   maxval=200,  group=grp_str)
+obScanBars  = input.int(20,    "OB Scan Bars",               minval=3,    maxval=50,   group=grp_str,
+     tooltip="How many bars back from the BOS to scan for the OB candle.\nFutures: 10–20\nCrypto: 15–30")
+maxSetups   = input.int(4,     "Max Active Setups",          minval=1,    maxval=10,   group=grp_str)
+
+tpPct   = input.float(0.5,  "TP %",           minval=0.05, maxval=20.0, step=0.05, group=grp_tm,
+     tooltip="Take profit as % from retest entry close.\nFutures (MNQ): 0.3–0.8%\nCrypto (BTC): 1.0–3.0%")
+slPct   = input.float(0.3,  "SL %",           minval=0.05, maxval=20.0, step=0.05, group=grp_tm,
+     tooltip="Stop loss as % from retest entry close.\nFutures (MNQ): 0.2–0.5%\nCrypto (BTC): 0.5–2.0%")
+maxBars  = input.int(40,     "Max Bars in Trade", minval=5, maxval=200,             group=grp_tm)
+cooldown = input.int(5,      "Cooldown Bars",     minval=1, maxval=100,             group=grp_tm,
+     tooltip="Minimum bars between signals.\nFutures (MNQ): 3–8\nCrypto (BTC): 5–15")
+showTP  = input.bool(true,  "Show TP Line",                                         group=grp_tm)
+showSL  = input.bool(true,  "Show SL Line",                                         group=grp_tm)
+
+showBOS   = input.bool(true,  "Show BOS Lines",    group=grp_vis)
+showRange = input.bool(true,  "Show Range Box",    group=grp_vis)
+showGhost = input.bool(true,  "Ghost Candles",     group=grp_vis)
+showDash  = input.bool(true,  "Show Dashboard",    group=grp_vis)
+showAtrPct = input.bool(false, "Show ATR% Row",    group=grp_vis,
+     tooltip="ATR as % of price.\nFutures (MNQ): ~0.05–0.15%\nCrypto (BTC): ~0.3–1.5%")
+
+// ─────────────────────────────────────────────────────────────────────────────
+// COLORS
+// ─────────────────────────────────────────────────────────────────────────────
+color C_TEAL    = #00F5D4
+color C_GOLD    = #FFD700
+color C_BULL    = #00FF88
+color C_BEAR    = #FF4466
+color C_GRAY    = #666677
+color C_BG      = color.new(#0a0a14, 10)
+color C_MUTED   = color.new(#AAAAAA, 40)
+color C_OB_BULL = color.new(#00FF88, 75)
+color C_OB_BEAR = color.new(#FF4466, 75)
+color C_RANGE   = color.new(#6C63FF, 80)   // purple/blue like the slides
+
+// ─────────────────────────────────────────────────────────────────────────────
+// CORE INDICATORS
+// ─────────────────────────────────────────────────────────────────────────────
+float atr14  = ta.atr(14)
+float rsi14  = ta.rsi(close, 14)
+float volMa  = ta.sma(volume, 20)
+
+// max_bars_back for series used inside functions
+max_bars_back(close, 500)
+max_bars_back(open,  500)
+max_bars_back(high,  500)
+max_bars_back(low,   500)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// UDT — SMC SETUP
+// ─────────────────────────────────────────────────────────────────────────────
+type SMCSetup
+    bool   isBear
+    float  bosLevel
+    int    bosBar
+
+    float  obTop
+    float  obBot
+    int    obBar
+
+    float  liqLevel          // SSL (bearish) or BSL (bullish)
+
+    // State machine
+    bool   waiting    = true
+    bool   armed      = false
+    bool   active     = false
+    bool   done       = false
+
+    // Trade levels — set at retest only
+    float  entryPrice = na
+    float  tp         = na
+    float  sl         = na
+    int    entryBar   = na
+    int    activatedBar = na   // for alert pattern — stamped at retest
+
+    // Visuals — all na until retest fires
+    box    obBox      = na
+    box    rangeBox   = na
+    line   bosLine    = na
+    line   sssLine    = na
+    line   liqLine    = na
+    line   tpLine     = na
+    line   slLine     = na
+    label  entryLbl   = na
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SWING STRUCTURE DETECTION
+// ─────────────────────────────────────────────────────────────────────────────
+float swHigh = ta.pivothigh(high, swingLen, swingLen)
+float swLow  = ta.pivotlow(low,  swingLen, swingLen)
+
+var float[] swingHighs    = array.new<float>()
+var int[]   swingHighBars = array.new<int>()
+var float[] swingLows     = array.new<float>()
+var int[]   swingLowBars  = array.new<int>()
+
+if not na(swHigh) and barstate.isconfirmed
+    array.unshift(swingHighs, swHigh)
+    array.unshift(swingHighBars, bar_index - swingLen)
+    if array.size(swingHighs) > 20
+        array.pop(swingHighs)
+        array.pop(swingHighBars)
+
+if not na(swLow) and barstate.isconfirmed
+    array.unshift(swingLows, swLow)
+    array.unshift(swingLowBars, bar_index - swingLen)
+    if array.size(swingLows) > 20
+        array.pop(swingLows)
+        array.pop(swingLowBars)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// BOS DETECTION
+// Close-based breaks only — wick sweeps are NOT structure breaks
+// ─────────────────────────────────────────────────────────────────────────────
+bool  bearBOS      = false
+float bearBOSLevel = na
+int   bearBOSBar   = na
+
+bool  bullBOS      = false
+float bullBOSLevel = na
+int   bullBOSBar   = na
+
+if barstate.isconfirmed and array.size(swingLows) > 0
+    int cap = math.min(array.size(swingLows) - 1, 9)
+    for i = 0 to cap
+        float lvl  = array.get(swingLows, i)
+        int   bIdx = array.get(swingLowBars, i)
+        if close < lvl and close[1] >= lvl and (bar_index - bIdx) < bosLookback
+            bearBOS      := true
+            bearBOSLevel := lvl
+            bearBOSBar   := bIdx
+            break
+
+if barstate.isconfirmed and array.size(swingHighs) > 0
+    int cap = math.min(array.size(swingHighs) - 1, 9)
+    for i = 0 to cap
+        float lvl  = array.get(swingHighs, i)
+        int   bIdx = array.get(swingHighBars, i)
+        if close > lvl and close[1] <= lvl and (bar_index - bIdx) < bosLookback
+            bullBOS      := true
+            bullBOSLevel := lvl
+            bullBOSBar   := bIdx
+            break
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ORDER BLOCK FINDER
+// Scans backwards from current bar for the last opposing candle
+// Uses candle BODY (not wicks) — tighter zone, institutional level only
+// ─────────────────────────────────────────────────────────────────────────────
+f_findOB(bool isBearSetup) =>
+    float obTop    = na
+    float obBot    = na
+    int   obBarIdx = na
+    for lookback = 1 to obScanBars
+        if isBearSetup
+            // Bear BOS → find last BULLISH candle before the drop
+            if close[lookback] > open[lookback]
+                obTop    := high[lookback]
+                obBot    := math.min(open[lookback], close[lookback])
+                obBarIdx := bar_index - lookback
+                break
+        else
+            // Bull BOS → find last BEARISH candle before the rally
+            if close[lookback] < open[lookback]
+                obTop    := math.max(open[lookback], close[lookback])
+                obBot    := low[lookback]
+                obBarIdx := bar_index - lookback
+                break
+    [obTop, obBot, obBarIdx]
+
+// ─────────────────────────────────────────────────────────────────────────────
+// METHODS
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Draw EVERYTHING at once on retest confirmation
+// extend.right on all boxes + lines — locked to chart regardless of zoom
+method drawSetup(SMCSetup self) =>
+    int x1_ob    = self.obBar
+    int x1_entry = self.entryBar
+
+    // ── OB BOX ──
+    color obCol = self.isBear ? C_OB_BEAR : C_OB_BULL
+    self.obBox := box.new(x1_ob, self.obTop, bar_index + 30, self.obBot,
+         border_color = color.new(obCol, 40),
+         bgcolor      = obCol)
+
+    // ── SSS / SDD LINE (midpoint of OB body) ──
+    float obMid  = (self.obTop + self.obBot) / 2
+    color midCol = self.isBear ? C_BEAR : C_BULL
+    self.sssLine := line.new(x1_ob, obMid, bar_index + 30, obMid,
+         color = color.new(midCol, 50),
+         style = line.style_dashed, width=1)
+
+    // ── RANGE BOX (OB boundary → liquidity level) ──
+    if showRange
+        float rangeTop = self.isBear ? self.obBot    : self.liqLevel
+        float rangeBot = self.isBear ? self.liqLevel : self.obTop
+        self.rangeBox := box.new(x1_ob, rangeTop, bar_index + 30, rangeBot,
+             border_color = color.new(C_RANGE, 60),
+             bgcolor      = C_RANGE)
+
+    // ── LIQUIDITY LINE (SSL or BSL) ──
+    self.liqLine := line.new(x1_ob, self.liqLevel, bar_index + 30, self.liqLevel,
+         color = color.new(C_GOLD, 30),
+         style = line.style_solid, width=1)
+
+    // ── BOS LINE ──
+    if showBOS
+        self.bosLine := line.new(self.bosBar, self.bosLevel, bar_index, self.bosLevel,
+             color = color.new(C_MUTED, 40),
+             style = line.style_dotted, width=1)
+
+    // ── TP / SL LINES ──
+    if showTP
+        self.tpLine := line.new(x1_entry, self.tp, bar_index + 30, self.tp,
+             color = color.new(C_TEAL, 25),
+             style = line.style_dashed, width=2)
+    if showSL
+        self.slLine := line.new(x1_entry, self.sl, bar_index + 30, self.sl,
+             color = color.new(C_BEAR, 40),
+             style = line.style_dashed, width=1)
+
+    // ── ENTRY LABEL ──
+    string dir = self.isBear ? "▼ SHORT" : "▲ BUY"
+    string txt = dir + "\nTP: " + str.tostring(self.tp, format.mintick) + "\nSL: " + str.tostring(self.sl, format.mintick)
+    self.entryLbl := label.new(bar_index, na, txt,
+         yloc      = self.isBear ? yloc.abovebar    : yloc.belowbar,
+         style     = self.isBear ? label.style_label_down : label.style_label_up,
+         color     = color.new(self.isBear ? C_BEAR : C_BULL, 95),
+         textcolor = self.isBear ? C_BEAR : C_BULL,
+         size      = size.small)
+
+// Fade all visuals to gray on exit
+method fadeSetup(SMCSetup self) =>
+    if not na(self.obBox)
+        box.set_bgcolor(self.obBox,      self.isBear ? color.new(#FF4466, 55) : color.new(#00FF88, 55))
+        box.set_border_color(self.obBox, self.isBear ? color.new(#FF4466, 30) : color.new(#00FF88, 30))
+    if not na(self.rangeBox)
+        box.set_bgcolor(self.rangeBox,      color.new(#6C63FF, 60))
+        box.set_border_color(self.rangeBox, color.new(#6C63FF, 35))
+    if not na(self.sssLine)
+        line.set_color(self.sssLine, self.isBear ? color.new(#FF4466, 50) : color.new(#00FF88, 50))
+    if not na(self.liqLine)
+        line.set_color(self.liqLine, color.new(#FFD700, 45))
+    if not na(self.bosLine)
+        line.set_color(self.bosLine, color.new(#AAAAAA, 50))
+    if not na(self.tpLine)
+        line.set_color(self.tpLine,  color.new(#00F5D4, 50))
+    if not na(self.slLine)
+        line.set_color(self.slLine,  color.new(#FF4466, 55))
+
+// extendSetup — push all right edges forward while trade is active
+method extendSetup(SMCSetup self) =>
+    int x2 = bar_index + 30
+    if not na(self.obBox)
+        box.set_right(self.obBox, x2)
+    if not na(self.rangeBox)
+        box.set_right(self.rangeBox, x2)
+    if not na(self.sssLine)
+        line.set_x2(self.sssLine, x2)
+    if not na(self.liqLine)
+        line.set_x2(self.liqLine, x2)
+    if not na(self.tpLine)
+        line.set_x2(self.tpLine,  x2)
+    if not na(self.slLine)
+        line.set_x2(self.slLine,  x2)
+    if not na(self.bosLine)
+        line.set_x2(self.bosLine, x2)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SETUP ARRAY
+// ─────────────────────────────────────────────────────────────────────────────
+var SMCSetup[] setups = array.new<SMCSetup>()
+
+// ── BEARISH BOS → CREATE BEARISH SETUP ──
+if bearBOS and barstate.isconfirmed
+    [obT, obB, obBI] = f_findOB(true)
+    if not na(obT)
+        SMCSetup s = SMCSetup.new(
+             isBear   = true,
+             bosLevel = bearBOSLevel,
+             bosBar   = bearBOSBar,
+             obTop    = obT,
+             obBot    = obB,
+             obBar    = obBI,
+             liqLevel = bearBOSLevel)  // SSL = the swing low that broke
+        array.unshift(setups, s)
+        if array.size(setups) > maxSetups
+            SMCSetup old = array.pop(setups)
+            old.fadeSetup()
+
+// ── BULLISH BOS → CREATE BULLISH SETUP ──
+if bullBOS and barstate.isconfirmed
+    [obT, obB, obBI] = f_findOB(false)
+    if not na(obT)
+        SMCSetup s = SMCSetup.new(
+             isBear   = false,
+             bosLevel = bullBOSLevel,
+             bosBar   = bullBOSBar,
+             obTop    = obT,
+             obBot    = obB,
+             obBar    = obBI,
+             liqLevel = bullBOSLevel)  // BSL = the swing high that broke
+        array.unshift(setups, s)
+        if array.size(setups) > maxSetups
+            SMCSetup old = array.pop(setups)
+            old.fadeSetup()
+
+// ─────────────────────────────────────────────────────────────────────────────
+// TRADE MANAGEMENT — ONE TRADE AT A TIME
+// g_inTrade and lastSigBar must live at global scope (Pine v6 rule)
+// ─────────────────────────────────────────────────────────────────────────────
+var bool g_inTrade  = false
+var int  lastSigBar = 0
+
+// ─────────────────────────────────────────────────────────────────────────────
+// STATE MACHINE — inlined at global scope
+// UDT fields CAN be modified inside called functions (reference types)
+// But we inline here for clarity and to keep g_inTrade at global scope
+// ─────────────────────────────────────────────────────────────────────────────
+int _sz = array.size(setups)
+if _sz > 0
+    for _i = _sz - 1 to 0
+        SMCSetup s = array.get(setups, _i)
+
+        if not s.done
+
+            // ── STATE: WAITING — price must leave OB zone first ──────────
+            if s.waiting
+                bool priceLeft = s.isBear ? close < s.obBot : close > s.obTop
+                if priceLeft and barstate.isconfirmed
+                    s.waiting := false
+                    s.armed   := true
+
+            // ── STATE: ARMED — watching for retest back into OB ──────────
+            else if s.armed
+                // Retest: wick touches OB, close confirms inside
+                bool retested = s.isBear ? (high >= s.obBot and close <= s.obTop) : (low <= s.obTop and close >= s.obBot)
+
+                // Invalidation: price blew THROUGH the OB
+                bool invalid = s.isBear ? close > s.obTop : close < s.obBot
+
+                if invalid and barstate.isconfirmed
+                    s.done := true
+                    // Nothing was ever drawn — no fade needed
+
+                else if retested and not g_inTrade and (bar_index - lastSigBar >= cooldown) and barstate.isconfirmed
+                    // ★ RETEST CONFIRMED — FIRE EVERYTHING ★
+                    g_inTrade       := true
+                    lastSigBar      := bar_index
+                    s.armed         := false
+                    s.active        := true
+                    s.entryPrice    := close
+                    s.entryBar      := bar_index
+                    s.activatedBar  := bar_index
+
+                    // TP/SL from RETEST CLOSE — not OB, not liquidity
+                    s.tp := s.isBear ? close * (1 - tpPct / 100) : close * (1 + tpPct / 100)
+                    s.sl := s.isBear ? close * (1 + slPct / 100) : close * (1 - slPct / 100)
+
+                    // DRAW EVERYTHING AT ONCE
+                    s.drawSetup()
+
+            // ── STATE: ACTIVE — trade live, monitor exits ─────────────────
+            // NOTE: exits do NOT require barstate.isconfirmed — they fire intrabar
+            // so TP/SL hit is detected the moment price touches the level, not at bar close
+            // Entry still requires confirmed bar to prevent repainting
+            else if s.active
+                int   barsHeld = bar_index - s.entryBar
+                // pnlPct for time exit uses close (accurate at bar close)
+                // pnlPct for TP/SL uses the actual level hit (accurate intrabar)
+                float pnlPct   = s.isBear ? (s.entryPrice - close) / s.entryPrice * 100 : (close - s.entryPrice) / s.entryPrice * 100
+                bool  tpHit    = s.isBear ? low  <= s.tp : high >= s.tp
+                bool  slHit    = s.isBear ? high >= s.sl : low  <= s.sl
+
+                // TP HIT — fires intrabar the moment price reaches level
+                if tpHit
+                    s.done      := true
+                    s.active    := false
+                    g_inTrade   := false
+                    s.fadeSetup()
+                    label.new(bar_index, na,
+                         " ✦ TAKE PROFIT  +" + str.tostring(tpPct, "#.##") + "% ",
+                         yloc      = s.isBear ? yloc.belowbar    : yloc.abovebar,
+                         style     = s.isBear ? label.style_label_up : label.style_label_down,
+                         color     = color.new(C_TEAL, 95),
+                         textcolor = C_TEAL, size=size.small)
+
+                // SL HIT — fires intrabar the moment price reaches level
+                else if slHit
+                    s.done      := true
+                    s.active    := false
+                    g_inTrade   := false
+                    s.fadeSetup()
+                    label.new(bar_index, na,
+                         " STOP LOSS  -" + str.tostring(slPct, "#.##") + "% ",
+                         yloc      = s.isBear ? yloc.abovebar    : yloc.belowbar,
+                         style     = s.isBear ? label.style_label_down : label.style_label_up,
+                         color     = color.new(C_BEAR, 95),
+                         textcolor = C_BEAR, size=size.tiny)
+
+                // MAX BARS — still confirmed only (time-based, bar close makes sense)
+                else if barsHeld >= maxBars and barstate.isconfirmed
+                    s.done      := true
+                    s.active    := false
+                    g_inTrade   := false
+                    s.fadeSetup()
+                    label.new(bar_index, na,
+                         " TIME EXIT  " + str.tostring(pnlPct, "#.##") + "% ",
+                         yloc      = s.isBear ? yloc.abovebar    : yloc.belowbar,
+                         style     = s.isBear ? label.style_label_down : label.style_label_up,
+                         color     = color.new(C_GRAY, 95),
+                         textcolor = color.new(C_GRAY, 20), size=size.tiny)
+
+                // EXTEND — trade still live
+                else
+                    s.extendSetup()
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ALERTS — activatedBar pattern (same as Momentum Blocks V2)
+// Scanned at global scope — never inside functions
+// ─────────────────────────────────────────────────────────────────────────────
+bool bullRetestFired = false
+bool bearRetestFired = false
+
+int _asz = array.size(setups)
+if _asz > 0
+    for _ai = 0 to _asz - 1
+        SMCSetup _s = array.get(setups, _ai)
+        if _s.activatedBar == bar_index
+            if _s.isBear
+                bearRetestFired := true
+            else
+                bullRetestFired := true
+
+alertcondition(bullRetestFired, "BUY OB Retest",   "OB Range Retest — BUY signal confirmed")
+alertcondition(bearRetestFired, "SHORT OB Retest",  "OB Range Retest — SHORT signal confirmed")
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GHOST CANDLES
+// ─────────────────────────────────────────────────────────────────────────────
+barcolor(showGhost ? color.new(color.gray, 80) : na)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GAUGE BAR HELPER
+// ─────────────────────────────────────────────────────────────────────────────
+f_gauge(float val, int segs) =>
+    int filled = math.round(math.max(math.min(val, 100), 0) / 100 * segs)
+    str.repeat("█", filled) + str.repeat("░", segs - filled)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// DASHBOARD
+// ─────────────────────────────────────────────────────────────────────────────
+// DASHBOARD — HORIZONTAL CINEMA BAR  (10 cols × 4 rows)
+// position.bottom_center | ArisCodes signature layout
+// ─────────────────────────────────────────────────────────────────────────────
+if showDash and barstate.islast
+
+    // ── Scan setups ──────────────────────────────────────────────────────
+    SMCSetup dBear   = na
+    SMCSetup dBull   = na
+    SMCSetup dActive = na
+    int _dsz = array.size(setups)
+    if _dsz > 0
+        for _di = 0 to _dsz - 1
+            SMCSetup _s = array.get(setups, _di)
+            if not _s.done
+                if _s.isBear and na(dBear)
+                    dBear := _s
+                if not _s.isBear and na(dBull)
+                    dBull := _s
+                if _s.active and na(dActive)
+                    dActive := _s
+
+    // ── Dot status ───────────────────────────────────────────────────────
+    string dotStr = ""
+    if _dsz > 0
+        for _di = 0 to math.min(_dsz, 4) - 1
+            SMCSetup _s = array.get(setups, _di)
+            dotStr := dotStr + (_s.active ? "✦" : _s.armed ? "◉" : _s.waiting ? "●" : "○") + " "
+
+    // ── Colors + backgrounds ─────────────────────────────────────────────
+    color C_HDR_BG  = color.new(#0d1f1e,  0)   // deep teal-black header
+    color C_COL_BG  = color.new(#0a0a14, 10)   // column body
+    color C_COL_ALT = color.new(#0d1117, 30)   // alternate column shade
+    color C_STRIPE  = color.new(#00F5D4, 20)   // teal accent stripe
+
+    // ── Gauge helpers ────────────────────────────────────────────────────
+    string rsiG   = f_gauge(rsi14, 8)
+    color  rsiCol = rsi14 > 70 ? C_BEAR : rsi14 < 30 ? C_BULL : C_MUTED
+    string rsiTxt = rsi14 > 70 ? "OB " + str.tostring(math.round(rsi14)) : rsi14 < 30 ? "OS " + str.tostring(math.round(rsi14)) : str.tostring(math.round(rsi14))
+    string volG   = f_gauge(math.min(volume / math.max(volMa, 1) * 50, 100), 8)
+    color  volCol = volume > volMa * 1.5 ? C_TEAL : volume > volMa ? C_GOLD : C_MUTED
+    string volTxt = volume > volMa * 1.5 ? "SURGE▲▲" : volume > volMa ? "ABOVE ▲" : volume > volMa * 0.7 ? "NORMAL" : "LOW  ▼"
+
+    // ── ATR% ─────────────────────────────────────────────────────────────
+    float  atrPct    = atr14 / close * 100
+    string atrPctStr = str.tostring(atrPct, "#.###") + "%"
+    color  atrCol    = atrPct > 1.0 ? C_BEAR : atrPct > 0.3 ? C_GOLD : C_TEAL
+
+    // ── Bear setup ───────────────────────────────────────────────────────
+    string bearState  = na(dBear) ? "  --" : dBear.active ? "ACTIVE ✦" : dBear.armed ? "ARMED  ◉" : "WAIT   ◷"
+    color  bearCol    = na(dBear) ? C_MUTED : dBear.active ? C_BEAR : dBear.armed ? C_GOLD : C_MUTED
+    string bearOBStr  = na(dBear) ? "--" : str.tostring(dBear.obBot, format.mintick) + "–" + str.tostring(dBear.obTop, format.mintick)
+    string bearLiqStr = na(dBear) ? "--" : str.tostring(dBear.liqLevel, format.mintick)
+
+    // ── Bull setup ───────────────────────────────────────────────────────
+    string bullState  = na(dBull) ? "  --" : dBull.active ? "ACTIVE ✦" : dBull.armed ? "ARMED  ◉" : "WAIT   ◷"
+    color  bullCol    = na(dBull) ? C_MUTED : dBull.active ? C_BULL : dBull.armed ? C_GOLD : C_MUTED
+    string bullOBStr  = na(dBull) ? "--" : str.tostring(dBull.obBot, format.mintick) + "–" + str.tostring(dBull.obTop, format.mintick)
+    string bullLiqStr = na(dBull) ? "--" : str.tostring(dBull.liqLevel, format.mintick)
+
+    // ── Active trade ─────────────────────────────────────────────────────
+    string dirTxt    = na(dActive) ? "  --" : dActive.isBear ? "▼ SHORT" : "▲ LONG"
+    color  dirCol    = na(dActive) ? C_MUTED : dActive.isBear ? C_BEAR : C_BULL
+    string tpTxt     = na(dActive) or na(dActive.tp)  ? "--" : str.tostring(dActive.tp,  format.mintick)
+    string slTxt     = na(dActive) or na(dActive.sl)  ? "--" : str.tostring(dActive.sl,  format.mintick)
+    string barsLeftTxt = na(dActive) or na(dActive.entryBar) ? "--" : str.tostring(maxBars - (bar_index - dActive.entryBar)) + "b left"
+    string coolTxt   = g_inTrade ? "IN TRADE" : bar_index - lastSigBar < cooldown ? "⏳ " + str.tostring(cooldown - (bar_index - lastSigBar)) + "b" : "✅ READY"
+    color  coolCol   = g_inTrade ? C_GOLD : bar_index - lastSigBar < cooldown ? C_GOLD : C_BULL
+
+    // ── Table: 10 cols × 4 rows ──────────────────────────────────────────
+    // Col layout: [TITLE] [BEAR◈] [BEAR DATA] [BULL◈] [BULL DATA] [MKT◈] [MKT DATA] [TRADE◈] [TRADE DATA] [LEGEND]
+    var table dash = table.new(position.bottom_center, 10, 4,
+         bgcolor      = C_COL_BG,
+         border_width = 1,
+         border_color = color.new(C_TEAL, 55))
+
+    // ════════════════════════════════════════════════
+    // ROW 0 — TEAL ACCENT STRIPE (signature top bar)
+    // ════════════════════════════════════════════════
+    for _c = 0 to 9
+        table.cell(dash, _c, 0, "", bgcolor=C_STRIPE, text_size=size.tiny)
+
+    // Override col 0 with title in the stripe
+    table.cell(dash, 0, 0, " ◈ OB RANGE RETEST ◈ ",
+         text_color=C_TEAL, text_size=size.small,
+         text_font_family=font.family_monospace,
+         bgcolor=C_HDR_BG)
+
+    // Override col 9 with dot status in the stripe
+    table.cell(dash, 9, 0, " ⬡ " + dotStr,
+         text_color=C_TEAL, text_size=size.small,
+         text_font_family=font.family_monospace,
+         bgcolor=C_HDR_BG)
+
+    // ════════════════════════════════════════════════
+    // ROW 1 — COLUMN HEADERS
+    // ════════════════════════════════════════════════
+    table.cell(dash, 0, 1, " [ CONFIRMED ] ",
+         text_color=color.new(C_TEAL, 40), text_size=size.tiny,
+         text_font_family=font.family_monospace, bgcolor=C_HDR_BG)
+    table.cell(dash, 1, 1, " ◈ BEAR SETUP ",
+         text_color=C_BEAR, text_size=size.small,
+         text_font_family=font.family_monospace, bgcolor=color.new(#1a0008, 30))
+    table.cell(dash, 2, 1, " ░░ BEAR DATA ",
+         text_color=color.new(C_BEAR, 60), text_size=size.tiny,
+         text_font_family=font.family_monospace, bgcolor=color.new(#1a0008, 50))
+    table.cell(dash, 3, 1, " ◈ BULL SETUP ",
+         text_color=C_BULL, text_size=size.small,
+         text_font_family=font.family_monospace, bgcolor=color.new(#001a08, 30))
+    table.cell(dash, 4, 1, " ░░ BULL DATA ",
+         text_color=color.new(C_BULL, 60), text_size=size.tiny,
+         text_font_family=font.family_monospace, bgcolor=color.new(#001a08, 50))
+    table.cell(dash, 5, 1, " ◈ RSI ",
+         text_color=rsiCol, text_size=size.small,
+         text_font_family=font.family_monospace, bgcolor=C_COL_ALT)
+    table.cell(dash, 6, 1, " ◈ VOLUME ",
+         text_color=volCol, text_size=size.small,
+         text_font_family=font.family_monospace, bgcolor=C_COL_BG)
+    table.cell(dash, 7, 1, " ◈ ATR ",
+         text_color=atrCol, text_size=size.small,
+         text_font_family=font.family_monospace, bgcolor=C_COL_ALT)
+    table.cell(dash, 8, 1, " ◈ POSITION ",
+         text_color=dirCol, text_size=size.small,
+         text_font_family=font.family_monospace, bgcolor=color.new(#0a0a20, 30))
+    table.cell(dash, 9, 1, " ◈ TRADE MGMT ",
+         text_color=C_TEAL, text_size=size.small,
+         text_font_family=font.family_monospace, bgcolor=color.new(#0a1a1a, 30))
+
+    // ════════════════════════════════════════════════
+    // ROW 2 — PRIMARY DATA
+    // ════════════════════════════════════════════════
+    table.cell(dash, 0, 2, " TP +" + str.tostring(tpPct) + "%",
+         text_color=C_TEAL, text_size=size.small,
+         text_font_family=font.family_monospace, bgcolor=C_HDR_BG)
+    table.cell(dash, 1, 2, " " + bearState,
+         text_color=bearCol, text_size=size.small,
+         text_font_family=font.family_monospace, bgcolor=color.new(#1a0008, 40))
+    table.cell(dash, 2, 2, " OB  " + bearOBStr,
+         text_color=C_BEAR, text_size=size.small,
+         text_font_family=font.family_monospace, bgcolor=color.new(#1a0008, 55))
+    table.cell(dash, 3, 2, " " + bullState,
+         text_color=bullCol, text_size=size.small,
+         text_font_family=font.family_monospace, bgcolor=color.new(#001a08, 40))
+    table.cell(dash, 4, 2, " OB  " + bullOBStr,
+         text_color=C_BULL, text_size=size.small,
+         text_font_family=font.family_monospace, bgcolor=color.new(#001a08, 55))
+    table.cell(dash, 5, 2, " " + rsiG + " " + rsiTxt,
+         text_color=rsiCol, text_size=size.small,
+         text_font_family=font.family_monospace, bgcolor=C_COL_ALT)
+    table.cell(dash, 6, 2, " " + volG + " " + volTxt,
+         text_color=volCol, text_size=size.small,
+         text_font_family=font.family_monospace, bgcolor=C_COL_BG)
+    table.cell(dash, 7, 2, " " + str.tostring(atr14, format.mintick) + "  " + atrPctStr,
+         text_color=atrCol, text_size=size.small,
+         text_font_family=font.family_monospace, bgcolor=C_COL_ALT)
+    table.cell(dash, 8, 2, " " + dirTxt + "  TP " + tpTxt,
+         text_color=dirCol, text_size=size.small,
+         text_font_family=font.family_monospace, bgcolor=color.new(#0a0a20, 40))
+    table.cell(dash, 9, 2, " SL " + slTxt + "  " + barsLeftTxt,
+         text_color=C_BEAR, text_size=size.small,
+         text_font_family=font.family_monospace, bgcolor=color.new(#0a1a1a, 40))
+
+    // ════════════════════════════════════════════════
+    // ROW 3 — SECONDARY DATA + BOTTOM ACCENT STRIPE
+    // ════════════════════════════════════════════════
+    table.cell(dash, 0, 3, " SL -" + str.tostring(slPct) + "%",
+         text_color=color.new(C_BEAR, 60), text_size=size.tiny,
+         text_font_family=font.family_monospace, bgcolor=C_HDR_BG)
+    table.cell(dash, 1, 3, " SSL " + bearLiqStr,
+         text_color=C_GOLD, text_size=size.tiny,
+         text_font_family=font.family_monospace, bgcolor=color.new(#1a0008, 55))
+    table.cell(dash, 2, 3, " BOS " + (na(dBear) ? "--" : str.tostring(dBear.bosLevel, format.mintick)),
+         text_color=color.new(C_BEAR, 60), text_size=size.tiny,
+         text_font_family=font.family_monospace, bgcolor=color.new(#1a0008, 65))
+    table.cell(dash, 3, 3, " BSL " + bullLiqStr,
+         text_color=C_GOLD, text_size=size.tiny,
+         text_font_family=font.family_monospace, bgcolor=color.new(#001a08, 55))
+    table.cell(dash, 4, 3, " BOS " + (na(dBull) ? "--" : str.tostring(dBull.bosLevel, format.mintick)),
+         text_color=color.new(C_BULL, 60), text_size=size.tiny,
+         text_font_family=font.family_monospace, bgcolor=color.new(#001a08, 65))
+    table.cell(dash, 5, 3, " ● WAIT  ◉ ARMED ",
+         text_color=C_MUTED, text_size=size.tiny,
+         text_font_family=font.family_monospace, bgcolor=C_COL_BG)
+    table.cell(dash, 6, 3, " ✦ ACTIVE  ○ DONE ",
+         text_color=C_MUTED, text_size=size.tiny,
+         text_font_family=font.family_monospace, bgcolor=C_COL_BG)
+    table.cell(dash, 7, 3, " COOLDOWN ",
+         text_color=C_MUTED, text_size=size.tiny,
+         text_font_family=font.family_monospace, bgcolor=C_COL_BG)
+    table.cell(dash, 8, 3, " " + coolTxt,
+         text_color=coolCol, text_size=size.small,
+         text_font_family=font.family_monospace, bgcolor=C_COL_BG)
+    table.cell(dash, 9, 3, " MAX " + str.tostring(maxBars) + "b  CD " + str.tostring(cooldown) + "b ",
+         text_color=C_MUTED, text_size=size.tiny,
+         text_font_family=font.family_monospace, bgcolor=C_COL_BG)
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  For educational and informational purposes only. Not financial advice.
+// ─────────────────────────────────────────────────────────────────────────────

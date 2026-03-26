@@ -1,0 +1,247 @@
+//@version=6
+strategy("QuantV6 – Institutional PRO+", overlay=true,
+     initial_capital=100000,
+     default_qty_type=strategy.percent_of_equity,
+     default_qty_value=8,
+     commission_type=strategy.commission.percent,
+     commission_value=0.06,
+     slippage=2,
+     pyramiding=0,
+     process_orders_on_close=true)
+
+// ==========================
+// INPUTS
+// ==========================
+
+lookback      = input.int(20, "Lookback")
+atr_period    = input.int(14, "ATR Period")
+adx_period    = input.int(14, "ADX Period")
+adx_threshold = input.float(22.0, "ADX Threshold")
+ema_trend_len = input.int(200, "EMA Trend Length")
+
+stopATR  = input.float(2.0, "Stop ATR Mult")
+tpATR    = input.float(2.8, "Take Profit ATR Mult")
+trailATR = input.float(1.5, "Trail ATR Mult")
+trailTrigger = input.float(1.2, "Trail Activation ATR")
+
+max_dd   = input.float(25.0, "Max Drawdown %")
+daily_loss_limit = input.float(5.0, "Prop Daily Loss %")
+
+show_dashboard = input.bool(true, "Show Dashboard")
+show_heatmap = input.bool(true, "Show Heatmap")
+
+// ==========================
+// CORE CALCULATIONS
+// ==========================
+
+ema_trend = ta.ema(close, ema_trend_len)
+atr = ta.atr(atr_period)
+[diplus, diminus, adx_val] = ta.dmi(adx_period, adx_period)
+
+[supertrend, direction] = ta.supertrend(2.8, 10)
+super_bull = direction < 0
+super_bear = direction > 0
+
+bb_basis = ta.sma(close, lookback)
+bb_dev   = ta.stdev(close, lookback) * 2.0
+bb_upper = bb_basis + bb_dev
+bb_lower = bb_basis - bb_dev
+bb_width = (bb_upper - bb_lower) / bb_basis
+bb_width_avg = ta.sma(bb_width, 20)
+
+rsi = ta.rsi(close, 14)
+[macd_line, signal_line, _] = ta.macd(close, 12, 26, 9)
+
+// ==========================
+// REGIME LOGIC
+// ==========================
+
+is_trending = adx_val > adx_threshold and bb_width > bb_width_avg
+is_ranging  = not is_trending
+
+trend_long  = is_trending and super_bull and close > ema_trend and macd_line > signal_line
+trend_short = is_trending and super_bear and close < ema_trend and macd_line < signal_line
+
+range_long  = is_ranging and close < bb_lower and rsi < 35
+range_short = is_ranging and close > bb_upper and rsi > 65
+
+// ==========================
+// DRAWDOWN CONTROL
+// ==========================
+
+var float peak_equity = strategy.equity
+peak_equity := math.max(peak_equity, strategy.equity)
+drawdown = (peak_equity - strategy.equity) / peak_equity * 100
+allow_trade = drawdown < max_dd
+
+// ==========================
+// PROP DAILY GUARDRAIL
+// ==========================
+
+newDay = ta.change(time("D")) != 0
+var float day_start_equity = strategy.equity
+if newDay
+    day_start_equity := strategy.equity
+
+daily_dd = (day_start_equity - strategy.equity) / day_start_equity * 100
+allow_trade := allow_trade and daily_dd < daily_loss_limit
+
+// ==========================
+// ENTRY LOGIC
+// ==========================
+
+long_condition  = allow_trade and (trend_long or range_long)
+short_condition = allow_trade and (trend_short or range_short)
+
+if long_condition and strategy.position_size == 0
+    strategy.entry("Long", strategy.long)
+
+if short_condition and strategy.position_size == 0
+    strategy.entry("Short", strategy.short)
+
+// ==========================
+// EXIT LOGIC
+// ==========================
+
+if strategy.position_size > 0
+    stop_price  = strategy.position_avg_price - atr * stopATR
+    take_price  = strategy.position_avg_price + atr * tpATR
+    trail_start = strategy.position_avg_price + atr * trailTrigger
+    
+    if close > trail_start
+        strategy.exit("Long Exit", "Long",
+            stop=stop_price,
+            trail_offset=atr * trailATR)
+    else
+        strategy.exit("Long Exit", "Long",
+            stop=stop_price,
+            limit=take_price)
+
+if strategy.position_size < 0
+    stop_price  = strategy.position_avg_price + atr * stopATR
+    take_price  = strategy.position_avg_price - atr * tpATR
+    trail_start = strategy.position_avg_price - atr * trailTrigger
+    
+    if close < trail_start
+        strategy.exit("Short Exit", "Short",
+            stop=stop_price,
+            trail_offset=atr * trailATR)
+    else
+        strategy.exit("Short Exit", "Short",
+            stop=stop_price,
+            limit=take_price)
+
+// ==========================
+// PERFORMANCE METRICS
+// ==========================
+
+net_profit_perc = strategy.netprofit / strategy.initial_capital * 100
+win_rate = strategy.wintrades / math.max(strategy.closedtrades, 1)
+avg_win = strategy.wintrades > 0 ? strategy.grossprofit / strategy.wintrades : 0
+avg_loss = strategy.losstrades > 0 ? math.abs(strategy.grossloss) / strategy.losstrades : 0
+expectancy = (win_rate * avg_win) - ((1 - win_rate) * avg_loss)
+
+profit_factor = strategy.grossloss != 0 ? strategy.grossprofit / math.abs(strategy.grossloss) : na
+
+// Sharpe-style approximation
+returns = strategy.netprofit / strategy.initial_capital
+volatility = ta.stdev(close, 30) / close
+sharpe = volatility != 0 ? returns / volatility : na
+
+// ==========================
+// MONTHLY TRACKING
+// ==========================
+
+var float month_start_equity = strategy.equity
+newMonth = ta.change(time("M")) != 0
+if newMonth
+    month_start_equity := strategy.equity
+
+monthly_return = (strategy.equity - month_start_equity) / month_start_equity * 100
+
+// ==========================
+// INDICATOR HEATMAP DATA
+// ==========================
+
+f_getColor(val, minVal, maxVal) =>
+    pct = (val - minVal) / math.max(maxVal - minVal, 1)
+    pct := math.max(0, math.min(pct, 1))
+    color.new(color.rgb(255 * (1 - pct), 100, 255 * pct), 0)
+
+// Create heatmap data for key indicators
+rsi_norm = rsi / 100
+adx_norm = adx_val / 50
+macd_norm = (macd_line - signal_line) / (atr * 2)
+macd_norm := (macd_norm + 1) / 2  // Normalize to 0-1
+macd_norm := math.max(0, math.min(macd_norm, 1))
+
+// ==========================
+// DASHBOARD
+// ==========================
+
+if show_dashboard and barstate.islast
+    var table dash = table.new(position.top_right, 2, 13, border_width=1)
+
+    table.cell(dash, 0, 0, "Net Profit %", bgcolor=color.new(color.gray, 50))
+    table.cell(dash, 1, 0, str.tostring(net_profit_perc, "#.##") + "%")
+
+    table.cell(dash, 0, 1, "Win Rate", bgcolor=color.new(color.gray, 50))
+    table.cell(dash, 1, 1, str.tostring(win_rate * 100, "#.##") + "%")
+
+    table.cell(dash, 0, 2, "Expectancy", bgcolor=color.new(color.gray, 50))
+    table.cell(dash, 1, 2, str.tostring(expectancy, "#.##"))
+
+    table.cell(dash, 0, 3, "Sharpe (Approx)", bgcolor=color.new(color.gray, 50))
+    table.cell(dash, 1, 3, str.tostring(sharpe, "#.##"))
+
+    table.cell(dash, 0, 4, "Profit Factor", bgcolor=color.new(color.gray, 50))
+    table.cell(dash, 1, 4, str.tostring(profit_factor, "#.##"))
+
+    table.cell(dash, 0, 5, "Total Trades", bgcolor=color.new(color.gray, 50))
+    table.cell(dash, 1, 5, str.tostring(strategy.closedtrades))
+
+    table.cell(dash, 0, 6, "Max DD %", bgcolor=color.new(color.gray, 50))
+    table.cell(dash, 1, 6,
+        str.tostring(strategy.max_drawdown / strategy.initial_capital * 100, "#.##") + "%")
+
+    table.cell(dash, 0, 7, "Current DD %", bgcolor=color.new(color.gray, 50))
+    table.cell(dash, 1, 7, str.tostring(drawdown, "#.##") + "%")
+
+    table.cell(dash, 0, 8, "Daily DD %", bgcolor=color.new(color.gray, 50))
+    table.cell(dash, 1, 8, str.tostring(daily_dd, "#.##") + "%")
+
+    table.cell(dash, 0, 9, "Monthly Return", bgcolor=color.new(color.gray, 50))
+    table.cell(dash, 1, 9, str.tostring(monthly_return, "#.##") + "%")
+
+    table.cell(dash, 0, 10, "Regime", bgcolor=color.new(color.gray, 50))
+    table.cell(dash, 1, 10, is_trending ? "Trending" : "Ranging")
+
+    table.cell(dash, 0, 11, "Position", bgcolor=color.new(color.gray, 50))
+    table.cell(dash, 1, 11,
+        strategy.position_size > 0 ? "Long" :
+        strategy.position_size < 0 ? "Short" : "Flat")
+
+    table.cell(dash, 0, 12, "Prop Guardrail", bgcolor=color.new(color.gray, 50))
+    table.cell(dash, 1, 12,
+        daily_dd < daily_loss_limit ? "Safe" : "Locked")
+
+// ==========================
+// INDICATOR HEATMAP TABLE
+// ==========================
+
+if show_heatmap and barstate.islast
+    var table heatmap = table.new(position.top_left, 2, 3, border_width=1)
+    
+    // Header
+    table.cell(heatmap, 0, 0, "Indicator", bgcolor=color.new(color.gray, 50), text_color=color.white)
+    table.cell(heatmap, 1, 0, "Value", bgcolor=color.new(color.gray, 50), text_color=color.white)
+    
+    // RSI Heatmap
+    rsi_color = f_getColor(rsi, 0, 100)
+    table.cell(heatmap, 0, 1, "RSI", bgcolor=color.new(color.gray, 50))
+    table.cell(heatmap, 1, 1, str.tostring(rsi, "#.##"), bgcolor=rsi_color, text_color=color.white)
+    
+    // ADX Heatmap
+    adx_color = f_getColor(adx_val, 0, 50)
+    table.cell(heatmap, 0, 2, "ADX", bgcolor=color.new(color.gray, 50))
+    table.cell(heatmap, 1, 2, str.tostring(adx_val, "#.##"), bgcolor=adx_color, text_color=color.white)

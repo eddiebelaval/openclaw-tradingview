@@ -1,0 +1,136 @@
+// This Pine Script™ code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © QuantumAlgo
+
+//@version=5
+indicator(title="Adaptive Trend Sentinel [Quantum Algo]", shorttitle="Adaptive Trend Sentinel [Quantum Algo]", overlay=true, precision=2)
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  ██████╗ ██╗   ██╗ █████╗ ███╗   ██╗████████╗██╗   ██╗███╗   ███╗
+// ██╔═══██╗██║   ██║██╔══██╗████╗  ██║╚══██╔══╝██║   ██║████╗ ████║
+// ██║   ██║██║   ██║███████║██╔██╗ ██║   ██║   ██║   ██║██╔████╔██║
+// ██║▄▄ ██║██║   ██║██╔══██║██║╚██╗██║   ██║   ██║   ██║██║╚██╔╝██║
+// ╚██████╔╝╚██████╔╝██║  ██║██║ ╚████║   ██║   ╚██████╔╝██║ ╚═╝ ██║
+//  ╚══▀▀═╝  ╚═════╝ ╚═╝  ╚═╝╚═╝  ╚═══╝   ╚═╝    ╚═════╝ ╚═╝     ╚═╝
+//  █████╗ ██╗      ██████╗  ██████╗ 
+// ██╔══██╗██║     ██╔════╝ ██╔═══██╗
+// ███████║██║     ██║  ███╗██║   ██║
+// ██╔══██║██║     ██║   ██║██║   ██║
+// ██║  ██║███████╗╚██████╔╝╚██████╔╝
+// ╚═╝  ╚═╝╚══════╝ ╚═════╝  ╚═════╝ 
+// ─────────────────────────────────────────────────────────────────────────────
+//
+//  Quantum Algo Adaptive Trend Sentinel [Quantum Algo]
+//
+//  A volatility-adaptive trend tracking system that dynamically adjusts 
+//  its protective boundary based on real-time market conditions. The 
+//  Sentinel calculates an intelligent trailing threshold using Average 
+//  True Range, automatically tightening in calm markets and widening 
+//  during volatile expansions — then generates clear directional signals 
+//  when price decisively breaches the threshold.
+//
+//  Unlike static moving average crossover systems, the Sentinel's 
+//  boundary is asymmetric and self-adjusting: it ratchets in the 
+//  direction of the trend but never retreats, creating a one-way 
+//  protective floor (in uptrends) or ceiling (in downtrends) that 
+//  locks in gains while giving the trend room to breathe.
+//
+//  Developed by QuantumAlgo
+// ─────────────────────────────────────────────────────────────────────────────
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// 𝗦 𝗘 𝗧 𝗧 𝗜 𝗡 𝗚 𝗦
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// ── Sentinel Engine ─────────────────────────────────────────────────────────
+grp_engine = "⚙️  Sentinel Engine"
+sensitivityFactor   = input.float(1.2, title="Sensitivity Factor", minval=0.1, maxval=10.0, step=0.1, tooltip="Controls how tightly the Sentinel tracks price. Lower values create a tighter boundary that triggers signals faster but may produce more whipsaws. Higher values give the trend more room to breathe but react slower to reversals.", group=grp_engine)
+volatilityPeriod    = input.int(10, title="Volatility Lookback", minval=1, maxval=100, tooltip="Number of bars used to measure the current volatility regime via Average True Range. Shorter periods make the boundary more reactive to recent conditions. Longer periods smooth the boundary for fewer false signals.", group=grp_engine)
+useSmoothedSource   = input.bool(false, title="Use Heikin Ashi Source", tooltip="When enabled, the Sentinel calculates its boundary using Heikin Ashi candle data instead of standard candles. This filters out intrabar noise and produces cleaner signals, especially on lower timeframes.", group=grp_engine)
+
+// ── Visual Style ────────────────────────────────────────────────────────────
+grp_visuals = "🎨  Visual Style"
+showBarColors       = input.bool(true, title="Color Bars by Regime", tooltip="Tints chart candles based on the current trend regime — cyan for bullish, violet for bearish.", group=grp_visuals)
+showBoundary        = input.bool(true, title="Show Sentinel Boundary", tooltip="Draws the adaptive trailing threshold on the chart. The boundary ratchets with the trend and never retreats.", group=grp_visuals)
+showSignalLabels    = input.bool(true, title="Show Signal Labels", tooltip="Displays Long/Short entry labels when the Sentinel detects a confirmed regime change.", group=grp_visuals)
+showBackground      = input.bool(false, title="Show Regime Background", tooltip="Applies a subtle background tint based on the active trend regime.", group=grp_visuals)
+
+// ── Quantum Algo Palette ────────────────────────────────────────────────────
+grp_palette = "🔮  Quantum Algo Palette"
+col_bullRegime      = input.color(#00e5ff, title="Bullish Regime", group=grp_palette)
+col_bearRegime      = input.color(#7c4dff, title="Bearish Regime", group=grp_palette)
+col_neutral         = input.color(#455a64, title="Neutral", group=grp_palette)
+col_longLabel       = input.color(#00e5ff, title="Long Signal Label", group=grp_palette)
+col_shortLabel      = input.color(#7c4dff, title="Short Signal Label", group=grp_palette)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// 𝗖 𝗢 𝗥 𝗘   𝗟 𝗢 𝗚 𝗜 𝗖
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// ── Price Source Selection ──────────────────────────────────────────────────
+// Optionally reads from Heikin Ashi candles for a smoother signal source,
+// reducing noise-driven whipsaws on lower timeframes.
+priceSource = useSmoothedSource ? request.security(ticker.heikinashi(syminfo.tickerid), timeframe.period, close, lookahead=barmerge.lookahead_off) : close
+
+// ── Volatility Measurement ──────────────────────────────────────────────────
+// ATR captures the true range of recent price action, forming the basis
+// for how wide the Sentinel's protective boundary needs to be.
+currentVolatility   = ta.atr(volatilityPeriod)
+boundaryDistance    = sensitivityFactor * currentVolatility
+
+// ── Adaptive Trailing Boundary ──────────────────────────────────────────────
+// The boundary ratchets in the trend direction but never retreats:
+// - In an uptrend: boundary = max(previous boundary, price - distance)
+//   → locks in gains as price rises, never drops
+// - In a downtrend: boundary = min(previous boundary, price + distance)
+//   → caps the ceiling as price falls, never rises
+// - On a regime flip: boundary resets to the opposite side of price
+sentinelBoundary = close
+sentinelBoundary := priceSource > nz(sentinelBoundary[1], close) and priceSource[1] > nz(sentinelBoundary[1], close) ? math.max(nz(sentinelBoundary[1], close), priceSource - boundaryDistance) : priceSource < nz(sentinelBoundary[1], close) and priceSource[1] < nz(sentinelBoundary[1], close) ? math.min(nz(sentinelBoundary[1], close), priceSource + boundaryDistance) : priceSource > nz(sentinelBoundary[1], close) ? priceSource - boundaryDistance : priceSource + boundaryDistance
+
+// ── Regime Detection ────────────────────────────────────────────────────────
+// Tracks the current directional regime as +1 (bullish) or -1 (bearish).
+// A regime change requires price to cross the boundary from the opposite side.
+trendRegime = 0
+trendRegime := nz(trendRegime[1], 0)
+trendRegime := priceSource[1] < nz(sentinelBoundary[1], close) and priceSource > nz(sentinelBoundary[1], close) ? 1 : priceSource[1] > nz(sentinelBoundary[1], close) and priceSource < nz(sentinelBoundary[1], close) ? -1 : trendRegime
+
+// ── Signal Generation ───────────────────────────────────────────────────────
+// Signals fire on the exact bar where a regime change is confirmed AND
+// price is on the correct side of the boundary — eliminating ambiguous bars.
+smoothedPrice       = ta.ema(priceSource, 1)
+priceBreaksAbove    = ta.crossover(smoothedPrice, sentinelBoundary)
+priceBreaksBelow    = ta.crossover(sentinelBoundary, smoothedPrice)
+
+longEntry   = priceSource > sentinelBoundary and priceBreaksAbove
+shortEntry  = priceSource < sentinelBoundary and priceBreaksBelow
+
+// ── Continuous State ────────────────────────────────────────────────────────
+isBullishRegime = priceSource > sentinelBoundary
+isBearishRegime = priceSource < sentinelBoundary
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// 𝗩 𝗜 𝗦 𝗨 𝗔 𝗟 𝗦
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// ── Sentinel Boundary Line ──────────────────────────────────────────────────
+boundaryColor = trendRegime == 1 ? col_bullRegime : trendRegime == -1 ? col_bearRegime : col_neutral
+plot(showBoundary ? sentinelBoundary : na, title="Sentinel Boundary", color=boundaryColor, linewidth=2, style=plot.style_line)
+
+// ── Entry Signal Labels ─────────────────────────────────────────────────────
+plotshape(showSignalLabels and longEntry, title="Long Entry", text="Long", style=shape.labelup, location=location.belowbar, color=col_longLabel, textcolor=color.white, size=size.tiny)
+plotshape(showSignalLabels and shortEntry, title="Short Entry", text="Short", style=shape.labeldown, location=location.abovebar, color=col_shortLabel, textcolor=color.white, size=size.tiny)
+
+// ── Bar Coloring ────────────────────────────────────────────────────────────
+barcolor(showBarColors and isBullishRegime ? col_bullRegime : showBarColors and isBearishRegime ? col_bearRegime : na)
+
+// ── Regime Background ───────────────────────────────────────────────────────
+bgcolor(showBackground and isBullishRegime ? color.new(col_bullRegime, 93) : showBackground and isBearishRegime ? color.new(col_bearRegime, 93) : na, title="Regime Background")
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// 𝗔 𝗟 𝗘 𝗥 𝗧 𝗦
+// ═══════════════════════════════════════════════════════════════════════════════
+
+alertcondition(longEntry,  title="🟢 Quantum Algo Long Entry",  message="Quantum Algo Trend Sentinel: Bullish regime confirmed on {{ticker}} ({{interval}}) — Long entry triggered")
+alertcondition(shortEntry, title="🔴 Quantum Algo Short Entry", message="Quantum Algo Trend Sentinel: Bearish regime confirmed on {{ticker}} ({{interval}}) — Short entry triggered")
+alertcondition(isBullishRegime, title="🟢 Bullish Regime Active", message="Quantum Algo Trend Sentinel: Price above Sentinel boundary on {{ticker}} ({{interval}})")
+alertcondition(isBearishRegime, title="🔴 Bearish Regime Active", message="Quantum Algo Trend Sentinel: Price below Sentinel boundary on {{ticker}} ({{interval}})")

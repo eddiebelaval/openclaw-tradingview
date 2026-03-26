@@ -1,0 +1,517 @@
+/// This Pine Script™ code is subject to the terms of the Mozilla Public License 2.0
+//@version=6
+indicator("ATR Trail Supreme [Confirmed]", overlay=true, max_lines_count=200, max_labels_count=100)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  ATR TRAIL SUPREME [Confirmed]
+//
+//  Three engines working as one:
+//
+//  ENGINE 1 — ATR TRAILING STOP
+//  Classic Chandelier Exit base. Trail flips on CLOSE only —
+//  no wick-triggered whipsaws. The foundation.
+//
+//  ENGINE 2 — VOLATILITY REGIME
+//  ATR ratio vs 50-bar SMA classifies market into 3 regimes:
+//  LOW / MEDIUM / HIGH volatility. The multiplier self-adjusts
+//  per regime — tight in trends, wide in chop. Set it and forget it.
+//
+//  ENGINE 3 — TREND STRENGTH SCORE (0–100)
+//  Composite of RSI Slope (40%) + Volume Surge (35%) + ATR Expansion (25%)
+//  Scores below threshold block entries — only trades when
+//  all three confirm the move has real institutional energy behind it.
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// ─────────────────────────────────────────────────────────────────────────────
+// INPUT GROUPS
+// ─────────────────────────────────────────────────────────────────────────────
+grp_atr  = "ATR Trail Settings"
+grp_reg  = "Volatility Regime Engine"
+grp_tss  = "Trend Strength Score"
+grp_tm   = "Trade Management"
+grp_vis  = "Visuals"
+
+// ATR Trail
+atrLen      = input.int(14,    "ATR Length",              group=grp_atr, minval=1,   maxval=100)
+atrSrc      = input.source(close,"Source",               group=grp_atr)
+showTrail   = input.bool(true, "Show Trail Line",         group=grp_atr)
+showFlip    = input.bool(true, "Show Flip Labels",        group=grp_atr)
+
+// Volatility Regime
+regLookback = input.int(50,    "Regime Lookback (bars)",  group=grp_reg, minval=10,  maxval=200,
+              tooltip="Bars to measure average ATR for regime classification.\nMore bars = smoother regime, less reactive")
+lowMult     = input.float(1.5, "LOW Vol Multiplier",      group=grp_reg, minval=0.5, maxval=5.0, step=0.1,
+              tooltip="Tight trail in low volatility trending markets.\nFutures: 1.2–1.8   Crypto: 1.5–2.0")
+medMult     = input.float(2.5, "MED Vol Multiplier",      group=grp_reg, minval=0.5, maxval=5.0, step=0.1,
+              tooltip="Standard trail in medium volatility.\nFutures: 2.0–3.0   Crypto: 2.5–3.5")
+highMult    = input.float(3.5, "HIGH Vol Multiplier",     group=grp_reg, minval=0.5, maxval=5.0, step=0.1,
+              tooltip="Wide trail in high volatility / choppy markets.\nFutures: 3.0–4.0   Crypto: 3.5–5.0")
+lowThresh   = input.float(0.8, "LOW Vol Threshold",       group=grp_reg, minval=0.1, maxval=1.0, step=0.05,
+              tooltip="ATR ratio below this = LOW regime (ATR contracting vs average)")
+highThresh  = input.float(1.4, "HIGH Vol Threshold",      group=grp_reg, minval=1.0, maxval=3.0, step=0.05,
+              tooltip="ATR ratio above this = HIGH regime (ATR expanding vs average)")
+showRegime  = input.bool(true, "Show Regime Background",  group=grp_reg,
+              tooltip="Subtle background color showing current volatility regime")
+
+// Trend Strength Score
+tssMinScore = input.int(40,    "Min Score to Trade (0-100)", group=grp_tss, minval=0, maxval=100,
+              tooltip="Entry blocked if Trend Strength Score below this.\n0 = all entries  40 = medium filter  70 = strong only\nFutures: 35–50   Crypto: 40–60")
+rsiSlopeLen = input.int(5,     "RSI Slope Bars",          group=grp_tss, minval=2,   maxval=20,
+              tooltip="How many bars to measure RSI direction/acceleration")
+volSurgeLen = input.int(20,    "Volume MA Length",        group=grp_tss, minval=5,   maxval=100)
+showScore   = input.bool(true, "Show Score on Flip",      group=grp_tss,
+              tooltip="Show Trend Strength Score on entry signal labels")
+showScoreLine= input.bool(false,"Show Score as Line (separate pane)", group=grp_tss)
+
+// Trade Management
+tpMult      = input.float(3.0, "TP ATR Multiplier",       group=grp_tm,  minval=0.5, maxval=20.0, step=0.5,
+              tooltip="TP = entry ± (ATR × this multiplier).\nFutures: 2.0–4.0   Crypto: 3.0–6.0")
+slMult      = input.float(1.5, "SL ATR Multiplier",       group=grp_tm,  minval=0.5, maxval=20.0, step=0.5,
+              tooltip="SL = opposite side of trail at entry.\nFutures: 1.0–2.0   Crypto: 1.5–3.0")
+tpPct       = input.float(1.0, "TP % (fallback)",         group=grp_tm,  minval=0.05, maxval=20.0, step=0.05,
+              tooltip="Used if ATR target is unreasonable.\nFutures (MNQ): 0.3–0.8%   Crypto: 1.0–3.0%")
+slPct       = input.float(0.5, "SL % (fallback)",         group=grp_tm,  minval=0.05, maxval=20.0, step=0.05)
+maxBars     = input.int(50,    "Max Bars in Trade",        group=grp_tm,  minval=5,   maxval=500)
+cooldown    = input.int(3,     "Cooldown Bars",            group=grp_tm,  minval=1,   maxval=100,
+              tooltip="Min bars between signals.\nFutures: 2–5   Crypto: 3–8")
+showSig     = input.bool(true, "Show Entry Labels",        group=grp_tm)
+showTPSL    = input.bool(true, "Show TP/SL Lines",         group=grp_tm)
+
+// Visuals
+showGhost   = input.bool(true, "Ghost Candles",            group=grp_vis)
+showDash    = input.bool(true, "Show Dashboard",           group=grp_vis)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// COLORS
+// ─────────────────────────────────────────────────────────────────────────────
+color C_TEAL   = #00F5D4
+color C_GOLD   = #FFD700
+color C_BULL   = #00FF88
+color C_BEAR   = #FF4466
+color C_MUTED  = color.new(#AAAAAA, 40)
+color C_HDR_BG = color.new(#0d1f1e,  0)
+color C_COL_BG = color.new(#0a0a14, 10)
+color C_COL_ALT= color.new(#0d1117, 30)
+color C_STRIPE = color.new(#00F5D4, 20)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ENGINE 2 — VOLATILITY REGIME
+// ATR ratio = current ATR / SMA of ATR over regLookback bars
+// < lowThresh  = LOW  (contracting, trending)
+// > highThresh = HIGH (expanding, choppy/news)
+// between      = MEDIUM (normal)
+// ─────────────────────────────────────────────────────────────────────────────
+float atrRaw   = ta.atr(atrLen)
+float atrSMA   = ta.sma(atrRaw, regLookback)
+float atrRatio = not na(atrSMA) and atrSMA > 0 ? atrRaw / atrSMA : 1.0
+
+// Regime classification
+bool regLow  = atrRatio < lowThresh
+bool regHigh = atrRatio > highThresh
+bool regMed  = not regLow and not regHigh
+
+// Self-adjusting multiplier
+float activeMult = regLow ? lowMult : regHigh ? highMult : medMult
+
+string regimeName = regLow ? "LOW ▼" : regHigh ? "HIGH ▲" : "MED  ●"
+color  regimeCol  = regLow ? C_TEAL  : regHigh ? C_BEAR   : C_GOLD
+color  regimeBG   = regLow ? color.new(#00F5D4, 97) : regHigh ? color.new(#FF4466, 97) : color.new(#FFD700, 97)
+
+// Regime background
+bgcolor(showRegime ? regimeBG : na, title="Volatility Regime")
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ENGINE 3 — TREND STRENGTH SCORE (0–100)
+// Component 1: RSI Slope  40% — RSI accelerating in direction?
+// Component 2: Vol Surge  35% — volume confirming the move?
+// Component 3: ATR Expand 25% — volatility expanding (trend energy)?
+// ─────────────────────────────────────────────────────────────────────────────
+float rsi14      = ta.rsi(atrSrc, 14)
+float rsiNow     = rsi14
+float rsiPrev    = rsi14[rsiSlopeLen]
+float rsiSlope   = not na(rsiPrev) ? rsiNow - rsiPrev : 0.0
+// Normalize slope: steeper = higher score (cap at ±20 RSI points = max score)
+float rsiComp    = math.min(math.abs(rsiSlope) / 20.0, 1.0)
+
+float volMA      = ta.sma(volume, volSurgeLen)
+float volRatio   = not na(volMA) and volMA > 0 ? volume / volMA : 1.0
+// Normalize: 1.5x avg vol = mid score, 2.5x = max
+float volComp    = math.min(math.max(volRatio - 1.0, 0.0) / 1.5, 1.0)
+
+// ATR expansion component: how much is current ATR above its short-term avg
+float atrShort   = ta.sma(atrRaw, 5)
+float atrExpand  = not na(atrShort) and atrShort > 0 ? atrRaw / atrShort : 1.0
+float atrComp    = math.min(math.max(atrExpand - 1.0, 0.0) / 0.5, 1.0)
+
+// Composite score 0–100
+float tssScore   = (rsiComp * 0.40 + volComp * 0.35 + atrComp * 0.25) * 100
+
+// Score classification
+bool  tssWeak    = tssScore < 40
+bool  tssMed     = tssScore >= 40 and tssScore < 70
+bool  tssStrong  = tssScore >= 70
+
+string scoreName = tssStrong ? "STRONG ✦" : tssMed ? "MEDIUM ◉" : "WEAK   ░"
+color  scoreCol  = tssStrong ? C_BULL : tssMed ? C_GOLD : C_MUTED
+
+// Strong trend: tighten TP slightly (trail is already tight from LOW regime)
+float scoreTPBoost = tssStrong ? 1.2 : 1.0   // 20% wider TP on strong signals
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ENGINE 1 — ATR TRAILING STOP
+// Chandelier Exit: trail = highest/lowest close ± (ATR × activeMult)
+// CLOSE-based flips only — no wick-triggered whipsaws
+// Multiplier is LIVE from Volatility Regime — self-adjusts every bar
+// ─────────────────────────────────────────────────────────────────────────────
+var float trail    = na
+var bool  trailUp  = true    // current trail direction
+var float prevTrail= na
+var bool  prevUp   = true
+
+float atrBand = atrRaw * activeMult
+
+// Calculate raw trail candidates
+float trailUpVal  = atrSrc - atrBand   // bull trail = below price
+float trailDnVal  = atrSrc + atrBand   // bear trail = above price
+
+// Chandelier logic — trail only moves in direction, never against
+float newTrailUp  = na
+float newTrailDn  = na
+
+if not na(trail)
+    // Bull trail: ratchet up, never drop
+    newTrailUp := math.max(trailUpVal, prevUp ? trail : trailUpVal)
+    // Bear trail: ratchet down, never rise
+    newTrailDn := math.min(trailDnVal, not prevUp ? trail : trailDnVal)
+else
+    newTrailUp := trailUpVal
+    newTrailDn := trailDnVal
+
+// Flip detection — close-based only
+bool flipToBull = not na(trail) and not prevUp and close > trail
+bool flipToBear = not na(trail) and prevUp     and close < trail
+
+// Update trail direction
+if flipToBull
+    trailUp := true
+    trail   := newTrailUp
+else if flipToBear
+    trailUp := false
+    trail   := newTrailDn
+else if trailUp
+    trail   := newTrailUp
+else
+    trail   := newTrailDn
+
+prevTrail := trail
+prevUp    := trailUp
+
+// Trail color — regime-aware
+color trailColor = trailUp ? (regLow ? C_TEAL : regHigh ? C_BEAR : C_BULL) : (regLow ? color.new(#00F5D4,40) : regHigh ? C_BEAR : C_BEAR)
+
+// Plot trail
+plot(showTrail ? trail : na, "ATR Trail", color=trailColor, linewidth=2, style=plot.style_linebr)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// TRADE STATE — CodaPro standard
+// ─────────────────────────────────────────────────────────────────────────────
+var bool  g_inTrade  = false
+var int   lastSigBar = 0
+var int   entryBar   = 0
+var float entryPrice = na
+var bool  g_isLong   = false
+var float g_tp       = na
+var float g_sl       = na
+var line  g_tpLine   = na
+var line  g_slLine   = na
+
+// Prev-bar trackers for bulletproof flip detection
+var bool prevTrailUp = true
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SIGNAL LOGIC
+// BUY:  trail flipped to bull (prevTrailUp=false, now true) + score >= min
+// SELL: trail flipped to bear (prevTrailUp=true,  now false) + score >= min
+// Score gate: blocks weak-trend entries — only confirmed energy
+// ─────────────────────────────────────────────────────────────────────────────
+bool cdOK  = bar_index - lastSigBar >= cooldown
+bool ready = not g_inTrade and cdOK and barstate.isconfirmed
+
+bool buySignal  = false
+bool sellSignal = false
+
+if ready and not na(trail)
+    bool scoreOK = tssScore >= tssMinScore
+    if flipToBull and scoreOK
+        buySignal := true
+    else if flipToBear and scoreOK
+        sellSignal := true
+
+// Flip labels (always show regardless of score — shows filtered flips too)
+if showFlip and barstate.isconfirmed and not na(trail)
+    if flipToBull and not buySignal and tssScore < tssMinScore
+        label.new(bar_index, na, "░ flip\n" + str.tostring(math.round(tssScore)),
+             yloc=yloc.belowbar, style=label.style_label_up,
+             color=color.new(C_MUTED, 85), textcolor=C_MUTED, size=size.tiny,
+             text_font_family=font.family_monospace)
+    if flipToBear and not sellSignal and tssScore < tssMinScore
+        label.new(bar_index, na, "░ flip\n" + str.tostring(math.round(tssScore)),
+             yloc=yloc.abovebar, style=label.style_label_down,
+             color=color.new(C_MUTED, 85), textcolor=C_MUTED, size=size.tiny,
+             text_font_family=font.family_monospace)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// TRADE EXITS — first (intrabar TP/SL, confirmed time exit)
+// ─────────────────────────────────────────────────────────────────────────────
+if g_inTrade
+    bool tpHit    = g_isLong ? high >= g_tp : low  <= g_tp
+    bool slHit    = g_isLong ? low  <= g_sl : high >= g_sl
+    bool timeExit = barstate.isconfirmed and (bar_index - entryBar) >= maxBars
+    // Trail flip exit — if trail flips against position, exit immediately
+    bool trailExit = barstate.isconfirmed and (g_isLong and flipToBear) or (not g_isLong and flipToBull)
+
+    if tpHit
+        g_inTrade := false
+        if not na(g_tpLine)
+            line.delete(g_tpLine)
+        if not na(g_slLine)
+            line.delete(g_slLine)
+        label.new(bar_index, na, " ✦ TP +" + str.tostring(tpPct, "#.##") + "% ",
+             yloc=g_isLong ? yloc.abovebar : yloc.belowbar,
+             style=g_isLong ? label.style_label_down : label.style_label_up,
+             color=color.new(C_TEAL, 85), textcolor=C_TEAL, size=size.small)
+
+    else if slHit
+        g_inTrade := false
+        if not na(g_tpLine)
+            line.delete(g_tpLine)
+        if not na(g_slLine)
+            line.delete(g_slLine)
+        label.new(bar_index, na, " SL -" + str.tostring(slPct, "#.##") + "% ",
+             yloc=g_isLong ? yloc.belowbar : yloc.abovebar,
+             style=g_isLong ? label.style_label_up : label.style_label_down,
+             color=color.new(C_BEAR, 85), textcolor=C_BEAR, size=size.tiny)
+
+    else if trailExit
+        float exitPnl = g_isLong ? (close - entryPrice) / entryPrice * 100 : (entryPrice - close) / entryPrice * 100
+        g_inTrade := false
+        if not na(g_tpLine)
+            line.delete(g_tpLine)
+        if not na(g_slLine)
+            line.delete(g_slLine)
+        label.new(bar_index, na, " ◈ TRAIL FLIP  " + str.tostring(exitPnl, "#.##") + "% ",
+             yloc=g_isLong ? yloc.belowbar : yloc.abovebar,
+             style=g_isLong ? label.style_label_up : label.style_label_down,
+             color=color.new(C_GOLD, 85), textcolor=C_GOLD, size=size.tiny)
+
+    else if timeExit
+        float exitPnl = g_isLong ? (close - entryPrice) / entryPrice * 100 : (entryPrice - close) / entryPrice * 100
+        g_inTrade := false
+        if not na(g_tpLine)
+            line.delete(g_tpLine)
+        if not na(g_slLine)
+            line.delete(g_slLine)
+        label.new(bar_index, na, " TIME  " + str.tostring(exitPnl, "#.##") + "% ",
+             yloc=g_isLong ? yloc.belowbar : yloc.abovebar,
+             style=g_isLong ? label.style_label_up : label.style_label_down,
+             color=color.new(C_MUTED, 85), textcolor=C_MUTED, size=size.tiny)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// TRADE EXECUTION — one trade at a time
+// TP = ATR-based (regime + score boost), SL = opposite trail side
+// ─────────────────────────────────────────────────────────────────────────────
+if buySignal and not g_inTrade
+    g_inTrade  := true
+    g_isLong   := true
+    entryBar   := bar_index
+    entryPrice := close
+    lastSigBar := bar_index
+    float atrTP = close + atrRaw * tpMult * scoreTPBoost
+    float atrSL = not na(trail) ? trail : close * (1 - slPct / 100)
+    g_tp := atrTP
+    g_sl := atrSL
+    if not na(g_tpLine)
+        line.delete(g_tpLine)
+    if not na(g_slLine)
+        line.delete(g_slLine)
+    if showTPSL
+        g_tpLine := line.new(bar_index, g_tp, bar_index + maxBars, g_tp,
+             color=color.new(C_TEAL, 25), style=line.style_dashed, width=2)
+        g_slLine := line.new(bar_index, g_sl, bar_index + maxBars, g_sl,
+             color=color.new(C_BEAR, 40), style=line.style_dashed, width=1)
+    if showSig
+        string scoreTxt = showScore ? "\n◈ SCORE " + str.tostring(math.round(tssScore)) : ""
+        string regTxt   = "\n" + regimeName
+        label.new(bar_index, na,
+             "▲ BUY" + regTxt + scoreTxt,
+             yloc=yloc.belowbar, style=label.style_label_up,
+             color=color.new(C_BULL, 65), textcolor=C_BULL, size=size.small,
+             text_font_family=font.family_monospace)
+
+else if sellSignal and not g_inTrade
+    g_inTrade  := true
+    g_isLong   := false
+    entryBar   := bar_index
+    entryPrice := close
+    lastSigBar := bar_index
+    float atrTP = close - atrRaw * tpMult * scoreTPBoost
+    float atrSL = not na(trail) ? trail : close * (1 + slPct / 100)
+    g_tp := atrTP
+    g_sl := atrSL
+    if not na(g_tpLine)
+        line.delete(g_tpLine)
+    if not na(g_slLine)
+        line.delete(g_slLine)
+    if showTPSL
+        g_tpLine := line.new(bar_index, g_tp, bar_index + maxBars, g_tp,
+             color=color.new(C_TEAL, 25), style=line.style_dashed, width=2)
+        g_slLine := line.new(bar_index, g_sl, bar_index + maxBars, g_sl,
+             color=color.new(C_BEAR, 40), style=line.style_dashed, width=1)
+    if showSig
+        string scoreTxt = showScore ? "\n◈ SCORE " + str.tostring(math.round(tssScore)) : ""
+        string regTxt   = "\n" + regimeName
+        label.new(bar_index, na,
+             "▼ SELL" + regTxt + scoreTxt,
+             yloc=yloc.abovebar, style=label.style_label_down,
+             color=color.new(C_BEAR, 65), textcolor=C_BEAR, size=size.small,
+             text_font_family=font.family_monospace)
+
+// Update prev-bar tracker after all logic
+prevTrailUp := trailUp
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GHOST CANDLES
+// ─────────────────────────────────────────────────────────────────────────────
+barcolor(showGhost ? color.new(color.gray, 80) : na)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SCORE LINE (optional separate pane plot)
+// ─────────────────────────────────────────────────────────────────────────────
+plot(showScoreLine ? tssScore : na, "Trend Strength Score", color=scoreCol, linewidth=2)
+hline(showScoreLine ? tssMinScore : na, "Min Score", color=color.new(C_GOLD, 40), linestyle=hline.style_dashed)
+hline(showScoreLine ? 70 : na,         "Strong",    color=color.new(C_BULL, 40), linestyle=hline.style_dotted)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// DASHBOARD — 9×4 cinema bar, bottom_center
+// ─────────────────────────────────────────────────────────────────────────────
+if showDash and barstate.islast
+    // ── Regime cell ──────────────────────────────────────────────────────────
+    string multTxt   = str.tostring(activeMult, "#.#") + "x"
+    string ratioTxt  = str.tostring(atrRatio,   "#.##") + "x avg"
+
+    // ── Score cell ───────────────────────────────────────────────────────────
+    int    scoreInt  = math.round(tssScore)
+    int    scoreFill = math.round(tssScore / 100 * 8)
+    string scoreBar  = str.repeat("█", scoreFill) + str.repeat("░", 8 - scoreFill)
+    string rsiCompTxt = str.tostring(math.round(rsiComp * 100)) + "%"
+    string volCompTxt = str.tostring(math.round(volComp * 100)) + "%"
+    string atrCompTxt = str.tostring(math.round(atrComp * 100)) + "%"
+
+    // ── Trail cell ───────────────────────────────────────────────────────────
+    string trailDir  = trailUp ? "BULL ▲" : "BEAR ▼"
+    color  trailDCol = trailUp ? C_BULL : C_BEAR
+    string trailTxt  = str.tostring(trail, format.mintick)
+    float  trailDist = math.abs(close - trail)
+    string distTxt   = str.tostring(trailDist, format.mintick) + " pts"
+
+    // ── Position cell ────────────────────────────────────────────────────────
+    string posTxt    = not g_inTrade ? "  FLAT  --" : g_isLong ? "LONG   ●" : "SHORT  ●"
+    color  posCol    = not g_inTrade ? C_MUTED : g_isLong ? C_BULL : C_BEAR
+    string tpDTxt    = not g_inTrade or na(g_tp) ? "--" : str.tostring(g_tp, format.mintick)
+    string slDTxt    = not g_inTrade or na(g_sl) ? "--" : str.tostring(g_sl, format.mintick)
+    string cdTxt     = g_inTrade ? "IN TRADE" : bar_index - lastSigBar < cooldown ? "CD " + str.tostring(cooldown - (bar_index - lastSigBar)) + "b" : "READY ✅"
+    color  cdCol     = g_inTrade ? C_GOLD : bar_index - lastSigBar < cooldown ? C_GOLD : C_BULL
+
+    // ── ATR cell ─────────────────────────────────────────────────────────────
+    string atrTxt    = str.tostring(atrRaw, format.mintick)
+    float  atrPct    = atrRaw / close * 100
+    string atrPctTxt = str.tostring(atrPct, "#.##") + "%"
+
+    var table dash = table.new(position.bottom_center, 9, 4,
+         bgcolor=C_COL_BG, border_width=1, border_color=color.new(C_TEAL, 55))
+
+    // ROW 0 — STRIPE
+    for _c = 0 to 8
+        table.cell(dash, _c, 0, "", bgcolor=C_STRIPE, text_size=size.tiny)
+    table.cell(dash, 0, 0, " ◈ ATR TRAIL SUPREME ◈ ",
+         text_color=C_TEAL, text_size=size.small, text_font_family=font.family_monospace, bgcolor=C_HDR_BG)
+    table.cell(dash, 8, 0, " CONFIRMED ◈ ",
+         text_color=C_TEAL, text_size=size.small, text_font_family=font.family_monospace, bgcolor=C_HDR_BG)
+
+    // ROW 1 — HEADERS
+    table.cell(dash, 0, 1, " ◈ VOL REGIME ",
+         text_color=regimeCol, text_size=size.small, text_font_family=font.family_monospace, bgcolor=C_HDR_BG)
+    table.cell(dash, 1, 1, " ◈ MULT ",
+         text_color=regimeCol, text_size=size.small, text_font_family=font.family_monospace, bgcolor=color.new(#0d1117, 30))
+    table.cell(dash, 2, 1, " ◈ TREND SCORE ",
+         text_color=scoreCol, text_size=size.small, text_font_family=font.family_monospace, bgcolor=color.new(#0a0a20, 30))
+    table.cell(dash, 3, 1, " ◈ COMPONENTS ",
+         text_color=C_MUTED, text_size=size.small, text_font_family=font.family_monospace, bgcolor=C_COL_ALT)
+    table.cell(dash, 4, 1, " ◈ TRAIL DIR ",
+         text_color=trailDCol, text_size=size.small, text_font_family=font.family_monospace, bgcolor=color.new(#001a14, 30))
+    table.cell(dash, 5, 1, " ◈ ATR ",
+         text_color=C_MUTED, text_size=size.small, text_font_family=font.family_monospace, bgcolor=C_COL_BG)
+    table.cell(dash, 6, 1, " ◈ POSITION ",
+         text_color=posCol, text_size=size.small, text_font_family=font.family_monospace, bgcolor=C_COL_ALT)
+    table.cell(dash, 7, 1, " ◈ TP / SL ",
+         text_color=C_TEAL, text_size=size.small, text_font_family=font.family_monospace, bgcolor=C_COL_BG)
+    table.cell(dash, 8, 1, " ◈ STATUS ",
+         text_color=cdCol, text_size=size.small, text_font_family=font.family_monospace, bgcolor=C_COL_BG)
+
+    // ROW 2 — PRIMARY DATA
+    table.cell(dash, 0, 2, " " + regimeName,
+         text_color=regimeCol, text_size=size.small, text_font_family=font.family_monospace, bgcolor=C_HDR_BG)
+    table.cell(dash, 1, 2, " " + multTxt + "  ATR",
+         text_color=regimeCol, text_size=size.small, text_font_family=font.family_monospace, bgcolor=color.new(#0d1117, 40))
+    table.cell(dash, 2, 2, " " + scoreBar + " " + str.tostring(scoreInt),
+         text_color=scoreCol, text_size=size.small, text_font_family=font.family_monospace, bgcolor=color.new(#0a0a20, 40))
+    table.cell(dash, 3, 2, " RSI " + rsiCompTxt + " VOL " + volCompTxt,
+         text_color=C_MUTED, text_size=size.small, text_font_family=font.family_monospace, bgcolor=C_COL_ALT)
+    table.cell(dash, 4, 2, " " + trailDir + "  " + trailTxt,
+         text_color=trailDCol, text_size=size.small, text_font_family=font.family_monospace, bgcolor=color.new(#001a14, 40))
+    table.cell(dash, 5, 2, " " + atrTxt + "  " + atrPctTxt,
+         text_color=C_MUTED, text_size=size.small, text_font_family=font.family_monospace, bgcolor=C_COL_BG)
+    table.cell(dash, 6, 2, " " + posTxt,
+         text_color=posCol, text_size=size.small, text_font_family=font.family_monospace, bgcolor=C_COL_ALT)
+    table.cell(dash, 7, 2, " TP " + tpDTxt,
+         text_color=C_TEAL, text_size=size.small, text_font_family=font.family_monospace, bgcolor=C_COL_BG)
+    table.cell(dash, 8, 2, " " + cdTxt,
+         text_color=cdCol, text_size=size.small, text_font_family=font.family_monospace, bgcolor=C_COL_BG)
+
+    // ROW 3 — SECONDARY
+    table.cell(dash, 0, 3, " " + ratioTxt,
+         text_color=color.new(regimeCol, 40), text_size=size.tiny, text_font_family=font.family_monospace, bgcolor=C_HDR_BG)
+    table.cell(dash, 1, 3, " L=" + str.tostring(lowMult) + " M=" + str.tostring(medMult) + " H=" + str.tostring(highMult),
+         text_color=C_MUTED, text_size=size.tiny, text_font_family=font.family_monospace, bgcolor=C_COL_BG)
+    table.cell(dash, 2, 3, " " + scoreName,
+         text_color=scoreCol, text_size=size.small, text_font_family=font.family_monospace, bgcolor=C_COL_BG)
+    table.cell(dash, 3, 3, " ATR " + atrCompTxt + "  MIN " + str.tostring(tssMinScore),
+         text_color=C_MUTED, text_size=size.tiny, text_font_family=font.family_monospace, bgcolor=C_COL_BG)
+    table.cell(dash, 4, 3, " DIST " + distTxt,
+         text_color=color.new(trailDCol, 40), text_size=size.tiny, text_font_family=font.family_monospace, bgcolor=C_COL_BG)
+    table.cell(dash, 5, 3, " " + str.tostring(activeMult, "#.#") + "x × " + atrTxt,
+         text_color=C_MUTED, text_size=size.tiny, text_font_family=font.family_monospace, bgcolor=C_COL_BG)
+    table.cell(dash, 6, 3, " Bars " + (g_inTrade ? str.tostring(bar_index - entryBar) + "/" + str.tostring(maxBars) : "--"),
+         text_color=C_MUTED, text_size=size.tiny, text_font_family=font.family_monospace, bgcolor=C_COL_BG)
+    table.cell(dash, 7, 3, " SL " + slDTxt,
+         text_color=color.new(C_BEAR, 40), text_size=size.tiny, text_font_family=font.family_monospace, bgcolor=C_COL_BG)
+    table.cell(dash, 8, 3, " CD " + str.tostring(cooldown) + "b  MAX " + str.tostring(maxBars) + "b",
+         text_color=C_MUTED, text_size=size.tiny, text_font_family=font.family_monospace, bgcolor=C_COL_BG)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ALERTS
+// ─────────────────────────────────────────────────────────────────────────────
+alertcondition(buySignal,  "ATR Trail BUY",       "ATR Trail Supreme — BUY: trail flipped bull, score confirmed")
+alertcondition(sellSignal, "ATR Trail SELL",      "ATR Trail Supreme — SELL: trail flipped bear, score confirmed")
+alertcondition(flipToBull and not buySignal, "Trail Flip Bull (filtered)", "ATR Trail Supreme — Bull flip filtered by score")
+alertcondition(flipToBear and not sellSignal,"Trail Flip Bear (filtered)", "ATR Trail Supreme — Bear flip filtered by score")
+alertcondition(regLow  and not regLow[1],  "Regime → LOW",  "ATR Trail Supreme — Volatility regime dropped to LOW")
+alertcondition(regHigh and not regHigh[1], "Regime → HIGH", "ATR Trail Supreme — Volatility regime spiked to HIGH")
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Want to see this indicator built out as a full trading strategy? I've put
+//  together a step-by-step tutorial — check my profile signature for details!
+//
+//  For educational and informational purposes only. Not financial advice.
+//  Past performance does not guarantee future results.
+//  Always use proper risk management.

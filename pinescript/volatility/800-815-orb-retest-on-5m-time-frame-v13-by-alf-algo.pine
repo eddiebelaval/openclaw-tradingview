@@ -1,0 +1,609 @@
+//@version=6
+indicator("8:00-8:15 ORB Retest on 5m Time Frame v1.3", overlay=true, max_lines_count=500, max_labels_count=500)
+
+//=================================================
+// Inputs
+//=================================================
+string sessionPreset = input.string("New York", "ORB Session", options=["New York", "London", "Asia"])
+int atrLength = input.int(14, "ATR Length", minval=1)
+string idwafe = "i"
+
+// --- Breakout Direction Mode ---
+string breakoutMode = input.string("First Break", "Breakout Direction Mode",
+     options=["First Break", "Last Break", "Strongest Break", "Directional Preference"],
+     tooltip="First Break = use whichever direction breaks out first (original behavior).\nLast Break = use the most recent breakout before entry window.\nStrongest Break = use the breakout with the largest candle body.\nDirectional Preference = manually pick Bull or Bear.")
+string dirPref = input.string("Bullish", "Directional Preference (if mode selected)",
+     options=["Bullish", "Bearish"],
+     tooltip="Only used when Breakout Direction Mode is set to Directional Preference.")
+
+// --- TP / SL ---
+float tp1AtrMult = input.float(2.0, "TP1 ATR Multiplier", step=0.25)
+float tp2AtrMult = input.float(3.0, "TP2 ATR Multiplier", step=0.25)
+float tp3AtrMult = input.float(5.0, "TP3 ATR Multiplier", step=0.25)
+float slAtrMult = input.float(2.0, "SL ATR Multiplier", step=0.25)
+
+bool showLabels = input.bool(true, "Show Labels")
+bool extendLevels = input.bool(true, "Extend Levels Right")
+bool requireBodyDirection = input.bool(true, "Require Confirmation Candle Direction")
+int maxRetestBars = input.int(25, "Max Bars To Wait After Retest", minval=1)
+
+string confirmationMode = input.string(
+     "Hybrid",
+     "Confirmation Mode",
+     options = ["Retest Close Reclaim", "Break Retest Candle", "Hybrid"])
+
+//==================================================
+// Timeframe guard
+//==================================================
+bool is5m = timeframe.isminutes and timeframe.multiplier == 5
+if not is5m
+    runtime.error("Use this indicator on a 5-minute chart.")
+
+//==================================================
+// Session presets
+//==================================================
+string sessionTz =
+     sessionPreset == "New York" ? "America/New_York" :
+     sessionPreset == "London"   ? "Europe/London" :
+     "Asia/Tokyo"
+
+int orStartHour =
+     sessionPreset == "New York" ? 8 :
+     sessionPreset == "London"   ? 8 :
+     9
+
+int orStartMin = 0
+
+int entryStartHour =
+     sessionPreset == "New York" ? 9 :
+     sessionPreset == "London"   ? 8 :
+     9
+
+int entryStartMin =
+     sessionPreset == "New York" ? 30 :
+     sessionPreset == "London"   ? 15 :
+     15
+
+int entryEndHour =
+     sessionPreset == "New York" ? 11 :
+     sessionPreset == "London"   ? 10 :
+     11
+
+int entryEndMin =
+     sessionPreset == "New York" ? 30 :
+     sessionPreset == "London"   ? 30 :
+     30
+
+//==================================================
+// Time logic
+//==================================================
+int h = hour(time, sessionTz)
+int m = minute(time, sessionTz)
+
+bool newDay = ta.change(dayofmonth(time, sessionTz)) != 0
+
+int nowMins = h * 60 + m
+int orStartMins = orStartHour * 60 + orStartMin
+int orEndMins = orStartMins + 15
+int entryStartMins = entryStartHour * 60 + entryStartMin
+int entryEndMins = entryEndHour * 60 + entryEndMin
+
+bool inORWindow = nowMins >= orStartMins and nowMins < orEndMins
+bool afterOR = nowMins >= orEndMins
+bool biasEligibleWindow = afterOR
+bool activeTradeWindow = nowMins >= entryStartMins and nowMins < entryEndMins
+bool postORTrackingWindow = afterOR
+
+// Can update bias: after OR locked but before entry window opens
+bool canUpdateBias = biasEligibleWindow and not activeTradeWindow and nowMins < entryStartMins
+
+//==================================================
+// ATR
+//==================================================
+float atr = ta.atr(atrLength)
+
+//==================================================
+// State
+//==================================================
+var float orHigh = na
+var float orLow = na
+var float orMid = na
+var bool orLocked = false
+
+var int bias = 0                  // 1 = bullish, -1 = bearish
+var bool biasSet = false
+var float strongestBody = 0.0     // for Strongest Break mode
+
+var float upsideExtreme = na
+var float downsideExtreme = na
+
+var bool waitingForRetest = false
+var bool retestSeen = false
+var int retestBarIndex = na
+var float retestHigh = na
+var float retestLow = na
+
+var bool signalTriggered = false
+var float entryPrice = na
+var float plannedTP1 = na
+var float plannedTP2 = na
+var float plannedTP3 = na
+var float plannedSL = na
+
+var bool tp1Hit = false
+var bool tp2Hit = false
+var bool tp3Hit = false
+var bool slHit = false
+
+var line l_orHigh = na
+var line l_orLow = na
+var line l_orMid = na
+var linefill lf_orZone = na
+var line l_tp1 = na
+var line l_tp2 = na
+var line l_tp3 = na
+var line l_sl = na
+
+var table dashboard = table.new(position.top_right, 2, 10, border_width=1)
+
+//==================================================
+// Per-bar event flags
+//==================================================
+bool firstBreakBullBar = false
+bool firstBreakBearBar = false
+bool retestBullBar = false
+bool retestBearBar = false
+bool longSignalBar = false
+bool shortSignalBar = false
+bool tp1JustHit = false
+bool tp2JustHit = false
+bool tp3JustHit = false
+bool slJustHit = false
+
+//==================================================
+// Reset daily
+//==================================================
+if newDay
+    orHigh := na
+    orLow := na
+    orMid := na
+    orLocked := false
+
+    bias := 0
+    biasSet := false
+    strongestBody := 0.0
+
+    upsideExtreme := na
+    downsideExtreme := na
+
+    waitingForRetest := false
+    retestSeen := false
+    retestBarIndex := na
+    retestHigh := na
+    retestLow := na
+
+    signalTriggered := false
+    entryPrice := na
+    plannedTP1 := na
+    plannedTP2 := na
+    plannedTP3 := na
+    plannedSL := na
+
+    tp1Hit := false
+    tp2Hit := false
+    tp3Hit := false
+    slHit := false
+
+    if not na(lf_orZone)
+        linefill.delete(lf_orZone)
+    if not na(l_orHigh)
+        line.delete(l_orHigh)
+    if not na(l_orLow)
+        line.delete(l_orLow)
+    if not na(l_orMid)
+        line.delete(l_orMid)
+    if not na(l_tp1)
+        line.delete(l_tp1)
+    if not na(l_tp2)
+        line.delete(l_tp2)
+    if not na(l_tp3)
+        line.delete(l_tp3)
+    if not na(l_sl)
+        line.delete(l_sl)
+
+    l_orHigh := na
+    l_orLow := na
+    l_orMid := na
+    lf_orZone := na
+    l_tp1 := na
+    l_tp2 := na
+    l_tp3 := na
+    l_sl := na
+
+//==================================================
+// Build OR from the first 3 x 5m candles
+//==================================================
+if inORWindow
+    orHigh := na(orHigh) ? high : math.max(orHigh, high)
+    orLow := na(orLow) ? low : math.min(orLow, low)
+
+if not orLocked and not na(orHigh) and not na(orLow) and afterOR
+    orMid := (orHigh + orLow) / 2.0
+    orLocked := true
+
+    // --- Styled OR lines ---
+    extendMode = extendLevels ? extend.right : extend.none
+    color orHighColor = #26a69a   // teal green
+    color orLowColor  = #ef5350   // soft red
+    color orMidColor  = #ffca28   // warm amber
+
+    l_orHigh := line.new(bar_index, orHigh, bar_index + 1, orHigh, extend=extendMode, color=orHighColor, width=2)
+    l_orLow := line.new(bar_index, orLow, bar_index + 1, orLow, extend=extendMode, color=orLowColor, width=2)
+    l_orMid := line.new(bar_index, orMid, bar_index + 1, orMid, extend=extendMode, color=orMidColor, width=1, style=line.style_dashed)
+
+    // --- Shaded zone between High and Low ---
+    lf_orZone := linefill.new(l_orHigh, l_orLow, color.new(#b2dfdb, 88))  // very faint teal fill
+
+    // For Directional Preference: set bias immediately when OR locks
+    if breakoutMode == "Directional Preference"
+        bias := dirPref == "Bullish" ? 1 : -1
+        biasSet := true
+
+//==================================================
+// Track extremes after OR for TP/SL logic
+//==================================================
+if orLocked and postORTrackingWindow and not signalTriggered
+    upsideExtreme := na(upsideExtreme) ? high : math.max(upsideExtreme, high)
+    downsideExtreme := na(downsideExtreme) ? low : math.min(downsideExtreme, low)
+
+//==================================================
+// Set bias based on Breakout Direction Mode
+//==================================================
+// Save previous bias to detect changes for marker flags
+int prevBias = bias
+
+if breakoutMode == "First Break"
+    // Original behavior: first breakout sets direction, never changes
+    if orLocked and biasEligibleWindow and not biasSet
+        if close > orHigh
+            bias := 1
+            biasSet := true
+        else if close < orLow
+            bias := -1
+            biasSet := true
+
+else if breakoutMode == "Last Break"
+    // Every breakout before entry window updates the bias
+    if orLocked and canUpdateBias
+        if close > orHigh
+            bias := 1
+            biasSet := true
+        else if close < orLow
+            bias := -1
+            biasSet := true
+
+else if breakoutMode == "Strongest Break"
+    // Breakout with largest candle body wins
+    if orLocked and canUpdateBias
+        float bodySize = math.abs(close - open)
+        if close > orHigh and bodySize > strongestBody
+            strongestBody := bodySize
+            bias := 1
+            biasSet := true
+        else if close < orLow and bodySize > strongestBody
+            strongestBody := bodySize
+            bias := -1
+            biasSet := true
+
+// Directional Preference is handled above at OR lock time
+
+// Set per-bar break marker flags when bias changes
+if bias != prevBias and bias != 0
+    if bias == 1
+        firstBreakBullBar := true
+    else if bias == -1
+        firstBreakBearBar := true
+
+//==================================================
+// After entry window opens, start waiting for midpoint retest
+//==================================================
+if activeTradeWindow and biasSet and not waitingForRetest and not signalTriggered
+    waitingForRetest := true
+    retestSeen := false
+    retestBarIndex := na
+    retestHigh := na
+    retestLow := na
+
+//==================================================
+// Helpers
+//==================================================
+bool bullishBody = close > open
+bool bearishBody = close < open
+
+bool bodyBullOK = not requireBodyDirection or bullishBody
+bool bodyBearOK = not requireBodyDirection or bearishBody
+
+bool longReclaimConfirm = bias == 1 and low <= orMid and close > orMid and bodyBullOK
+bool shortReclaimConfirm = bias == -1 and high >= orMid and close < orMid and bodyBearOK
+
+bool longBreakRetestConfirm = bias == 1 and close > orMid and close > retestHigh and bodyBullOK
+bool shortBreakRetestConfirm = bias == -1 and close < orMid and close < retestLow and bodyBearOK
+
+bool longConfirm =
+     confirmationMode == "Retest Close Reclaim" ? longReclaimConfirm :
+     confirmationMode == "Break Retest Candle" ? longBreakRetestConfirm :
+     (longReclaimConfirm or longBreakRetestConfirm)
+
+bool shortConfirm =
+     confirmationMode == "Retest Close Reclaim" ? shortReclaimConfirm :
+     confirmationMode == "Break Retest Candle" ? shortBreakRetestConfirm :
+     (shortReclaimConfirm or shortBreakRetestConfirm)
+
+//==================================================
+// Midpoint retest + confirmation engine
+//==================================================
+if waitingForRetest and biasSet and not signalTriggered and activeTradeWindow
+    if retestSeen and not na(retestBarIndex) and (bar_index - retestBarIndex > maxRetestBars)
+        retestSeen := false
+        retestBarIndex := na
+        retestHigh := na
+        retestLow := na
+
+    if not retestSeen
+        bool longRetest = bias == 1 and low <= orMid
+        bool shortRetest = bias == -1 and high >= orMid
+
+        if longRetest
+            retestSeen := true
+            retestBarIndex := bar_index
+            retestHigh := high
+            retestLow := low
+            retestBullBar := true
+
+        if shortRetest
+            retestSeen := true
+            retestBarIndex := bar_index
+            retestHigh := high
+            retestLow := low
+            retestBearBar := true
+
+    else
+        if longConfirm
+            signalTriggered := true
+            longSignalBar := true
+            entryPrice := close
+            plannedTP1 := entryPrice + tp1AtrMult * atr
+            plannedTP2 := entryPrice + tp2AtrMult * atr
+            plannedTP3 := entryPrice + tp3AtrMult * atr
+            plannedSL := downsideExtreme - slAtrMult * atr
+
+            extendMode2 = extendLevels ? extend.right : extend.none
+            l_tp1 := line.new(bar_index, plannedTP1, bar_index + 1, plannedTP1, extend=extendMode2, color=color.lime, width=2)
+            l_tp2 := line.new(bar_index, plannedTP2, bar_index + 1, plannedTP2, extend=extendMode2, color=color.lime, width=1, style=line.style_dashed)
+            l_tp3 := line.new(bar_index, plannedTP3, bar_index + 1, plannedTP3, extend=extendMode2, color=color.lime, width=1, style=line.style_dotted)
+            l_sl := line.new(bar_index, plannedSL, bar_index + 1, plannedSL, extend=extendMode2, color=color.orange, width=2)
+
+            if showLabels
+                label.new(bar_index, low, "Buy Signal",
+                     style=label.style_label_up,
+                     color=color.new(color.rgb(0,70,0), 40),
+                     textcolor=color.white)
+                label.new(bar_index, plannedTP1, "TP1",
+                     style=label.style_label_left,
+                     color=color.new(color.lime, 65),
+                     textcolor=color.black)
+                label.new(bar_index, plannedTP2, "TP2",
+                     style=label.style_label_left,
+                     color=color.new(color.lime, 75),
+                     textcolor=color.black)
+                label.new(bar_index, plannedTP3, "TP3",
+                     style=label.style_label_left,
+                     color=color.new(color.lime, 85),
+                     textcolor=color.black)
+                label.new(bar_index, plannedSL, "SL",
+                     style=label.style_label_left,
+                     color=color.new(color.orange, 65),
+                     textcolor=color.black)
+
+        else if shortConfirm
+            signalTriggered := true
+            shortSignalBar := true
+            entryPrice := close
+            plannedTP1 := entryPrice - tp1AtrMult * atr
+            plannedTP2 := entryPrice - tp2AtrMult * atr
+            plannedTP3 := entryPrice - tp3AtrMult * atr
+            plannedSL := upsideExtreme + slAtrMult * atr
+
+            extendMode2 = extendLevels ? extend.right : extend.none
+            l_tp1 := line.new(bar_index, plannedTP1, bar_index + 1, plannedTP1, extend=extendMode2, color=color.lime, width=2)
+            l_tp2 := line.new(bar_index, plannedTP2, bar_index + 1, plannedTP2, extend=extendMode2, color=color.lime, width=1, style=line.style_dashed)
+            l_tp3 := line.new(bar_index, plannedTP3, bar_index + 1, plannedTP3, extend=extendMode2, color=color.lime, width=1, style=line.style_dotted)
+            l_sl := line.new(bar_index, plannedSL, bar_index + 1, plannedSL, extend=extendMode2, color=color.orange, width=2)
+
+            if showLabels
+                label.new(bar_index, high, "Sell Signal",
+                     style=label.style_label_down,
+                     color=color.new(color.rgb(160,0,0), 40),
+                     textcolor=color.white)
+                label.new(bar_index, plannedTP1, "TP1",
+                     style=label.style_label_left,
+                     color=color.new(color.lime, 65),
+                     textcolor=color.black)
+                label.new(bar_index, plannedTP2, "TP2",
+                     style=label.style_label_left,
+                     color=color.new(color.lime, 75),
+                     textcolor=color.black)
+                label.new(bar_index, plannedTP3, "TP3",
+                     style=label.style_label_left,
+                     color=color.new(color.lime, 85),
+                     textcolor=color.black)
+                label.new(bar_index, plannedSL, "SL",
+                     style=label.style_label_left,
+                     color=color.new(color.orange, 65),
+                     textcolor=color.black)
+
+//==================================================
+// TP / SL hit tracking with labels
+//==================================================
+bool tradeActive = signalTriggered and not slHit and not (tp1Hit and tp2Hit and tp3Hit)
+
+if tradeActive
+    // Check SL first (conservative: assume worst case)
+    bool slTriggered = false
+    if bias == 1 and low <= plannedSL
+        slTriggered := true
+    else if bias == -1 and high >= plannedSL
+        slTriggered := true
+
+    if slTriggered
+        slHit := true
+        slJustHit := true
+    else
+        // Check TPs progressively
+        if bias == 1
+            if not tp1Hit and high >= plannedTP1
+                tp1Hit := true
+                tp1JustHit := true
+            if not tp2Hit and high >= plannedTP2
+                tp2Hit := true
+                tp2JustHit := true
+            if not tp3Hit and high >= plannedTP3
+                tp3Hit := true
+                tp3JustHit := true
+        else if bias == -1
+            if not tp1Hit and low <= plannedTP1
+                tp1Hit := true
+                tp1JustHit := true
+            if not tp2Hit and low <= plannedTP2
+                tp2Hit := true
+                tp2JustHit := true
+            if not tp3Hit and low <= plannedTP3
+                tp3Hit := true
+                tp3JustHit := true
+
+// Draw labels when TPs / SL are hit
+if tp1JustHit and showLabels
+    label.new(bar_index, plannedTP1, "TP1 ✓",
+         style=bias == 1 ? label.style_label_down : label.style_label_up,
+         color=color.new(color.lime, 30),
+         textcolor=color.white,
+         size=size.small)
+
+if tp2JustHit and showLabels
+    label.new(bar_index, plannedTP2, "TP2 ✓",
+         style=bias == 1 ? label.style_label_down : label.style_label_up,
+         color=color.new(color.lime, 30),
+         textcolor=color.white,
+         size=size.small)
+
+if tp3JustHit and showLabels
+    label.new(bar_index, plannedTP3, "TP3 ✓",
+         style=bias == 1 ? label.style_label_down : label.style_label_up,
+         color=color.new(color.lime, 30),
+         textcolor=color.white,
+         size=size.small)
+
+if slJustHit and showLabels
+    label.new(bar_index, plannedSL, "SL ✗",
+         style=bias == 1 ? label.style_label_up : label.style_label_down,
+         color=color.new(color.red, 30),
+         textcolor=color.white,
+         size=size.small)
+
+//==================================================
+// Alert conditions
+//==================================================
+alertcondition(
+     signalTriggered and bias == 1 and close == entryPrice,
+     title="Buy Signal",
+     message="Buy Signal on {{ticker}}")
+
+alertcondition(
+     signalTriggered and bias == -1 and close == entryPrice,
+     title="Sell Signal",
+     message="Sell Signal on {{ticker}}")
+
+alertcondition(tp1JustHit, title="TP1 Hit", message="TP1 hit on {{ticker}}")
+alertcondition(tp2JustHit, title="TP2 Hit", message="TP2 hit on {{ticker}}")
+alertcondition(tp3JustHit, title="TP3 Hit", message="TP3 hit on {{ticker}}")
+alertcondition(slJustHit, title="SL Hit", message="SL hit on {{ticker}}")
+
+//==================================================
+// Plots
+//==================================================
+plot(orLocked ? orHigh : na, "OR High", color=color.new(#26a69a, 0), linewidth=1, style=plot.style_linebr)
+plot(orLocked ? orLow : na, "OR Low", color=color.new(#ef5350, 0), linewidth=1, style=plot.style_linebr)
+plot(orLocked ? orMid : na, "OR Mid", color=color.new(#ffca28, 0), linewidth=1, style=plot.style_linebr)
+
+plot(signalTriggered ? plannedTP1 : na, "Planned TP1", color=color.new(color.lime, 0), linewidth=2, style=plot.style_linebr)
+plot(signalTriggered ? plannedTP2 : na, "Planned TP2", color=color.new(color.lime, 30), linewidth=1, style=plot.style_linebr)
+plot(signalTriggered ? plannedTP3 : na, "Planned TP3", color=color.new(color.lime, 60), linewidth=1, style=plot.style_linebr)
+plot(signalTriggered ? plannedSL : na, "Planned SL", color=color.new(color.orange, 0), linewidth=2, style=plot.style_linebr)
+
+plotshape(bias == 1 and waitingForRetest and not signalTriggered, title="Waiting Bullish Retest", style=shape.circle, location=location.bottom, color=color.lime, size=size.tiny)
+plotshape(bias == -1 and waitingForRetest and not signalTriggered, title="Waiting Bearish Retest", style=shape.circle, location=location.top, color=color.orange, size=size.tiny)
+
+// Breakout markers (triangle for each bias change)
+plotshape(showLabels and firstBreakBullBar, title="Breakout Bull", style=shape.triangleup, location=location.belowbar, color=color.lime, size=size.small)
+plotshape(showLabels and firstBreakBearBar, title="Breakout Bear", style=shape.triangledown, location=location.abovebar, color=color.red, size=size.small)
+
+// Retest = diamond
+plotshape(showLabels and retestBullBar, title="Bullish Retest", style=shape.diamond, location=location.belowbar, color=color.yellow, size=size.small)
+plotshape(showLabels and retestBearBar, title="Bearish Retest", style=shape.diamond, location=location.abovebar, color=color.yellow, size=size.small)
+
+//==================================================
+// Dashboard
+//==================================================
+string biasText = bias == 1 ? "Bullish ▲" : bias == -1 ? "Bearish ▼" : "-"
+string firstBreakText = not biasSet ? "-" : bias == 1 ? "▲ Bull" : "▼ Bear"
+string retestText = not (retestSeen or signalTriggered) ? "-" : bias == 1 ? "◆ Bull" : "◆ Bear"
+string signalText = not signalTriggered ? "-" : bias == 1 ? "Buy" : "Sell"
+
+string tp1Status = tp1Hit ? "✓" : "-"
+string tp2Status = tp2Hit ? "✓" : "-"
+string tp3Status = tp3Hit ? "✓" : "-"
+string slStatus = slHit ? "✗" : "-"
+string tpSlText = "TP " + tp1Status + " | " + tp2Status + " | " + tp3Status + "  SL " + slStatus
+
+color bullColor = color.lime
+color bearColor = color.red
+color neutralColor = color.white
+
+color firstBreakColor = not biasSet ? neutralColor : bias == 1 ? bullColor : bearColor
+color biasColor = bias == 1 ? bullColor : bias == -1 ? bearColor : neutralColor
+color retestColor = not (retestSeen or signalTriggered) ? neutralColor : bias == 1 ? bullColor : bearColor
+color signalColor = not signalTriggered ? neutralColor : bias == 1 ? bullColor : bearColor
+
+// TP/SL row color: green if all 3 TPs hit, red if SL hit, white otherwise
+color tpSlColor = (tp1Hit and tp2Hit and tp3Hit) ? bullColor : slHit ? bearColor : neutralColor
+
+if barstate.islast
+    table.cell(dashboard, 0, 0, "Parameter", text_color=color.white, bgcolor=color.new(color.gray, 20))
+    table.cell(dashboard, 1, 0, "Value", text_color=color.white, bgcolor=color.new(color.gray, 20))
+
+    table.cell(dashboard, 0, 1, "Session", text_color=color.white, bgcolor=color.new(color.black, 0))
+    table.cell(dashboard, 1, 1, sessionPreset, text_color=color.white, bgcolor=color.new(color.black, 0))
+
+    table.cell(dashboard, 0, 2, "Break Mode", text_color=color.white, bgcolor=color.new(color.black, 0))
+    table.cell(dashboard, 1, 2, breakoutMode, text_color=color.white, bgcolor=color.new(color.black, 0))
+
+    table.cell(dashboard, 0, 3, "1st Break ▲/▼", text_color=color.white, bgcolor=color.new(color.black, 0))
+    table.cell(dashboard, 1, 3, firstBreakText, text_color=firstBreakColor, bgcolor=color.new(color.black, 0))
+
+    table.cell(dashboard, 0, 4, "Bias", text_color=color.white, bgcolor=color.new(color.black, 0))
+    table.cell(dashboard, 1, 4, biasText, text_color=biasColor, bgcolor=color.new(color.black, 0))
+
+    table.cell(dashboard, 0, 5, "Retest ◆", text_color=color.white, bgcolor=color.new(color.black, 0))
+    table.cell(dashboard, 1, 5, retestText, text_color=retestColor, bgcolor=color.new(color.black, 0))
+
+    table.cell(dashboard, 0, 6, "Signal", text_color=color.white, bgcolor=color.new(color.black, 0))
+    table.cell(dashboard, 1, 6, signalText, text_color=signalColor, bgcolor=color.new(color.black, 0))
+
+    table.cell(dashboard, 0, 7, "Confirm Mode", text_color=color.white, bgcolor=color.new(color.black, 0))
+    table.cell(dashboard, 1, 7, confirmationMode, text_color=color.white, bgcolor=color.new(color.black, 0))
+
+    table.cell(dashboard, 0, 8, "Targets", text_color=color.white, bgcolor=color.new(color.black, 0))
+    table.cell(dashboard, 1, 8, tpSlText, text_color=tpSlColor, bgcolor=color.new(color.black, 0))
+
+    table.cell(dashboard, 0, 9, "TP Mults", text_color=color.white, bgcolor=color.new(color.black, 0))
+    table.cell(dashboard, 1, 9, str.tostring(tp1AtrMult) + " / " + str.tostring(tp2AtrMult) + " / " + str.tostring(tp3AtrMult), text_color=color.white, bgcolor=color.new(color.black, 0))

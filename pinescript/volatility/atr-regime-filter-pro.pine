@@ -1,0 +1,301 @@
+//@version=6
+indicator("ATR Regime Filter Pro", overlay=false)
+
+//════════════════════════════════════════════════════════════════
+// ─── ATR SETTINGS ────────────────────────────────────────────
+//════════════════════════════════════════════════════════════════
+atrLen = input.int(
+     14,
+     title       = "ATR Length",
+     minval      = 1,
+     tooltip     = "Number of bars used to calculate the raw Average True Range. " +
+                   "Lower values react faster to sudden volatility spikes; " +
+                   "higher values produce a smoother, slower-reacting ATR. " +
+                   "Default 14 is the standard Wilder setting.",
+     group       = "ATR Settings"
+)
+
+atrAvg = input.int(
+     50,
+     title       = "ATR Average Length",
+     minval      = 1,
+     tooltip     = "Number of bars used to compute the Simple Moving Average of the ATR " +
+                   "that becomes the normalisation baseline. " +
+                   "The indicator divides the current ATR by this average to produce a " +
+                   "dimensionless ratio centred near 1.0, making it comparable across " +
+                   "different assets and timeframes. Increase this value for a more stable " +
+                   "long-term baseline; decrease it if you want the baseline to adapt faster.",
+     group       = "ATR Settings"
+)
+
+//════════════════════════════════════════════════════════════════
+// ─── REGIME THRESHOLDS ───────────────────────────────────────
+//════════════════════════════════════════════════════════════════
+lowThr = input.float(
+     0.80,
+     title       = "ATR Lower Threshold (No-Trade zone)",
+     step        = 0.01,
+     tooltip     = "When the ATR Ratio falls below this value the market is classified as " +
+                   "'Dead / No-Trade'. Current volatility is significantly below its own " +
+                   "historical average, meaning spreads eat into any edge, stops are too " +
+                   "tight to be meaningful, and breakout signals are statistically unreliable. " +
+                   "A value of 0.80 means ATR is less than 80 % of its average. " +
+                   "Raise this threshold to be more conservative (skip more low-vol periods); " +
+                   "lower it to allow slightly quieter markets through the filter.",
+     group       = "Regime Thresholds"
+)
+
+highThr = input.float(
+     1.80,
+     title       = "ATR Upper Threshold (Extreme zone)",
+     step        = 0.01,
+     tooltip     = "When the ATR Ratio exceeds this value the market is classified as " +
+                   "'Extreme'. Volatility is far above its historical average — " +
+                   "typical of news events, earnings, or liquidity gaps. " +
+                   "Risk-reward calculations break down and position sizing based on " +
+                   "normal ATR becomes dangerously under-sized. " +
+                   "A value of 1.80 means ATR is 80 % above its average. " +
+                   "Lower this threshold to catch extreme regimes earlier; " +
+                   "raise it to tolerate higher volatility before flagging extreme conditions.",
+     group       = "Regime Thresholds"
+)
+
+//════════════════════════════════════════════════════════════════
+// ─── EMA SLOPE (HTF TREND FILTER) ────────────────────────────
+//════════════════════════════════════════════════════════════════
+emaLen = input.int(
+     200,
+     title       = "EMA Length (Higher Timeframe)",
+     minval      = 1,
+     tooltip     = "Length of the Exponential Moving Average calculated on the Higher " +
+                   "Timeframe (HTF) chosen below. A 200-period EMA on the 4-hour chart, " +
+                   "for example, captures the dominant macro trend that most institutional " +
+                   "participants use as a directional bias anchor. Shorter lengths give a " +
+                   "more reactive trend read; longer lengths filter out more noise.",
+     group       = "EMA Slope — HTF Trend Filter"
+)
+
+slopeBars = input.int(
+     10,
+     title       = "EMA Slope Lookback (bars)",
+     minval      = 1,
+     tooltip     = "Number of HTF bars over which the EMA slope is measured. " +
+                   "The slope is expressed as a percentage of price: " +
+                   "(EMA[now] − EMA[N bars ago]) / close × 100. " +
+                   "This normalises the slope across assets with very different price scales. " +
+                   "A larger lookback smooths out bar-to-bar noise; " +
+                   "a smaller lookback catches directional changes earlier.",
+     group       = "EMA Slope — HTF Trend Filter"
+)
+
+htf = input.timeframe(
+     "240",
+     title       = "Higher Timeframe for EMA",
+     tooltip     = "The timeframe on which the EMA and its slope are evaluated. " +
+                   "Always set this to a timeframe higher than the chart you trade on. " +
+                   "Example: if you scalp on the 5-minute chart, use 1H or 4H here. " +
+                   "If you swing-trade on the 1H chart, use Daily or Weekly. " +
+                   "Using the same timeframe as the chart degrades the multi-timeframe " +
+                   "filtering effect.",
+     group       = "EMA Slope — HTF Trend Filter"
+)
+
+//════════════════════════════════════════════════════════════════
+// ─── BACKGROUND OPTIONS ──────────────────────────────────────
+//════════════════════════════════════════════════════════════════
+bgExtreme = input.bool(
+     false,
+     title       = "Shade background on Extreme ATR",
+     tooltip     = "When enabled, paints a semi-transparent yellow background on the " +
+                   "indicator pane whenever the ATR Ratio is in the Extreme zone " +
+                   "(above the upper threshold). Useful for quickly spotting high-volatility " +
+                   "events on a scrolled-back chart without inspecting the ratio line.",
+     group       = "Background Options"
+)
+
+bgHealthy = input.bool(
+     false,
+     title       = "Shade background on Healthy ATR",
+     tooltip     = "When enabled, paints a semi-transparent green background on the " +
+                   "indicator pane whenever the ATR Ratio is in the Healthy/Trade zone " +
+                   "(between the two thresholds). Useful for visually confirming " +
+                   "tradeable windows at a glance.",
+     group       = "Background Options"
+)
+
+//════════════════════════════════════════════════════════════════
+// ─── ATR CALCULATION — NORMALISED RATIO ──────────────────────
+//════════════════════════════════════════════════════════════════
+atrValue = ta.atr(atrLen)
+atrAvgV  = ta.sma(atrValue, atrAvg)
+atrRatio = atrValue / atrAvgV
+
+atrDead    = atrRatio < lowThr
+atrExtreme = atrRatio > highThr
+atrHealthy = not atrDead and not atrExtreme
+
+//════════════════════════════════════════════════════════════════
+// ─── EMA SLOPE — HTF REQUEST ─────────────────────────────────
+//════════════════════════════════════════════════════════════════
+htfEMA = request.security(
+     syminfo.tickerid,
+     htf,
+     ta.ema(close, emaLen),
+     lookahead = barmerge.lookahead_off
+)
+
+htfSlopePct = request.security(
+     syminfo.tickerid,
+     htf,
+     ((ta.ema(close, emaLen) - ta.ema(close, emaLen)[slopeBars]) / close) * 100.0,
+     lookahead = barmerge.lookahead_off
+)
+
+// EMA directional states
+emaFlat = math.abs(htfSlopePct) < 0.05
+emaBull = htfSlopePct >  0.05
+emaBear = htfSlopePct < -0.05
+
+//════════════════════════════════════════════════════════════════
+// ─── COMPOSITE MARKET PERMISSION ─────────────────────────────
+//════════════════════════════════════════════════════════════════
+marketOK = atrHealthy and not emaFlat
+
+//════════════════════════════════════════════════════════════════
+// ─── COLOURS ─────────────────────────────────────────────────
+//════════════════════════════════════════════════════════════════
+greenPRO  = color.new(#06fb0e, 0)
+redPRO    = color.new(#fb0303, 0)
+yellowPRO = color.new(#f0ff00, 0)
+
+//════════════════════════════════════════════════════════════════
+// ─── ATR RATIO LINE COLOUR ───────────────────────────────────
+//════════════════════════════════════════════════════════════════
+atrColor = greenPRO
+if atrDead
+    atrColor := redPRO
+else if atrExtreme
+    atrColor := yellowPRO
+
+//════════════════════════════════════════════════════════════════
+// ─── BACKGROUND SHADING ──────────────────────────────────────
+//════════════════════════════════════════════════════════════════
+bgColor =
+     atrDead                        ? color.new(#fb0303, 75) :
+     atrExtreme and bgExtreme       ? color.new(#f0ff00, 75) :
+     atrHealthy and bgHealthy       ? color.new(#06fb0e, 75) :
+     na
+
+bgcolor(bgColor)
+
+//════════════════════════════════════════════════════════════════
+// ─── PLOTS ───────────────────────────────────────────────────
+//════════════════════════════════════════════════════════════════
+plot(atrRatio, title = "ATR Ratio", color = atrColor, linewidth = 2)
+plot(0, title = "compiler_guard", display = display.none)
+
+//════════════════════════════════════════════════════════════════
+// ─── REFERENCE LINES ─────────────────────────────────────────
+//════════════════════════════════════════════════════════════════
+hline(lowThr,  "Low Vol — No Trade",  color = color.red)
+hline(1.00,    "Normal Vol",          color = color.gray)
+hline(highThr, "Extreme Vol",         color = color.black)
+
+//════════════════════════════════════════════════════════════════
+// ─── STATUS MATRIX TABLE ─────────────────────────────────────
+//════════════════════════════════════════════════════════════════
+var table matrix = table.new(position.bottom_right, 2, 4, border_width = 1)
+
+if barstate.islast
+    table.clear(matrix, 0, 0)
+
+    table.cell(matrix, 0, 0, "Filter",    text_color = color.white, bgcolor = color.black)
+    table.cell(matrix, 1, 0, "Status",    text_color = color.white, bgcolor = color.black)
+
+    table.cell(matrix, 0, 1, "ATR Regime", bgcolor = color.white)
+    table.cell(matrix, 1, 1,
+         atrDead ? "No Trade" : atrExtreme ? "Extreme" : "Trade OK",
+         bgcolor = atrDead ? redPRO : atrExtreme ? yellowPRO : greenPRO
+    )
+
+    table.cell(matrix, 0, 2, "EMA Slope", bgcolor = color.white)
+    table.cell(matrix, 1, 2,
+         emaFlat ? "Flat" : emaBull ? "Bullish" : "Bearish",
+         bgcolor = emaFlat ? yellowPRO : emaBull ? greenPRO : redPRO
+    )
+
+    table.cell(matrix, 0, 3, "Market", bgcolor = color.white)
+    table.cell(matrix, 1, 3,
+         marketOK ? "Trade" : "Stay Out",
+         bgcolor = marketOK ? greenPRO : redPRO
+    )
+
+//════════════════════════════════════════════════════════════════
+// ─── ALERTS ──────────────────────────────────────────────────
+//════════════════════════════════════════════════════════════════
+
+// ATR Regime alerts — state transitions (trigger once on the bar that changes state)
+alertcondition(
+     ta.crossunder(atrRatio, lowThr),
+     title   = "ATR entered No-Trade zone",
+     message = "ATR Regime Filter Pro — ATR Ratio dropped below the lower threshold. " +
+               "Volatility is insufficient for reliable entries. Consider standing aside."
+)
+
+alertcondition(
+     ta.crossover(atrRatio, lowThr),
+     title   = "ATR exited No-Trade zone (Healthy)",
+     message = "ATR Regime Filter Pro — ATR Ratio recovered above the lower threshold. " +
+               "Volatility has returned to a healthy range. Check EMA slope before trading."
+)
+
+alertcondition(
+     ta.crossover(atrRatio, highThr),
+     title   = "ATR entered Extreme zone",
+     message = "ATR Regime Filter Pro — ATR Ratio exceeded the upper threshold. " +
+               "Extreme volatility detected. Risk sizing models may underestimate exposure."
+)
+
+alertcondition(
+     ta.crossunder(atrRatio, highThr),
+     title   = "ATR exited Extreme zone (Healthy)",
+     message = "ATR Regime Filter Pro — ATR Ratio dropped back below the upper threshold. " +
+               "Volatility returning to a healthy range. Reassess your trade plan."
+)
+
+// EMA slope state-change alerts
+alertcondition(
+     ta.change(emaFlat ? 1 : 0) > 0,
+     title   = "EMA slope turned Flat",
+     message = "ATR Regime Filter Pro — The Higher Timeframe EMA slope has gone flat. " +
+               "Trend conviction is weak. Avoid directional bias trades until slope resolves."
+)
+
+alertcondition(
+     ta.change(emaBull ? 1 : 0) > 0,
+     title   = "EMA slope turned Bullish",
+     message = "ATR Regime Filter Pro — The Higher Timeframe EMA slope has turned bullish. " +
+               "Directional bias is now upward on the higher timeframe."
+)
+
+alertcondition(
+     ta.change(emaBear ? 1 : 0) > 0,
+     title   = "EMA slope turned Bearish",
+     message = "ATR Regime Filter Pro — The Higher Timeframe EMA slope has turned bearish. " +
+               "Directional bias is now downward on the higher timeframe."
+)
+
+// Composite Market Permission alerts
+alertcondition(
+     ta.change(marketOK ? 1 : 0) > 0,
+     title   = "Market Permission: TRADE",
+     message = "ATR Regime Filter Pro — Both filters are now green: ATR is healthy and " +
+               "the EMA slope is directional. Market permission is active."
+)
+
+alertcondition(
+     ta.change(marketOK ? 1 : 0) < 0,
+     title   = "Market Permission: STAY OUT",
+     message = "ATR Regime Filter Pro — Market permission has been revoked. " +
+               "Either ATR is in a dead or extreme regime, or the EMA slope has gone flat."
+)

@@ -1,0 +1,233 @@
+//@version=6
+indicator("VWAP Confluence Bounce [Darwinian]", overlay=true, timeframe="", timeframe_gaps=true)
+
+// ================================================================================
+// INPUT SETTINGS
+// ================================================================================
+
+// VWAP Configuration
+var anchor = input.string(defval="Decade", title="Anchor Period",
+    options=["Session", "Week", "Month", "Quarter", "Year", "Decade", "Century", "Earnings", "Dividends", "Splits"],
+    group="VWAP Settings", display=display.none)
+src = input(title="Source", defval=hlc3, group="VWAP Settings", display=display.none)
+
+// Band Configuration
+BANDS_GROUP = "VWAP Bands Settings"
+CALC_MODE_TOOLTIP = "Determines the units used to calculate the distance of the bands. When 'Percentage' is selected, a multiplier of 1 means 1%."
+calcModeInput = input.string("Standard Deviation", "Bands Calculation Mode",
+    options=["Standard Deviation", "Percentage"], group=BANDS_GROUP, tooltip=CALC_MODE_TOOLTIP, display=display.none)
+showBand_1 = input(true, title="", group=BANDS_GROUP, inline="band_1", display=display.none)
+bandMult_1 = input.float(1.0, title="Bands Multiplier #1", group=BANDS_GROUP, inline="band_1", step=0.5, minval=0, display=display.none)
+showBand_2 = input(false, title="", group=BANDS_GROUP, inline="band_2", display=display.none)
+bandMult_2 = input.float(2.0, title="Bands Multiplier #2", group=BANDS_GROUP, inline="band_2", step=0.5, minval=0, display=display.none)
+showBand_3 = input(false, title="", group=BANDS_GROUP, inline="band_3", display=display.none)
+bandMult_3 = input.float(3.0, title="Bands Multiplier #3", group=BANDS_GROUP, inline="band_3", step=0.5, minval=0, display=display.none)
+
+// EMA & Band Detection
+emaLength = input.int(50, "EMA Length", group="Filter Settings", display=display.none)
+detectBandL3 = input.bool(true, "Detect Lower Band 3", group="Filter Settings", tooltip="First 25% from Lower Band #3", display=display.none)
+detectBandL2 = input.bool(true, "Detect Lower Band 2", group="Filter Settings", tooltip="First 25% from Lower Band #2", display=display.none)
+detectBandL1 = input.bool(true, "Detect Lower Band 1", group="Filter Settings", tooltip="First 25% from Lower Band #1", display=display.none)
+detectBandVWAP = input.bool(true, "Detect VWAP Band", group="Filter Settings", tooltip="First 25% above VWAP", display=display.none)
+detectBandU1 = input.bool(false, "Detect Upper Band 1", group="Filter Settings", tooltip="First 25% from Upper Band #1", display=display.none)
+detectBandU2 = input.bool(false, "Detect Upper Band 2", group="Filter Settings", tooltip="First 25% from Upper Band #2", display=display.none)
+detectBandU3 = input.bool(false, "Detect Upper Band 3", group="Filter Settings", tooltip="First 25% from Upper Band #3", display=display.none)
+
+// Compression Filter
+useCompression = input.bool(true, "Use Compression Filter", group="Compression Settings", display=display.none)
+volLength = input.int(10, "Volume MA Length", group="Compression Settings", display=display.none)
+useATR = input.bool(false, "Use ATR Filter", group="Compression Settings", display=display.none)
+atrLength = input.int(14, "ATR Length", group="Compression Settings", display=display.none)
+
+// RSI Filter
+useRSI = input.bool(true, "Use RSI Filter", group="RSI Settings", display=display.none)
+rsiLength = input.int(14, "RSI Length", group="RSI Settings", display=display.none)
+rsiSmaLength = input.int(14, "RSI SMA Length", group="RSI Settings", display=display.none)
+
+// Directional Indicator Filter
+useDI = input.bool(true, "Use DI Filter", group="DI Settings",
+    tooltip="Directional Indicator: Above EMA requires +DI > -DI, Below EMA requires -DI > +DI", display=display.none)
+diLength = input.int(9, "DI Length", minval=1, group="DI Settings", display=display.none)
+
+// Candle Color Filter
+useCandleColor = input.bool(true, "Use Candle Color Filter", group="Candle Settings",
+    tooltip="Above EMA requires green candle, Below EMA requires red candle", display=display.none)
+
+// ================================================================================
+// VWAP CALCULATION
+// ================================================================================
+
+cumVolume = ta.cum(volume)
+if barstate.islast and cumVolume == 0
+    runtime.error("No volume is provided by the data vendor.")
+
+// Determine VWAP reset period
+isNewPeriod = switch anchor
+    "Earnings" =>
+        new_earnings_actual = request.earnings(syminfo.tickerid, earnings.actual, barmerge.gaps_on, barmerge.lookahead_on, ignore_invalid_symbol=true)
+        new_earnings_standardized = request.earnings(syminfo.tickerid, earnings.standardized, barmerge.gaps_on, barmerge.lookahead_on, ignore_invalid_symbol=true)
+        not na(new_earnings_actual) or not na(new_earnings_standardized)
+    "Dividends" =>
+        new_dividends = request.dividends(syminfo.tickerid, dividends.gross, barmerge.gaps_on, barmerge.lookahead_on, ignore_invalid_symbol=true)
+        not na(new_dividends)
+    "Splits" =>
+        new_split = request.splits(syminfo.tickerid, splits.denominator, barmerge.gaps_on, barmerge.lookahead_on, ignore_invalid_symbol=true)
+        not na(new_split)
+    "Session" => timeframe.change("D")
+    "Week" => timeframe.change("W")
+    "Month" => timeframe.change("M")
+    "Quarter" => timeframe.change("3M")
+    "Year" => timeframe.change("12M")
+    "Decade" => timeframe.change("12M") and year % 10 == 0
+    "Century" => timeframe.change("12M") and year % 100 == 0
+    => false
+
+isEsdAnchor = anchor == "Earnings" or anchor == "Dividends" or anchor == "Splits"
+if na(src[1]) and not isEsdAnchor
+    isNewPeriod := true
+
+// Calculate VWAP and standard deviation bands
+[_vwap, _stdevUpper, _] = ta.vwap(src, isNewPeriod, 1)
+vwapValue = _vwap
+stdevAbs = _stdevUpper - _vwap
+bandBasis = calcModeInput == "Standard Deviation" ? stdevAbs : _vwap * 0.01
+
+// Calculate band values
+upperBandValue1 = _vwap + bandBasis * bandMult_1
+lowerBandValue1 = _vwap - bandBasis * bandMult_1
+upperBandValue2 = _vwap + bandBasis * bandMult_2
+lowerBandValue2 = _vwap - bandBasis * bandMult_2
+upperBandValue3 = _vwap + bandBasis * bandMult_3
+lowerBandValue3 = _vwap - bandBasis * bandMult_3
+
+// ================================================================================
+// INDICATOR CALCULATIONS
+// ================================================================================
+
+// EMA
+ema50 = ta.ema(close, emaLength)
+
+// Compression: Volume & ATR contraction
+volMA = ta.sma(volume, volLength)
+atr = ta.atr(atrLength)
+volContract = volume < volMA
+atrContract = atr < ta.sma(atr, atrLength)
+compression = useATR ? (volContract and atrContract) : volContract
+
+// RSI: Momentum filter
+rsi = ta.rsi(close, rsiLength)
+rsiSma = ta.sma(rsi, rsiSmaLength)
+rsiAboveSma = rsi > rsiSma
+
+// Directional Indicator: Trend strength
+up = ta.change(high)
+down = -ta.change(low)
+plusDM = na(up) ? na : (up > down and up > 0 ? up : 0)
+minusDM = na(down) ? na : (down > up and down > 0 ? down : 0)
+trur = ta.rma(ta.tr, diLength)
+plusDI = fixnan(100 * ta.rma(plusDM, diLength) / trur)
+minusDI = fixnan(100 * ta.rma(minusDM, diLength) / trur)
+diConditionAbove = plusDI > minusDI
+diConditionBelow = minusDI > plusDI
+
+// Candle Color: Directional bias
+isGreenCandle = close > open
+isRedCandle = close < open
+
+// ================================================================================
+// BAND DETECTION LOGIC
+// ================================================================================
+
+// Calculate detection zone (first 25% of each band)
+sectionHeight = bandBasis * 0.25
+
+// Lower Bands (below VWAP)
+inBandL3 = close >= lowerBandValue3 and close < (lowerBandValue3 + sectionHeight)
+inBandL2 = close >= lowerBandValue2 and close < (lowerBandValue2 + sectionHeight)
+inBandL1 = close >= lowerBandValue1 and close < (lowerBandValue1 + sectionHeight)
+
+// VWAP Band
+inBandVWAP = close >= vwapValue and close < (vwapValue + sectionHeight)
+
+// Upper Bands (above VWAP)
+inBandU1 = close >= upperBandValue1 and close < (upperBandValue1 + sectionHeight)
+inBandU2 = close >= upperBandValue2 and close < (upperBandValue2 + sectionHeight)
+inBandU3 = close >= upperBandValue3 and close < (upperBandValue3 + sectionHeight)
+
+// Combine enabled band detections
+inTargetBand = (detectBandL3 and inBandL3) or
+               (detectBandL2 and inBandL2) or
+               (detectBandL1 and inBandL1) or
+               (detectBandVWAP and inBandVWAP) or
+               (detectBandU1 and inBandU1) or
+               (detectBandU2 and inBandU2) or
+               (detectBandU3 and inBandU3)
+
+// ================================================================================
+// CONFLUENCE DETECTION (Multi-Filter State Machine)
+// ================================================================================
+
+// Base conditions: Price position relative to EMA
+priceAboveEMA = close > ema50
+priceBelowEMA = close < ema50
+
+// Initial corridor: Price in target band zones
+corridorAbove = priceAboveEMA and inTargetBand
+corridorBelow = priceBelowEMA and inTargetBand
+
+// Layer 1: Compression filter
+stateAbove_1 = useCompression ? (corridorAbove and compression) : corridorAbove
+stateBelow_1 = useCompression ? (corridorBelow and compression) : corridorBelow
+
+// Layer 2: RSI filter
+stateAbove_2 = useRSI ? (stateAbove_1 and rsiAboveSma) : stateAbove_1
+stateBelow_2 = useRSI ? (stateBelow_1 and rsiAboveSma) : stateBelow_1
+
+// Layer 3: Directional Indicator filter
+stateAbove_3 = useDI ? (stateAbove_2 and diConditionAbove) : stateAbove_2
+stateBelow_3 = useDI ? (stateBelow_2 and diConditionBelow) : stateBelow_2
+
+// Layer 4: Candle Color filter
+stateAbove = useCandleColor ? (stateAbove_3 and isGreenCandle) : stateAbove_3
+stateBelow = useCandleColor ? (stateBelow_3 and isRedCandle) : stateBelow_3
+
+// Final combined state for alerts
+state = stateAbove or stateBelow
+
+// ================================================================================
+// VISUALIZATION
+// ================================================================================
+
+// VWAP Line
+plot(vwapValue, title="VWAP", color=#2962FF, linewidth=2, display=display.all - display.status_line)
+
+// Band #1
+displayBand1 = showBand_1 ? display.all : display.none
+upperBand_1 = plot(upperBandValue1, title="Upper Band #1", color=color.green, display=displayBand1 - display.status_line, editable=showBand_1)
+lowerBand_1 = plot(lowerBandValue1, title="Lower Band #1", color=color.green, display=displayBand1 - display.status_line, editable=showBand_1)
+fill(upperBand_1, lowerBand_1, title="Bands Fill #1", color=color.new(color.green, 95), display=displayBand1, editable=showBand_1)
+
+// Band #2
+displayBand2 = showBand_2 ? display.all : display.none
+upperBand_2 = plot(upperBandValue2, title="Upper Band #2", color=color.olive, display=displayBand2 - display.status_line, editable=showBand_2)
+lowerBand_2 = plot(lowerBandValue2, title="Lower Band #2", color=color.olive, display=displayBand2 - display.status_line, editable=showBand_2)
+fill(upperBand_2, lowerBand_2, title="Bands Fill #2", color=color.new(color.olive, 95), display=displayBand2, editable=showBand_2)
+
+// Band #3
+displayBand3 = showBand_3 ? display.all : display.none
+upperBand_3 = plot(upperBandValue3, title="Upper Band #3", color=color.teal, display=displayBand3 - display.status_line, editable=showBand_3)
+lowerBand_3 = plot(lowerBandValue3, title="Lower Band #3", color=color.teal, display=displayBand3 - display.status_line, editable=showBand_3)
+fill(upperBand_3, lowerBand_3, title="Bands Fill #3", color=color.new(color.teal, 95), display=displayBand3, editable=showBand_3)
+
+// EMA Line
+plot(ema50, color=color.orange, linewidth=2, title="EMA", display=display.all - display.status_line)
+
+// Confluence Zones (dual shading)
+bgcolor(stateBelow ? color.new(color.orange, 80) : na, title="Confluence Below EMA")
+bgcolor(stateAbove ? color.new(color.blue, 80) : na, title="Confluence Above EMA")
+
+// ================================================================================
+// ALERTS
+// ================================================================================
+
+alertcondition(state, title="Confluence Detected", message="VWAP Confluence Bounce detected")

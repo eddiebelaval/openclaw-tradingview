@@ -1,0 +1,427 @@
+//@version=6
+indicator("NY Open Range Breakout (ORB) & Retest [SSFX]", overlay=true, max_boxes_count=500, max_lines_count=500, max_labels_count=500)
+
+//==================================================
+// INPUTS
+//==================================================
+groupSession   = "Session"
+nyTz           = input.string("America/New_York", "Timezone", group=groupSession)
+nyOpenSession  = input.session("0930-0945", "Opening Range (NY)", group=groupSession)
+
+groupBreakout  = "Breakout / Retest"
+breakoutBufferTicks = input.int(0, "Breakout Buffer (ticks)", minval=0, group=groupBreakout)
+retestBufferTicks   = input.int(4, "Retest Buffer (ticks)", minval=0, group=groupBreakout)
+minRetestBars       = input.int(1, "Min Bars To Wait For Retest", minval=0, group=groupBreakout)
+maxRetestBars       = input.int(20, "Max Bars To Wait For Retest", minval=1, group=groupBreakout)
+maxConfirmBars      = input.int(12, "Max Bars To Wait For Confirmation", minval=1, group=groupBreakout)
+
+groupIndecision = "Indecision / Consolidation"
+indecisionBodyFrac = input.float(0.30, "Max Body % Of Candle Range", minval=0.05, maxval=1.0, step=0.05, group=groupIndecision)
+narrowLookback     = input.int(10, "Narrow Range Lookback", minval=2, group=groupIndecision)
+narrowRangeFactor  = input.float(0.80, "Narrow Range Factor", minval=0.10, maxval=2.0, step=0.05, group=groupIndecision)
+minPauseBars       = input.int(1, "Min Indecision / Consolidation Bars", minval=1, group=groupIndecision)
+
+groupConfirm = "Confirmation"
+confirmBodyFrac = input.float(0.55, "Strong Confirmation Body %", minval=0.10, maxval=1.0, step=0.05, group=groupConfirm)
+
+groupRisk = "Risk / Reward"
+swingLen   = input.int(1, "Swing Pivot Length", minval=1, group=groupRisk)
+rrMultiple = input.float(1.5, "Risk Reward", minval=0.25, step=0.1, group=groupRisk)
+rrBoxBars  = input.int(20, "RR Box Forward Bars", minval=1, group=groupRisk)
+
+groupVisual = "Visual"
+bullColor    = input.color(color.lime, "Bullish Color", group=groupVisual)
+bearColor    = input.color(color.red, "Bearish Color", group=groupVisual)
+neutralColor = input.color(color.gray, "Neutral Color", group=groupVisual)
+showLabels   = input.bool(false, "Show Labels", group=groupVisual)
+showRRLines  = input.bool(true, "Show Entry / SL / TP / RR Boxes", group=groupVisual)
+showORBox    = input.bool(true, "Show Opening Range Box", group=groupVisual)
+showORLevels = input.bool(true, "Show Opening Range Levels", group=groupVisual)
+
+//==================================================
+// HELPERS
+//==================================================
+tick = syminfo.mintick
+breakoutBuffer = breakoutBufferTicks * tick
+retestBuffer   = retestBufferTicks * tick
+
+barRange = math.max(high - low, tick)
+bodySize = math.abs(close - open)
+avgRange = ta.sma(high - low, narrowLookback)
+
+in_session(sess) =>
+    not na(time(timeframe.period, sess, nyTz))
+
+start_time(sess) =>
+    int startTime = na
+    startTime := in_session(sess) and not in_session(sess)[1] ? time : startTime[1]
+    startTime
+
+overlapsLevel(float level, float buffer) =>
+    high >= level - buffer and low <= level + buffer
+
+bullishEngulfing = close > open and close[1] < open[1] and close >= open[1] and open <= close[1]
+
+bearishEngulfing = close < open and close[1] > open[1] and close <= open[1] and open >= close[1]
+
+strongBullConfirm = close > open and bodySize >= barRange * confirmBodyFrac and close > high[1]
+
+strongBearConfirm =close < open and bodySize >= barRange * confirmBodyFrac and close < low[1]
+
+isDojiLike  = bodySize <= barRange * indecisionBodyFrac
+isInsideBar = high <= high[1] and low >= low[1]
+isNarrowBar = not na(avgRange) and (high - low) <= avgRange * narrowRangeFactor
+isPauseBar  = isDojiLike or isInsideBar or isNarrowBar
+
+//==================================================
+// NEW YORK DAY DETECTION
+//==================================================
+nyDayId = year(time, nyTz) * 10000 + month(time, nyTz) * 100 + dayofmonth(time, nyTz)
+isNewNyDay = ta.change(nyDayId) != 0
+
+//==================================================
+// SESSION DETECTION
+//==================================================
+inOpeningRange = in_session(nyOpenSession)
+orStart = inOpeningRange and not inOpeningRange[1]
+orEnd   = not inOpeningRange and inOpeningRange[1]
+orSessionStart = start_time(nyOpenSession)
+
+//==================================================
+// SWINGS
+//==================================================
+pivotLow  = ta.pivotlow(low, swingLen, swingLen)
+pivotHigh = ta.pivothigh(high, swingLen, swingLen)
+
+var float lastSwingLow  = na
+var float lastSwingHigh = na
+
+if not na(pivotLow)
+    lastSwingLow := pivotLow
+
+if not na(pivotHigh)
+    lastSwingHigh := pivotHigh
+
+//==================================================
+// STATE
+// 0 = building OR
+// 1 = waiting breakout
+// 2 = breakout found, waiting retest
+// 3 = retest found, waiting confirmation
+// 4 = setup complete / cancelled for day
+//==================================================
+var int state = 0
+
+var float orHigh = na
+var float orLow  = na
+
+var int breakoutDir = 0
+var float breakoutLevel = na
+var int breakoutBar = na
+
+var int retestBar = na
+var int pauseBars = 0
+var float retestLow = na
+var float retestHigh = na
+
+var float entryPrice = na
+var float stopPrice  = na
+var float targetPrice = na
+
+var box orBox = na
+var box breakoutBox = na
+var line orHighLine = na
+var line orLowLine  = na
+var line entryLine  = na
+var line stopLine   = na
+var line targetLine = na
+var box riskBox     = na
+var box rewardBox   = na
+var label tradeLabel = na
+
+var color activeColor = neutralColor
+
+longSignal = false
+shortSignal = false
+
+//==================================================
+// DAILY RESET
+//==================================================
+if barstate.isfirst or isNewNyDay
+    state := 0
+    orHigh := na
+    orLow := na
+    breakoutDir := 0
+    breakoutLevel := na
+    breakoutBar := na
+    retestBar := na
+    pauseBars := 0
+    retestLow := na
+    retestHigh := na
+    entryPrice := na
+    stopPrice := na
+    targetPrice := na
+    orBox := na
+    breakoutBox := na
+    orHighLine := na
+    orLowLine := na
+    activeColor := neutralColor
+
+    if not na(entryLine)
+        line.delete(entryLine)
+        entryLine := na
+    if not na(stopLine)
+        line.delete(stopLine)
+        stopLine := na
+    if not na(targetLine)
+        line.delete(targetLine)
+        targetLine := na
+    if not na(riskBox)
+        box.delete(riskBox)
+        riskBox := na
+    if not na(rewardBox)
+        box.delete(rewardBox)
+        rewardBox := na
+    if not na(tradeLabel)
+        label.delete(tradeLabel)
+        tradeLabel := na
+
+//==================================================
+// OPENING RANGE BOX
+//==================================================
+if inOpeningRange
+    orHigh := orStart ? high : math.max(high, nz(orHigh[1], high))
+    orLow  := orStart ? low  : math.min(low,  nz(orLow[1], low))
+    state := 0
+    activeColor := neutralColor
+
+    if inOpeningRange[1] and not na(orBox[1])
+        box.delete(orBox[1])
+
+    if showORBox
+        orBox := box.new(
+             left=orSessionStart,
+             top=orHigh,
+             right=time,
+             bottom=orLow,
+             xloc=xloc.bar_time,
+             bgcolor=color.new(neutralColor, 88),
+             border_color=neutralColor,
+             border_style=line.style_solid
+         )
+
+if orEnd and not na(orHigh) and not na(orLow)
+    if showORLevels
+        orHighLine := line.new(
+             x1=orSessionStart,
+             y1=orHigh,
+             x2=time[1],
+             y2=orHigh,
+             xloc=xloc.bar_time,
+             extend=extend.none,
+             color=neutralColor,
+             width=2
+         )
+        orLowLine := line.new(
+             x1=orSessionStart,
+             y1=orLow,
+             x2=time[1],
+             y2=orLow,
+             xloc=xloc.bar_time,
+             extend=extend.none,
+             color=neutralColor,
+             width=2
+         )
+    state := 1
+
+//==================================================
+// BREAKOUT DETECTION
+//==================================================
+if state == 1 and not inOpeningRange and not na(orHigh) and not na(orLow)
+    longBreak  = close > orHigh + breakoutBuffer
+    shortBreak = close < orLow  - breakoutBuffer
+
+    if longBreak or shortBreak
+        breakoutDir   := longBreak ? 1 : -1
+        breakoutLevel := breakoutDir == 1 ? orHigh : orLow
+        breakoutBar   := bar_index
+        state         := 2
+        activeColor   := breakoutDir == 1 ? bullColor : bearColor
+
+        if not na(orHighLine)
+            line.set_color(orHighLine, activeColor)
+        if not na(orLowLine)
+            line.set_color(orLowLine, activeColor)
+        if not na(orBox)
+            box.set_border_color(orBox, activeColor)
+            box.set_bgcolor(orBox, color.new(activeColor, 88))
+
+        breakoutBox := box.new(
+             left=bar_index,
+             top=high,
+             right=bar_index + 1,
+             bottom=low,
+             border_color=activeColor,
+             bgcolor=color.new(activeColor, 80)
+         )
+
+        if showLabels
+            label.new(
+                 x=bar_index,
+                 y=breakoutDir == 1 ? high : low,
+                 text=breakoutDir == 1 ? "NY Breakout ↑" : "NY Breakout ↓",
+                 style=breakoutDir == 1 ? label.style_label_down : label.style_label_up,
+                 textcolor=color.white,
+                 color=activeColor
+             )
+
+//==================================================
+// WAIT FOR RETEST OF BROKEN LEVEL
+//==================================================
+if state == 2 and bar_index > breakoutBar
+    barsSinceBreakout = bar_index - breakoutBar
+    retestTouched     = overlapsLevel(breakoutLevel, retestBuffer)
+    retestAllowed     = barsSinceBreakout >= minRetestBars
+    setupExpired      = barsSinceBreakout > maxRetestBars
+    failedLong        = breakoutDir == 1 and close < orLow - breakoutBuffer
+    failedShort       = breakoutDir == -1 and close > orHigh + breakoutBuffer
+
+    if retestTouched and retestAllowed
+        state := 3
+        retestBar := bar_index
+        retestLow := low
+        retestHigh := high
+        pauseBars := isPauseBar ? 1 : 0
+
+        if showLabels
+            label.new(
+                 x=bar_index,
+                 y=breakoutDir == 1 ? low : high,
+                 text="Retest",
+                 style=breakoutDir == 1 ? label.style_label_up : label.style_label_down,
+                 textcolor=color.white,
+                 color=color.new(activeColor, 10)
+             )
+
+    if setupExpired or failedLong or failedShort
+        state := 4
+
+//==================================================
+// AFTER RETEST: WAIT FOR PAUSE + CONFIRMATION
+//==================================================
+if state == 3
+    retestLow  := math.min(retestLow, low)
+    retestHigh := math.max(retestHigh, high)
+
+    nearBrokenLevel = overlapsLevel(breakoutLevel, retestBuffer * 1.25)
+
+    if nearBrokenLevel and isPauseBar
+        pauseBars += 1
+
+    longConfirmed =
+         breakoutDir == 1 and
+         pauseBars >= minPauseBars and
+         close > breakoutLevel and
+         (bullishEngulfing or strongBullConfirm)
+
+    shortConfirmed =
+         breakoutDir == -1 and
+         pauseBars >= minPauseBars and
+         close < breakoutLevel and
+         (bearishEngulfing or strongBearConfirm)
+
+    confirmExpired = (bar_index - retestBar) > maxConfirmBars
+    failedLong2    = breakoutDir == 1 and close < orLow - breakoutBuffer
+    failedShort2   = breakoutDir == -1 and close > orHigh + breakoutBuffer
+
+    if longConfirmed or shortConfirmed
+        entryPrice := close
+
+        if breakoutDir == 1
+            stopBase = na(lastSwingLow) ? math.min(retestLow, orLow) : math.min(lastSwingLow, retestLow)
+            stopPrice := stopBase >= entryPrice ? math.min(retestLow, orLow) : stopBase
+            risk = entryPrice - stopPrice
+            targetPrice := entryPrice + risk * rrMultiple
+            longSignal := true
+        else
+            stopBase = na(lastSwingHigh) ? math.max(retestHigh, orHigh) : math.max(lastSwingHigh, retestHigh)
+            stopPrice := stopBase <= entryPrice ? math.max(retestHigh, orHigh) : stopBase
+            risk = stopPrice - entryPrice
+            targetPrice := entryPrice - risk * rrMultiple
+            shortSignal := true
+
+        if not na(entryLine)
+            line.delete(entryLine)
+            entryLine := na
+        if not na(stopLine)
+            line.delete(stopLine)
+            stopLine := na
+        if not na(targetLine)
+            line.delete(targetLine)
+            targetLine := na
+        if not na(riskBox)
+            box.delete(riskBox)
+            riskBox := na
+        if not na(rewardBox)
+            box.delete(rewardBox)
+            rewardBox := na
+        if not na(tradeLabel)
+            label.delete(tradeLabel)
+            tradeLabel := na
+
+        if showRRLines
+            entryLine := line.new(x1=bar_index, y1=entryPrice,  x2=bar_index + rrBoxBars, y2=entryPrice,  color=color.white, width=2)
+            stopLine  := line.new(x1=bar_index, y1=stopPrice,   x2=bar_index + rrBoxBars, y2=stopPrice,   color=color.red, width=2)
+            targetLine:= line.new(x1=bar_index, y1=targetPrice, x2=bar_index + rrBoxBars, y2=targetPrice, color=color.lime, width=2)
+
+            riskTop      = math.max(entryPrice, stopPrice)
+            riskBottom   = math.min(entryPrice, stopPrice)
+            rewardTop    = math.max(entryPrice, targetPrice)
+            rewardBottom = math.min(entryPrice, targetPrice)
+
+            riskBox := box.new(
+                 left=bar_index,
+                 top=riskTop,
+                 right=bar_index + rrBoxBars,
+                 bottom=riskBottom,
+                 border_color=color.red,
+                 bgcolor=color.new(color.red, 82)
+             )
+
+            rewardBox := box.new(
+                 left=bar_index,
+                 top=rewardTop,
+                 right=bar_index + rrBoxBars,
+                 bottom=rewardBottom,
+                 border_color=color.lime,
+                 bgcolor=color.new(color.lime, 82)
+             )
+
+        if showLabels
+            rrTxt = breakoutDir == 1 ? "LONG" : "SHORT"
+            labelY = breakoutDir == 1 ? low : high
+            tradeLabel := label.new(
+                 x=bar_index,
+                 y=labelY,
+                 text=rrTxt + "\nEntry: " + str.tostring(entryPrice, format.mintick) +
+                      "\nSL: " + str.tostring(stopPrice, format.mintick) +
+                      "\nTP: " + str.tostring(targetPrice, format.mintick) +
+                      "\nRR: " + str.tostring(rrMultiple, "#.##") + "R",
+                 style=breakoutDir == 1 ? label.style_label_up : label.style_label_down,
+                 textcolor=color.white,
+                 color=activeColor
+             )
+
+        state := 4
+
+    if confirmExpired or failedLong2 or failedShort2
+        state := 4
+
+//==================================================
+// PLOTS
+//==================================================
+plotshape(longSignal,  title="Long Entry",  style=shape.triangleup,   location=location.belowbar, color=bullColor, size=size.small, text="LONG")
+plotshape(shortSignal, title="Short Entry", style=shape.triangledown, location=location.abovebar, color=bearColor, size=size.small, text="SHORT")
+
+alertcondition(longSignal, title="NY Long Entry", message="NY Open breakout retest LONG confirmed")
+alertcondition(shortSignal, title="NY Short Entry", message="NY Open breakout retest SHORT confirmed")

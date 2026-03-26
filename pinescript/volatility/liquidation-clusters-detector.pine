@@ -1,0 +1,222 @@
+//@version=6
+// Created with MintScript.io — Build any TradingView indicator. Just describe it.
+indicator('Liquidation Clusters Detector', 'LiqClusters', overlay=true, max_lines_count=500, max_labels_count=100)
+
+// Default values
+color BULL_COLOR = #089981
+color BEAR_COLOR = #f23645
+
+// Input groups
+group_core = 'Core Settings'
+group_data = 'Data Mode Settings'
+group_proxy = 'Proxy Mode Settings'
+group_thresh = 'Threshold Settings'
+group_vis = 'Visualization'
+group_debug = 'Debug Settings'
+
+// Core inputs
+mode = input.string('PROXY', 'Detection Mode', options=['DATA', 'PROXY'], group=group_core, tooltip='DATA: Use actual liquidation data feeds. PROXY: Detect liquidation patterns from price action')
+lookback = input.int(20, 'Lookback Period', minval=5, maxval=100, group=group_core, tooltip='Bars to look back for local extremes and pattern detection')
+atrLen = input.int(14, 'ATR Length', minval=5, group=group_core, tooltip='Period for ATR calculation used in wick and distance normalization')
+volLen = input.int(20, 'Volume Length', minval=5, group=group_core, tooltip='Period for volume average calculation')
+
+// Debug input
+debug = input.bool(true, 'Debug Mode', group=group_debug, tooltip='Show debug markers and labels for SHORT liquidations')
+
+// Data mode inputs
+liqTicker = input.string('BINANCE:BTCUSDT', 'Liquidation Data Ticker', group=group_data, tooltip='Ticker symbol for liquidation data (replace with actual liquidation feed)')
+
+// Threshold settings
+thresholdMode = input.string('Z', 'Threshold Mode', options=['Z', 'Percentile', 'SMA+StDev'], group=group_thresh, tooltip='Method for determining liquidation cluster peaks')
+zThreshold = input.float(2.0, 'Z-Score Threshold', minval=0.5, step=0.1, group=group_thresh, tooltip='Z-score threshold for peak detection')
+percentileThreshold = input.float(90.0, 'Percentile Threshold', minval=50.0, maxval=99.0, step=1.0, group=group_thresh, tooltip='Percentile threshold for peak detection')
+kStdev = input.float(2.0, 'Standard Deviation Multiple', minval=0.5, step=0.1, group=group_thresh, tooltip='Multiple of standard deviation above SMA for peak detection')
+
+// Visualization inputs
+lineWidth = input.int(2, 'Line Width', minval=1, maxval=5, group=group_vis, tooltip='Width of horizontal cluster lines')
+longLineColor = input.color(color.new(BULL_COLOR, 20), 'Long Cluster Line Color', group=group_vis, tooltip='Color for long liquidation cluster lines')
+shortLineColor = input.color(color.new(BEAR_COLOR, 20), 'Short Cluster Line Color', group=group_vis, tooltip='Color for short liquidation cluster lines')
+maxLines = input.int(50, 'Max Lines Count', minval=10, maxval=100, group=group_vis, tooltip='Maximum number of cluster lines to keep on chart')
+showLabels = input.bool(true, 'Show Cluster Labels', group=group_vis, tooltip='Display labels on cluster lines with intensity information')
+
+// Line management arrays
+var array<line> shortLines = array.new<line>(0)
+var array<line> longLines = array.new<line>(0)
+var array<label> clusterLabels = array.new<label>(0)
+
+// DATA mode with error handling
+liq_value = mode == 'DATA' ? nz(request.security(liqTicker, timeframe.period, close), 0.0) : 0.0
+
+// Market structure calculations
+atr = ta.atr(atrLen)
+volAvg = ta.sma(volume, volLen)
+localLow = ta.lowest(low, lookback)
+localHigh = ta.highest(high, lookback)
+
+// PROXY mode liquidation detection
+upperWick = high - math.max(open, close)
+lowerWick = math.min(open, close) - low
+bodySize = math.abs(close - open)
+
+// Long liquidation sweep conditions
+longSweepBreak = low < localLow[1]
+longBigWick = lowerWick > atr * 1.5
+longElevatedVol = volume > volAvg * 2.0
+longReclaim = close > open or close > (high + low) / 2
+longSweep = longSweepBreak and longBigWick and longElevatedVol and longReclaim
+
+// Short liquidation sweep conditions
+shortSweepBreak = high > localHigh[1]
+shortBigWick = upperWick > atr * 1.5
+shortElevatedVol = volume > volAvg * 2.0
+shortReversal = close < open or close < (high + low) / 2
+shortSweep = shortSweepBreak and shortBigWick and shortElevatedVol and shortReversal
+
+// Intensity calculation for PROXY mode
+normalizedVolume = volume / volAvg
+var float wickIntensity = 0.0
+var float distanceFromExtreme = 0.0
+
+if mode == 'PROXY' and longSweep
+    wickIntensity := lowerWick / atr
+else if mode == 'PROXY' and shortSweep
+    wickIntensity := upperWick / atr
+else
+    wickIntensity := 0.0
+
+if mode == 'PROXY' and longSweep
+    distanceFromExtreme := math.abs(low - localLow[1]) / atr
+else if mode == 'PROXY' and shortSweep
+    distanceFromExtreme := math.abs(high - localHigh[1]) / atr
+else
+    distanceFromExtreme := 0.0
+
+// Final intensity score
+intensityProxy = normalizedVolume * wickIntensity * (1 + distanceFromExtreme)
+intensityData = mode == 'DATA' ? liq_value : 0.0
+intensity = mode == 'PROXY' ? intensityProxy : intensityData
+
+// Threshold calculations
+var array<float> intensityHistory = array.new<float>(0)
+if barstate.isconfirmed and intensity > 0
+    array.push(intensityHistory, intensity)
+    if array.size(intensityHistory) > 200
+        array.shift(intensityHistory)
+
+// Peak detection based on threshold mode
+var bool isAboveThreshold = false
+if array.size(intensityHistory) > 20
+    if thresholdMode == 'Z'
+        mean = array.avg(intensityHistory)
+        stdev = array.stdev(intensityHistory)
+        zScore = stdev > 0 ? (intensity - mean) / stdev : 0
+        isAboveThreshold := zScore > zThreshold
+    else if thresholdMode == 'Percentile'
+        sortedIntensity = array.copy(intensityHistory)
+        array.sort(sortedIntensity)
+        percentileIndex = math.round(array.size(sortedIntensity) * percentileThreshold / 100) - 1
+        percentileValue = array.get(sortedIntensity, math.max(0, percentileIndex))
+        isAboveThreshold := intensity > percentileValue
+    else if thresholdMode == 'SMA+StDev'
+        mean = array.avg(intensityHistory)
+        stdev = array.stdev(intensityHistory)
+        threshold = mean + kStdev * stdev
+        isAboveThreshold := intensity > threshold
+
+// Peak signals
+isLongPeak = barstate.isconfirmed and mode == 'PROXY' and longSweep and isAboveThreshold
+isShortPeak = barstate.isconfirmed and mode == 'PROXY' and shortSweep and isAboveThreshold
+isDataPeak = barstate.isconfirmed and mode == 'DATA' and isAboveThreshold and liq_value > 0
+
+// Line management function
+manageLineArray(lineArray, maxCount) =>
+    while array.size(lineArray) >= maxCount
+        oldLine = array.shift(lineArray)
+        line.delete(oldLine)
+
+// Create lines for SHORT liquidations - ALWAYS draw when conditions are met
+if barstate.isconfirmed and not na(high) and shortSweep
+    // Clean up old lines if needed
+    manageLineArray(shortLines, maxLines)
+    
+    // Create new line at high level
+    newLine = line.new(bar_index, high, bar_index + 1, high, 
+                       color=shortLineColor, style=line.style_dotted, 
+                       width=lineWidth)
+    line.set_extend(newLine, extend.right)
+    array.push(shortLines, newLine)
+    
+    // Debug visualization
+    if debug
+        debugLabel = label.new(bar_index, high, text='SHORT', 
+                              style=label.style_label_down, color=color.new(BEAR_COLOR, 0), 
+                              textcolor=color.white, size=size.small)
+        array.push(clusterLabels, debugLabel)
+        
+        // Clean up old labels
+        while array.size(clusterLabels) >= maxLines
+            oldLabel = array.shift(clusterLabels)
+            label.delete(oldLabel)
+
+// Create lines for LONG liquidations
+if isLongPeak
+    manageLineArray(longLines, maxLines)
+    
+    newLine = line.new(bar_index, low, bar_index + 1, low, 
+                       color=longLineColor, style=line.style_dotted, 
+                       width=lineWidth)
+    line.set_extend(newLine, extend.right)
+    array.push(longLines, newLine)
+    
+    if showLabels
+        labelText = 'Long\nIntensity: ' + str.tostring(intensity, '#.##')
+        newLabel = label.new(bar_index, low, text=labelText, 
+                            style=label.style_label_up, color=color.new(longLineColor, 0), 
+                            textcolor=chart.fg_color, size=size.small)
+        array.push(clusterLabels, newLabel)
+        
+        while array.size(clusterLabels) >= maxLines
+            oldLabel = array.shift(clusterLabels)
+            label.delete(oldLabel)
+
+// Create lines for DATA mode
+if isDataPeak
+    manageLineArray(shortLines, maxLines)
+    
+    newLine = line.new(bar_index, close, bar_index + 1, close, 
+                       color=color.new(color.purple, 20), style=line.style_dotted, 
+                       width=lineWidth)
+    line.set_extend(newLine, extend.right)
+    array.push(shortLines, newLine)
+    
+    if showLabels
+        labelText = 'Data\nValue: ' + str.tostring(liq_value, '#.##')
+        newLabel = label.new(bar_index, close, text=labelText, 
+                            style=label.style_label_left, color=color.new(color.purple, 0), 
+                            textcolor=chart.fg_color, size=size.small)
+        array.push(clusterLabels, newLabel)
+        
+        while array.size(clusterLabels) >= maxLines
+            oldLabel = array.shift(clusterLabels)
+            label.delete(oldLabel)
+
+// Debug plotshapes for SHORT sweeps
+plotshape(debug and barstate.isconfirmed and shortSweep, 'Debug Short Sweep', style=shape.triangledown, location=location.abovebar, color=BEAR_COLOR, size=size.small, text='S')
+plotshape(isLongPeak, 'Long Liquidation', style=shape.triangleup, location=location.belowbar, color=BULL_COLOR, size=size.small, text='L')
+plotshape(isShortPeak, 'Short Liquidation', style=shape.triangledown, location=location.abovebar, color=BEAR_COLOR, size=size.small, text='S')
+plotshape(isDataPeak, 'Data Liquidation', style=shape.diamond, location=location.absolute, color=color.purple, size=size.tiny, text='D')
+
+// Hidden intensity plot for debugging
+plot(intensity, 'Intensity', color=color.new(color.gray, 100), display=display.none)
+
+// Alerts
+if isLongPeak
+    alert('Long liquidation cluster detected at ' + str.tostring(low), alert.freq_once_per_bar)
+if isShortPeak or (barstate.isconfirmed and shortSweep)
+    alert('Short liquidation cluster detected at ' + str.tostring(high), alert.freq_once_per_bar)
+if isDataPeak
+    alert('Liquidation cluster detected in data feed', alert.freq_once_per_bar)
+
+alertcondition(isLongPeak, 'Long Liquidation Peak', 'Long liquidation cluster detected')
+alertcondition(isShortPeak or shortSweep, 'Short Liquidation Peak', 'Short liquidation cluster detected')
+alertcondition(isDataPeak, 'Data Liquidation Peak', 'Data liquidation cluster detected')

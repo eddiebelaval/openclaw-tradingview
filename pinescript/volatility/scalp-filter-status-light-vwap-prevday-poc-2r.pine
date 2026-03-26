@@ -1,0 +1,199 @@
+//@version=6
+indicator("Scalp Filter Status Light (VWAP + PrevDay POC, >=2R)", overlay=true, max_bars_back=5000)
+
+//=========================
+// Inputs
+//=========================
+atrLen              = input.int(14, "ATR Length", minval=1)
+atrMult             = input.float(1.3, "ATR Multiplier", minval=0.1, step=0.1)
+rr                  = input.float(2.0, "Risk/Reward Threshold", minval=0.1, step=0.1)
+profileLookbackBars = input.int(200, "Profile Lookback Bars", minval=50, maxval=5000)
+numBins             = input.int(40, "Profile Bins", minval=5, maxval=200)
+showVWAP            = input.bool(true, "Show VWAP")
+showPOC             = input.bool(true, "Show POC")
+showBarMarkers      = input.bool(false, "Show Bar Markers")
+showDebugInTable    = input.bool(true, "Show Debug In Table")
+
+//=========================
+// VWAP (Session-anchored)
+//=========================
+float src = hlc3
+bool isNewPeriod = timeframe.change("D")
+float vwapVal = ta.vwap(src, isNewPeriod)
+
+//=========================
+// Core math
+//=========================
+float stopDist = ta.atr(atrLen) * atrMult
+float minTargetDist = rr * stopDist
+
+//=========================
+// Previous Day POC (non-developing, fixed today)
+//=========================
+var float[] volBins = array.new_float()
+
+if array.size(volBins) != numBins
+    array.clear(volBins)
+    for b = 0 to numBins - 1
+        array.push(volBins, 0.0)
+else
+    for b = 0 to numBins - 1
+        array.set(volBins, b, 0.0)
+
+float tfSec = timeframe.in_seconds()
+int barsPerDay = (na(tfSec) or tfSec <= 0) ? profileLookbackBars : int(math.ceil(86400.0 / tfSec))
+int scanBars = math.min(5000, math.max(profileLookbackBars, barsPerDay * 3))
+
+int prevDayTs = int(time("D")[1])
+
+float pdLow = na
+float pdHigh = na
+int pdCount = 0
+
+for i = 1 to scanBars
+    int dayTs = int(time("D")[i])
+    if dayTs == prevDayTs
+        pdLow := na(pdLow) ? low[i] : math.min(pdLow, low[i])
+        pdHigh := na(pdHigh) ? high[i] : math.max(pdHigh, high[i])
+        pdCount += 1
+    else if pdCount > 0 and dayTs < prevDayTs
+        break
+
+float pocVal = na
+
+if pdCount > 0 and not na(pdLow) and not na(pdHigh)
+    float pdSpan = pdHigh - pdLow
+    if pdSpan <= 0
+        pocVal := pdLow
+    else
+        float binSize = pdSpan / numBins
+
+        for i = 1 to scanBars
+            int dayTs = int(time("D")[i])
+            if dayTs == prevDayTs
+                float barL = low[i]
+                float barH = high[i]
+                float barV = volume[i]
+
+                if na(barL) or na(barH) or na(barV) or barV <= 0
+                    continue
+
+                float lo = math.min(barL, barH)
+                float hi = math.max(barL, barH)
+                float barSpan = hi - lo
+
+                if barSpan <= 0
+                    int idx = int(math.floor((lo - pdLow) / binSize))
+                    idx := math.max(0, math.min(numBins - 1, idx))
+                    array.set(volBins, idx, array.get(volBins, idx) + barV)
+                else
+                    int startBin = int(math.floor((lo - pdLow) / binSize))
+                    int endBin = int(math.floor((hi - pdLow) / binSize))
+                    startBin := math.max(0, math.min(numBins - 1, startBin))
+                    endBin := math.max(0, math.min(numBins - 1, endBin))
+
+                    for b = startBin to endBin
+                        float binLow = pdLow + b * binSize
+                        float binHigh = b == numBins - 1 ? pdHigh : (binLow + binSize)
+                        float overlap = math.max(0.0, math.min(hi, binHigh) - math.max(lo, binLow))
+                        if overlap > 0
+                            float contrib = barV * (overlap / barSpan)
+                            array.set(volBins, b, array.get(volBins, b) + contrib)
+            else if dayTs < prevDayTs
+                break
+
+        float maxVol = -1.0
+        int pocIdx = 0
+        for b = 0 to numBins - 1
+            float vb = array.get(volBins, b)
+            if vb > maxVol
+                maxVol := vb
+                pocIdx := b
+
+        pocVal := pdLow + (pocIdx + 0.5) * binSize
+
+//=========================
+// Direction filter + 2R feasibility (intrabar)
+//=========================
+bool hasData = not na(vwapVal) and not na(pocVal) and not na(minTargetDist)
+
+bool longCandidate = hasData and close < vwapVal and close < pocVal
+bool shortCandidate = hasData and close > vwapVal and close > pocVal
+
+float targetLong = na
+float targetShort = na
+if hasData
+    targetLong := math.min(vwapVal, pocVal)
+    targetShort := math.max(vwapVal, pocVal)
+
+float longDist = na
+float shortDist = na
+if hasData
+    longDist := targetLong - close
+    shortDist := close - targetShort
+
+bool longOk = longCandidate and not na(longDist) and longDist >= minTargetDist
+bool shortOk = shortCandidate and not na(shortDist) and shortDist >= minTargetDist
+
+//=========================
+// One-shot alerts on state change
+//=========================
+int currentState = longOk ? 1 : shortOk ? -1 : 0   // 1=LONG OK, -1=SHORT OK, 0=NO TRADE
+var int lastState = 0
+
+bool fireLong = currentState == 1 and lastState != 1
+bool fireShort = currentState == -1 and lastState != -1
+
+lastState := currentState
+
+//=========================
+// Status table (top-right)
+//=========================
+var table statusTbl = na
+var bool prevDebug = false
+var bool tableInit = false
+
+if not tableInit or prevDebug != showDebugInTable
+    if tableInit and not na(statusTbl)
+        table.delete(statusTbl)
+    statusTbl := table.new(position.top_right, 1, showDebugInTable ? 6 : 1, frame_color=color.new(color.white, 70), frame_width=1)
+    prevDebug := showDebugInTable
+    tableInit := true
+
+string statusText = longOk ? "LONG OK (>=2R)" : shortOk ? "SHORT OK (>=2R)" : "NO TRADE"
+color statusBg = longOk ? color.green : shortOk ? color.red : color.blue
+table.cell(statusTbl, 0, 0, statusText, text_color=color.white, bgcolor=statusBg, text_size=size.normal)
+
+if showDebugInTable
+    string chosenTargetName = "N/A"
+    float distanceToNearestTarget = na
+
+    if longCandidate
+        bool useVWAP = vwapVal <= pocVal
+        chosenTargetName := useVWAP ? "VWAP" : "POC"
+        distanceToNearestTarget := (useVWAP ? vwapVal : pocVal) - close
+    else if shortCandidate
+        bool useVWAP = vwapVal >= pocVal
+        chosenTargetName := useVWAP ? "VWAP" : "POC"
+        distanceToNearestTarget := close - (useVWAP ? vwapVal : pocVal)
+
+    table.cell(statusTbl, 0, 1, "stopDist: " + str.tostring(stopDist, format.mintick), text_color=color.white, bgcolor=color.new(color.black, 0))
+    table.cell(statusTbl, 0, 2, "minTargetDist: " + str.tostring(minTargetDist, format.mintick), text_color=color.white, bgcolor=color.new(color.black, 0))
+    table.cell(statusTbl, 0, 3, "chosenTarget: " + chosenTargetName, text_color=color.white, bgcolor=color.new(color.black, 0))
+    table.cell(statusTbl, 0, 4, "distToNearest: " + str.tostring(distanceToNearestTarget, format.mintick), text_color=color.white, bgcolor=color.new(color.black, 0))
+    table.cell(statusTbl, 0, 5, "longOk/shortOk: " + str.tostring(longOk ? 1 : 0) + " / " + str.tostring(shortOk ? 1 : 0), text_color=color.white, bgcolor=color.new(color.black, 0))
+
+//=========================
+// Plots
+//=========================
+plot(showVWAP ? vwapVal : na, "VWAP", color=#2962FF, linewidth=2)
+plot(showPOC ? pocVal : na, "POC", color=color.aqua, linewidth=2)
+
+plotshape(showBarMarkers and longOk, title="Long OK Marker", style=shape.triangleup, location=location.belowbar, color=color.lime, size=size.tiny, text="L")
+plotshape(showBarMarkers and shortOk, title="Short OK Marker", style=shape.triangledown, location=location.abovebar, color=color.red, size=size.tiny, text="S")
+
+//=========================
+// Alerts (one-shot per new state)
+//=========================
+alertcondition(fireLong, "Long OK (>=2R)", "Long filter passed: nearest target >= 2R")
+alertcondition(fireShort, "Short OK (>=2R)", "Short filter passed: nearest target >= 2R")

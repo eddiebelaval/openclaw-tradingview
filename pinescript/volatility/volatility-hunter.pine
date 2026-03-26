@@ -1,0 +1,195 @@
+//@version=6
+indicator("Volatility Hunter v1.1 ⚡", shorttitle="VolHunter", overlay=false)
+
+// ══════════════════════════════════════════════════════════════
+// SETTINGS
+// ══════════════════════════════════════════════════════════════
+
+bbLength           = input.int(20,   "Bollinger Band Length", minval=10, maxval=50, group="⚙️ Detection")
+bbMult             = input.float(2.0,"BB Std Dev", minval=1.0, maxval=3.0, step=0.1, group="⚙️ Detection")
+atrLength          = input.int(14,   "ATR Length", minval=5, maxval=30, group="⚙️ Detection")
+lookback           = input.int(100,  "Compression Lookback", minval=50, maxval=200, group="⚙️ Detection")
+
+explosionThreshold = input.float(5.0, "Explosion Size %", minval=1.0, maxval=20.0, step=0.5, group="🎯 Thresholds",
+     tooltip="Minimum move to count as 'explosion'")
+criticalLevel      = input.int(90,   "Critical Alert Level %", minval=70, maxval=95, group="🎯 Thresholds",
+     tooltip="Compression % for RED ALERT – test per symbol/timeframe; 80–95% common depending on asset volatility")
+
+showStats          = input.bool(true, "Show Statistics Panel", group="🎨 Display")
+showMeter          = input.bool(true, "Show Compression Meter", group="🎨 Display")
+showAlerts         = input.bool(true, "Enable Alerts", group="🎨 Display")
+
+// ══════════════════════════════════════════════════════════════
+// COMPRESSION DETECTION (simplified: BB + ATR only)
+// ══════════════════════════════════════════════════════════════
+
+basis     = ta.sma(close, bbLength)
+dev       = ta.stdev(close, bbLength) * bbMult
+upperBB   = basis + dev
+lowerBB   = basis - dev
+bbWidth   = (upperBB - lowerBB) / basis * 100
+
+atr        = ta.atr(atrLength)
+atrPercent = atr / close * 100
+
+avgBBWidth    = ta.sma(bbWidth, lookback)
+avgATRPercent = ta.sma(atrPercent, lookback)
+
+bbCompression  = avgBBWidth  > 0 ? (1 - bbWidth  / avgBBWidth)  * 100 : 0
+atrCompression = avgATRPercent > 0 ? (1 - atrPercent / avgATRPercent) * 100 : 0
+
+compressionScore = math.avg(bbCompression, atrCompression)
+compressionScore := math.max(0, math.min(100, compressionScore))
+
+// SQUEEZE STATE
+isNormal   = compressionScore < 30
+isForming  = compressionScore >= 30 and compressionScore < 70
+isHigh     = compressionScore >= 70 and compressionScore < criticalLevel
+isCritical = compressionScore >= criticalLevel
+
+squeezeState = isCritical ? "CRITICAL" : isHigh ? "HIGH" : isForming ? "FORMING" : "NORMAL"
+squeezeColor = isCritical ? color.red : isHigh ? color.orange : isForming ? color.yellow : color.green
+
+// DIRECTION BIAS
+ema20 = ta.ema(close, 20)
+ema50 = ta.ema(close, 50)
+
+isBullishTrend = close > ema20 and ema20 > ema50
+isBearishTrend = close < ema20 and ema20 < ema50
+isNeutral      = not isBullishTrend and not isBearishTrend
+
+directionBias = isBullishTrend ? "Bullish" : isBearishTrend ? "Bearish" : "Neutral"
+biasColor     = isBullishTrend ? color.green : isBearishTrend ? color.red : color.gray
+
+// HISTORICAL TRACKING
+var array<float> squeezeHistory = array.new<float>()
+var array<float> moveHistory    = array.new<float>()
+var array<int>   timeHistory    = array.new<int>()
+
+var int   barsInSqueeze   = 0
+var float squeezeStartPrice = 0.0
+var bool  wasInSqueeze    = false
+
+if isCritical and not wasInSqueeze
+    squeezeStartPrice := close
+    barsInSqueeze     := 0
+    wasInSqueeze      := true
+
+if isCritical
+    barsInSqueeze += 1
+
+if wasInSqueeze and not isCritical
+    movePercent = math.abs((close - squeezeStartPrice) / squeezeStartPrice * 100)
+    if array.size(squeezeHistory) >= 20
+        array.shift(squeezeHistory)
+        array.shift(moveHistory)
+        array.shift(timeHistory)
+    array.push(squeezeHistory, compressionScore[1])
+    array.push(moveHistory,    movePercent)
+    array.push(timeHistory,    barsInSqueeze)
+    wasInSqueeze := false
+
+historySize   = array.size(moveHistory)
+successCount  = 0
+totalMove     = 0.0
+totalTime     = 0
+
+if historySize > 0
+    for i = 0 to historySize - 1
+        move = array.get(moveHistory, i)
+        if move >= explosionThreshold
+            successCount += 1
+        totalMove += move
+        totalTime += array.get(timeHistory, i)
+
+accuracy  = historySize > 0 ? successCount / historySize * 100 : 0.0
+avgMove   = historySize > 0 ? totalMove  / historySize       : 0.0
+avgTime   = historySize > 0 ? totalTime  / historySize       : 0.0
+
+estimatedBars = math.round(avgTime > 0 ? avgTime : 5)
+
+// ALERTS
+if showAlerts
+    if ta.crossover(compressionScore, criticalLevel)
+        alert("CRITICAL SQUEEZE! Compression: " + str.tostring(compressionScore, "#.#") + "%", alert.freq_once_per_bar_close)
+    if wasInSqueeze[1] and not wasInSqueeze
+        movePct = math.abs((close - squeezeStartPrice) / squeezeStartPrice * 100)
+        alert("BREAKOUT! Move: " + str.tostring(movePct, "#.#") + "%", alert.freq_once_per_bar_close)
+
+// VISUAL – COMPRESSION METER
+plot(showMeter ? compressionScore : na, "Compression %", color = showMeter ? squeezeColor : na, linewidth=3, style=plot.style_area)
+
+hline(30,           "Forming",  color = showMeter ? color.new(color.yellow, 70)  : na, linestyle=hline.style_dashed)
+hline(70,           "High",     color = showMeter ? color.new(color.orange,70) : na, linestyle=hline.style_dashed)
+hline(criticalLevel,"CRITICAL", color = showMeter ? color.new(color.red,   50) : na, linestyle=hline.style_solid, linewidth=2)
+
+// STATISTICS PANEL – rows=12 to match logic safely
+if showStats
+    var table statsTable = table.new(position.top_right, columns=2, rows=12, 
+                                     bgcolor=color.new(color.black, 10), 
+                                     frame_color=squeezeColor, 
+                                     frame_width=2)
+    
+    if barstate.islast
+        int row = 0
+        
+        // Header + version in one row (merged)
+        table.cell(statsTable, 0, row, "VOLATILITY HUNTER  v1.1", 
+                   text_color=color.white, bgcolor=squeezeColor, 
+                   text_size=size.normal, text_halign=text.align_center)
+        table.merge_cells(statsTable, 0, row, 1, row)
+        row += 1
+        
+        table.cell(statsTable, 0, row, "Status", text_color=color.gray, text_size=size.small)
+        table.cell(statsTable, 1, row, squeezeState, text_color=color.white, text_size=size.normal, text_halign=text.align_right)
+        row += 1
+        
+        table.cell(statsTable, 0, row, "Compression", text_color=color.gray, text_size=size.small)
+        table.cell(statsTable, 1, row, str.tostring(compressionScore, "#.#") + "%", 
+                   text_color=squeezeColor, text_size=size.large, text_halign=text.align_right)
+        row += 1
+        
+        table.cell(statsTable, 0, row, "Expected bars", text_color=color.gray, text_size=size.small)
+        table.cell(statsTable, 1, row, isCritical ? str.format("{0}-{1}", math.max(1, estimatedBars-2), estimatedBars+2) : "N/A", 
+                   text_color=color.white, text_size=size.small, text_halign=text.align_right)
+        row += 1
+        
+        table.cell(statsTable, 0, row, "Bias", text_color=color.gray, text_size=size.small)
+        table.cell(statsTable, 1, row, directionBias, text_color=biasColor, text_size=size.small, text_halign=text.align_right)
+        row += 1
+        
+        // Separator
+        table.cell(statsTable, 0, row, "━━━━━━━━━━", text_color=color.gray, text_size=size.tiny, text_halign=text.align_center)
+        table.merge_cells(statsTable, 0, row, 1, row)
+        row += 1
+        
+        // HISTORY header
+        table.cell(statsTable, 0, row, "HISTORY (last " + str.tostring(historySize) + ")", 
+                   text_color=color.yellow, text_size=size.small, text_halign=text.align_center)
+        table.merge_cells(statsTable, 0, row, 1, row)
+        row += 1
+        
+        table.cell(statsTable, 0, row, "Success Rate", text_color=color.gray, text_size=size.small)
+        color accColor = accuracy >= 70 ? color.green : accuracy >= 50 ? color.yellow : color.red
+        table.cell(statsTable, 1, row, historySize > 0 ? str.tostring(accuracy, "#.#") + "%" : "N/A", 
+                   text_color=accColor, text_size=size.small, text_halign=text.align_right)
+        row += 1
+        
+        table.cell(statsTable, 0, row, "Avg Move", text_color=color.gray, text_size=size.small)
+        table.cell(statsTable, 1, row, historySize > 0 ? str.tostring(avgMove, "#.#") + "%" : "N/A", 
+                   text_color=color.white, text_size=size.small, text_halign=text.align_right)
+        row += 1
+        
+        table.cell(statsTable, 0, row, "Avg Time", text_color=color.gray, text_size=size.small)
+        table.cell(statsTable, 1, row, historySize > 0 ? str.tostring(avgTime, "#.#") + " bars" : "N/A", 
+                   text_color=color.white, text_size=size.small, text_halign=text.align_right)
+        row += 1
+        
+        // ACTION (merged)
+        table.cell(statsTable, 0, row, "ACTION", text_color=color.white, bgcolor=color.new(color.blue, 70), 
+                   text_size=size.small, text_halign=text.align_center)
+        string actionText = isCritical ? "WATCH CLOSELY" : isHigh ? "GET READY" : isForming ? "Monitor" : "Relax"
+        table.cell(statsTable, 1, row, actionText, text_color=color.white, bgcolor=color.new(color.blue, 70), 
+                   text_size=size.small, text_halign=text.align_center)
+        table.merge_cells(statsTable, 0, row, 1, row)
+        // No row +=1 needed after last row

@@ -1,0 +1,146 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © Tonzlnxz
+
+//@version=6
+indicator("TX Smooth Reversal", overlay=true, max_labels_count=500, max_lines_count=500)
+
+// --- Color Constants ---
+color C_BULL = #089981
+color C_BEAR = #f23645
+color C_NEUT = #5b9cf6
+
+// ==========================================
+// 0) INPUT GROUPS
+// ==========================================
+string grpHA    = "0. Heikin Ashi Logic"
+bool useHA      = input.bool(false, "Use Heikin Ashi Logic", group=grpHA, tooltip="Calculate all logic based on Heikin Ashi candles to smooth out noise.")
+
+string grpMode  = "1. Mode & Sensitivity"
+string mode     = input.string("Normal", "Algorithm Mode", options=["Conservative","Normal","Aggressive"], group=grpMode)
+
+string grpMTF   = "2. MTF Fusion"
+bool useMTF     = input.bool(true, "Enable MTF Alignment Gate", group=grpMTF)
+string microTF  = input.timeframe("5",   "Micro TF (Trigger)", group=grpMTF)
+string opTF     = input.timeframe("30",  "Operational TF (Trend)", group=grpMTF)
+string regTF    = input.timeframe("240", "Regime TF (Bias)", group=grpMTF)
+float alignTh   = input.float(0.55, "Alignment Threshold", group=grpMTF, step=0.05, tooltip="How much the multiple timeframes must agree before a signal is shown.")
+
+string grpBand  = "3. Band Engine"
+int lenATR      = input.int(100, "ATR Length", group=grpBand, minval=1)
+int smoothW     = input.int(10,  "ATR Smooth (RMA)", group=grpBand, minval=1)
+int lenER       = input.int(20,  "KAMA ER Length", group=grpBand, minval=1)
+int kamaFast    = input.int(2,   "KAMA Fast", group=grpBand, minval=1)
+int kamaSlow    = input.int(30,  "KAMA Slow", group=grpBand, minval=2)
+float widthBase = input.float(1.00, "Width Base Mult", group=grpBand, step=0.05)
+
+string grpRev   = "4. Reversal Signals"
+float sigThresh = input.float(75.0, "Signal Probability Threshold", group=grpRev, minval=50, maxval=100, tooltip="Minimum probability % to trigger a Buy/Sell signal.")
+bool showLabels = input.bool(true, "Show Buy/Sell Labels", group=grpRev)
+
+string grpVis   = "5. Visual & Dashboard"
+bool showCloud  = input.bool(true, "Show Band Cloud", group=grpVis)
+bool showDash   = input.bool(true, "Show Info Dashboard", group=grpVis)
+string dashLoc  = input.string("Top Right", "Dashboard Location", options=["Top Right", "Bottom Right", "Top Left", "Bottom Left"], group=grpVis)
+
+// ==========================================
+// 1) UTILITIES
+// ==========================================
+f_clamp(float x, float lo, float hi) => math.min(math.max(x, lo), hi)
+
+// ==========================================
+// 2) CORE CALCULATIONS
+// ==========================================
+ha_c = request.security(ticker.heikinashi(syminfo.tickerid), timeframe.period, close)
+ha_h = request.security(ticker.heikinashi(syminfo.tickerid), timeframe.period, high)
+ha_l = request.security(ticker.heikinashi(syminfo.tickerid), timeframe.period, low)
+ha_o = request.security(ticker.heikinashi(syminfo.tickerid), timeframe.period, open)
+
+src_c = useHA ? ha_c : close
+src_h = useHA ? ha_h : high
+src_l = useHA ? ha_l : low
+src_o = useHA ? ha_o : open
+
+// Band Engine
+f_kama(float x, int lER, int fL, int sL) =>
+    change = math.abs(x - x[lER])
+    vol = 0.0
+    for i = 0 to lER - 1
+        vol += math.abs(x[i] - x[i + 1])
+    er = vol != 0.0 ? change / vol : 0.0
+    sc = math.pow(er * (2.0/(fL+1) - 2.0/(sL+1)) + 2.0/(sL+1), 2.0)
+    var float k = na
+    k := na(k[1]) ? x : k[1] + sc * (x - k[1])
+
+center = f_kama(src_c, lenER, kamaFast, kamaSlow)
+atr    = ta.rma(math.max(src_h - src_l, math.abs(src_h - nz(src_c[1])), math.abs(src_l - nz(src_c[1]))), lenATR)
+width  = ta.rma(atr, smoothW) * widthBase
+
+upperOuter = center + (2.2 * width)
+upperInner = center + (1.2 * width)
+lowerInner = center - (1.2 * width)
+lowerOuter = center - (2.2 * width)
+
+// ==========================================
+// 3) PROBABILITY LOGIC
+// ==========================================
+slope = ta.ema(center - center[1], 10)
+dev   = (src_c - center) / math.max(width, 1e-6)
+
+// Reversal Score (Pseudo-Logistic)
+bullScore = f_clamp((-dev - 1.0), 0, 1) * 50 + (src_l < lowerOuter ? 30 : 0) + (ta.change(src_c) > 0 ? 20 : 0)
+bearScore = f_clamp((dev - 1.0), 0, 1) * 50 + (src_h > upperOuter ? 30 : 0) + (ta.change(src_c) < 0 ? 20 : 0)
+
+P_rev_bull = f_clamp(bullScore, 0, 100)
+P_rev_bear = f_clamp(bearScore, 0, 100)
+
+// ==========================================
+// 4) MTF ALIGNMENT
+// ==========================================
+f_get_tf_data(string tf) =>
+    request.security(syminfo.tickerid, tf, [center, slope, dev], barmerge.gaps_off, barmerge.lookahead_off)
+
+[mCenter, mSlope, mDev] = f_get_tf_data(microTF)
+[oCenter, oSlope, oDev] = f_get_tf_data(opTF)
+[rCenter, rSlope, rDev] = f_get_tf_data(regTF)
+
+alignBull = (mDev < -0.5 ? 0.3 : 0) + (oSlope > 0 ? 0.3 : 0) + (rSlope > 0 ? 0.4 : 0)
+alignBear = (mDev > 0.5 ? 0.3 : 0) + (oSlope < 0 ? 0.3 : 0) + (rSlope < 0 ? 0.4 : 0)
+
+mtfGateBull = not useMTF or alignBull >= alignTh
+mtfGateBear = not useMTF or alignBear >= alignTh
+
+// ==========================================
+// 5) SIGNALS & VISUALS
+// ==========================================
+buySig  = P_rev_bull >= sigThresh and mtfGateBull and src_l <= lowerInner and src_c > src_l
+sellSig = P_rev_bear >= sigThresh and mtfGateBear and src_h >= upperInner and src_c < src_h
+
+plotshape(buySig and showLabels, "Buy", shape.labelup, location.belowbar, C_BULL, size=size.small, text="BUY", textcolor=color.white)
+plotshape(sellSig and showLabels, "Sell", shape.labeldown, location.abovebar, C_BEAR, size=size.small, text="SELL", textcolor=color.white)
+
+// Band Visualization
+pUo = plot(upperOuter, "Upper Outer", color.new(C_BEAR, 30))
+pUi = plot(upperInner, "Upper Inner", color.new(C_BEAR, 70))
+pLi = plot(lowerInner, "Lower Inner", color.new(C_BULL, 70))
+pLo = plot(lowerOuter, "Lower Outer", color.new(C_BULL, 30))
+
+fill(pUi, pUo, color.new(C_BEAR, 90), "Upper Band Cloud")
+fill(pLi, pLo, color.new(C_BULL, 90), "Lower Band Cloud")
+
+// ==========================================
+// 6) DASHBOARD
+// ==========================================
+var table dash = table.new(dashLoc == "Top Right" ? position.top_right : dashLoc == "Bottom Right" ? position.bottom_right : dashLoc == "Top Left" ? position.top_left : position.bottom_left, 2, 4, color.new(color.black, 20), color.gray, 1, color.gray, 1)
+
+if barstate.islast and showDash
+    table.cell(dash, 0, 0, "Metric", text_color=color.white, bgcolor=color.gray)
+    table.cell(dash, 1, 0, "Value", text_color=color.white, bgcolor=color.gray)
+    
+    table.cell(dash, 0, 1, "Bull Prob", text_color=color.white)
+    table.cell(dash, 1, 1, str.tostring(P_rev_bull, "#.##") + "%", text_color=color.white, bgcolor=color.from_gradient(P_rev_bull, 0, 100, color.new(C_BULL, 80), C_BULL))
+    
+    table.cell(dash, 0, 2, "Bear Prob", text_color=color.white)
+    table.cell(dash, 1, 2, str.tostring(P_rev_bear, "#.##") + "%", text_color=color.white, bgcolor=color.from_gradient(P_rev_bear, 0, 100, color.new(C_BEAR, 80), C_BEAR))
+    
+    table.cell(dash, 0, 3, "MTF Alignment", text_color=color.white)
+    table.cell(dash, 1, 3, (alignBull > alignBear ? "BULLISH" : "BEARISH"), text_color=color.white, bgcolor=alignBull > alignBear ? C_BULL : C_BEAR)

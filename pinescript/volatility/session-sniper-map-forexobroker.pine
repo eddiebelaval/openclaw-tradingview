@@ -1,0 +1,655 @@
+//@version=6
+indicator("Session Sniper Map [forexobroker]",
+     shorttitle="Session Sniper",
+     overlay=true,
+     max_boxes_count=500,
+     max_labels_count=200,
+     max_lines_count=200)
+
+// ══════════════════════════════════════════════════════════════════════════════
+// Session Sniper Map [forexobroker]
+// Version 1.0
+//
+// Visualizes major forex trading sessions (Asian, London, NY AM, NY PM) with
+// ICT killzone precision windows, Silver Bullet time windows, session open
+// levels, prior session reference lines, and per-session statistical analysis.
+//
+// Methodology:
+//   Session detection via time() with UTC timezone strings. Each session is
+//   drawn as a colored box tracking high/low. ICT killzones and Silver Bullet
+//   windows are highlighted within sessions. Statistics (avg range, breakout
+//   rate, volume) accumulate over a configurable lookback. Sessions are ranked
+//   by historical volatility.
+//
+// (c) forexobroker | Open-source | Educational use
+// ══════════════════════════════════════════════════════════════════════════════
+
+// ┌──────────────────────────────────────────────────────────────────────────┐
+// │ INPUTS                                                                  │
+// └──────────────────────────────────────────────────────────────────────────┘
+
+// Sessions
+showAsian   = input.bool(true, "Show Asian Session", group="Sessions", tooltip="Display the Asian/Tokyo session box (00:00-09:00 UTC)")
+showLondon  = input.bool(true, "Show London Session", group="Sessions", tooltip="Display the London session box (07:00-16:00 UTC)")
+showNYAM    = input.bool(true, "Show NY AM Session", group="Sessions", tooltip="Display the New York AM session box (12:00-17:00 UTC)")
+showNYPM    = input.bool(true, "Show NY PM Session", group="Sessions", tooltip="Display the New York PM session box (17:00-21:00 UTC)")
+showOverlap = input.bool(true, "Show London-NY Overlap", group="Sessions", tooltip="Highlight the London-NY overlap window (12:00-16:00 UTC)")
+
+// ICT Killzones
+showKillzones     = input.bool(true, "Show Killzones", group="ICT Killzones", tooltip="Display ICT killzone windows: London Open (07-08), NY Open (12-13), London Close (15-16) UTC")
+showSilverBullets = input.bool(true, "Show Silver Bullet Windows", group="ICT Killzones", tooltip="Display ICT Silver Bullet time windows: London (10-11), NY AM (14-15), NY PM (19-20) UTC")
+
+// Statistics
+statsLookback = input.int(20, "History Lookback", minval=5, maxval=100, group="Statistics", tooltip="Number of completed sessions to average for statistics")
+showStats     = input.bool(true, "Show Stats Dashboard", group="Statistics", tooltip="Display the per-session statistics table")
+
+// Levels
+showOpenLevels  = input.bool(true, "Show Session Open Levels", group="Levels", tooltip="Draw horizontal lines at each session's opening price")
+showPriorHL     = input.bool(true, "Show Prior Session H/L", group="Levels", tooltip="Draw dotted lines for the previous session's high and low")
+openLineStyleIn = input.string("Solid", "Open Line Style", options=["Solid", "Dashed", "Dotted"], group="Levels", tooltip="Line style for session open levels")
+priorLineStyleIn = input.string("Dotted", "Prior Session Line Style", options=["Solid", "Dashed", "Dotted"], group="Levels", tooltip="Line style for prior session high/low reference lines")
+
+// Display
+tablePos       = input.string("top_right", "Table Position", options=["top_left", "top_center", "top_right", "bottom_left", "bottom_center", "bottom_right"], group="Display")
+textSizeInput  = input.string("small", "Text Size", options=["tiny", "small", "normal"], group="Display")
+maxVisibleSess = input.int(5, "Max Visible Sessions", minval=1, maxval=20, group="Display", tooltip="How many past session boxes to keep visible on the chart per session type")
+
+// Colors
+asianColor    = input.color(#E040FB, "Asian Color", group="Colors", tooltip="Color for Asian/Tokyo session")
+londonColor   = input.color(#2196F3, "London Color", group="Colors", tooltip="Color for London session")
+nyamColor     = input.color(#FF9800, "NY AM Color", group="Colors", tooltip="Color for New York AM session")
+nypmColor     = input.color(#4CAF50, "NY PM Color", group="Colors", tooltip="Color for New York PM session")
+overlapColorIn = input.color(#FFD600, "Overlap Color", group="Colors", tooltip="Color for London-NY overlap highlight")
+killzoneColorIn = input.color(#F44336, "Killzone Color", group="Colors", tooltip="Color for ICT killzone windows")
+silverBulletColorIn = input.color(#00BCD4, "Silver Bullet Color", group="Colors", tooltip="Color for ICT Silver Bullet windows")
+
+// ┌──────────────────────────────────────────────────────────────────────────┐
+// │ THEME-AWARE COLORS                                                      │
+// └──────────────────────────────────────────────────────────────────────────┘
+headerBg   = color.new(chart.fg_color, 85)
+headerText = chart.fg_color
+cellBg     = color.new(chart.bg_color, 20)
+borderCol  = color.new(chart.fg_color, 75)
+mutedText  = color.new(chart.fg_color, 50)
+
+// ┌──────────────────────────────────────────────────────────────────────────┐
+// │ SESSION TIME CONSTANTS (UTC, Weekdays Only)                             │
+// └──────────────────────────────────────────────────────────────────────────┘
+ASIAN_STR    = "0000-0900:23456"
+LONDON_STR   = "0700-1600:23456"
+NYAM_STR     = "1200-1700:23456"
+NYPM_STR     = "1700-2100:23456"
+OVERLAP_STR  = "1200-1600:23456"
+
+// ICT Killzones
+LON_OPEN_KZ  = "0700-0800:23456"
+NY_OPEN_KZ   = "1200-1300:23456"
+LON_CLOSE_KZ = "1500-1600:23456"
+
+// ICT Silver Bullet Windows
+LON_SB       = "1000-1100:23456"
+NYAM_SB      = "1400-1500:23456"
+NYPM_SB      = "1900-2000:23456"
+
+TZ = "UTC"
+
+// ┌──────────────────────────────────────────────────────────────────────────┐
+// │ USER-DEFINED TYPES                                                      │
+// └──────────────────────────────────────────────────────────────────────────┘
+type SessionData
+    string  name
+    string  shortName
+    color   sessionColor
+    bool    isActive
+    bool    wasActive
+    float   openPrice
+    float   highPrice
+    float   lowPrice
+    float   closePrice
+    float   totalVol
+    int     startBar
+    float   priorHigh
+    float   priorLow
+    box     sessionBox
+    line    openLine
+    line    priorHighLine
+    line    priorLowLine
+    label   nameLabel
+    array<float> histRanges
+    array<float> histVolumes
+    int     sessionsCompleted
+    int     breakoutCount
+    float   avgRange
+    float   avgVolume
+    float   breakoutRate
+
+type KillzoneData
+    string  name
+    string  sessionStr
+    color   kzColor
+    bool    isActive
+    bool    wasActive
+    float   highPrice
+    float   lowPrice
+    int     startBar
+    box     kzBox
+
+// ┌──────────────────────────────────────────────────────────────────────────┐
+// │ HELPER FUNCTIONS                                                        │
+// └──────────────────────────────────────────────────────────────────────────┘
+getTablePos(pos) =>
+    switch pos
+        "top_left"      => position.top_left
+        "top_center"    => position.top_center
+        "top_right"     => position.top_right
+        "bottom_left"   => position.bottom_left
+        "bottom_center" => position.bottom_center
+        "bottom_right"  => position.bottom_right
+        => position.top_right
+
+getTextSize(s) =>
+    switch s
+        "tiny"   => size.tiny
+        "small"  => size.small
+        "normal" => size.normal
+        => size.small
+
+getLineStyle(s) =>
+    switch s
+        "Solid"  => line.style_solid
+        "Dashed" => line.style_dashed
+        "Dotted" => line.style_dotted
+        => line.style_solid
+
+formatRange(val) =>
+    syminfo.mintick < 0.01 ? str.tostring(val / syminfo.mintick / 10, "#.#") + "p" : str.tostring(val, format.mintick)
+
+formatVol(v) =>
+    v >= 1000000000 ? str.tostring(v / 1000000000, "#.#") + "B" : v >= 1000000 ? str.tostring(v / 1000000, "#.#") + "M" : v >= 1000 ? str.tostring(v / 1000, "#.#") + "K" : str.tostring(v, "#")
+
+// ┌──────────────────────────────────────────────────────────────────────────┐
+// │ PERSISTENT STATE                                                        │
+// └──────────────────────────────────────────────────────────────────────────┘
+var SessionData asianData  = SessionData.new("Asian", "ASIA", asianColor, false, false, na, na, na, na, 0.0, na, na, na, na, na, na, na, na, array.new<float>(), array.new<float>(), 0, 0, 0.0, 0.0, 0.0)
+var SessionData londonData = SessionData.new("London", "LON", londonColor, false, false, na, na, na, na, 0.0, na, na, na, na, na, na, na, na, array.new<float>(), array.new<float>(), 0, 0, 0.0, 0.0, 0.0)
+var SessionData nyamData   = SessionData.new("NY AM", "NYAM", nyamColor, false, false, na, na, na, na, 0.0, na, na, na, na, na, na, na, na, array.new<float>(), array.new<float>(), 0, 0, 0.0, 0.0, 0.0)
+var SessionData nypmData   = SessionData.new("NY PM", "NYPM", nypmColor, false, false, na, na, na, na, 0.0, na, na, na, na, na, na, na, na, array.new<float>(), array.new<float>(), 0, 0, 0.0, 0.0, 0.0)
+
+var KillzoneData lonOpenKZ  = KillzoneData.new("London Open KZ", LON_OPEN_KZ, killzoneColorIn, false, false, na, na, na, na)
+var KillzoneData nyOpenKZ   = KillzoneData.new("NY Open KZ", NY_OPEN_KZ, killzoneColorIn, false, false, na, na, na, na)
+var KillzoneData lonCloseKZ = KillzoneData.new("London Close KZ", LON_CLOSE_KZ, killzoneColorIn, false, false, na, na, na, na)
+var KillzoneData lonSB      = KillzoneData.new("London SB", LON_SB, silverBulletColorIn, false, false, na, na, na, na)
+var KillzoneData nyamSB     = KillzoneData.new("NY AM SB", NYAM_SB, silverBulletColorIn, false, false, na, na, na, na)
+var KillzoneData nypmSB     = KillzoneData.new("NY PM SB", NYPM_SB, silverBulletColorIn, false, false, na, na, na, na)
+
+// Drawing cleanup arrays
+var array<box>   asianBoxes  = array.new<box>()
+var array<box>   londonBoxes = array.new<box>()
+var array<box>   nyamBoxes   = array.new<box>()
+var array<box>   nypmBoxes   = array.new<box>()
+var array<box>   overlapBoxes = array.new<box>()
+var array<box>   kzBoxes     = array.new<box>()
+var array<line>  openLines   = array.new<line>()
+var array<line>  priorLines  = array.new<line>()
+var array<label> sessLabels  = array.new<label>()
+
+// Overlap tracking
+var bool  overlapActive  = false
+var bool  overlapWas     = false
+var float overlapHigh    = na
+var float overlapLow     = na
+var int   overlapStart   = na
+var box   overlapBox     = na
+
+// Stats table
+var table statsTable = na
+
+// ┌──────────────────────────────────────────────────────────────────────────┐
+// │ INTRADAY CHECK                                                          │
+// └──────────────────────────────────────────────────────────────────────────┘
+isIntraday = timeframe.isintraday
+
+// ┌──────────────────────────────────────────────────────────────────────────┐
+// │ SESSION DETECTION                                                       │
+// └──────────────────────────────────────────────────────────────────────────┘
+inAsian   = isIntraday and not na(time(timeframe.period, ASIAN_STR, TZ))
+inLondon  = isIntraday and not na(time(timeframe.period, LONDON_STR, TZ))
+inNYAM    = isIntraday and not na(time(timeframe.period, NYAM_STR, TZ))
+inNYPM    = isIntraday and not na(time(timeframe.period, NYPM_STR, TZ))
+inOverlap = isIntraday and not na(time(timeframe.period, OVERLAP_STR, TZ))
+
+// Killzones
+inLonOpenKZ  = isIntraday and not na(time(timeframe.period, LON_OPEN_KZ, TZ))
+inNYOpenKZ   = isIntraday and not na(time(timeframe.period, NY_OPEN_KZ, TZ))
+inLonCloseKZ = isIntraday and not na(time(timeframe.period, LON_CLOSE_KZ, TZ))
+
+// Silver Bullets
+inLonSB  = isIntraday and not na(time(timeframe.period, LON_SB, TZ))
+inNYAMSB = isIntraday and not na(time(timeframe.period, NYAM_SB, TZ))
+inNYPMSB = isIntraday and not na(time(timeframe.period, NYPM_SB, TZ))
+
+// ┌──────────────────────────────────────────────────────────────────────────┐
+// │ SESSION MANAGEMENT FUNCTIONS                                            │
+// └──────────────────────────────────────────────────────────────────────────┘
+openLineStyle  = getLineStyle(openLineStyleIn)
+priorLineStyle = getLineStyle(priorLineStyleIn)
+
+// Process a main session: create box on enter, update during, finalize on leave
+processSession(SessionData sd, bool nowActive, bool showSess, array<box> boxArr) =>
+    entering = nowActive and not sd.wasActive
+    leaving  = not nowActive and sd.wasActive
+
+    if showSess and isIntraday
+        // SESSION OPEN
+        if entering
+            sd.openPrice := open
+            sd.highPrice := high
+            sd.lowPrice  := low
+            sd.closePrice := close
+            sd.totalVol  := volume
+            sd.startBar  := bar_index
+
+            // Create session box
+            sd.sessionBox := box.new(bar_index, high, bar_index + 1, low,
+                 bgcolor=color.new(sd.sessionColor, 88),
+                 border_color=color.new(sd.sessionColor, 40),
+                 border_width=1, border_style=line.style_solid)
+
+            // Session name label
+            sd.nameLabel := label.new(bar_index, high, sd.shortName,
+                 color=color.new(sd.sessionColor, 60),
+                 textcolor=color.white, size=size.tiny,
+                 style=label.style_label_lower_right)
+            array.push(sessLabels, sd.nameLabel)
+            if array.size(sessLabels) > maxVisibleSess * 4 + 10
+                old = array.shift(sessLabels)
+                label.delete(old)
+
+            // Open level line
+            if showOpenLevels
+                sd.openLine := line.new(bar_index, sd.openPrice, bar_index + 1, sd.openPrice,
+                     color=color.new(sd.sessionColor, 30),
+                     width=1, style=openLineStyle)
+                array.push(openLines, sd.openLine)
+                if array.size(openLines) > maxVisibleSess * 4 + 10
+                    old = array.shift(openLines)
+                    line.delete(old)
+
+            // Prior session H/L lines
+            if showPriorHL and not na(sd.priorHigh)
+                sd.priorHighLine := line.new(bar_index, sd.priorHigh, bar_index + 1, sd.priorHigh,
+                     color=color.new(sd.sessionColor, 60),
+                     width=1, style=priorLineStyle)
+                sd.priorLowLine := line.new(bar_index, sd.priorLow, bar_index + 1, sd.priorLow,
+                     color=color.new(sd.sessionColor, 60),
+                     width=1, style=priorLineStyle)
+                array.push(priorLines, sd.priorHighLine)
+                array.push(priorLines, sd.priorLowLine)
+                if array.size(priorLines) > maxVisibleSess * 8 + 20
+                    old = array.shift(priorLines)
+                    line.delete(old)
+
+        // SESSION ONGOING
+        if nowActive and not entering
+            sd.highPrice  := math.max(nz(sd.highPrice, high), high)
+            sd.lowPrice   := math.min(nz(sd.lowPrice, low), low)
+            sd.closePrice := close
+            sd.totalVol   := nz(sd.totalVol) + volume
+
+            // Update box
+            if not na(sd.sessionBox)
+                box.set_right(sd.sessionBox, bar_index + 1)
+                box.set_top(sd.sessionBox, sd.highPrice)
+                box.set_bottom(sd.sessionBox, sd.lowPrice)
+
+            // Update label position
+            if not na(sd.nameLabel)
+                label.set_xy(sd.nameLabel, sd.startBar, sd.highPrice)
+
+            // Extend open line
+            if not na(sd.openLine)
+                line.set_x2(sd.openLine, bar_index + 1)
+
+            // Extend prior session lines
+            if not na(sd.priorHighLine)
+                line.set_x2(sd.priorHighLine, bar_index + 1)
+            if not na(sd.priorLowLine)
+                line.set_x2(sd.priorLowLine, bar_index + 1)
+
+        // SESSION CLOSE
+        if leaving
+            float sessionRange = nz(sd.highPrice) - nz(sd.lowPrice)
+
+            // Store to history
+            array.push(sd.histRanges, sessionRange)
+            if array.size(sd.histRanges) > statsLookback
+                array.shift(sd.histRanges)
+
+            array.push(sd.histVolumes, nz(sd.totalVol))
+            if array.size(sd.histVolumes) > statsLookback
+                array.shift(sd.histVolumes)
+
+            // Check breakout vs prior session
+            if not na(sd.priorHigh) and not na(sd.priorLow)
+                if nz(sd.highPrice) > sd.priorHigh or nz(sd.lowPrice) < sd.priorLow
+                    sd.breakoutCount += 1
+
+            sd.sessionsCompleted += 1
+
+            // Store current H/L as prior for next session
+            sd.priorHigh := nz(sd.highPrice)
+            sd.priorLow  := nz(sd.lowPrice)
+
+            // Add completed box to cleanup array
+            if not na(sd.sessionBox)
+                array.push(boxArr, sd.sessionBox)
+                if array.size(boxArr) > maxVisibleSess
+                    old = array.shift(boxArr)
+                    box.delete(old)
+            sd.sessionBox := na
+
+    // Update state
+    sd.wasActive := nowActive
+    sd.isActive  := nowActive
+
+// Process a killzone/Silver Bullet sub-window
+processKZ(KillzoneData kd, bool nowActive, bool showKZ, bool isDashed) =>
+    entering = nowActive and not kd.wasActive
+    leaving  = not nowActive and kd.wasActive
+
+    if showKZ and isIntraday
+        if entering
+            kd.highPrice := high
+            kd.lowPrice  := low
+            kd.startBar  := bar_index
+            bStyle = isDashed ? line.style_dashed : line.style_solid
+            bWidth = isDashed ? 1 : 2
+            transp = isDashed ? 92 : 82
+            bTransp = isDashed ? 50 : 20
+            kd.kzBox := box.new(bar_index, high, bar_index + 1, low,
+                 bgcolor=color.new(kd.kzColor, transp),
+                 border_color=color.new(kd.kzColor, bTransp),
+                 border_width=bWidth, border_style=bStyle)
+
+        if nowActive and not entering
+            kd.highPrice := math.max(nz(kd.highPrice, high), high)
+            kd.lowPrice  := math.min(nz(kd.lowPrice, low), low)
+            if not na(kd.kzBox)
+                box.set_right(kd.kzBox, bar_index + 1)
+                box.set_top(kd.kzBox, kd.highPrice)
+                box.set_bottom(kd.kzBox, kd.lowPrice)
+
+        if leaving
+            if not na(kd.kzBox)
+                array.push(kzBoxes, kd.kzBox)
+                if array.size(kzBoxes) > maxVisibleSess * 6 + 10
+                    old = array.shift(kzBoxes)
+                    box.delete(old)
+            kd.kzBox := na
+
+    kd.wasActive := nowActive
+    kd.isActive  := nowActive
+
+// ┌──────────────────────────────────────────────────────────────────────────┐
+// │ MAIN PROCESSING                                                         │
+// └──────────────────────────────────────────────────────────────────────────┘
+
+// Save transition states BEFORE processing (for alert detection)
+wasInAsian   = asianData.wasActive
+wasInLondon  = londonData.wasActive
+wasInNYAM    = nyamData.wasActive
+wasInNYPM    = nypmData.wasActive
+wasInLonKZ   = lonOpenKZ.wasActive
+wasInNYKZ    = nyOpenKZ.wasActive
+wasInLonClKZ = lonCloseKZ.wasActive
+
+// Capture open prices before they get updated
+asianOpenRef  = asianData.openPrice
+londonOpenRef = londonData.openPrice
+nyamOpenRef   = nyamData.openPrice
+nypmOpenRef   = nypmData.openPrice
+
+// Process main sessions
+processSession(asianData, inAsian, showAsian, asianBoxes)
+processSession(londonData, inLondon, showLondon, londonBoxes)
+processSession(nyamData, inNYAM, showNYAM, nyamBoxes)
+processSession(nypmData, inNYPM, showNYPM, nypmBoxes)
+
+// Process overlap
+overlapWas := overlapActive
+overlapActive := inOverlap
+
+if showOverlap and isIntraday
+    overlapEntering = overlapActive and not overlapWas
+    overlapLeaving  = not overlapActive and overlapWas
+
+    if overlapEntering
+        overlapHigh  := high
+        overlapLow   := low
+        overlapStart := bar_index
+        overlapBox   := box.new(bar_index, high, bar_index + 1, low,
+             bgcolor=color.new(overlapColorIn, 92),
+             border_color=color.new(overlapColorIn, 60),
+             border_width=1, border_style=line.style_dotted)
+
+    if overlapActive and not overlapEntering
+        overlapHigh := math.max(nz(overlapHigh, high), high)
+        overlapLow  := math.min(nz(overlapLow, low), low)
+        if not na(overlapBox)
+            box.set_right(overlapBox, bar_index + 1)
+            box.set_top(overlapBox, overlapHigh)
+            box.set_bottom(overlapBox, overlapLow)
+
+    if overlapLeaving
+        if not na(overlapBox)
+            array.push(overlapBoxes, overlapBox)
+            if array.size(overlapBoxes) > maxVisibleSess
+                old = array.shift(overlapBoxes)
+                box.delete(old)
+        overlapBox := na
+
+// Process killzones (solid border, thicker)
+processKZ(lonOpenKZ, inLonOpenKZ, showKillzones, false)
+processKZ(nyOpenKZ, inNYOpenKZ, showKillzones, false)
+processKZ(lonCloseKZ, inLonCloseKZ, showKillzones, false)
+
+// Process Silver Bullets (dashed border, subtler)
+processKZ(lonSB, inLonSB, showSilverBullets, true)
+processKZ(nyamSB, inNYAMSB, showSilverBullets, true)
+processKZ(nypmSB, inNYPMSB, showSilverBullets, true)
+
+// ┌──────────────────────────────────────────────────────────────────────────┐
+// │ ALERT DETECTION                                                         │
+// └──────────────────────────────────────────────────────────────────────────┘
+// Killzone open transitions (using pre-processing state saved before processKZ updated wasActive)
+lonKZOpening      = inLonOpenKZ and not wasInLonKZ
+nyKZOpening       = inNYOpenKZ and not wasInNYKZ
+lonCloseKZOpening = inLonCloseKZ and not wasInLonClKZ
+anyKZOpening      = lonKZOpening or nyKZOpening or lonCloseKZOpening
+
+// Session open break (price crosses session open level during the session)
+// Uses pre-processing open prices and current session active state
+asianOpenBreakUp   = inAsian and not na(asianOpenRef) and close > asianOpenRef and close[1] <= asianOpenRef
+asianOpenBreakDown = inAsian and not na(asianOpenRef) and close < asianOpenRef and close[1] >= asianOpenRef
+lonOpenBreakUp     = inLondon and not na(londonOpenRef) and close > londonOpenRef and close[1] <= londonOpenRef
+lonOpenBreakDown   = inLondon and not na(londonOpenRef) and close < londonOpenRef and close[1] >= londonOpenRef
+nyamOpenBreakUp    = inNYAM and not na(nyamOpenRef) and close > nyamOpenRef and close[1] <= nyamOpenRef
+nyamOpenBreakDown  = inNYAM and not na(nyamOpenRef) and close < nyamOpenRef and close[1] >= nyamOpenRef
+nypmOpenBreakUp    = inNYPM and not na(nypmOpenRef) and close > nypmOpenRef and close[1] <= nypmOpenRef
+nypmOpenBreakDown  = inNYPM and not na(nypmOpenRef) and close < nypmOpenRef and close[1] >= nypmOpenRef
+
+anyOpenBreak = asianOpenBreakUp or asianOpenBreakDown or lonOpenBreakUp or lonOpenBreakDown or nyamOpenBreakUp or nyamOpenBreakDown or nypmOpenBreakUp or nypmOpenBreakDown
+
+// Prior session H/L break (uses inSession bools which are unaffected by processSession)
+priorHighBreak = false
+priorLowBreak  = false
+if inAsian and not na(asianData.priorHigh) and high > asianData.priorHigh
+    priorHighBreak := true
+if inLondon and not na(londonData.priorHigh) and high > londonData.priorHigh
+    priorHighBreak := true
+if inNYAM and not na(nyamData.priorHigh) and high > nyamData.priorHigh
+    priorHighBreak := true
+if inNYPM and not na(nypmData.priorHigh) and high > nypmData.priorHigh
+    priorHighBreak := true
+
+if inAsian and not na(asianData.priorLow) and low < asianData.priorLow
+    priorLowBreak := true
+if inLondon and not na(londonData.priorLow) and low < londonData.priorLow
+    priorLowBreak := true
+if inNYAM and not na(nyamData.priorLow) and low < nyamData.priorLow
+    priorLowBreak := true
+if inNYPM and not na(nypmData.priorLow) and low < nypmData.priorLow
+    priorLowBreak := true
+
+// ┌──────────────────────────────────────────────────────────────────────────┐
+// │ STATS DASHBOARD                                                         │
+// └──────────────────────────────────────────────────────────────────────────┘
+if barstate.islast and isIntraday
+    sz = getTextSize(textSizeInput)
+
+    // Compute stats for each session
+    asianAvgR  = array.size(asianData.histRanges) > 0 ? array.avg(asianData.histRanges) : 0.0
+    londonAvgR = array.size(londonData.histRanges) > 0 ? array.avg(londonData.histRanges) : 0.0
+    nyamAvgR   = array.size(nyamData.histRanges) > 0 ? array.avg(nyamData.histRanges) : 0.0
+    nypmAvgR   = array.size(nypmData.histRanges) > 0 ? array.avg(nypmData.histRanges) : 0.0
+
+    asianAvgV  = array.size(asianData.histVolumes) > 0 ? array.avg(asianData.histVolumes) : 0.0
+    londonAvgV = array.size(londonData.histVolumes) > 0 ? array.avg(londonData.histVolumes) : 0.0
+    nyamAvgV   = array.size(nyamData.histVolumes) > 0 ? array.avg(nyamData.histVolumes) : 0.0
+    nypmAvgV   = array.size(nypmData.histVolumes) > 0 ? array.avg(nypmData.histVolumes) : 0.0
+
+    asianBR  = asianData.sessionsCompleted > 0 ? (asianData.breakoutCount / asianData.sessionsCompleted) * 100 : 0.0
+    londonBR = londonData.sessionsCompleted > 0 ? (londonData.breakoutCount / londonData.sessionsCompleted) * 100 : 0.0
+    nyamBR   = nyamData.sessionsCompleted > 0 ? (nyamData.breakoutCount / nyamData.sessionsCompleted) * 100 : 0.0
+    nypmBR   = nypmData.sessionsCompleted > 0 ? (nypmData.breakoutCount / nypmData.sessionsCompleted) * 100 : 0.0
+
+    // Current ranges
+    asianCurR  = asianData.isActive and not na(asianData.highPrice) and not na(asianData.lowPrice) ? asianData.highPrice - asianData.lowPrice : 0.0
+    londonCurR = londonData.isActive and not na(londonData.highPrice) and not na(londonData.lowPrice) ? londonData.highPrice - londonData.lowPrice : 0.0
+    nyamCurR   = nyamData.isActive and not na(nyamData.highPrice) and not na(nyamData.lowPrice) ? nyamData.highPrice - nyamData.lowPrice : 0.0
+    nypmCurR   = nypmData.isActive and not na(nypmData.highPrice) and not na(nypmData.lowPrice) ? nypmData.highPrice - nypmData.lowPrice : 0.0
+
+    // Volatility ranking (rank 1 = highest avg range)
+    asianRank = 1
+    londonRank = 1
+    nyamRank = 1
+    nypmRank = 1
+
+    if londonAvgR > asianAvgR
+        asianRank += 1
+    if nyamAvgR > asianAvgR
+        asianRank += 1
+    if nypmAvgR > asianAvgR
+        asianRank += 1
+
+    if asianAvgR > londonAvgR
+        londonRank += 1
+    if nyamAvgR > londonAvgR
+        londonRank += 1
+    if nypmAvgR > londonAvgR
+        londonRank += 1
+
+    if asianAvgR > nyamAvgR
+        nyamRank += 1
+    if londonAvgR > nyamAvgR
+        nyamRank += 1
+    if nypmAvgR > nyamAvgR
+        nyamRank += 1
+
+    if asianAvgR > nypmAvgR
+        nypmRank += 1
+    if londonAvgR > nypmAvgR
+        nypmRank += 1
+    if nyamAvgR > nypmAvgR
+        nypmRank += 1
+
+    // Build table
+    if showStats
+        if na(statsTable)
+            statsTable := table.new(getTablePos(tablePos), 7, 6, bgcolor=cellBg, border_width=1, border_color=borderCol, frame_width=2, frame_color=borderCol)
+
+        // Title row
+        table.cell(statsTable, 0, 0, "SESSION SNIPER MAP", bgcolor=color.new(#1565C0, 15), text_color=color.white, text_size=sz, text_halign=text.align_left)
+        table.merge_cells(statsTable, 0, 0, 4, 0)
+        table.cell(statsTable, 5, 0, "forexobroker", bgcolor=color.new(#1565C0, 15), text_color=color.new(color.white, 40), text_size=sz, text_halign=text.align_right)
+        table.merge_cells(statsTable, 5, 0, 6, 0)
+
+        // Header row
+        headers = array.from("SESSION", "STATUS", "RANGE", "AVG", "BKOUT%", "VOL", "RANK")
+        if array.size(headers) > 0
+            for i = 0 to array.size(headers) - 1
+                table.cell(statsTable, i, 1, array.get(headers, i), bgcolor=headerBg, text_color=headerText, text_size=sz)
+
+        // Session data rows
+        names     = array.from("ASIA", "LONDON", "NY AM", "NY PM")
+        actives   = array.from(asianData.isActive ? 1.0 : 0.0, londonData.isActive ? 1.0 : 0.0, nyamData.isActive ? 1.0 : 0.0, nypmData.isActive ? 1.0 : 0.0)
+        curRanges = array.from(asianCurR, londonCurR, nyamCurR, nypmCurR)
+        avgRs     = array.from(asianAvgR, londonAvgR, nyamAvgR, nypmAvgR)
+        bkRates   = array.from(asianBR, londonBR, nyamBR, nypmBR)
+        avgVols   = array.from(asianAvgV, londonAvgV, nyamAvgV, nypmAvgV)
+        ranks     = array.from(asianRank * 1.0, londonRank * 1.0, nyamRank * 1.0, nypmRank * 1.0)
+        sessColors = array.from(asianColor, londonColor, nyamColor, nypmColor)
+
+        for i = 0 to 3
+            row = i + 2
+            isLive   = array.get(actives, i) > 0.5
+            curR     = array.get(curRanges, i)
+            avgR     = array.get(avgRs, i)
+            bkR      = array.get(bkRates, i)
+            avgV     = array.get(avgVols, i)
+            rnk      = math.round(array.get(ranks, i))
+            sColor   = array.get(sessColors, i)
+
+            statusText  = isLive ? "LIVE" : "--"
+            statusColor = isLive ? color.new(#4CAF50, 0) : mutedText
+            rankText    = "#" + str.tostring(rnk)
+            rankColor   = rnk == 1 ? color.new(#FFD600, 0) : headerText
+            rangeText   = isLive ? formatRange(curR) : "--"
+            avgText     = avgR > 0 ? formatRange(avgR) : "--"
+            bkText      = bkR > 0 ? str.tostring(bkR, "#.#") + "%" : "--"
+            volText     = avgV > 0 ? formatVol(avgV) : "--"
+
+            rowBg = isLive ? color.new(sColor, 92) : cellBg
+
+            table.cell(statsTable, 0, row, array.get(names, i), bgcolor=rowBg, text_color=color.new(sColor, 0), text_size=sz, text_halign=text.align_left)
+            table.cell(statsTable, 1, row, statusText, bgcolor=rowBg, text_color=statusColor, text_size=sz)
+            table.cell(statsTable, 2, row, rangeText, bgcolor=rowBg, text_color=headerText, text_size=sz)
+            table.cell(statsTable, 3, row, avgText, bgcolor=rowBg, text_color=headerText, text_size=sz)
+            table.cell(statsTable, 4, row, bkText, bgcolor=rowBg, text_color=bkR >= 70 ? color.new(#4CAF50, 0) : bkR >= 50 ? color.new(#FF9800, 0) : headerText, text_size=sz)
+            table.cell(statsTable, 5, row, volText, bgcolor=rowBg, text_color=headerText, text_size=sz)
+            table.cell(statsTable, 6, row, rankText, bgcolor=rowBg, text_color=rankColor, text_size=sz)
+
+// Non-intraday warning
+if barstate.islast and not isIntraday
+    var label warnLabel = na
+    if na(warnLabel)
+        warnLabel := label.new(bar_index, high, "Session Sniper Map requires an intraday timeframe\n(15m or lower recommended)",
+             color=color.new(color.red, 20), textcolor=color.white,
+             style=label.style_label_center, size=size.normal)
+
+// ┌──────────────────────────────────────────────────────────────────────────┐
+// │ DATA WINDOW PLOTS                                                       │
+// └──────────────────────────────────────────────────────────────────────────┘
+plot(asianData.isActive ? 1 : 0, "Asian Active", display=display.data_window)
+plot(londonData.isActive ? 1 : 0, "London Active", display=display.data_window)
+plot(nyamData.isActive ? 1 : 0, "NY AM Active", display=display.data_window)
+plot(nypmData.isActive ? 1 : 0, "NY PM Active", display=display.data_window)
+plot(asianData.isActive and not na(asianData.openPrice) ? asianData.openPrice : na, "Asian Open", display=display.data_window)
+plot(londonData.isActive and not na(londonData.openPrice) ? londonData.openPrice : na, "London Open", display=display.data_window)
+plot(nyamData.isActive and not na(nyamData.openPrice) ? nyamData.openPrice : na, "NY AM Open", display=display.data_window)
+plot(nypmData.isActive and not na(nypmData.openPrice) ? nypmData.openPrice : na, "NY PM Open", display=display.data_window)
+
+// ┌──────────────────────────────────────────────────────────────────────────┐
+// │ ALERT CONDITIONS                                                        │
+// └──────────────────────────────────────────────────────────────────────────┘
+alertcondition(lonKZOpening, "London Killzone Open", "London Open Killzone is now active — Session Sniper Map")
+alertcondition(nyKZOpening, "NY Killzone Open", "New York Open Killzone is now active — Session Sniper Map")
+alertcondition(lonCloseKZOpening, "London Close Killzone", "London Close Killzone is now active — Session Sniper Map")
+alertcondition(anyKZOpening, "Any Killzone Open", "A killzone has opened — Session Sniper Map")
+alertcondition(anyOpenBreak, "Session Open Break", "Price has crossed a session open level — Session Sniper Map")
+alertcondition(priorHighBreak, "Prior Session High Break", "Price broke above prior session high — Session Sniper Map")
+alertcondition(priorLowBreak, "Prior Session Low Break", "Price broke below prior session low — Session Sniper Map")
+alertcondition(priorHighBreak or priorLowBreak, "Any Session Level Break", "Price broke a prior session high or low — Session Sniper Map")
+// ══════════════════════════════════════════════════════════════════════════════
+// End of Session Sniper Map [forexobroker]
+// ══════════════════════════════════════════════════════════════════════════════

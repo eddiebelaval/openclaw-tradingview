@@ -1,0 +1,412 @@
+//@version=6
+indicator("Qantum Algo Risk Management", overlay=true, shorttitle="Quantum Algo Risk Management")
+
+// ── User Inputs for Risk Management
+accountSize     = input.float(6000, "Account Size ($)", step=100)
+riskPercent     = input.float(3, "Risk % per Trade", minval=0.1, step=0.1)
+stopLossMult    = input.float(1.0, "Stop Loss ATR Multiplier", step=0.1)
+isBTCPair       = input.bool(true, "Is BTC Pair? (Else, Altcoin)")
+leverageBTC     = input.float(5, "BTC Leverage", step=0.1)
+leverageAlt     = input.float(2, "Altcoin Leverage", step=0.1)
+atrPeriod       = input.int(14, "ATR Period", minval=1)
+riskRewardRatio = input.float(3.33, "Risk:Reward Ratio", step=0.01)
+
+// ── Regime ATR% + BTC Correlation
+benchSym        = input.symbol("BINANCE:BTCUSDT", "Benchmark for Correlation")
+corrLen         = input.int(30, "Correlation Lookback", minval=5)
+volLook         = input.int(200, "ATR% PercentRank Lookback", minval=20)
+
+// ── Volume Intelligence
+useDollarVol    = input.bool(true, "Use $ Volume (price × volume) for metrics")
+volLookback     = input.int(50, "Volume Lookback (RVOL/percentile)", minval=5)
+marketSym1      = input.symbol("BINANCE:BTCUSDT", "Market Proxy #1")
+marketSym2      = input.symbol("BINANCE:ETHUSDT", "Market Proxy #2")
+
+// ── Volume Spike Watch (Quiet → Spike)
+quietVolPctile    = input.int(20, "Quiet threshold: Volume Percentile ≤", minval=1, maxval=99)
+quietATRpctile    = input.int(30, "Quiet threshold: ATR% Percentile ≤",   minval=1, maxval=99)
+quietRVOLmax      = input.float(0.70, "Quiet threshold: RVOL ≤", step=0.05)
+paceLookback      = input.int(50, "Expected Volume Pace Lookback", minval=10)
+paceSpikeMult     = input.float(2.0, "Intrabar Pace Spike × Average", step=0.1)
+closeBarSpikeMult = input.float(2.0, "Close-Bar Volume Spike × Average", step=0.1)
+
+// ── Surge % output (kept as a component)
+showSurgeProb     = input.bool(true, "Show Potential Volume Surge %")
+surgeAlertThresh  = input.int(70, "Alert when Surge % ≥", minval=1, maxval=100)
+
+// ── LEAD SCORE (pre-pump) — predictive blend (quiet + early ignition)
+showLeadScoreRow  = input.bool(true, "Show LEAD SCORE (pre-pump)")
+// Weights (sum auto-normalized in code)
+wQuiet            = input.float(0.30, "Weight: Quiet/Squeeze", step=0.05, minval=0, maxval=1)
+wPreheat          = input.float(0.15, "Weight: Pre-heat Vol (EMA ratio)", step=0.05, minval=0, maxval=1)
+wOBV              = input.float(0.15, "Weight: OBV Accumulation", step=0.05, minval=0, maxval=1)
+wEarlyPace        = input.float(0.20, "Weight: Early Intrabar Pace", step=0.05, minval=0, maxval=1)
+wMarket           = input.float(0.10, "Weight: Market Heat (RVOL)", step=0.05, minval=0, maxval=1)
+wSurgeHeuristic   = input.float(0.10, "Weight: Surge Heuristic", step=0.05, minval=0, maxval=1)
+// Anti-reactive penalty
+wPenaltyReactive  = input.float(0.30, "Penalty weight: Already Pumped", step=0.05, minval=0, maxval=1)
+reactiveRVOLcut   = input.float(1.50, "Penalty kicks in above RVOL ≥", step=0.05)
+reactiveVolPct    = input.int(80, "Penalty kicks in above Volume Percentile ≥", minval=50, maxval=99)
+// Early window (fraction of bar for early pace)
+earlyWindowFrac   = input.float(0.35, "Early bar window (fraction of bar)", step=0.05, minval=0.1, maxval=0.9)
+
+// — MTF squeeze & RS / Dominance / Patterns / Cooldown
+useHTFregime   = input.bool(true, "Use Higher-TF Regime in Lead Score")
+atrTF          = input.timeframe("240", "Higher TF for Regime", confirm=true)
+
+rsLen          = input.int(40, "Relative Strength lookback vs BTC", minval=5)
+rsSmooth       = input.int(10, "RS Smoothing", minval=1)
+
+useDominance   = input.bool(true, "Use BTC Dominance (alt tailwind)")
+btcDomSym      = input.symbol("CRYPTOCAP:BTC.D", "BTC Dominance symbol")
+
+nrLen          = input.int(7, "NRx length (NR7)", minval=4, maxval=20)
+ibLookback     = input.int(6, "Inside-bar cluster lookback", minval=3, maxval=20)
+
+leadReadyThresh = input.int(70, "LEAD SCORE READY threshold %", minval=1, maxval=100)
+cooldownBars    = input.int(20, "Cooldown bars after READY", minval=1, maxval=500)
+
+// NEW: Weights for added components
+wMTF           = input.float(0.18, "Weight: MTF Squeeze", step=0.01, minval=0, maxval=1)
+wRS            = input.float(0.18, "Weight: RS vs BTC",   step=0.01, minval=0, maxval=1)
+wDOM           = input.float(0.12, "Weight: Dominance ↓", step=0.01, minval=0, maxval=1)
+wPAT           = input.float(0.12, "Weight: NR7 / Inside",step=0.01, minval=0, maxval=1)
+
+// ── Table Appearance (metrics appear ONLY in the table)
+tablePosStr     = input.string("top_right", "Table Position", options=["top_right","top_left","bottom_right","bottom_left","center"])
+textSizeStr     = input.string("tiny", "Table Text Size", options=["tiny","small","normal","large","huge"])
+
+// ── Show/Hide Rows
+showAccountSize   = input.bool(true,  "Show Account Size")
+showRiskTrade     = input.bool(true,  "Show Risk/Trade")
+showStopLoss      = input.bool(true,  "Show Stop Loss %")
+showPosSize       = input.bool(false, "Show Position Size")
+showLeverage      = input.bool(false, "Show Leverage")
+showMargin        = input.bool(true,  "Show Margin Req.")
+showTakeProfit    = input.bool(true,  "Show Take Profit %")
+showRiskReward    = input.bool(false, "Show Risk:Reward Ratio")
+showRegimeATR     = input.bool(true,  "Show Regime / ATR%")
+showCorrBTC       = input.bool(false, "Show Corr vs BTC")
+showRelVol        = input.bool(false, "Show Relative Volume (RVOL)")
+showVolPercentile = input.bool(false, "Show Volume Percentile")
+showMktShare      = input.bool(false, "Show Market Volume Share")
+showMktRVOL       = input.bool(false, "Show Market RVOL")
+showSpikeRow      = input.bool(true,  "Show 'Spike Watch' Row in Table")
+
+// ── Chart drawing controls (levels only; no metric drawings)
+plotLevels        = input.bool(true, "Draw Entry/SL/TP on Chart")
+positionSide      = input.string("Short", "Position Side", options=["Long","Short"])
+entrySource       = input.source(close, "Entry Price (source)")
+
+// ── Helpers
+clamp01(x) => math.max(0.0, math.min(1.0, x))
+
+toPos(p) =>
+    pos = position.top_right
+    if p == "top_left"
+        pos := position.top_left
+    else if p == "bottom_right"
+        pos := position.bottom_right
+    else if p == "bottom_left"
+        pos := position.bottom_left
+    else if p == "center"
+        pos := position.middle_center
+    pos
+
+// ── Core Calculations
+riskAmount       = accountSize * riskPercent / 100
+atrValue         = ta.atr(atrPeriod)
+stopLossFraction = (atrValue * stopLossMult) / close
+stopLossPerc     = stopLossFraction * 100
+posSize          = stopLossFraction != 0.0 ? riskAmount / stopLossFraction : na
+currentLeverage  = isBTCPair ? leverageBTC : leverageAlt
+marginRequired   = posSize / currentLeverage
+takeProfitPerc   = stopLossPerc * riskRewardRatio
+
+// ── Prices for Entry/SL/TP based on side
+slPct  = stopLossPerc / 100.0
+tpPct  = takeProfitPerc / 100.0
+entry  = entrySource
+slPrice = positionSide == "Long" ? entry * (1 - slPct) : entry * (1 + slPct)
+tpPrice = positionSide == "Long" ? entry * (1 + tpPct) : entry * (1 - tpPct)
+
+// ── ATR% regime + correlation
+atrPct    = atrValue / entry * 100.0
+atrPctPR  = ta.percentrank(atrPct, volLook)
+regime = atrPctPR >= 90 ? "Very High Vol" : atrPctPR >= 70 ? "High Vol" : atrPctPR <= 10 ? "Very Low Vol" : atrPctPR <= 30 ? "Low Vol" : "Normal Vol"
+regColor = atrPctPR >= 90 ? color.rgb(200,0,0) : atrPctPR >= 70 ? color.rgb(255,120,0) : atrPctPR <= 10 ? color.rgb(0,140,0) : atrPctPR <= 30 ? color.rgb(0,180,0) : color.rgb(40,120,255)
+benchClose = request.security(benchSym, timeframe.period, close, barmerge.gaps_off, barmerge.lookahead_off)
+corrBTC    = ta.correlation(close, benchClose, corrLen)
+
+// ── Volume metrics
+symVolRaw = volume
+symVol    = useDollarVol ? symVolRaw * close : symVolRaw
+rvol       = ta.sma(symVol, 1) / ta.sma(symVol, volLookback)
+volPctRank = ta.percentrank(symVol, volLookback)
+bench1Vol  = request.security(marketSym1, timeframe.period, useDollarVol ? volume * close : volume, barmerge.gaps_off, barmerge.lookahead_off)
+bench2Vol  = request.security(marketSym2, timeframe.period, useDollarVol ? volume * close : volume, barmerge.gaps_off, barmerge.lookahead_off)
+marketVol  = bench1Vol + bench2Vol
+marketSharePct = marketVol > 0 ? (symVol / marketVol) * 100.0 : na
+marketRVOL     = ta.sma(marketVol, 1) / ta.sma(marketVol, volLookback)
+
+// ── Quiet regime + squeeze signals
+isQuietVolume     = na(volPctRank) ? false : (volPctRank <= quietVolPctile) and (rvol <= quietRVOLmax)
+isQuietVolatility = na(atrPctPR)   ? false : (atrPctPR <= quietATRpctile)
+isQuietRegime     = isQuietVolume and isQuietVolatility
+
+bbLen     = 20
+bbBasis   = ta.sma(close, bbLen)
+bbStdev   = ta.stdev(close, bbLen)
+bbUpper   = bbBasis + 2.0 * bbStdev
+bbLower   = bbBasis - 2.0 * bbStdev
+bbWidth   = bbBasis != 0 ? (bbUpper - bbLower) / bbBasis * 100.0 : na
+bbWidthPR = ta.percentrank(bbWidth, 200) // low percentile = tight/squeezed
+
+// ── Intrabar pace (early ignition; realtime only)
+barDurMs  = time_close - time
+avgVol    = ta.sma(symVol, paceLookback)
+expPace   = (barDurMs > 0 and not na(avgVol)) ? (avgVol / barDurMs) : na
+elapsedMs = math.max(1, timenow - time)
+progress  = (barDurMs > 0) ? clamp01(elapsedMs / barDurMs) : 1.0
+earlyFac  = clamp01((earlyWindowFrac - progress) / earlyWindowFrac)  // 1 at start → 0 after early window
+livePace  = (barstate.isrealtime and elapsedMs > 0) ? (symVol / elapsedMs) : na
+paceRatio = (na(livePace) or na(expPace)) ? na : livePace / expPace
+
+// ── Surge heuristic (kept, lower weight in lead score)
+volQuietScore   = na(volPctRank) ? 0.0 : clamp01(quietVolPctile > 0 ? (quietVolPctile - volPctRank) / quietVolPctile : 0.0)
+atrQuietScore   = na(atrPctPR)   ? 0.0 : clamp01(quietATRpctile > 0 ? (quietATRpctile - atrPctPR) / quietATRpctile : 0.0)
+rvolQuietScore  = na(rvol)       ? 0.0 : clamp01(quietRVOLmax > 0 ? (quietRVOLmax - rvol) / quietRVOLmax : 0.0)
+quietScore      = volQuietScore * 0.5 + atrQuietScore * 0.3 + rvolQuietScore * 0.2
+paceScore       = na(paceRatio)  ? 0.0 : clamp01((paceRatio - 1.0) / math.max(0.0001, (paceSpikeMult - 1.0)))
+marketHeatScore = na(marketRVOL) ? 0.0 : clamp01((marketRVOL - 1.0) / 0.8)  // 1.0→0, 1.8→1
+surgeScore      = clamp01(quietScore * 0.45 + paceScore * 0.40 + marketHeatScore * 0.15)
+surgeProbPct    = surgeScore * 100.0
+
+// ── EXTRA predictive components
+// Pre-heat: slow rise in volume while still quiet (EMA ratio)
+preheatRatio = ta.ema(symVol, 10) / ta.ema(symVol, 50)
+preheatScore = clamp01((preheatRatio - 1.0) / 0.5)  // 1.0→0, 1.5→1
+
+// OBV accumulation (normalized via percentrank of OBV change)
+obv       = ta.cum(close > close[1] ? volume : close < close[1] ? -volume : 0)
+obvDelta  = ta.ema(ta.change(obv), 8)
+obvPR     = ta.percentrank(obvDelta, 200)
+obvScore  = clamp01((obvPR - 50.0) / 50.0)  // above-median accumulation → positive
+
+// Squeeze/quiet score combining ATR%, BB width, and low volume percentile
+bbTightScore = na(bbWidthPR) ? 0.0 : clamp01((50.0 - bbWidthPR) / 50.0)  // tight if percentile is low
+quietSqueeze = clamp01( (isQuietRegime ? 0.6 : 0.0) + 0.4 * bbTightScore )
+
+// Early intrabar pace (only during early window, realtime)
+earlyPaceScore = (na(paceRatio) ? 0.0 : clamp01((paceRatio - 1.0) / math.max(0.0001, (paceSpikeMult - 1.0)))) * earlyFac
+
+// Market alignment (breadth warming but not exploding)
+marketScore = na(marketRVOL) ? 0.0 : clamp01((marketRVOL - 1.0) / 0.8)   // 1.0→0, 1.8→1
+
+// Anti-reactive penalty: discourage already-pumped bars
+penRVOL  = clamp01((rvol - reactiveRVOLcut) / math.max(0.0001, 2.5 - reactiveRVOLcut))
+penVPct  = clamp01((volPctRank - reactiveVolPct) / math.max(1.0, 100.0 - reactiveVolPct))
+reactivePenalty = math.max(penRVOL, penVPct)
+
+// ── MTF regime (ATR% & BB width on higher TF)
+htfClose   = request.security(syminfo.tickerid, atrTF, close, barmerge.gaps_off, barmerge.lookahead_off)
+htfATR     = request.security(syminfo.tickerid, atrTF, ta.atr(atrPeriod), barmerge.gaps_off, barmerge.lookahead_off)
+htfATRpct  = (htfClose > 0) ? (htfATR / htfClose) * 100.0 : na
+htfATRpr   = ta.percentrank(htfATRpct, 200)
+
+htfBasis   = request.security(syminfo.tickerid, atrTF, ta.sma(close, 20))
+htfStdev   = request.security(syminfo.tickerid, atrTF, ta.stdev(close, 20))
+htfBBw     = (htfBasis != 0 and not na(htfStdev)) ? (((htfBasis + 2*htfStdev) - (htfBasis - 2*htfStdev)) / htfBasis * 100.0) : na
+htfBBpr    = ta.percentrank(htfBBw, 200)
+
+// Low percentiles = tight/quiet → higher score
+mtfQuietScore = useHTFregime ? clamp01((quietATRpctile - nz(htfATRpr, 100.0)) / quietATRpctile) : 0.0
+mtfTightScore = useHTFregime ? clamp01((50.0 - nz(htfBBpr, 50.0)) / 50.0) : 0.0
+mtfSqueeze    = clamp01(0.6*mtfQuietScore + 0.4*mtfTightScore)
+
+// ── Relative Strength vs BTC
+rsSeries   = benchClose > 0 ? close / benchClose : na
+rsSlope    = ta.ema(ta.roc(rsSeries, rsLen), rsSmooth)
+rsPR       = ta.percentrank(rsSlope, 200)
+rsScore    = clamp01(rsPR / 100.0) // positive when RS slope ranks high
+
+// ── BTC Dominance tailwind (falling dom helps alts)
+domClose   = useDominance ? request.security(btcDomSym, timeframe.period, close, barmerge.gaps_off, barmerge.lookahead_off) : na
+domSlope   = useDominance ? ta.ema(ta.roc(domClose, 20), 5) : na
+domScore   = useDominance ? clamp01((-nz(domSlope, 0.0)) / 1.0) : 0.0  // falling → positive
+
+// ── Pattern compression: NR7 + inside-bar clustering (use SMA of boolean instead of ta.sum)
+rng        = high - low
+isNR7      = rng <= ta.lowest(rng, nrLen)
+isInside   = high <= high[1] and low >= low[1]
+ibCluster  = nz(ta.sma(isInside ? 1.0 : 0.0, ibLookback), 0.0)  // fraction 0..1
+patScore   = clamp01((isNR7 ? 1.0 : 0.0) * 1.0 + ibCluster * 0.6)
+
+// ── Cooldown management
+var int lastReadyBar = na
+onCooldown  = not na(lastReadyBar) and (bar_index - lastReadyBar < cooldownBars)
+
+// ── LEAD SCORE (pre-pump): normalize all weights and compute cleanly
+wAll = math.max(0.0001, wQuiet + wPreheat + wOBV + wEarlyPace + wMarket + wSurgeHeuristic + wMTF + wRS + wDOM + wPAT)
+leadNumerator = quietSqueeze*wQuiet + preheatScore*wPreheat + obvScore*wOBV + earlyPaceScore*wEarlyPace + marketScore*wMarket + surgeScore*wSurgeHeuristic + mtfSqueeze*wMTF + rsScore*wRS + domScore*wDOM + patScore*wPAT
+
+
+
+leadRaw = (leadNumerator / wAll) - wPenaltyReactive*reactivePenalty - (onCooldown ? 0.15 : 0.0)
+leadScore01 = clamp01(leadRaw)
+leadScorePct = leadScore01 * 100.0
+leadBg = leadScorePct >= 80 ? color.rgb(0,120,0) : leadScorePct >= 60 ? color.rgb(120,120,0) : leadScorePct >= 40 ? color.rgb(140,90,0) : color.rgb(120,0,0)
+leadTxt = leadScorePct >= 80 ? "READY (pre)" : leadScorePct >= 60 ? "WATCH" : leadScorePct >= 40 ? "MAYBE" : "LOW"
+
+readyEvent  = (leadScorePct >= leadReadyThresh) and not onCooldown and barstate.isconfirmed
+if readyEvent
+    lastReadyBar := bar_index
+
+// ── "Spike Watch" status text (table only)
+spikeStatus = (barstate.isrealtime and earlyPaceScore > 0.0) ? "⚡ Early Pace" : (isQuietRegime ? "⏳ Quiet" : "—")
+spikeBg     = (barstate.isrealtime and earlyPaceScore > 0.0) ? color.rgb(0,100,0) : (isQuietRegime ? color.rgb(60,60,60) : color.rgb(30,30,30))
+
+// ── Drivers (why now) compact text
+driversTxt = ""
+sep = ""
+if quietSqueeze > 0.5
+    driversTxt += sep + "Quiet"
+    sep := " · "
+if earlyPaceScore > 0.3
+    driversTxt += sep + "EarlyPace"
+    sep := " · "
+if obvScore > 0.5
+    driversTxt += sep + "OBV↑"
+    sep := " · "
+if rsScore > 0.6
+    driversTxt += sep + "RS↑"
+    sep := " · "
+if domScore > 0.5
+    driversTxt += sep + "Dom↓"
+    sep := " · "
+if patScore > 0.5
+    driversTxt += sep + "NR7/IB"
+    sep := " · "
+
+// ── Level drawing (SL/TP/Entry) — fixed so lines show and extend right
+plotLevelsOK = plotLevels and not na(slPrice) and not na(tpPrice) and not na(entry)
+
+var line lEntry = na
+var line lSL    = na
+var line lTP    = na
+
+if plotLevelsOK
+    // Create with a real segment (two distinct x's). Guard the very first bar.
+    if na(lEntry)
+        x1 = bar_index > 0 ? bar_index - 1 : bar_index
+        x2 = bar_index
+        lEntry := line.new(x1, entry,  x2, entry,  xloc=xloc.bar_index, extend=extend.right, color=color.new(color.silver, 0), style=line.style_dotted, width=2)
+        lSL    := line.new(x1, slPrice, x2, slPrice, xloc=xloc.bar_index, extend=extend.right, color=color.new(color.red, 0),    width=2)
+        lTP    := line.new(x1, tpPrice, x2, tpPrice, xloc=xloc.bar_index, extend=extend.right, color=color.new(color.lime, 0),   width=2)
+
+    // Update BOTH endpoints each bar so the ray stays locked to current prices
+    x1u = bar_index > 0 ? bar_index - 1 : bar_index
+    line.set_xy1(lEntry, x1u, entry)
+    line.set_xy2(lEntry, bar_index, entry)
+    line.set_xy1(lSL,    x1u, slPrice)
+    line.set_xy2(lSL,    bar_index, slPrice)
+    line.set_xy1(lTP,    x1u, tpPrice)
+    line.set_xy2(lTP,    bar_index, tpPrice)
+else
+    // Clean up if gating turns false
+    if not na(lEntry)
+        line.delete(lEntry)
+        line.delete(lSL)
+        line.delete(lTP)
+        lEntry := na
+        lSL    := na
+        lTP    := na
+
+
+// ── TABLE (fixed-size & recreate when position changes)
+var string _lastPos = na
+var table  riskTable = na
+MAX_ROWS = 32
+newTableNeeded = na(riskTable) or (_lastPos != tablePosStr)
+if newTableNeeded
+    if not na(riskTable)
+        table.delete(riskTable)
+    riskTable := table.new(toPos(tablePosStr), 2, MAX_ROWS, border_width=1, frame_color=color.gray)
+    _lastPos  := tablePosStr
+
+if barstate.islast
+    table.clear(riskTable, 0, 0)
+    row = 0
+    if showAccountSize
+        table.cell(riskTable, 0, row, "Account Size", text_color=color.white, bgcolor=color.blue, text_size=textSizeStr)
+        table.cell(riskTable, 1, row, "$" + str.tostring(accountSize, format.mintick), text_color=color.white, bgcolor=color.blue, text_size=textSizeStr)
+        row += 1
+    if showRiskTrade
+        table.cell(riskTable, 0, row, "Risk/Trade", text_color=color.white, bgcolor=color.blue, text_size=textSizeStr)
+        table.cell(riskTable, 1, row, "$" + str.tostring(riskAmount, format.mintick), text_color=color.white, bgcolor=color.blue, text_size=textSizeStr)
+        row += 1
+    if showStopLoss
+        table.cell(riskTable, 0, row, "Stop Loss %", text_color=color.white, bgcolor=color.blue, text_size=textSizeStr)
+        table.cell(riskTable, 1, row, str.tostring(stopLossPerc, "#.##") + "%", text_color=color.white, bgcolor=color.blue, text_size=textSizeStr)
+        row += 1
+    if showPosSize
+        table.cell(riskTable, 0, row, "Position Size", text_color=color.white, bgcolor=color.blue, text_size=textSizeStr)
+        table.cell(riskTable, 1, row, "$" + str.tostring(posSize, format.mintick), text_color=color.white, bgcolor=color.blue, text_size=textSizeStr)
+        row += 1
+    if showLeverage
+        table.cell(riskTable, 0, row, "Leverage", text_color=color.white, bgcolor=color.blue, text_size=textSizeStr)
+        table.cell(riskTable, 1, row, isBTCPair ? str.tostring(leverageBTC, "#.##") + "x" : str.tostring(leverageAlt, "#.##") + "x", text_color=color.white, bgcolor=color.blue, text_size=textSizeStr)
+        row += 1
+    if showMargin
+        table.cell(riskTable, 0, row, "Margin Req.", text_color=color.white, bgcolor=color.blue, text_size=textSizeStr)
+        table.cell(riskTable, 1, row, "$" + str.tostring(marginRequired, format.mintick), text_color=color.white, bgcolor=color.blue, text_size=textSizeStr)
+        row += 1
+    if showTakeProfit
+        table.cell(riskTable, 0, row, "Take Profit %", text_color=color.white, bgcolor=color.blue, text_size=textSizeStr)
+        table.cell(riskTable, 1, row, str.tostring(takeProfitPerc, "#.##") + "%", text_color=color.white, bgcolor=color.blue, text_size=textSizeStr)
+        row += 1
+    if showRiskReward
+        table.cell(riskTable, 0, row, "Risk:Reward", text_color=color.white, bgcolor=color.blue, text_size=textSizeStr)
+        table.cell(riskTable, 1, row, str.tostring(riskRewardRatio, "#.##") + "x", text_color=color.white, bgcolor=color.blue, text_size=textSizeStr)
+        row += 1
+    if showRegimeATR
+        table.cell(riskTable, 0, row, "ATR%", text_color=color.white, bgcolor=regColor, text_size=textSizeStr)
+        table.cell(riskTable, 1, row, regime + "  |  " + str.tostring(atrPct, "#.##") + "%", text_color=color.white, bgcolor=regColor, text_size=textSizeStr)
+        row += 1
+    if showCorrBTC
+        table.cell(riskTable, 0, row, "Corr vs BTC)", text_color=color.white, bgcolor=color.rgb(30,30,60), text_size=textSizeStr)
+        table.cell(riskTable, 1, row, str.tostring(corrBTC, "#.##"), text_color=color.white, bgcolor=color.rgb(30,30,60), text_size=textSizeStr)
+        row += 1
+    if showRelVol
+        table.cell(riskTable, 0, row, "Relative Volume (RVOL)", text_color=color.white, bgcolor=color.rgb(40,40,40), text_size=textSizeStr)
+        table.cell(riskTable, 1, row, str.tostring(rvol, "#.##") + "×", text_color=color.white, bgcolor=color.rgb(40,40,40), text_size=textSizeStr)
+        row += 1
+    if showVolPercentile
+        table.cell(riskTable, 0, row, "Volume Percentile", text_color=color.white, bgcolor=color.rgb(40,40,40), text_size=textSizeStr)
+        table.cell(riskTable, 1, row, str.tostring(volPctRank, "#") + "%", text_color=color.white, bgcolor=color.rgb(40,40,40), text_size=textSizeStr)
+        row += 1
+    if showMktShare
+        table.cell(riskTable, 0, row, "Market Vol Share", text_color=color.white, bgcolor=color.rgb(40,40,40), text_size=textSizeStr)
+        table.cell(riskTable, 1, row, na(marketSharePct) ? "—" : str.tostring(marketSharePct, "#.##") + "%", text_color=color.white, bgcolor=color.rgb(40,40,40), text_size=textSizeStr)
+        row += 1
+    if showMktRVOL
+        table.cell(riskTable, 0, row, "Market RVOL", text_color=color.white, bgcolor=color.rgb(40,40,40), text_size=textSizeStr)
+        table.cell(riskTable, 1, row, na(marketRVOL) ? "—" : str.tostring(marketRVOL, "#.##") + "×", text_color=color.white, bgcolor=color.rgb(40,40,40), text_size=textSizeStr)
+        row += 1
+    if showSpikeRow
+        table.cell(riskTable, 0, row, "Spike Watch", text_color=color.white, bgcolor=spikeBg, text_size=textSizeStr)
+        table.cell(riskTable, 1, row, spikeStatus, text_color=color.white, bgcolor=spikeBg, text_size=textSizeStr)
+        row += 1
+    if showSurgeProb
+        surgeBg = surgeProbPct >= 80 ? color.rgb(0,120,0) : surgeProbPct >= 60 ? color.rgb(120,120,0) : surgeProbPct >= 40 ? color.rgb(140,90,0) : color.rgb(120,0,0)
+        table.cell(riskTable, 0, row, " Surge %", text_color=color.white, bgcolor=surgeBg, text_size=textSizeStr)
+        table.cell(riskTable, 1, row, str.tostring(surgeProbPct, "#") + "%", text_color=color.white, bgcolor=surgeBg, text_size=textSizeStr)
+        row += 1
+    if showLeadScoreRow
+        table.cell(riskTable, 0, row, "LEAD SCORE (pre)", text_color=color.white, bgcolor=leadBg, text_size=textSizeStr)
+        table.cell(riskTable, 1, row, str.tostring(leadScorePct, "#") + "%  (" + leadTxt + (onCooldown ? " | cooldown" : "") + ")", text_color=color.white, bgcolor=leadBg, text_size=textSizeStr)
+        row += 1
+    // Drivers (why now)
+    table.cell(riskTable, 0, row, "Drivers", text_color=color.white, bgcolor=color.rgb(28,28,28), text_size=textSizeStr)
+    table.cell(riskTable, 1, row, (driversTxt == "" ? "—" : driversTxt), text_color=color.white, bgcolor=color.rgb(28,28,28), text_size=textSizeStr)
+    row += 1

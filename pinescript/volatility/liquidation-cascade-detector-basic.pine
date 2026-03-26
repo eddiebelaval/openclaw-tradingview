@@ -1,0 +1,429 @@
+// This Pine Script™ code is subject to the terms of the Mozilla Public License 2.0
+// https://mozilla.org/MPL/2.0/
+// © cascadeindicators
+
+//@version=6
+indicator("Liquidation Cascade Detector - Basic", shorttitle="Liquidation Cascade - Basic", overlay=true, max_bars_back=500)
+
+
+// =====================================================================
+// ABOUT
+// =====================================================================
+//
+// Detects the microstructure footprint of forced liquidations in futures
+// markets. When leveraged positions are stopped out in clusters, they
+// leave recognizable signatures in price action, volume, and volatility.
+// This indicator scores the confluence of those signatures for both long
+// and short setups and fires a signal when evidence exceeds a threshold.
+//
+// BASIC VERSION — 4 of 7 analysis modules, 5 signals per session,
+// fixed threshold, aggregate score only. Does not include CVD divergence analysis,
+// cross-asset breadth, ETF correlation, MFP macro regime filtering,
+// adaptive thresholds, full pattern library, and unlimited signals.
+//
+// =====================================================================
+ 
+
+// =====================================================================
+// INPUTS
+// =====================================================================
+
+string GRP_VOL    = "Volume Analysis"
+string GRP_KELT   = "Keltner Channels"
+string GRP_PA     = "Price Action"
+string GRP_HTF    = "Higher Timeframe Trend"
+string GRP_SIG    = "Signal Settings"
+string GRP_VIS    = "Display"
+
+// --- Volume ---
+int    i_volLen       = input.int(20,    "Volume Lookback",      minval=5,  maxval=100, group=GRP_VOL)
+float  i_spikeMult    = input.float(1.8, "Spike Multiplier",     minval=1.1, maxval=5.0, step=0.1, group=GRP_VOL, tooltip="Volume must exceed this multiple of its rolling average to qualify as a spike.")
+
+// --- Keltner ---
+int    i_keltLen      = input.int(20,    "Keltner Length",       minval=5,  maxval=100, group=GRP_KELT)
+float  i_keltMult     = input.float(2.0, "Keltner ATR Multiple", minval=0.5, maxval=5.0, step=0.1, group=GRP_KELT)
+int    i_atrLen       = input.int(14,    "ATR Length",           minval=5,  maxval=50,  group=GRP_KELT)
+
+// --- Price Action ---
+float  i_liqWickRatio = input.float(0.6, "Liquidation Wick Ratio", minval=0.3, maxval=0.9, step=0.05, group=GRP_PA, tooltip="Minimum wick-to-range ratio to classify a candle as a liquidation bar. Higher = stricter.")
+float  i_liqBodyMax   = input.float(0.35,"Max Body Ratio",         minval=0.1, maxval=0.6, step=0.05, group=GRP_PA, tooltip="Maximum body-to-range ratio. Liquidation bars have small bodies and large wicks.")
+
+// --- HTF Trend ---
+string i_htfTF        = input.timeframe("15", "Trend Timeframe", group=GRP_HTF, tooltip="Higher timeframe used for trend direction. Aligned signals receive a score bonus.")
+int    i_htfEmaLen    = input.int(21,    "Trend EMA Length",     minval=5,  maxval=100, group=GRP_HTF)
+
+// --- Signal ---
+float  i_threshold    = input.float(45.0,"Signal Threshold",     minval=20.0, maxval=90.0, step=5.0, group=GRP_SIG, tooltip="Minimum confluence score required to fire a signal. Lower = more signals.")
+int    i_cooldownBars = input.int(10,    "Cooldown Bars",        minval=1,  maxval=50,  group=GRP_SIG, tooltip="Minimum bars between signals to prevent clustering.")
+int    i_maxSignals   = input.int(5,     "Signals per Session",  minval=1,  maxval=10,  group=GRP_SIG, tooltip="Maximum signals per RTH session. Free version capped at 5.")
+
+// --- Display ---
+bool   i_showKeltner  = input.bool(true,  "Show Keltner Bands",   group=GRP_VIS)
+bool   i_showSession  = input.bool(true,  "Show Session Markers",  group=GRP_VIS)
+bool   i_showTable    = input.bool(true,  "Show Info Table",       group=GRP_VIS)
+bool   i_showGauge    = input.bool(true,  "Show Score Gauge",      group=GRP_VIS)
+string i_tablePos     = input.string("Top Right", "Table Position", options=["Top Right", "Top Left", "Bottom Right", "Bottom Left"], group=GRP_VIS)
+
+
+// =====================================================================
+// CONSTANTS & HELPERS
+// =====================================================================
+
+// Scoring weights (fixed — paid version has adaptive weighting)
+float WT_VOLUME  = 20.0   // Max contribution from volume module
+float WT_KELTNER = 30.0   // Max contribution from Keltner exhaustion
+float WT_PA      = 25.0   // Max contribution from price action
+float WT_HTF     = 25.0   // Max contribution from HTF trend alignment
+
+// Colors
+color COL_LONG_SIG   = color.new(#00E676, 0)   // Green — long signal
+color COL_SHORT_SIG  = color.new(#FF5252, 0)   // Red — short signal
+color COL_LONG_DIM   = color.new(#00E676, 70)  // Dimmed long (counter-trend)
+color COL_SHORT_DIM  = color.new(#FF5252, 70)  // Dimmed short (counter-trend)
+color COL_KELT_UP    = color.new(#2196F3, 85)  // Keltner upper band
+color COL_KELT_DN    = color.new(#FF9800, 85)  // Keltner lower band
+color COL_KELT_MID   = color.new(#9E9E9E, 90)  // Keltner midline
+color COL_SESSION    = color.new(#FFFFFF, 93)   // Session marker lines
+color COL_BG_OPEN    = color.new(#FFD600, 96)   // Opening range background
+color COL_TABLE_BG   = color.new(#1A1A2E, 5)   // Table background
+color COL_TABLE_TXT  = color.new(#E0E0E0, 0)   // Table text
+color COL_TABLE_HEAD = color.new(#0D0D1A, 0)   // Table header background
+color COL_GAUGE_BG   = color.new(#333333, 20)  // Gauge background
+color COL_GAUGE_LO   = color.new(#FF5252, 30)  // Gauge low score
+color COL_GAUGE_MID  = color.new(#FFD600, 30)  // Gauge medium score
+color COL_GAUGE_HI   = color.new(#00E676, 30)  // Gauge high score
+color COL_GATED      = color.new(#FF9800, 0)   // Gated signal marker
+
+// Utility
+clamp(float val, float lo, float hi) =>
+    math.max(lo, math.min(val, hi))
+
+remap(float val, float inLo, float inHi, float outLo, float outHi) =>
+    outLo + (clamp(val, inLo, inHi) - inLo) / (inHi - inLo) * (outHi - outLo)
+
+
+// =====================================================================
+// SESSION DETECTION
+// =====================================================================
+
+// RTH session: 9:30 AM – 4:00 PM ET (futures exchanges use ET)
+// We use exchange timezone for reliability across brokers
+bool isRTH      = not na(time(timeframe.period, "0930-1600", "America/New_York"))
+bool wasRTH     = not na(time(timeframe.period, "0930-1600", "America/New_York")[1])
+bool sessionOpen = isRTH and not wasRTH
+
+// Key session windows
+bool isOpenRange  = not na(time(timeframe.period, "0930-1000", "America/New_York"))
+bool isPowerHour  = not na(time(timeframe.period, "1500-1600", "America/New_York"))
+bool isLunchLull  = not na(time(timeframe.period, "1200-1330", "America/New_York"))
+
+// Session signal counter (resets on RTH open)
+var int sessionSignalCount = 0
+if sessionOpen
+    sessionSignalCount := 0
+
+
+// =====================================================================
+// MODULE 1 — VOLUME ANALYSIS
+// =====================================================================
+// Basic volume spike detection. Scores volume relative to rolling
+// average. The paid version adds z-score classification, ultra-spike
+// tiers, and thin-market penalization.
+
+float volAvg   = ta.sma(volume, i_volLen)
+float volRatio = volAvg > 0 ? volume / volAvg : 0.0
+bool  volSpike = volRatio >= i_spikeMult
+
+// Score: linear ramp from 0 at ratio=1.0 to max at ratio=spikeMult*2
+float volScore = 0.0
+if volRatio >= 1.0
+    volScore := remap(volRatio, 1.0, i_spikeMult * 2.0, 0.0, WT_VOLUME)
+
+
+// =====================================================================
+// MODULE 2 — KELTNER CHANNEL EXHAUSTION
+// =====================================================================
+// Full Keltner exhaustion scoring. Measures how far price extends
+// beyond the channel bands relative to ATR. Higher overextension =
+// higher score, indicating conditions consistent with forced
+// liquidation overshoot.
+
+float keltBasis = ta.ema(close, i_keltLen)
+float atrVal    = ta.atr(i_atrLen)
+float keltUpper = keltBasis + i_keltMult * atrVal
+float keltLower = keltBasis - i_keltMult * atrVal
+
+// Overextension distance normalized by ATR
+float upperExt  = atrVal > 0 ? math.max(0.0, high - keltUpper) / atrVal  : 0.0
+float lowerExt  = atrVal > 0 ? math.max(0.0, keltLower - low)  / atrVal  : 0.0
+
+// Score for each direction (0 to WT_KELTNER)
+// Starts scoring at 0.0 ATR beyond band, maxes at 2.0 ATR beyond
+float keltScoreLong  = remap(lowerExt, 0.0, 2.0, 0.0, WT_KELTNER)
+float keltScoreShort = remap(upperExt, 0.0, 2.0, 0.0, WT_KELTNER)
+
+// Boolean flags for threshold breach
+bool keltExhaustLong  = low  < keltLower
+bool keltExhaustShort = high > keltUpper
+
+
+// =====================================================================
+// MODULE 3 — PRICE ACTION (LIQUIDATION BAR)
+// =====================================================================
+// Detects the single most recognizable liquidation candle pattern:
+// a bar with a very large wick and small body on elevated volume,
+// indicating price was pushed through a level by forced exits and
+// then reclaimed. The paid version adds sweep-reclaim, stop-hunt,
+// multi-bar absorption, and quality scoring across the full pattern
+// taxonomy.
+
+float barRange   = high - low
+float bodySize   = math.abs(close - open)
+float bodyRatio  = barRange > 0 ? bodySize / barRange          : 1.0
+float upperWick  = barRange > 0 ? (high - math.max(close, open)) / barRange : 0.0
+float lowerWick  = barRange > 0 ? (math.min(close, open) - low)  / barRange : 0.0
+
+// Liquidation bar for LONG: large lower wick, small body, on volume
+bool liqBarLong  = lowerWick >= i_liqWickRatio and bodyRatio <= i_liqBodyMax and volRatio >= 1.2
+// Liquidation bar for SHORT: large upper wick, small body, on volume
+bool liqBarShort = upperWick >= i_liqWickRatio and bodyRatio <= i_liqBodyMax and volRatio >= 1.2
+
+// Additional basic pattern: engulfing on volume
+bool bullEngulf  = close > open and close > high[1] and open <= low[1] and volRatio >= 1.3
+bool bearEngulf  = close < open and close < low[1]  and open >= high[1] and volRatio >= 1.3
+
+// Score: full points for liq bar, partial for engulfing
+float paScoreLong  = liqBarLong  ? WT_PA : bullEngulf ? WT_PA * 0.6 : 0.0
+float paScoreShort = liqBarShort ? WT_PA : bearEngulf ? WT_PA * 0.6 : 0.0
+
+
+// =====================================================================
+// MODULE 4 — HIGHER TIMEFRAME TREND
+// =====================================================================
+// Single higher-timeframe EMA slope for trend direction. Aligned
+// signals receive the full bonus; counter-trend signals receive zero
+// but are not blocked (they just need higher confluence from other
+// modules). The paid version uses configurable TF selection, trend
+// strength scoring, and weighted bonus/penalty integration.
+
+float htfEma = request.security(syminfo.tickerid, i_htfTF, ta.ema(close, i_htfEmaLen), lookahead=barmerge.lookahead_off)
+float htfEmaPrev = request.security(syminfo.tickerid, i_htfTF, ta.ema(close, i_htfEmaLen)[1], lookahead=barmerge.lookahead_off)
+
+// Trend direction: +1 up, -1 down, 0 flat
+int htfTrend = htfEma > htfEmaPrev ? 1 : htfEma < htfEmaPrev ? -1 : 0
+
+// Score: full points when aligned, zero when counter
+float htfScoreLong  = htfTrend >= 0  ? WT_HTF : 0.0   // Bullish or flat = OK for longs
+float htfScoreShort = htfTrend <= 0  ? WT_HTF : 0.0   // Bearish or flat = OK for shorts
+
+// Track alignment for visual dimming
+bool longAligned  = htfTrend >= 0
+bool shortAligned = htfTrend <= 0
+
+
+// =====================================================================
+// CONFLUENCE SCORING
+// =====================================================================
+// Aggregate score from all four modules. Fixed threshold (paid version
+// uses adaptive threshold that adjusts to volatility regime).
+// Score range: 0–100.
+
+float longScore  = volScore + keltScoreLong  + paScoreLong  + htfScoreLong
+float shortScore = volScore + keltScoreShort + paScoreShort + htfScoreShort
+
+// Require minimum evidence: at least 2 modules contributing non-trivially
+int longModules  = (volScore > 3 ? 1 : 0) + (keltScoreLong > 3 ? 1 : 0) + (paScoreLong > 3 ? 1 : 0) + (htfScoreLong > 3 ? 1 : 0)
+int shortModules = (volScore > 3 ? 1 : 0) + (keltScoreShort > 3 ? 1 : 0) + (paScoreShort > 3 ? 1 : 0) + (htfScoreShort > 3 ? 1 : 0)
+
+bool longAboveThreshold  = longScore  >= i_threshold and longModules  >= 2
+bool shortAboveThreshold = shortScore >= i_threshold and shortModules >= 2
+
+
+// =====================================================================
+// SIGNAL GATING
+// =====================================================================
+// Fixed cooldown between signals + per-session signal cap.
+// Paid version: adaptive cooldown based on volatility and MFP regime,
+// unlimited signals per session.
+
+var int barsSinceLong  = 999
+var int barsSinceShort = 999
+barsSinceLong  += 1
+barsSinceShort += 1
+
+// Cooldown check
+bool longCooldownOK  = barsSinceLong  >= i_cooldownBars
+bool shortCooldownOK = barsSinceShort >= i_cooldownBars
+
+// Session cap check
+bool underSignalCap = sessionSignalCount < i_maxSignals
+
+// Resolve conflicts: if both directions qualify, take the stronger one
+bool longRaw  = longAboveThreshold  and longCooldownOK  and barstate.isconfirmed
+bool shortRaw = shortAboveThreshold and shortCooldownOK and barstate.isconfirmed
+
+// Conflict resolution
+bool longQualified  = longRaw  and (not shortRaw or longScore >= shortScore)
+bool shortQualified = shortRaw and (not longRaw  or shortScore > longScore)
+
+// Apply session cap
+bool longSignal  = longQualified  and underSignalCap and isRTH
+bool shortSignal = shortQualified and underSignalCap and isRTH
+
+// Track whether a signal was gated (for display)
+bool signalGated = (longQualified or shortQualified) and not underSignalCap
+
+// Update state on signal fire
+if longSignal
+    barsSinceLong      := 0
+    sessionSignalCount += 1
+
+if shortSignal
+    barsSinceShort     := 0
+    sessionSignalCount += 1
+
+
+// =====================================================================
+// SESSION MARKERS
+// =====================================================================
+
+// RTH open line
+var line rthOpenLine = na
+if sessionOpen and i_showSession
+    if not na(rthOpenLine)
+        line.delete(rthOpenLine)
+    rthOpenLine := line.new(bar_index, open, bar_index + 1, open, xloc.bar_index, extend.right, COL_SESSION, line.style_dashed, 1)
+
+// Opening range background
+bgcolor(isOpenRange and i_showSession ? COL_BG_OPEN : na, title="Opening Range")
+
+
+// =====================================================================
+// KELTNER BAND PLOTS
+// =====================================================================
+
+plot(i_showKeltner ? keltUpper : na, "Keltner Upper", COL_KELT_UP, 1, plot.style_line)
+plot(i_showKeltner ? keltBasis : na, "Keltner Mid",   COL_KELT_MID, 1, plot.style_line)
+plot(i_showKeltner ? keltLower : na, "Keltner Lower", COL_KELT_DN, 1, plot.style_line)
+
+// Band fill
+p_ku = plot(i_showKeltner ? keltUpper : na, display=display.none)
+p_kl = plot(i_showKeltner ? keltLower : na, display=display.none)
+fill(p_ku, p_kl, color.new(#2196F3, 95), title="Keltner Fill")
+
+
+// =====================================================================
+// SIGNAL MARKERS
+// =====================================================================
+
+// Signal arrows with trend-dimming
+color longColor  = longAligned  ? COL_LONG_SIG  : COL_LONG_DIM
+color shortColor = shortAligned ? COL_SHORT_SIG : COL_SHORT_DIM
+
+plotshape(longSignal,  title="Long Signal",   style=shape.triangleup,   location=location.belowbar, color=longColor,  size=size.small)
+plotshape(shortSignal, title="Short Signal",  style=shape.triangledown, location=location.abovebar, color=shortColor, size=size.small)
+
+// Gated signal indicator (small dot when signal was suppressed by cap)
+plotshape(signalGated and not longSignal and not shortSignal, title="Signal Gated", style=shape.circle, location=location.bottom, color=COL_GATED, size=size.tiny)
+
+
+// =====================================================================
+// SCORE GAUGE
+// =====================================================================
+// Horizontal bar showing aggregate score. No module breakdown —
+// paid version shows full per-module decomposition table.
+
+var table gaugeTable = na
+
+if i_showGauge and barstate.islast
+    // Determine which score to display (higher of the two)
+    float displayScore  = math.max(longScore, shortScore)
+    bool  isLongLeading = longScore >= shortScore
+    string dirLabel     = isLongLeading ? "▲ LONG" : "▼ SHORT"
+
+    // Gauge color based on score relative to threshold
+    color gaugeCol = displayScore >= i_threshold * 1.3 ? COL_GAUGE_HI :
+                     displayScore >= i_threshold        ? COL_GAUGE_MID :
+                     COL_GAUGE_LO
+
+    color dirCol = isLongLeading ? COL_LONG_SIG : COL_SHORT_SIG
+
+    // Build gauge table
+    var table gt = table.new(position.bottom_right, 5, 1, border_width=0)
+    gaugeTable := gt
+
+    table.cell(gt, 0, 0, dirLabel, text_color=dirCol, text_size=size.small, bgcolor=COL_TABLE_BG, text_halign=text.align_center)
+    table.cell(gt, 1, 0, str.tostring(math.round(displayScore)) + " / 100", text_color=gaugeCol, text_size=size.small, bgcolor=COL_TABLE_BG, text_halign=text.align_center)
+    table.cell(gt, 2, 0, "  Thr: " + str.tostring(math.round(i_threshold)), text_color=COL_TABLE_TXT, text_size=size.tiny, bgcolor=COL_TABLE_BG, text_halign=text.align_left)
+    table.cell(gt, 3, 0, "  Sig: " + str.tostring(sessionSignalCount) + "/" + str.tostring(i_maxSignals), text_color=sessionSignalCount >= i_maxSignals ? COL_GATED : COL_TABLE_TXT, text_size=size.tiny, bgcolor=COL_TABLE_BG, text_halign=text.align_left)
+    table.cell(gt, 4, 0, "  " + (isRTH ? "RTH" : "ETH"), text_color=isRTH ? COL_LONG_SIG : color.new(#9E9E9E, 0), text_size=size.tiny, bgcolor=COL_TABLE_BG, text_halign=text.align_left)
+
+
+// =====================================================================
+// INFO TABLE
+// =====================================================================
+
+if i_showTable and barstate.islast
+    // Table position mapping
+    var tPos = switch i_tablePos
+        "Top Right"    => position.top_right
+        "Top Left"     => position.top_left
+        "Bottom Left"  => position.bottom_left
+        => position.top_right
+
+    var table infoTbl = table.new(tPos, 2, 9, bgcolor=COL_TABLE_BG, border_width=1, border_color=color.new(#333333, 0))
+
+    // Header
+    table.cell(infoTbl, 0, 0, "LCD Basic", bgcolor=COL_TABLE_HEAD, text_color=color.new(#00BCD4, 0), text_size=size.small, text_halign=text.align_center)
+    table.cell(infoTbl, 1, 0, syminfo.ticker, bgcolor=COL_TABLE_HEAD, text_color=COL_TABLE_TXT, text_size=size.small, text_halign=text.align_center)
+
+    // Long score
+    color lsCol = longScore >= i_threshold ? COL_LONG_SIG : COL_TABLE_TXT
+    table.cell(infoTbl, 0, 1, "Long Score", text_color=COL_TABLE_TXT, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(infoTbl, 1, 1, str.tostring(math.round(longScore, 1)), text_color=lsCol, text_size=size.tiny, text_halign=text.align_center)
+
+    // Short score
+    color ssCol = shortScore >= i_threshold ? COL_SHORT_SIG : COL_TABLE_TXT
+    table.cell(infoTbl, 0, 2, "Short Score", text_color=COL_TABLE_TXT, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(infoTbl, 1, 2, str.tostring(math.round(shortScore, 1)), text_color=ssCol, text_size=size.tiny, text_halign=text.align_center)
+
+    // Threshold
+    table.cell(infoTbl, 0, 3, "Threshold", text_color=COL_TABLE_TXT, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(infoTbl, 1, 3, str.tostring(math.round(i_threshold, 1)), text_color=COL_TABLE_TXT, text_size=size.tiny, text_halign=text.align_center)
+
+    // HTF Trend
+    string trendStr = htfTrend == 1 ? "▲ Bullish" : htfTrend == -1 ? "▼ Bearish" : "— Flat"
+    color  trendCol = htfTrend == 1 ? COL_LONG_SIG : htfTrend == -1 ? COL_SHORT_SIG : COL_TABLE_TXT
+    table.cell(infoTbl, 0, 4, "HTF Trend", text_color=COL_TABLE_TXT, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(infoTbl, 1, 4, trendStr, text_color=trendCol, text_size=size.tiny, text_halign=text.align_center)
+
+    // Volume
+    string volStr = volSpike ? "SPIKE ×" + str.tostring(math.round(volRatio, 1)) : "×" + str.tostring(math.round(volRatio, 1))
+    color  volCol = volSpike ? COL_GATED : COL_TABLE_TXT
+    table.cell(infoTbl, 0, 5, "Volume", text_color=COL_TABLE_TXT, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(infoTbl, 1, 5, volStr, text_color=volCol, text_size=size.tiny, text_halign=text.align_center)
+
+    // Keltner state
+    string keltStr = keltExhaustShort ? "▲ Extended" : keltExhaustLong ? "▼ Extended" : "In Range"
+    color  keltCol = (keltExhaustShort or keltExhaustLong) ? COL_GATED : COL_TABLE_TXT
+    table.cell(infoTbl, 0, 6, "Keltner", text_color=COL_TABLE_TXT, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(infoTbl, 1, 6, keltStr, text_color=keltCol, text_size=size.tiny, text_halign=text.align_center)
+
+    // Session signals
+    color sigCapCol = sessionSignalCount >= i_maxSignals ? COL_SHORT_SIG : COL_TABLE_TXT
+    table.cell(infoTbl, 0, 7, "Signals", text_color=COL_TABLE_TXT, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(infoTbl, 1, 7, str.tostring(sessionSignalCount) + " / " + str.tostring(i_maxSignals), text_color=sigCapCol, text_size=size.tiny, text_halign=text.align_center)
+
+// =====================================================================
+// ALERTS
+// =====================================================================
+
+alertcondition(longSignal,  title="LCD Long Signal",  message="LCD BASIC — Long signal on {{ticker}} at {{close}}")
+alertcondition(shortSignal, title="LCD Short Signal", message="LCD BASIC — Short signal on {{ticker}} at {{close}}")
+alertcondition(longSignal or shortSignal, title="LCD Any Signal", message="LCD BASIC — {{ticker}} signal at {{close}}")
+alertcondition(signalGated, title="LCD Signal Gated", message="LCD BASIC — Signal detected but session cap reached on {{ticker}}")
+
+
+// =====================================================================
+// END
+// =====================================================================

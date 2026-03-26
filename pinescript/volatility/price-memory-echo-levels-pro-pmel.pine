@@ -1,0 +1,418 @@
+//@version=6
+indicator("Price Memory Echo Levels Pro [PMEL]", shorttitle="PMEL Pro", overlay=true, max_lines_count=100, max_labels_count=50)
+
+//==================================================================================================
+// Price Memory Echo Levels Pro [PMEL]
+// Maps the strongest recurring intraday reaction levels and ranks them by memory strength.
+//==================================================================================================
+
+//----------------------------------------
+// Inputs
+//----------------------------------------
+groupCore = "Core Logic"
+lookbackBars    = input.int(120, "Lookback bars", minval=40, maxval=500, group=groupCore)
+binCount        = input.int(20, "Price bins", minval=8, maxval=40, group=groupCore)
+mergeGapBins    = input.int(2, "Minimum spacing between ranked levels", minval=1, maxval=8, group=groupCore)
+toleranceFactor = input.float(0.60, "Level tolerance (x bin size)", minval=0.20, maxval=1.50, step=0.05, group=groupCore)
+recencyBoost    = input.float(0.60, "Recency boost", minval=0.0, maxval=2.0, step=0.05, group=groupCore)
+
+groupScoring = "Reaction Scoring"
+wickWeight      = input.float(1.20, "Wick touch weight", minval=0.0, maxval=5.0, step=0.05, group=groupScoring)
+closeWeight     = input.float(0.90, "Close clustering weight", minval=0.0, maxval=5.0, step=0.05, group=groupScoring)
+rejectionWeight = input.float(1.40, "Rejection weight", minval=0.0, maxval=5.0, step=0.05, group=groupScoring)
+bodyPauseWeight = input.float(0.50, "Pause / indecision weight", minval=0.0, maxval=5.0, step=0.05, group=groupScoring)
+
+groupDisplay = "Display"
+showStrongest   = input.bool(true, "Show strongest level", group=groupDisplay)
+showSecondary   = input.bool(true, "Show secondary level", group=groupDisplay)
+showTertiary    = input.bool(true, "Show tertiary level", group=groupDisplay)
+showLevelLabels = input.bool(true, "Show full level labels", group=groupDisplay)
+extendBars      = input.int(120, "Forward line length", minval=20, maxval=500, group=groupDisplay)
+fadeLowerRanks  = input.bool(true, "Fade lower ranked levels", group=groupDisplay)
+highlightNearby = input.bool(true, "Highlight when price is near a level", group=groupDisplay)
+highlightOnlyStrongest = input.bool(false, "Highlight only strongest level", group=groupDisplay)
+
+groupDashboard = "Dashboard"
+showDashboard = input.bool(true, "Show dashboard", group=groupDashboard)
+dashboardPosition = input.string("Top Right", "Dashboard position", options=[
+     "Top Left", "Top Center", "Top Right",
+     "Middle Left", "Middle Center", "Middle Right",
+     "Bottom Left", "Bottom Center", "Bottom Right"
+], group=groupDashboard)
+dashboardTextSize = input.string("Large", "Dashboard text size", options=["Tiny", "Small", "Normal", "Large"], group=groupDashboard)
+
+//----------------------------------------
+// Helpers
+//----------------------------------------
+f_clamp(val, minv, maxv) =>
+    math.max(minv, math.min(maxv, val))
+
+f_tablePos(pos) =>
+    pos == "Top Left" ? position.top_left :
+     pos == "Top Center" ? position.top_center :
+     pos == "Top Right" ? position.top_right :
+     pos == "Middle Left" ? position.middle_left :
+     pos == "Middle Center" ? position.middle_center :
+     pos == "Middle Right" ? position.middle_right :
+     pos == "Bottom Left" ? position.bottom_left :
+     pos == "Bottom Center" ? position.bottom_center :
+     position.bottom_right
+
+f_txtSize(sz) =>
+    sz == "Tiny" ? size.tiny :
+     sz == "Small" ? size.small :
+     sz == "Large" ? size.large :
+     size.normal
+
+f_bias_text(bullScore, bearScore) =>
+    bullScore > bearScore * 1.15 ? "Bullish" :
+     bearScore > bullScore * 1.15 ? "Bearish" :
+     "Neutral"
+
+f_bias_color(bullScore, bearScore) =>
+    bullScore > bearScore * 1.15 ? color.rgb(0, 210, 120) :
+     bearScore > bullScore * 1.15 ? color.rgb(235, 70, 70) :
+     color.rgb(90, 125, 255)
+
+f_dist_text(v) =>
+    na(v) ? "-" : str.tostring(v, format.mintick)
+
+//----------------------------------------
+// Persistent storage
+//----------------------------------------
+var float[] scores = array.new_float()
+var float[] bulls  = array.new_float()
+var float[] bears  = array.new_float()
+var float[] levels = array.new_float()
+
+var line strongestLine = na
+var line secondaryLine = na
+var line tertiaryLine  = na
+
+var label strongestLabel = na
+var label secondaryLabel = na
+var label tertiaryLabel  = na
+
+var string lastDashboardPosition = dashboardPosition
+var table dash = table.new(f_tablePos(dashboardPosition), 2, 8, border_width=1)
+
+if barstate.isfirst or array.size(scores) != binCount
+    array.clear(scores)
+    array.clear(bulls)
+    array.clear(bears)
+    array.clear(levels)
+    for _ = 0 to binCount - 1
+        array.push(scores, 0.0)
+        array.push(bulls, 0.0)
+        array.push(bears, 0.0)
+        array.push(levels, 0.0)
+
+if dashboardPosition != lastDashboardPosition
+    table.delete(dash)
+    dash := table.new(f_tablePos(dashboardPosition), 2, 8, border_width=1)
+    lastDashboardPosition := dashboardPosition
+
+//----------------------------------------
+// Core calculations
+//----------------------------------------
+ready = bar_index > lookbackBars
+
+recentHigh = ta.highest(high, lookbackBars)
+recentLow  = ta.lowest(low, lookbackBars)
+priceRange = recentHigh - recentLow
+binSize    = priceRange / math.max(binCount, 1)
+tol        = binSize * toleranceFactor
+
+if ready and binSize > syminfo.mintick
+    for j = 0 to binCount - 1
+        array.set(scores, j, 0.0)
+        array.set(bulls, j, 0.0)
+        array.set(bears, j, 0.0)
+        lvl = recentLow + binSize * (j + 0.5)
+        array.set(levels, j, lvl)
+
+    for j = 0 to binCount - 1
+        lvl = array.get(levels, j)
+        s = 0.0
+        b = 0.0
+        r = 0.0
+
+        for i = 0 to lookbackBars - 1
+            rng = math.max(high[i] - low[i], syminfo.mintick)
+            recW = 1.0 + ((lookbackBars - i) / lookbackBars) * recencyBoost
+
+            wickTouch  = high[i] >= lvl and low[i] <= lvl
+            closeNear  = math.abs(close[i] - lvl) <= tol * 0.7
+            bodyPause  = math.abs(close[i] - open[i]) <= rng * 0.35 and closeNear
+            bullReject = low[i] < lvl and close[i] > lvl and wickTouch
+            bearReject = high[i] > lvl and close[i] < lvl and wickTouch
+
+            localScore = 0.0
+            if wickTouch
+                localScore += wickWeight
+            if closeNear
+                localScore += closeWeight
+            if bullReject or bearReject
+                localScore += rejectionWeight
+            if bodyPause
+                localScore += bodyPauseWeight
+
+            s += localScore * recW
+            if bullReject
+                b += rejectionWeight * recW
+            if bearReject
+                r += rejectionWeight * recW
+
+        array.set(scores, j, s)
+        array.set(bulls, j, b)
+        array.set(bears, j, r)
+
+//----------------------------------------
+// Pick top 3 distinct bins by score
+//----------------------------------------
+best1Idx = -1
+best2Idx = -1
+best3Idx = -1
+
+best1Score = -1.0
+best2Score = -1.0
+best3Score = -1.0
+
+if ready and binSize > syminfo.mintick
+    for j = 0 to binCount - 1
+        sj = array.get(scores, j)
+        if sj > best1Score
+            best1Score := sj
+            best1Idx := j
+
+    for j = 0 to binCount - 1
+        sj = array.get(scores, j)
+        farEnough1 = best1Idx == -1 ? true : math.abs(j - best1Idx) > mergeGapBins
+        if farEnough1 and sj > best2Score
+            best2Score := sj
+            best2Idx := j
+
+    for j = 0 to binCount - 1
+        sj = array.get(scores, j)
+        farEnough1 = best1Idx == -1 ? true : math.abs(j - best1Idx) > mergeGapBins
+        farEnough2 = best2Idx == -1 ? true : math.abs(j - best2Idx) > mergeGapBins
+        if farEnough1 and farEnough2 and sj > best3Score
+            best3Score := sj
+            best3Idx := j
+
+strongestLevel = best1Idx >= 0 ? array.get(levels, best1Idx) : na
+secondaryLevel = best2Idx >= 0 ? array.get(levels, best2Idx) : na
+tertiaryLevel  = best3Idx >= 0 ? array.get(levels, best3Idx) : na
+
+strongestBull = best1Idx >= 0 ? array.get(bulls, best1Idx) : na
+strongestBear = best1Idx >= 0 ? array.get(bears, best1Idx) : na
+secondaryBull = best2Idx >= 0 ? array.get(bulls, best2Idx) : na
+secondaryBear = best2Idx >= 0 ? array.get(bears, best2Idx) : na
+tertiaryBull  = best3Idx >= 0 ? array.get(bulls, best3Idx) : na
+tertiaryBear  = best3Idx >= 0 ? array.get(bears, best3Idx) : na
+
+strongestColor = na(strongestBull) or na(strongestBear) ? color.gray : f_bias_color(strongestBull, strongestBear)
+secondaryColor = na(secondaryBull) or na(secondaryBear) ? color.gray : f_bias_color(secondaryBull, secondaryBear)
+tertiaryColor  = na(tertiaryBull)  or na(tertiaryBear)  ? color.gray : f_bias_color(tertiaryBull, tertiaryBear)
+
+//----------------------------------------
+// Nearest level logic
+//----------------------------------------
+dStrongest = na(strongestLevel) ? na : math.abs(close - strongestLevel)
+dSecondary = na(secondaryLevel) ? na : math.abs(close - secondaryLevel)
+dTertiary  = na(tertiaryLevel)  ? na : math.abs(close - tertiaryLevel)
+
+float nearestLevel = na
+float nearestDist  = na
+string nearestName = "None"
+string nearestBias = "None"
+color nearestColor = color.rgb(90, 125, 255)
+
+if not na(dStrongest)
+    nearestLevel := strongestLevel
+    nearestDist  := dStrongest
+    nearestName  := "Strongest"
+    nearestBias  := f_bias_text(strongestBull, strongestBear)
+    nearestColor := strongestColor
+
+if not na(dSecondary) and (na(nearestDist) or dSecondary < nearestDist)
+    nearestLevel := secondaryLevel
+    nearestDist  := dSecondary
+    nearestName  := "Secondary"
+    nearestBias  := f_bias_text(secondaryBull, secondaryBear)
+    nearestColor := secondaryColor
+
+if not na(dTertiary) and (na(nearestDist) or dTertiary < nearestDist)
+    nearestLevel := tertiaryLevel
+    nearestDist  := dTertiary
+    nearestName  := "Tertiary"
+    nearestBias  := f_bias_text(tertiaryBull, tertiaryBear)
+    nearestColor := tertiaryColor
+
+nearStrongest = not na(strongestLevel) and math.abs(close - strongestLevel) <= tol
+nearSecondary = not na(secondaryLevel) and math.abs(close - secondaryLevel) <= tol
+nearTertiary  = not na(tertiaryLevel) and math.abs(close - tertiaryLevel) <= tol
+nearAny       = not na(nearestLevel) and math.abs(close - nearestLevel) <= tol
+
+reactionState =
+     nearAny and close > nearestLevel ? "Trading Above Memory" :
+     nearAny and close < nearestLevel ? "Trading Below Memory" :
+     nearAny ? "At Memory Level" : "Away From Levels"
+
+//----------------------------------------
+// Draw / update lines
+//----------------------------------------
+lineStart = bar_index - lookbackBars
+lineEnd   = bar_index + extendBars
+
+strongestWidth = 4
+secondaryWidth = fadeLowerRanks ? 3 : 4
+tertiaryWidth  = fadeLowerRanks ? 2 : 4
+
+strongestLineColor = nearStrongest and highlightNearby ? color.new(strongestColor, 0) : color.new(strongestColor, 5)
+secondaryLineColor = nearSecondary and highlightNearby and not highlightOnlyStrongest ? color.new(secondaryColor, 0) : color.new(secondaryColor, fadeLowerRanks ? 20 : 5)
+tertiaryLineColor  = nearTertiary  and highlightNearby and not highlightOnlyStrongest ? color.new(tertiaryColor, 0)  : color.new(tertiaryColor,  fadeLowerRanks ? 35 : 5)
+
+if showStrongest and not na(strongestLevel)
+    if na(strongestLine)
+        strongestLine := line.new(lineStart, strongestLevel, lineEnd, strongestLevel, extend=extend.right, color=strongestLineColor, width=strongestWidth)
+    else
+        line.set_xy1(strongestLine, lineStart, strongestLevel)
+        line.set_xy2(strongestLine, lineEnd, strongestLevel)
+        line.set_extend(strongestLine, extend.right)
+        line.set_color(strongestLine, strongestLineColor)
+        line.set_width(strongestLine, strongestWidth)
+else
+    if not na(strongestLine)
+        line.delete(strongestLine)
+        strongestLine := na
+
+if showSecondary and not na(secondaryLevel)
+    if na(secondaryLine)
+        secondaryLine := line.new(lineStart, secondaryLevel, lineEnd, secondaryLevel, extend=extend.right, color=secondaryLineColor, width=secondaryWidth)
+    else
+        line.set_xy1(secondaryLine, lineStart, secondaryLevel)
+        line.set_xy2(secondaryLine, lineEnd, secondaryLevel)
+        line.set_extend(secondaryLine, extend.right)
+        line.set_color(secondaryLine, secondaryLineColor)
+        line.set_width(secondaryLine, secondaryWidth)
+else
+    if not na(secondaryLine)
+        line.delete(secondaryLine)
+        secondaryLine := na
+
+if showTertiary and not na(tertiaryLevel)
+    if na(tertiaryLine)
+        tertiaryLine := line.new(lineStart, tertiaryLevel, lineEnd, tertiaryLevel, extend=extend.right, color=tertiaryLineColor, width=tertiaryWidth)
+    else
+        line.set_xy1(tertiaryLine, lineStart, tertiaryLevel)
+        line.set_xy2(tertiaryLine, lineEnd, tertiaryLevel)
+        line.set_extend(tertiaryLine, extend.right)
+        line.set_color(tertiaryLine, tertiaryLineColor)
+        line.set_width(tertiaryLine, tertiaryWidth)
+else
+    if not na(tertiaryLine)
+        line.delete(tertiaryLine)
+        tertiaryLine := na
+
+//----------------------------------------
+// Labels
+//----------------------------------------
+if showLevelLabels and barstate.islast
+    if not na(strongestLabel)
+        label.delete(strongestLabel)
+    if not na(secondaryLabel)
+        label.delete(secondaryLabel)
+    if not na(tertiaryLabel)
+        label.delete(tertiaryLabel)
+
+    strongestLabel := not na(strongestLevel) and showStrongest ? label.new(bar_index + 1, strongestLevel, "Strongest", style=label.style_label_left, textcolor=color.white, color=color.new(strongestColor, 18), size=size.tiny) : na
+    secondaryLabel := not na(secondaryLevel) and showSecondary ? label.new(bar_index + 1, secondaryLevel, "Secondary", style=label.style_label_left, textcolor=color.white, color=color.new(secondaryColor, 24), size=size.tiny) : na
+    tertiaryLabel  := not na(tertiaryLevel)  and showTertiary  ? label.new(bar_index + 1, tertiaryLevel,  "Tertiary",  style=label.style_label_left, textcolor=color.white, color=color.new(tertiaryColor, 30),  size=size.tiny) : na
+else
+    if not na(strongestLabel)
+        label.delete(strongestLabel)
+        strongestLabel := na
+    if not na(secondaryLabel)
+        label.delete(secondaryLabel)
+        secondaryLabel := na
+    if not na(tertiaryLabel)
+        label.delete(tertiaryLabel)
+        tertiaryLabel := na
+
+//----------------------------------------
+// Optional background highlight
+//----------------------------------------
+highlightColor =
+     nearStrongest ? strongestColor :
+     nearSecondary and not highlightOnlyStrongest ? secondaryColor :
+     nearTertiary and not highlightOnlyStrongest ? tertiaryColor :
+     na
+
+bgcolor(highlightNearby and not na(highlightColor) ? color.new(highlightColor, 92) : na)
+
+//----------------------------------------
+// Dashboard
+//----------------------------------------
+if showDashboard and barstate.islast
+    txtSz = f_txtSize(dashboardTextSize)
+
+    headerBg = color.rgb(10, 12, 18)
+    leftBg   = color.rgb(22, 26, 34)
+    rightBg  = color.rgb(14, 17, 24)
+
+    frameTxt = color.rgb(255, 255, 255)
+    softTxt  = color.rgb(255, 255, 255)
+
+    strongestTxt = na(strongestLevel) ? "-" : str.tostring(strongestLevel, format.mintick)
+    secondaryTxt = na(secondaryLevel) ? "-" : str.tostring(secondaryLevel, format.mintick)
+    tertiaryTxt  = na(tertiaryLevel)  ? "-" : str.tostring(tertiaryLevel, format.mintick)
+
+    strongestBias = na(strongestLevel) ? "-" : f_bias_text(strongestBull, strongestBear)
+    secondaryBias = na(secondaryLevel) ? "-" : f_bias_text(secondaryBull, secondaryBear)
+    tertiaryBias  = na(tertiaryLevel)  ? "-" : f_bias_text(tertiaryBull, tertiaryBear)
+
+    nearestTxt = na(nearestLevel) ? "-" : nearestName + " @ " + str.tostring(nearestLevel, format.mintick)
+    distanceTxt = f_dist_text(nearestDist)
+
+    stateBg = nearAny ? color.new(nearestColor, 20) : rightBg
+    nearestBiasBg =
+         nearestBias == "Bullish" ? color.new(color.rgb(0, 210, 120), 18) :
+         nearestBias == "Bearish" ? color.new(color.rgb(235, 70, 70), 18) :
+         color.new(color.rgb(90, 125, 255), 18)
+
+    table.cell(dash, 0, 0, "PMEL", text_color=color.white, text_size=txtSz, bgcolor=headerBg)
+    table.cell(dash, 1, 0, "PRO",  text_color=color.white, text_size=txtSz, bgcolor=headerBg)
+
+    table.cell(dash, 0, 1, "State", text_color=frameTxt, text_size=txtSz, bgcolor=leftBg)
+    table.cell(dash, 1, 1, reactionState, text_color=color.white, text_size=txtSz, bgcolor=stateBg)
+
+    table.cell(dash, 0, 2, "Nearest", text_color=frameTxt, text_size=txtSz, bgcolor=leftBg)
+    table.cell(dash, 1, 2, nearestTxt, text_color=softTxt, text_size=txtSz, bgcolor=rightBg)
+
+    table.cell(dash, 0, 3, "Distance", text_color=frameTxt, text_size=txtSz, bgcolor=leftBg)
+    table.cell(dash, 1, 3, distanceTxt, text_color=softTxt, text_size=txtSz, bgcolor=rightBg)
+
+    table.cell(dash, 0, 4, "Nearest Bias", text_color=frameTxt, text_size=txtSz, bgcolor=leftBg)
+    table.cell(dash, 1, 4, nearestBias, text_color=color.black, text_size=txtSz, bgcolor=nearestBiasBg)
+
+    table.cell(dash, 0, 5, "Strongest", text_color=frameTxt, text_size=txtSz, bgcolor=leftBg)
+    table.cell(dash, 1, 5, strongestTxt + " | " + strongestBias, text_color=color.white, text_size=txtSz, bgcolor=color.new(strongestColor, 18))
+
+    table.cell(dash, 0, 6, "Secondary", text_color=frameTxt, text_size=txtSz, bgcolor=leftBg)
+    table.cell(dash, 1, 6, secondaryTxt + " | " + secondaryBias, text_color=color.white, text_size=txtSz, bgcolor=color.new(secondaryColor, 24))
+
+    table.cell(dash, 0, 7, "Tertiary", text_color=frameTxt, text_size=txtSz, bgcolor=leftBg)
+    table.cell(dash, 1, 7, tertiaryTxt + " | " + tertiaryBias, text_color=color.white, text_size=txtSz, bgcolor=color.new(tertiaryColor, 30))
+
+//----------------------------------------
+// Alerts
+//----------------------------------------
+touchStrongest = not na(strongestLevel) and math.abs(close - strongestLevel) <= tol
+touchSecondary = not na(secondaryLevel) and math.abs(close - secondaryLevel) <= tol
+touchTertiary  = not na(tertiaryLevel)  and math.abs(close - tertiaryLevel) <= tol
+
+alertcondition(touchStrongest, title="PMEL Strongest Level Touch", message="PMEL Pro: Price is interacting with the strongest memory level.")
+alertcondition(touchSecondary, title="PMEL Secondary Level Touch", message="PMEL Pro: Price is interacting with the secondary memory level.")
+alertcondition(touchTertiary, title="PMEL Tertiary Level Touch", message="PMEL Pro: Price is interacting with the tertiary memory level.")
+alertcondition(nearAny, title="PMEL Near Memory Level", message="PMEL Pro: Price is near a ranked memory level.")

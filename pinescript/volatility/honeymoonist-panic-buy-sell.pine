@@ -1,0 +1,227 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
+// © Attakorn Poonsilp (@attakorn_poonsilp)
+
+//@version=6
+indicator("Honeymoonist - Panic Buy / Sell", shorttitle = "Panic B/S", overlay = true, max_labels_count = 500)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// §1  Configuration Parameters
+// ─────────────────────────────────────────────────────────────────────────────
+
+// ── Signal Group ──
+buyThreshold  = input.float(1.0,   "Panic Buy Threshold (%)",  minval = 0.01, step = 0.1, group = "Signal")
+sellThreshold = input.float(1.0,   "Panic Sell Threshold (%)", minval = 0.01, step = 0.1, group = "Signal")
+lookbackMode  = input.string("Time Interval", "Lookback Mode",
+                 options = ["Bar Count", "Time Interval", "Cumulative Streak"], group = "Signal")
+lookbackBars  = input.int(10,      "Lookback (bars)",          minval = 1,                group = "Signal")
+lookbackTF    = input.timeframe("1","Lookback Timeframe",                                  group = "Signal")
+cooldownBars  = input.int(3,       "Cooldown (bars)",          minval = 0,                group = "Signal")
+
+// ── Alert Group ──
+alertOnClose  = input.bool(false,  "Alert Only on Bar Close",                             group = "Alert")
+
+// ── Visuals Group ──
+showLabels    = input.bool(true,   "Show Info Labels",                                    group = "Visuals")
+showBG        = input.bool(true,   "Show Background",                                     group = "Visuals")
+labelSizeIn   = input.string("small", "Label Size",
+                 options = ["tiny", "small", "normal", "large"],                           group = "Visuals")
+buyColor      = input.color(#089981, "Panic Buy Color",                                   group = "Visuals")
+sellColor     = input.color(#f23645, "Panic Sell Color",                                  group = "Visuals")
+bgOpacity     = input.int(80,      "Background Opacity",       minval = 0, maxval = 100,  group = "Visuals")
+
+// ── Resolve label size ──
+labelSize = switch labelSizeIn
+    "tiny"   => size.tiny
+    "small"  => size.small
+    "normal" => size.normal
+    "large"  => size.large
+    => size.small
+
+// ─────────────────────────────────────────────────────────────────────────────
+// §2  Helper Functions
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Convert a timeframe string to its duration in seconds.
+tfToSeconds(tf) =>
+    timeframe.in_seconds(tf)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// §3  Lookback Calculation  (Bar Count / Time Interval → fixedN)
+// ─────────────────────────────────────────────────────────────────────────────
+
+chartTFSec    = tfToSeconds(timeframe.period)
+lookbackTFSec = tfToSeconds(lookbackTF)
+
+// Derive N: user-supplied bars or auto-calculated from timeframe ratio.
+fixedN = switch lookbackMode
+    "Bar Count"      => lookbackBars
+    "Time Interval"  => math.max(1, int(math.ceil(lookbackTFSec / chartTFSec)))
+    => 0  // Not used in Cumulative Streak mode
+
+// ─────────────────────────────────────────────────────────────────────────────
+// §4  Fixed-Lookback Detection  (Bar Count & Time Interval)
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Percentage change relative to close[fixedN].
+fixedRefPrice = fixedN > 0 ? close[fixedN] : na
+fixedPctChange = not na(fixedRefPrice) ? (close - fixedRefPrice) / fixedRefPrice * 100 : na
+
+// Raw condition flags (current bar).
+fixedBuyCondition  = not na(fixedPctChange) and fixedPctChange >=  buyThreshold
+fixedSellCondition = not na(fixedPctChange) and fixedPctChange <= -sellThreshold
+
+// Previous bar condition flags (for rising-edge detection — FR-07).
+prevFixedRefPrice   = fixedN > 0 ? close[fixedN + 1] : na
+prevFixedPctChange  = not na(prevFixedRefPrice) ? (close[1] - prevFixedRefPrice) / prevFixedRefPrice * 100 : na
+prevFixedBuyCondition  = not na(prevFixedPctChange) and prevFixedPctChange >=  buyThreshold
+prevFixedSellCondition = not na(prevFixedPctChange) and prevFixedPctChange <= -sellThreshold
+
+// Rising-edge signals: fire only on the transition from false → true.
+fixedRawBuy  = fixedBuyCondition  and not prevFixedBuyCondition
+fixedRawSell = fixedSellCondition and not prevFixedSellCondition
+
+// ─────────────────────────────────────────────────────────────────────────────
+// §5  Cumulative Streak Detection
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Streak state variables (persistent across bars).
+var int   streakDir       = 0      // Current streak direction: +1, -1, or 0
+var float streakAnchor    = na     // Close of the bar before the streak began
+var bool  streakFired     = false  // Has a signal already fired for this streak?
+var bool  isFirstStreak   = true   // Suppress the very first streak on chart load
+
+// Determine bar direction: +1 (up), -1 (down), 0 (neutral).
+barDir = close > close[1] ? 1 : close < close[1] ? -1 : 0
+
+// Track the last definitive (non-neutral) close for anchor purposes.
+var float lastDefinitiveClose = na
+if not na(close[1])
+    if barDir != 0
+        // This bar has a definitive direction; previous close becomes the
+        // potential anchor if a new streak starts.
+        lastDefinitiveClose := close[1]
+    // If barDir == 0 (neutral), we keep lastDefinitiveClose unchanged.
+
+// Detect streak changes.
+if barDir != 0 and barDir != streakDir
+    // Direction reversed → new streak.
+    if streakDir != 0
+        isFirstStreak := false
+    streakDir    := barDir
+    streakAnchor := nz(lastDefinitiveClose, close[1])
+    streakFired  := false
+
+// Cumulative percentage change from the streak anchor.
+streakPctChange = not na(streakAnchor) and streakAnchor != 0
+                  ? (close - streakAnchor) / streakAnchor * 100
+                  : 0.0
+
+// Streak signals (once per streak, suppress first streak).
+streakRawBuy  = false
+streakRawSell = false
+
+if lookbackMode == "Cumulative Streak" and not isFirstStreak and not streakFired
+    if streakDir == 1 and streakPctChange >= buyThreshold
+        streakRawBuy  := true
+        streakFired   := true
+    else if streakDir == -1 and streakPctChange <= -sellThreshold
+        streakRawSell := true
+        streakFired   := true
+
+// ─────────────────────────────────────────────────────────────────────────────
+// §6  Unified Raw Signals
+// ─────────────────────────────────────────────────────────────────────────────
+
+isStreakMode = lookbackMode == "Cumulative Streak"
+rawBuy  = isStreakMode ? streakRawBuy  : fixedRawBuy
+rawSell = isStreakMode ? streakRawSell : fixedRawSell
+
+// ─────────────────────────────────────────────────────────────────────────────
+// §7  Cooldown Gate
+// ─────────────────────────────────────────────────────────────────────────────
+
+var int buyCooldownCounter  = 0
+var int sellCooldownCounter = 0
+
+// Decrement cooldown counters each bar.
+if buyCooldownCounter > 0
+    buyCooldownCounter -= 1
+if sellCooldownCounter > 0
+    sellCooldownCounter -= 1
+
+// Final signals after cooldown suppression.
+panicBuy  = rawBuy  and buyCooldownCounter  == 0
+panicSell = rawSell and sellCooldownCounter == 0
+
+// Reset cooldown on signal fire.
+if panicBuy
+    buyCooldownCounter := cooldownBars
+if panicSell
+    sellCooldownCounter := cooldownBars
+
+// ─────────────────────────────────────────────────────────────────────────────
+// §8  Visual Output
+// ─────────────────────────────────────────────────────────────────────────────
+
+// ── Determine reference price and pctChange for display ──
+displayRefPrice  = isStreakMode ? streakAnchor : fixedRefPrice
+displayPctChange = isStreakMode ? streakPctChange : fixedPctChange
+modeTag          = isStreakMode ? "streak" : str.tostring(fixedN) + " bars"
+
+// ── Shape Markers (FR-12) ──
+plotshape(panicBuy,  title = "Panic Buy Shape",  style = shape.triangleup,
+          location = location.belowbar, color = buyColor,  size = size.small)
+plotshape(panicSell, title = "Panic Sell Shape",  style = shape.triangledown,
+          location = location.abovebar, color = sellColor, size = size.small)
+
+// ── Info Labels (FR-13) ──
+if showLabels and panicBuy
+    txt = "PANIC BUY\n"
+          + str.tostring(displayRefPrice, format.mintick) + " → " + str.tostring(close, format.mintick) + "\n"
+          + str.tostring(displayPctChange, "#.##") + "% (" + modeTag + ")"
+    label.new(bar_index, low, txt,
+              style = label.style_label_up, color = buyColor,
+              textcolor = color.white, size = labelSize)
+
+if showLabels and panicSell
+    txt = "PANIC SELL\n"
+          + str.tostring(displayRefPrice, format.mintick) + " → " + str.tostring(close, format.mintick) + "\n"
+          + str.tostring(displayPctChange, "#.##") + "% (" + modeTag + ")"
+    label.new(bar_index, high, txt,
+              style = label.style_label_down, color = sellColor,
+              textcolor = color.white, size = labelSize)
+
+// ── Background Highlight (FR-14) ──
+bgBuyColor  = color.new(buyColor,  bgOpacity)
+bgSellColor = color.new(sellColor, bgOpacity)
+bgcolor(showBG and panicBuy  ? bgBuyColor  : na, title = "Panic Buy Background")
+bgcolor(showBG and panicSell ? bgSellColor : na, title = "Panic Sell Background")
+
+// ─────────────────────────────────────────────────────────────────────────────
+// §9  Alerts
+// ─────────────────────────────────────────────────────────────────────────────
+
+alertFreq = alertOnClose ? alert.freq_once_per_bar_close : alert.freq_once_per_bar
+
+buyAlertMsg  = "🟢 PANIC BUY — " + syminfo.tickerid
+               + " | " + str.tostring(displayRefPrice, format.mintick)
+               + " → " + str.tostring(close, format.mintick)
+               + " | " + str.tostring(displayPctChange, "#.##") + "%"
+               + " | TF: " + timeframe.period
+               + " | Mode: " + lookbackMode
+
+sellAlertMsg = "🔴 PANIC SELL — " + syminfo.tickerid
+               + " | " + str.tostring(displayRefPrice, format.mintick)
+               + " → " + str.tostring(close, format.mintick)
+               + " | " + str.tostring(displayPctChange, "#.##") + "%"
+               + " | TF: " + timeframe.period
+               + " | Mode: " + lookbackMode
+
+if panicBuy
+    alert(buyAlertMsg, alertFreq)
+
+if panicSell
+    alert(sellAlertMsg, alertFreq)

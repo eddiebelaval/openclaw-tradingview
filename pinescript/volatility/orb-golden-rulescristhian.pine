@@ -1,0 +1,107 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+//@version=6
+strategy("ORB Golden Rules - Smart Sizing", overlay = true, margin_long = 0, margin_short = 0, initial_capital = 2000, currency = currency.USD)
+
+// --- Inputs ---
+grp_risk = "Risk Management"
+slPts    = input.float(30.0, "Stop Loss (Pts)", minval = 1.0, group = grp_risk)
+tpPts    = input.float(30.0, "Take Profit (Pts)", minval = 1.0, group = grp_risk)
+
+grp_chop = "Anti-Chop Filter"
+useChopFilter = input.bool(true, "Enable ADX & Volume Filter", group = grp_chop)
+adxThreshold  = input.int(20, "Min ADX Strength", minval = 1, group = grp_chop)
+volThreshold  = input.float(1.0, "Min Volume Multiplier (RVOL)", minval = 0.1, group = grp_chop)
+
+// --- Smart Sizing Logic ---
+// Detect if we are on MNQ (Micro) or NQ (Mini)
+is_micro = str.contains(syminfo.ticker, "MNQ")
+is_mini  = str.contains(syminfo.ticker, "NQ") and not is_micro
+qtyEntry = is_micro ? 10 : (is_mini ? 1 : 1) // Default to 1 if neither (safety)
+sizingText = is_micro ? "10 MICROS" : (is_mini ? "1 MINI" : "1 CONT.")
+
+// --- Indicators ---
+[plus, minus, adxValue] = ta.dmi(14, 14)
+avgVol = ta.sma(volume, 10)
+relativeVol = not na(avgVol) and avgVol > 0 ? volume / avgVol : 1.0
+
+// --- Time Logic ---
+t_hour = hour(time, "America/New_York")
+t_min  = minute(time, "America/New_York")
+t_total_min = t_hour * 60 + t_min
+
+is_orb_session  = t_total_min >= (9 * 60 + 15) and t_total_min < (9 * 60 + 30)
+is_trade_window = t_total_min >= (9 * 60 + 30) and t_total_min < (11 * 60 + 00)
+is_new_day      = ta.change(dayofmonth(time, "America/New_York")) != 0
+
+// --- State Variables ---
+var float hi915 = na
+var float lo915 = na
+var int tradesToday = 0
+var box orbBox = na
+
+if is_new_day
+    hi915 := na
+    lo915 := na
+    tradesToday := 0
+    orbBox := na
+
+// --- ORB Capture (9:15 - 9:30) ---
+if is_orb_session
+    if na(hi915) or is_new_day
+        hi915 := high
+        lo915 := low
+        orbBox := box.new(bar_index, hi915, bar_index, lo915, border_width = 0, bgcolor = color.new(#434651, 80))
+    else
+        hi915 := math.max(hi915, high)
+        lo915 := math.min(lo915, low)
+        box.set_top(orbBox, hi915)
+        box.set_bottom(orbBox, lo915)
+        box.set_right(orbBox, bar_index)
+
+float rangeSize = not na(hi915) ? hi915 - lo915 : 0
+bool is_valid_range = rangeSize >= 20 and rangeSize <= 40
+bool is_not_choppy = not useChopFilter or (adxValue > adxThreshold and relativeVol >= volThreshold)
+
+// --- Execution (Strict Golden Rules) ---
+if is_trade_window and tradesToday == 0 and is_valid_range and is_not_choppy and strategy.position_size == 0
+    // LONG
+    if close > hi915 and close[1] <= hi915
+        float move = high - open
+        if move > 7
+            strategy.entry("Long", strategy.long, qty = qtyEntry)
+            strategy.exit("Exit", "Long", limit = close + tpPts, stop = close - slPts)
+            tradesToday := 1
+            label.new(bar_index, high, "A+ LONG", color = #089981, textcolor = color.white, style = label.style_label_down, size = size.small)
+            box.new(bar_index, close + tpPts, bar_index + 12, close, bgcolor = color.new(#2962ff, 60), border_width = 0) 
+            box.new(bar_index, close, bar_index + 12, close - slPts, bgcolor = color.new(#434651, 60), border_width = 0)
+
+    // SHORT
+    else if close < lo915 and close[1] >= lo915
+        float move = open - low
+        if move > 7
+            strategy.entry("Short", strategy.short, qty = qtyEntry)
+            strategy.exit("Exit", "Short", limit = close - tpPts, stop = close + slPts)
+            tradesToday := 1
+            label.new(bar_index, low, "A+ SHORT", color = #f23645, textcolor = color.white, style = label.style_label_up, size = size.small)
+            box.new(bar_index, close, bar_index + 12, close - tpPts, bgcolor = color.new(#2962ff, 60), border_width = 0) 
+            box.new(bar_index, close + slPts, bar_index + 12, close, bgcolor = color.new(#434651, 60), border_width = 0)
+
+// --- Funding Hub Dashboard ---
+var table hub = table.new(position.bottom_right, 2, 6, bgcolor = #1e222d, border_width = 1, border_color = #363a45)
+if barstate.islast
+    table.cell(hub, 0, 0, "FUNDING HUB", bgcolor = #2962ff, text_color = color.white)
+    table.cell(hub, 1, 0, sizingText, bgcolor = #2962ff, text_color = color.white)
+    table.cell(hub, 0, 1, "Context", text_color = color.white, text_halign = text.align_left)
+    table.cell(hub, 1, 1, adxValue > adxThreshold ? "TRENDING" : "CHOPPY", text_color = adxValue > adxThreshold ? color.green : color.red)
+    table.cell(hub, 0, 2, "ORB Size", text_color = color.white, text_halign = text.align_left)
+    table.cell(hub, 1, 2, str.tostring(rangeSize, "#.#"), text_color = is_valid_range ? color.green : color.red)
+    table.cell(hub, 0, 3, "RVOL", text_color = color.white, text_halign = text.align_left)
+    table.cell(hub, 1, 3, str.tostring(relativeVol, "#.##") + "x", text_color = relativeVol >= volThreshold ? color.green : color.red)
+    table.cell(hub, 0, 4, "Trades Today", text_color = color.white, text_halign = text.align_left)
+    table.cell(hub, 1, 4, str.tostring(tradesToday), text_color = color.yellow)
+    table.cell(hub, 0, 5, "Allocation", text_color = color.white, text_halign = text.align_left)
+    table.cell(hub, 1, 5, "ACTIVE", text_color = #00bcd4)
+
+// Visual Plots
+plot(is_trade_window and is_valid_range ? hi915 : na, "High", color = color.new(#089981, 75), style = plot.style_linebr)
+plot(is_trade_window and is_valid_range ? lo915 : na, "Low", color = color.new(#f23645, 75), style = plot.style_linebr)

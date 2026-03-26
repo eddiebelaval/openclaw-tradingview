@@ -1,0 +1,294 @@
+//@version=6
+indicator("Absorption Detector [forexobroker]", shorttitle="ABD", overlay=true, max_labels_count=500, max_boxes_count=200)
+
+// ══════════════════════════════════════════════════════════════════════════════
+// Absorption Detector [forexobroker]
+// Detects volume absorption at key levels — heavy volume with minimal price
+// movement signals institutional orders absorbing opposing pressure.
+// ══════════════════════════════════════════════════════════════════════════════
+
+// ──────────────────────────────────────────────────────────────────────────────
+// INPUTS
+// ──────────────────────────────────────────────────────────────────────────────
+
+grp_det = "Detection"
+volLen       = input.int(20, "Volume Lookback", minval=5, maxval=100, group=grp_det, tooltip="Period for calculating average volume")
+volMult      = input.float(2.0, "Volume Spike Multiplier", minval=1.0, maxval=5.0, step=0.1, group=grp_det, tooltip="Volume must exceed average × this to qualify as a spike")
+maxBodyPct   = input.float(30.0, "Max Body % of Range", minval=5.0, maxval=60.0, step=5.0, group=grp_det, tooltip="Maximum body-to-range ratio — absorption bars have small bodies relative to range")
+minWickPct   = input.float(40.0, "Min Wick % of Range", minval=10.0, maxval=80.0, step=5.0, group=grp_det, tooltip="Minimum total wick percentage — absorption bars have large wicks showing rejection")
+atrLen       = input.int(14, "ATR Length", minval=5, maxval=50, group=grp_det, tooltip="ATR period for range normalization")
+maxRangeATR  = input.float(1.5, "Max Range × ATR", minval=0.5, maxval=3.0, step=0.1, group=grp_det, tooltip="Bar range must not exceed ATR × this — absorption = contained range despite volume")
+
+grp_cls = "Classification"
+showPassive  = input.bool(true, "Show Passive Absorption", group=grp_cls, tooltip="Small body, big wicks — orders quietly absorbed")
+showAggress  = input.bool(true, "Show Aggressive Absorption", group=grp_cls, tooltip="Engulfing pattern with high volume — aggressive defense of level")
+showExhaust  = input.bool(true, "Show Exhaustion Absorption", group=grp_cls, tooltip="Volume climax with reversal wick — final push absorbed")
+
+grp_sig = "Signals"
+showSignals  = input.bool(true, "Show BUY/SELL Signals", group=grp_sig, tooltip="Directional signals based on absorption type and wick direction")
+minIntensity = input.int(2, "Min Intensity for Signals", minval=1, maxval=5, group=grp_sig, tooltip="Minimum intensity score (1-5) to trigger BUY/SELL")
+showZones    = input.bool(true, "Show Absorption Zones", group=grp_sig, tooltip="Draw zones around absorption bars")
+zoneExtend   = input.int(20, "Zone Extension (bars)", minval=5, maxval=100, group=grp_sig, tooltip="How far right absorption zones extend")
+
+grp_dsp = "Display"
+showDashboard = input.bool(true, "Show Dashboard", group=grp_dsp)
+showDots      = input.bool(true, "Show Volume Dots", group=grp_dsp, tooltip="Small dots marking high-volume bars")
+tblPos        = input.string("top_right", "Dashboard Position", options=["top_left", "top_center", "top_right", "bottom_left", "bottom_center", "bottom_right"], group=grp_dsp)
+txtSize       = input.string("normal", "Text Size", options=["tiny", "small", "normal", "large"], group=grp_dsp)
+
+grp_clr = "Colors"
+bullAbsColor  = input.color(#26A69A, "Bullish Absorption", group=grp_clr)
+bearAbsColor  = input.color(#EF5350, "Bearish Absorption", group=grp_clr)
+passiveColor  = input.color(#42A5F5, "Passive", group=grp_clr)
+aggressColor  = input.color(#FF9800, "Aggressive", group=grp_clr)
+exhaustColor  = input.color(#AB47BC, "Exhaustion", group=grp_clr)
+
+// ──────────────────────────────────────────────────────────────────────────────
+// CORE CALCULATIONS
+// ──────────────────────────────────────────────────────────────────────────────
+
+float avgVol   = ta.sma(volume, volLen)
+float atrVal   = ta.atr(atrLen)
+float barRng   = high - low
+float bodySize = math.abs(close - open)
+float upperWick = high - math.max(close, open)
+float lowerWick = math.min(close, open) - low
+float totalWick = upperWick + lowerWick
+
+// Ratios
+float bodyPct  = barRng > 0 ? bodySize / barRng * 100 : 100.0
+float wickPct  = barRng > 0 ? totalWick / barRng * 100 : 0.0
+float volRatio = avgVol > 0 ? volume / avgVol : 0.0
+
+// Direction bias from wicks
+bool bullWick = lowerWick > upperWick  // bigger lower wick = buying absorbed selling
+bool bearWick = upperWick > lowerWick  // bigger upper wick = selling absorbed buying
+
+// Is this bar a volume spike?
+bool isVolSpike = volume > avgVol * volMult and volume > 0
+
+// Is range contained (not a breakout bar)?
+bool isContained = barRng <= atrVal * maxRangeATR and barRng > 0
+
+// ──────────────────────────────────────────────────────────────────────────────
+// ABSORPTION CLASSIFICATION
+// ──────────────────────────────────────────────────────────────────────────────
+
+// --- Passive Absorption ---
+// Small body, large wicks, high volume — orders quietly absorbed without price movement
+bool passiveAbs = isVolSpike and isContained and bodyPct <= maxBodyPct and wickPct >= minWickPct
+
+// --- Aggressive Absorption ---
+// Engulfing bar with high volume — one side aggressively defending a level
+// Current bar engulfs previous bar AND has high volume
+bool bullEngulf = close > open and open <= close[1] and close >= open[1] and low < low[1]
+bool bearEngulf = close < open and open >= close[1] and close <= open[1] and high > high[1]
+bool aggressAbs = isVolSpike and isContained and (bullEngulf or bearEngulf)
+
+// --- Exhaustion Absorption ---
+// Volume climax (very high volume) with strong wick rejection — final push absorbed
+float exhaustMult = volMult * 1.5  // higher threshold for exhaustion
+bool isVolClimax = volume > avgVol * exhaustMult
+// One wick must be dominant (>60% of total wick)
+float wickDominance = totalWick > 0 ? math.max(upperWick, lowerWick) / totalWick * 100 : 0
+bool hasRejectionWick = wickDominance > 60 and wickPct >= 50
+bool exhaustAbs = isVolClimax and isContained and hasRejectionWick
+
+// Any absorption detected
+bool isPassive  = showPassive and passiveAbs and not aggressAbs and not exhaustAbs
+bool isAggress  = showAggress and aggressAbs and not exhaustAbs
+bool isExhaust  = showExhaust and exhaustAbs
+
+bool anyAbsorption = isPassive or isAggress or isExhaust
+
+// ──────────────────────────────────────────────────────────────────────────────
+// INTENSITY SCORING
+// ──────────────────────────────────────────────────────────────────────────────
+
+// Score 1-5 based on volume magnitude, wick dominance, and type
+int intensity = 0
+if anyAbsorption
+    // Base score from volume ratio
+    intensity := volRatio >= 4.0 ? 3 : volRatio >= 3.0 ? 2 : 1
+    // Bonus for wick dominance
+    if wickDominance > 75
+        intensity += 1
+    // Bonus for exhaustion type (rarest, strongest)
+    if isExhaust
+        intensity += 1
+    // Cap at 5
+    intensity := math.min(intensity, 5)
+
+// Determine direction
+bool isBullish = anyAbsorption and (bullWick or bullEngulf)
+bool isBearish = anyAbsorption and (bearWick or bearEngulf) and not isBullish
+
+// ──────────────────────────────────────────────────────────────────────────────
+// TRACKING & SUCCESS RATE
+// ──────────────────────────────────────────────────────────────────────────────
+
+var int totalBullAbs    = 0
+var int totalBearAbs    = 0
+var int successBullAbs  = 0
+var int successBearAbs  = 0
+var int totalPassive    = 0
+var int totalAggressive = 0
+var int totalExhaustion = 0
+var int lastAbsBar      = 0
+var int lastAbsType     = 0  // 1=bull passive, 2=bear passive, 3=bull aggress, 4=bear aggress, 5=bull exhaust, 6=bear exhaust
+
+// Pending success checks
+var int   pendBullBar   = 0
+var float pendBullPrice = 0.0
+var int   pendBearBar   = 0
+var float pendBearPrice = 0.0
+
+if anyAbsorption and barstate.isconfirmed
+    if isPassive
+        totalPassive += 1
+    if isAggress
+        totalAggressive += 1
+    if isExhaust
+        totalExhaustion += 1
+
+    if isBullish
+        totalBullAbs += 1
+        pendBullBar   := bar_index
+        pendBullPrice := close
+        lastAbsBar    := bar_index
+        lastAbsType   := isExhaust ? 5 : isAggress ? 3 : 1
+    if isBearish
+        totalBearAbs += 1
+        pendBearBar   := bar_index
+        pendBearPrice := close
+        lastAbsBar    := bar_index
+        lastAbsType   := isExhaust ? 6 : isAggress ? 4 : 2
+
+// Check success after 10 bars
+if pendBullBar > 0 and bar_index - pendBullBar == 10
+    if close > pendBullPrice
+        successBullAbs += 1
+    pendBullBar := 0
+if pendBearBar > 0 and bar_index - pendBearBar == 10
+    if close < pendBearPrice
+        successBearAbs += 1
+    pendBearBar := 0
+
+// ──────────────────────────────────────────────────────────────────────────────
+// VISUALS — LABELS & ZONES
+// ──────────────────────────────────────────────────────────────────────────────
+
+// Determine label color by type
+color absLabelColor = isExhaust ? exhaustColor : isAggress ? aggressColor : passiveColor
+string absTypeText = isExhaust ? "EXH" : isAggress ? "AGG" : "PAS"
+
+// Absorption labels
+if anyAbsorption and barstate.isconfirmed
+    string dirText = isBullish ? "Bull" : isBearish ? "Bear" : "Neut"
+    string fullText = absTypeText + " " + dirText + "\n" + str.tostring(intensity) + "/5"
+    if isBullish
+        label.new(bar_index, low, fullText, style=label.style_label_up, color=color.new(absLabelColor, 50), textcolor=absLabelColor, size=size.small)
+    else
+        label.new(bar_index, high, fullText, style=label.style_label_down, color=color.new(absLabelColor, 50), textcolor=absLabelColor, size=size.small)
+
+// Absorption zones
+if anyAbsorption and showZones and barstate.isconfirmed
+    color zoneCol = isBullish ? bullAbsColor : isBearish ? bearAbsColor : passiveColor
+    int zoneTransp = intensity >= 4 ? 80 : intensity >= 3 ? 85 : 90
+    box.new(bar_index, high, bar_index + zoneExtend, low, border_color=color.new(zoneCol, 50), bgcolor=color.new(zoneCol, zoneTransp), border_width=1, border_style=line.style_dotted)
+
+// Volume spike dots
+plotshape(showDots and isVolSpike and not anyAbsorption, "Vol Spike", shape.circle, location.belowbar, color.new(color.gray, 50), size=size.tiny)
+
+// ──────────────────────────────────────────────────────────────────────────────
+// BUY/SELL SIGNALS
+// ──────────────────────────────────────────────────────────────────────────────
+
+bool buySignal  = anyAbsorption and isBullish and intensity >= minIntensity
+bool sellSignal = anyAbsorption and isBearish and intensity >= minIntensity
+
+plotshape(showSignals and buySignal, "BUY", shape.labelup, location.belowbar, bullAbsColor, text="BUY", textcolor=color.white, size=size.small)
+plotshape(showSignals and sellSignal, "SELL", shape.labeldown, location.abovebar, bearAbsColor, text="SELL", textcolor=color.white, size=size.small)
+
+// ──────────────────────────────────────────────────────────────────────────────
+// BAR COLORING
+// ──────────────────────────────────────────────────────────────────────────────
+
+color absBarCol = isExhaust ? exhaustColor : isAggress ? aggressColor : isPassive ? passiveColor : na
+barcolor(anyAbsorption ? absBarCol : na, title="Absorption Bar Color")
+
+// ──────────────────────────────────────────────────────────────────────────────
+// DASHBOARD
+// ──────────────────────────────────────────────────────────────────────────────
+
+var tblSz = txtSize == "tiny" ? size.tiny : txtSize == "small" ? size.small : txtSize == "large" ? size.large : size.normal
+var tblPosition = tblPos == "top_left" ? position.top_left : tblPos == "top_center" ? position.top_center : tblPos == "top_right" ? position.top_right : tblPos == "bottom_left" ? position.bottom_left : tblPos == "bottom_center" ? position.bottom_center : position.bottom_right
+
+if showDashboard and barstate.islast
+    var table dash = table.new(tblPosition, 2, 10, border_width=1, border_color=#333333, frame_width=2, frame_color=#333333)
+
+    // Title
+    table.cell(dash, 0, 0, "ABSORPTION", bgcolor=#1a1a2e, text_color=#e0e0e0, text_size=tblSz)
+    table.cell(dash, 1, 0, "DETECTOR", bgcolor=#1a1a2e, text_color=#aaaaaa, text_size=tblSz)
+
+    // Current volume
+    string volTxt = str.tostring(volRatio, "#.#") + "x avg"
+    color volCol = volRatio >= volMult ? bullAbsColor : color.gray
+    table.cell(dash, 0, 1, "Volume", bgcolor=#2a2a3e, text_color=#aaaaaa, text_size=tblSz)
+    table.cell(dash, 1, 1, volTxt, bgcolor=#1e1e1e, text_color=volCol, text_size=tblSz)
+
+    // Body/Wick ratios
+    table.cell(dash, 0, 2, "Body/Wick %", bgcolor=#2a2a3e, text_color=#aaaaaa, text_size=tblSz)
+    table.cell(dash, 1, 2, str.tostring(bodyPct, "#") + "% / " + str.tostring(wickPct, "#") + "%", bgcolor=#1e1e1e, text_color=#e0e0e0, text_size=tblSz)
+
+    // Type counts
+    table.cell(dash, 0, 3, "Passive", bgcolor=#2a2a3e, text_color=passiveColor, text_size=tblSz)
+    table.cell(dash, 1, 3, str.tostring(totalPassive), bgcolor=#1e1e1e, text_color=passiveColor, text_size=tblSz)
+
+    table.cell(dash, 0, 4, "Aggressive", bgcolor=#2a2a3e, text_color=aggressColor, text_size=tblSz)
+    table.cell(dash, 1, 4, str.tostring(totalAggressive), bgcolor=#1e1e1e, text_color=aggressColor, text_size=tblSz)
+
+    table.cell(dash, 0, 5, "Exhaustion", bgcolor=#2a2a3e, text_color=exhaustColor, text_size=tblSz)
+    table.cell(dash, 1, 5, str.tostring(totalExhaustion), bgcolor=#1e1e1e, text_color=exhaustColor, text_size=tblSz)
+
+    // Direction counts
+    table.cell(dash, 0, 6, "Bull / Bear", bgcolor=#2a2a3e, text_color=#aaaaaa, text_size=tblSz)
+    table.cell(dash, 1, 6, str.tostring(totalBullAbs) + " / " + str.tostring(totalBearAbs), bgcolor=#1e1e1e, text_color=#e0e0e0, text_size=tblSz)
+
+    // Success rates
+    float bullSuccRate = totalBullAbs > 0 ? successBullAbs * 100.0 / totalBullAbs : 0.0
+    float bearSuccRate = totalBearAbs > 0 ? successBearAbs * 100.0 / totalBearAbs : 0.0
+    table.cell(dash, 0, 7, "Bull Success", bgcolor=#2a2a3e, text_color=#aaaaaa, text_size=tblSz)
+    table.cell(dash, 1, 7, str.tostring(bullSuccRate, "#.#") + "%", bgcolor=#1e1e1e, text_color=bullSuccRate > 50 ? bullAbsColor : bearAbsColor, text_size=tblSz)
+
+    table.cell(dash, 0, 8, "Bear Success", bgcolor=#2a2a3e, text_color=#aaaaaa, text_size=tblSz)
+    table.cell(dash, 1, 8, str.tostring(bearSuccRate, "#.#") + "%", bgcolor=#1e1e1e, text_color=bearSuccRate > 50 ? bullAbsColor : bearAbsColor, text_size=tblSz)
+
+    // Last absorption
+    string lastTypeTxt = lastAbsType == 1 ? "Bull Pas" : lastAbsType == 2 ? "Bear Pas" : lastAbsType == 3 ? "Bull Agg" : lastAbsType == 4 ? "Bear Agg" : lastAbsType == 5 ? "Bull Exh" : lastAbsType == 6 ? "Bear Exh" : "None"
+    color lastCol = lastAbsType == 1 or lastAbsType == 3 or lastAbsType == 5 ? bullAbsColor : lastAbsType == 2 or lastAbsType == 4 or lastAbsType == 6 ? bearAbsColor : #aaaaaa
+    int barsAgo = lastAbsBar > 0 ? bar_index - lastAbsBar : 0
+    string agoTxt = barsAgo > 0 ? " (" + str.tostring(barsAgo) + " bars)" : ""
+    table.cell(dash, 0, 9, "Last Signal", bgcolor=#2a2a3e, text_color=#aaaaaa, text_size=tblSz)
+    table.cell(dash, 1, 9, lastTypeTxt + agoTxt, bgcolor=#1e1e1e, text_color=lastCol, text_size=tblSz)
+
+// ──────────────────────────────────────────────────────────────────────────────
+// DATA WINDOW
+// ──────────────────────────────────────────────────────────────────────────────
+
+plot(volRatio, "Volume Ratio", display=display.data_window)
+plot(bodyPct, "Body %", display=display.data_window)
+plot(wickPct, "Wick %", display=display.data_window)
+plot(intensity * 1.0, "Intensity", display=display.data_window)
+
+// ──────────────────────────────────────────────────────────────────────────────
+// ALERTS
+// ──────────────────────────────────────────────────────────────────────────────
+
+alertcondition(isPassive and isBullish, "Bullish Passive Absorption", "ABD: Bullish passive absorption detected")
+alertcondition(isPassive and isBearish, "Bearish Passive Absorption", "ABD: Bearish passive absorption detected")
+alertcondition(isAggress and isBullish, "Bullish Aggressive Absorption", "ABD: Bullish aggressive absorption detected")
+alertcondition(isAggress and isBearish, "Bearish Aggressive Absorption", "ABD: Bearish aggressive absorption detected")
+alertcondition(isExhaust, "Exhaustion Absorption", "ABD: Exhaustion absorption detected")
+alertcondition(buySignal, "Buy Signal", "ABD: Absorption BUY signal")
+alertcondition(sellSignal, "Sell Signal", "ABD: Absorption SELL signal")

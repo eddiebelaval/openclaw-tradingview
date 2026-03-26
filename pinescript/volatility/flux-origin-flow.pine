@@ -1,0 +1,2485 @@
+//@version=6
+indicator("Flux Origin_Flow", overlay=true, max_labels_count=500, max_boxes_count=200, max_lines_count=500, dynamic_requests=true)
+
+// -------------------- Settings: Mode
+grpMode = "Quick Setup"
+settingsMode = input.string("Simple", "Settings Mode", options=["Simple", "Advanced"], group=grpMode, tooltip="Simple keeps the most-used controls active. Advanced unlocks all tuning controls.")
+futuresProfileMode = input.string("ES Default", "Futures Profile", options=["ES Default", "NQ Default", "CL Default", "GC Default", "General Futures", "Custom"], group=grpMode, tooltip="ES Default applies the recommended ES footprint and zone settings. NQ Default applies a stricter NQ profile. CL Default is tuned for crude oil, GC Default for gold, General Futures for a broad balanced preset, and Custom uses the manual settings below.")
+settingsAdvanced = settingsMode == "Advanced"
+
+// -------------------- Settings: Signal Filters
+grpFilters = "Signal Filters"
+newsGuard = input.bool(false, "Pause All Signals", group=grpFilters, tooltip="Manual kill switch. Blocks all chart marks and alert events.")
+cooldownBars = input.int(5, "Cooldown After Signal (Bars)", minval=0, group=grpFilters, tooltip="After any emitted mark, suppress new marks for this many bars.")
+
+// -------------------- Settings: Pattern Model
+grpPattern = "Pattern Model"
+atrLen = input.int(14, "ATR Length", minval=1, group=grpPattern, tooltip="ATR smoothing length used for range-normalized pattern checks.")
+atrMult = input.float(1.4, "Momentum Range Multiplier (TR > ATR x)", step=0.1, group=grpPattern, tooltip="Momentum needs TR > ATR x this multiplier. Higher is stricter.")
+useVolRegimeFilter = input.bool(true, "Use ATR/VIX Regime Filter", group=grpPattern, tooltip="When enabled, high-volatility regimes raise thresholds to reduce turbulence-driven false positives.")
+vixSymbol = input.symbol("CBOE:VIX", "VIX Symbol", group=grpPattern, tooltip="Volatility index used for regime checks. If unavailable, ATR percentile still works.", active=settingsAdvanced)
+vixHighThreshold = input.float(22.0, "VIX High Threshold", step=0.5, group=grpPattern, tooltip="If VIX is at or above this level, stricter filtering is applied.", active=settingsAdvanced)
+vixShockThresholdPct = input.float(8.0, "VIX Shock Threshold (% vs prior day)", step=0.5, group=grpPattern, tooltip="If daily VIX change is at or above this percent, stricter filtering is applied.", active=settingsAdvanced)
+atrRegimeLookback = input.int(200, "ATR Percentile Lookback", minval=50, group=grpPattern, tooltip="Lookback for ATR percentile ranking used in volatility regime detection.", active=settingsAdvanced)
+atrHighPercentile = input.float(80.0, "ATR High Percentile Trigger", minval=50.0, maxval=99.0, step=1.0, group=grpPattern, tooltip="If ATR percentile is at or above this value, stricter filtering is applied.", active=settingsAdvanced)
+regimeZBump = input.float(0.35, "Regime Z Threshold Add", step=0.05, group=grpPattern, tooltip="Added to elevated/institutional z thresholds during high-volatility regime.", active=settingsAdvanced)
+regimeScoreBump = input.float(0.5, "Regime Min Score Add", step=0.1, group=grpPattern, tooltip="Added to the minimum pattern score during high-volatility regime.", active=settingsAdvanced)
+
+// -------------------- Settings: Economic Context (Backup Layer)
+grpEcon = "Advanced: Economic Context"
+useEconomicContext = input.bool(false, "Use Economic Context Layer", group=grpEcon, tooltip="Optional backup context from request.economic() series. Affects regime strictness only.", active=settingsAdvanced)
+econUnrateLevel = input.float(4.5, "US Unemployment Caution Level", step=0.1, group=grpEcon, tooltip="If UR (US unemployment rate) is at/above this level, context regime is considered cautious.", active=settingsAdvanced)
+econUnrateMoMJump = input.float(0.2, "US Unemployment MoM Jump Trigger", step=0.1, group=grpEcon, tooltip="If UR monthly change is at/above this value, context regime is considered cautious.", active=settingsAdvanced)
+econZBump = input.float(0.2, "Economic Regime Z Add", step=0.05, group=grpEcon, tooltip="Added to z-threshold gates when economic caution regime is active.", active=settingsAdvanced)
+econScoreBump = input.float(0.3, "Economic Regime Score Add", step=0.1, group=grpEcon, tooltip="Added to min pattern score when economic caution regime is active.", active=settingsAdvanced)
+
+// -------------------- Settings: High-Impact Releases (News Row)
+grpImpact = "High-Impact Releases (News Row)"
+useHighImpactActivity = input.bool(true, "Show High-Impact Releases In News Row", group=grpImpact, tooltip="Flags release bars from request.economic() in the News row. This is release-detection context, not a forward calendar.")
+impactHoldBars = input.int(3, "Release Highlight Hold (Bars)", minval=0, maxval=240, group=grpImpact, tooltip="Keep release context active for this many bars after a detected update.", active=settingsAdvanced)
+trackImpactAHE = input.bool(true, "Track Average Hourly Earnings", group=grpImpact, active=settingsAdvanced)
+trackImpactCoreCPI = input.bool(true, "Track Core CPI", group=grpImpact, active=settingsAdvanced)
+trackImpactCorePCE = input.bool(true, "Track Core PCE", group=grpImpact, active=settingsAdvanced)
+trackImpactCoreRetail = input.bool(true, "Track Core Retail Sales", group=grpImpact, tooltip="Uses Retail Sales Excluding Autos as the closest TradingView economic series.", active=settingsAdvanced)
+trackImpactCPI = input.bool(true, "Track CPI", group=grpImpact, active=settingsAdvanced)
+trackImpactPCE = input.bool(true, "Track PCE", group=grpImpact, active=settingsAdvanced)
+trackImpactPPI = input.bool(true, "Track PPI", group=grpImpact, active=settingsAdvanced)
+trackImpactNFP = input.bool(true, "Track NFP", group=grpImpact, active=settingsAdvanced)
+trackImpactClaims = input.bool(true, "Track Initial Jobless Claims", group=grpImpact, active=settingsAdvanced)
+trackImpactADP = input.bool(true, "Track ADP Employment Change", group=grpImpact, active=settingsAdvanced)
+trackImpactRetailSales = input.bool(true, "Track Retail Sales", group=grpImpact, active=settingsAdvanced)
+trackImpactUnemployment = input.bool(true, "Track Unemployment Rate", group=grpImpact, active=settingsAdvanced)
+trackImpactCCI = input.bool(true, "Track CCI", group=grpImpact, active=settingsAdvanced)
+trackImpactFOMCProxy = input.bool(true, "Track FOMC Proxy (US INTR)", group=grpImpact, tooltip="FOMC proxy uses US Interest Rate (INTR) updates via request.economic().", active=settingsAdvanced)
+
+// -------------------- Settings: MTF Gate
+grpMTF = "MTF Gate"
+requireMTF = input.bool(false, "Force HTF Confirmation Gate", group=grpMTF, tooltip="Always enforces HTF pass as a hard signal gate, regardless of Advanced Mode.")
+higherTF_override = input.string("60", "HTF Override (e.g. 60,120,240,1D)", group=grpMTF, tooltip="Default is 60 minutes. If blank, 60 is used. If not higher than chart timeframe, script auto-raises to the next higher timeframe.", active=settingsAdvanced)
+zThreshHTF = input.float(0.8, "HTF Gate Threshold (Z >)", step=0.1, group=grpMTF, tooltip="HTF passes when confirmed HTF z is greater than this threshold.", active=settingsAdvanced)
+
+// -------------------- Settings: Relative Activity
+grpRel = "Advanced: Relative Activity"
+useRelativeActivity = input.bool(false, "Use Relative Activity vs Benchmark", group=grpRel, tooltip="Uses symbol z minus benchmark z to isolate symbol-specific activity.", active=settingsAdvanced)
+benchmarkSymbol = input.symbol("AMEX:SPY", "Benchmark Symbol", group=grpRel, tooltip="Reference symbol used when Relative Activity mode is ON.", active=settingsAdvanced)
+relativeZOffset = input.float(0.0, "Relative Z Offset", step=0.1, group=grpRel, tooltip="Extra strictness in relative mode. Positive values require stronger relative activity.", active=settingsAdvanced)
+
+// -------------------- Settings: Session Context
+grpSession = "Advanced: Session Context"
+sessionModel = input.string("Futures (24h)", "Session Model", options=["Futures (24h)", "Auto (Exchange Session)"], group=grpSession, tooltip="Session phase model for non-futures symbols. Futures symbols always use the Futures (24h) phase map.", active=settingsAdvanced)
+futSessionStartHour = input.int(18, "Futures Session Start Hour (NY)", minval=0, maxval=23, group=grpSession, tooltip="NY-time hour when the futures trading day starts.", active=settingsAdvanced)
+futSessionStartMin = input.int(0, "Futures Session Start Minute (NY)", minval=0, maxval=59, group=grpSession, tooltip="NY-time minute when the futures trading day starts.", active=settingsAdvanced)
+tokyoOpenHour = input.int(21, "Tokyo Session Hour (NY)", minval=0, maxval=23, group=grpSession, tooltip="Hour marker for Tokyo phase start in the futures footprint map.", active=settingsAdvanced)
+tokyoOpenMin = input.int(0, "Tokyo Session Minute (NY)", minval=0, maxval=59, group=grpSession, tooltip="Minute marker for Tokyo phase start in the futures footprint map.", active=settingsAdvanced)
+preLondonHour = input.int(2, "PreLondon Hour (NY)", minval=0, maxval=23, group=grpSession, tooltip="Hour marker for PreLondon phase start in the futures footprint map.", active=settingsAdvanced)
+preLondonMin = input.int(0, "PreLondon Minute (NY)", minval=0, maxval=59, group=grpSession, tooltip="Minute marker for PreLondon phase start in the futures footprint map.", active=settingsAdvanced)
+londonOpenHour = input.int(3, "London Session Hour (NY)", minval=0, maxval=23, group=grpSession, tooltip="Hour marker for London phase start in the futures phase map.", active=settingsAdvanced)
+londonOpenMin = input.int(0, "London Session Minute (NY)", minval=0, maxval=59, group=grpSession, tooltip="Minute marker for London phase start in the futures phase map.", active=settingsAdvanced)
+usOpenHour = input.int(8, "NY Open Hour", minval=0, maxval=23, group=grpSession, tooltip="Hour marker for NY Open phase start in the futures phase map.", active=settingsAdvanced)
+usOpenMin = input.int(30, "NY Open Minute", minval=0, maxval=59, group=grpSession, tooltip="Minute marker for NY Open phase start in the futures phase map.", active=settingsAdvanced)
+usMiddayHour = input.int(11, "NY Midday Hour", minval=0, maxval=23, group=grpSession, tooltip="Hour marker for NY Midday phase start in the futures phase map.", active=settingsAdvanced)
+usMiddayMin = input.int(0, "NY Midday Minute", minval=0, maxval=59, group=grpSession, tooltip="Minute marker for NY Midday phase start in the futures phase map.", active=settingsAdvanced)
+usClosePhaseHour = input.int(13, "NY Close Phase Hour", minval=0, maxval=23, group=grpSession, tooltip="Hour marker for NY Close phase start in the futures phase map.", active=settingsAdvanced)
+usClosePhaseMin = input.int(30, "NY Close Phase Minute", minval=0, maxval=59, group=grpSession, tooltip="Minute marker for NY Close phase start in the futures phase map.", active=settingsAdvanced)
+futSessionEndHour = input.int(17, "Futures Session End Hour (NY)", minval=0, maxval=23, group=grpSession, tooltip="NY-time hour when the futures session ends before maintenance.", active=settingsAdvanced)
+futSessionEndMin = input.int(0, "Futures Session End Minute (NY)", minval=0, maxval=59, group=grpSession, tooltip="NY-time minute when the futures session ends before maintenance.", active=settingsAdvanced)
+
+// -------------------- Settings: Footprint (Futures)
+grpFootprint = "Footprint (Futures)"
+useFootprintContext = input.bool(true, "Enable Footprint", group=grpFootprint, tooltip="Turns ON the futures footprint module in the dashboard and signal gating.")
+footprintGateMode = input.string("Soft", "Signal Filter Mode", options=["Soft", "Hard"], group=grpFootprint, tooltip="Soft = reduce confidence on mismatch. Hard = block directional signals on mismatch.", active=settingsAdvanced and useFootprintContext)
+fpProfile = input.string("ES", "Instrument Preset", options=["Manual", "ES", "NQ", "Generic Futures", "GC", "CL", "YM"], group=grpFootprint, tooltip="Quick preset for ES/NQ/GC/CL/YM. Choose Manual to use custom values below. When Futures Profile is ES Default or NQ Default, that profile overrides this preset.")
+fpRowsPerFootprint = input.int(100, "Footprint Detail (Ticks/Row)", minval=10, group=grpFootprint, tooltip="Smaller row size = more detailed footprint rows.", active=settingsAdvanced and useFootprintContext)
+fpValueAreaPct = input.int(70, "Value Area (%)", minval=50, maxval=99, group=grpFootprint, tooltip="Value-area parameter used by request.footprint().", active=settingsAdvanced and useFootprintContext)
+fpDeltaPctThreshold = input.float(0.08, "Bias Threshold (0.08 = 8%)", minval=0.01, maxval=0.50, step=0.01, group=grpFootprint, tooltip="Bull if session delta/volume is above +threshold. Bear if below -threshold.", active=settingsAdvanced and useFootprintContext)
+fpMinSessionVol = input.float(120000, "Base Min Session Volume", minval=0, step=1000, group=grpFootprint, tooltip="Base volume threshold used by Footprint. In Adaptive mode, this scales by session length.", active=settingsAdvanced and useFootprintContext)
+fpVolumeCheckMode = input.string("Adaptive", "Volume Check Mode", options=["Adaptive", "Fixed"], group=grpFootprint, tooltip="Adaptive scales volume threshold by session length. Fixed uses the base threshold directly.", active=settingsAdvanced and useFootprintContext)
+fpBreakoutBufferTicks = input.int(2, "Breakout Buffer (Ticks)", minval=0, group=grpFootprint, tooltip="Buffer added beyond session high/low for breakout confirmation state.", active=settingsAdvanced and useFootprintContext)
+fpConfirmBars = input.int(2, "Confirm Bars", minval=1, maxval=3, group=grpFootprint, tooltip="Consecutive bars required for breakout confirmation.", active=settingsAdvanced and useFootprintContext)
+fpDeltaConfirm = input.float(500, "Delta Confirm (Per Bar)", minval=0, step=50, group=grpFootprint, tooltip="Per-bar footprint delta threshold used in breakout confirmation.", active=settingsAdvanced and useFootprintContext)
+fpMinBarsWithData = input.int(3, "Min Bars With Footprint", minval=1, maxval=500, group=grpFootprint, tooltip="Minimum bars in a session that must include footprint data.", active=settingsAdvanced and useFootprintContext)
+fpMaxChartTf = input.string("15m", "Footprint Max Chart TF", options=["15m", "30m", "1h"], group=grpFootprint, tooltip="Above this chart timeframe, footprint requests are disabled and the script falls back to the non-footprint logic so higher timeframes still render.", active=settingsAdvanced and useFootprintContext)
+fpRegimeFilter = input.string("VWAP", "Trend Filter", options=["VWAP", "EMA200"], group=grpFootprint, tooltip="Directional filter used before breakout confirmation.", active=settingsAdvanced and useFootprintContext)
+fpOneSignalPerSide = input.bool(true, "One Signal Per Direction", group=grpFootprint, tooltip="Prevents repeated same-side breakout signals until next completed session context.", active=settingsAdvanced and useFootprintContext)
+fpSoftPenaltyPct = input.float(8.0, "Soft Penalty (%)", minval=0.0, maxval=50.0, step=0.5, group=grpFootprint, tooltip="Confidence penalty applied in Soft mode during bias mismatch.", active=settingsAdvanced and useFootprintContext)
+allowAbsorptionAgainstBias = input.bool(true, "Allow Absorption Against Bias", group=grpFootprint, tooltip="If ON, absorption marks are not hard-blocked by footprint mismatch.", active=settingsAdvanced and useFootprintContext)
+
+// -------------------- Settings: Dashboard Layout
+grpDisplay = "Dashboard Layout"
+showDashboard = input.bool(true, "Show Dashboard", group=grpDisplay, tooltip="Shows the 2-column activity dashboard.")
+showIconBanner = input.bool(true, "Show Bottom Icon Banner", group=grpDisplay, tooltip="Shows an icon legend banner on the chart.")
+dashboardPosition = input.string("Top Right", "Dashboard Location", options=["Top Left", "Top Center", "Top Right", "Middle Left", "Middle Center", "Middle Right", "Bottom Left", "Bottom Center", "Bottom Right"], group=grpDisplay, tooltip="Move dashboard to any chart corner/side.")
+dashboardTextSize = input.string("Normal", "Dashboard Text Size", options=["Tiny", "Small", "Normal", "Large", "Huge"], group=grpDisplay, tooltip="Text size used for all dashboard rows.", active=settingsAdvanced)
+bannerPosition = input.string("Top Center", "Icon Banner Location", options=["Top Left", "Top Center", "Top Right", "Middle Left", "Middle Center", "Middle Right", "Bottom Left", "Bottom Center", "Bottom Right"], group=grpDisplay, tooltip="Move the icon banner.", active=settingsAdvanced and showIconBanner)
+bannerTextSize = input.string("Normal", "Banner Text Size", options=["Tiny", "Small", "Normal", "Large", "Huge"], group=grpDisplay, tooltip="Text size used for the icon banner.", active=settingsAdvanced and showIconBanner)
+
+// -------------------- Settings: Displacement Origin
+grpOrigin = "Displacement Origin"
+showOriginBox = input.bool(true, "Show Origin Box", group=grpOrigin, tooltip="Marks the final compact two-way balance area before a new displacement leg.")
+showOriginLabel = input.bool(true, "Show Origin Label", group=grpOrigin, tooltip="Shows a text label to the right of each displacement origin box.")
+enableOriginReaction = input.bool(true, "Enable Reaction State Machine", group=grpOrigin, tooltip="Tracks enter > decelerate > structure shift > re-displacement behavior on each origin box.")
+showOriginTriggerLabel = input.bool(true, "Show Reaction Trigger Label", group=grpOrigin, tooltip="Adds an entry-trigger label when a zone completes the full reaction sequence.")
+originUseSignalGates = input.bool(false, "Origin Box Obeys Signal Gates", group=grpOrigin, tooltip="If ON, origin boxes follow the same cooldown and HTF gate used by signal marks.")
+originMinBaseBars = input.int(2, "Min Base Bars", minval=2, maxval=10, group=grpOrigin, tooltip="Minimum bars required in the pre-displacement balance.")
+originMaxBaseBars = input.int(5, "Max Base Bars", minval=2, maxval=12, group=grpOrigin, tooltip="Maximum bars checked for the final micro-balance before displacement.")
+originConfirmBars = input.int(2, "Confirm Leg Bars", minval=1, maxval=3, group=grpOrigin, tooltip="Number of displacement bars required to confirm clean expansion away from the base.")
+originExtendBars = input.int(40, "Box Extend (Bars)", minval=1, maxval=500, group=grpOrigin, tooltip="How far the origin box projects to the right after detection.")
+originLabelOffsetBars = input.int(4, "Label Offset (Bars)", minval=0, maxval=50, group=grpOrigin, tooltip="Places the origin label this many bars to the right of the box.")
+originAllowSingleBarPrecursor = input.bool(true, "Show Displacement Block", group=grpOrigin, tooltip="If ON, a smaller candle immediately before a strong displacement is boxed separately as a displacement block.")
+zoneMitigationMode = input.string("Close", "Mitigation Method", options=["Close", "Wick"], group=grpOrigin, tooltip="Close invalidates a zone only when price closes through its far side. Wick invalidates on any wick breach beyond the far side.", active=settingsAdvanced)
+showZoneMidpoint = input.bool(true, "Show Zone Midpoint", group=grpOrigin, tooltip="Draws a midpoint line inside each Base and Block zone.", active=settingsAdvanced)
+oneActiveBasePerLeg = input.bool(true, "One Active Base Per BOS Leg", group=grpOrigin, tooltip="If ON, the script allows only one active same-side Base zone inside each BOS leg. A new same-side Base is gated until the current leg's Base invalidates or structure flips.", active=settingsAdvanced)
+oneActiveBlockPerLeg = input.bool(true, "One Active Block Per Impulse Leg", group=grpOrigin, tooltip="If ON, a new same-side displacement block retires older active same-side blocks so only the newest remains active.", active=settingsAdvanced and originAllowSingleBarPrecursor)
+blockQualityMode = input.string("Strong", "Block Quality", options=["Basic", "Strong"], group=grpOrigin, tooltip="Strong requires elevated activity on the displacement leg, a decisive close beyond the precursor midpoint, and no opposing flow-bias context when available.", active=settingsAdvanced and originAllowSingleBarPrecursor)
+allowImbalanceBlockFallback = input.bool(true, "Allow Imbalance Block Fallback", group=grpOrigin, tooltip="If ON, the script can create a Block from a single strong displacement bar off the immediately prior candle when the stricter multi-bar block test fails.", active=settingsAdvanced and originAllowSingleBarPrecursor)
+imbalanceBlockMode = input.string("Balanced", "Imbalance Block Mode", options=["Strict", "Balanced", "Aggressive"], group=grpOrigin, tooltip="Controls how permissive the single-bar imbalance fallback is. Balanced accepts a wick break plus a strong close on the correct side of the precursor midpoint. Aggressive also tolerates a slightly larger precursor.", active=settingsAdvanced and originAllowSingleBarPrecursor and allowImbalanceBlockFallback)
+sessionBlockProfile = input.string("Moderate", "Session Block Profile", options=["Off", "Moderate"], group=grpOrigin, tooltip="Moderate makes block thresholds slightly stricter in Asia/Tokyo, baseline in London, easier in NY Open, stricter in NY Midday, and baseline-to-mildly stricter in NY Close.", active=settingsAdvanced and originAllowSingleBarPrecursor)
+keepInvalidBlocks = input.bool(false, "Keep Invalid Blocks", group=grpOrigin, tooltip="If OFF, invalidated displacement blocks are hidden immediately. Base zones remain visible.", active=settingsAdvanced and originAllowSingleBarPrecursor)
+originSwingPivotLen = input.int(3, "Swing Pivot Length", minval=1, maxval=20, group=grpOrigin, tooltip="Left/right bars used to confirm swing highs and lows for the BOS leg model that groups displacement blocks by structure leg.", active=settingsAdvanced and originAllowSingleBarPrecursor)
+baseMinSpacingBars2m = input.int(12, "Base Min Spacing (2m Bars)", minval=0, maxval=100, group=grpOrigin, tooltip="Minimum bars between same-side Base detections on 2-minute charts. 0 disables spacing on 2m.", active=settingsAdvanced)
+baseMinSpacingBars5m = input.int(6, "Base Min Spacing (5m Bars)", minval=0, maxval=100, group=grpOrigin, tooltip="Minimum bars between same-side Base detections on 5-minute charts. 0 disables spacing on 5m.", active=settingsAdvanced)
+maxVisibleBasesPerSide = input.int(4, "Max Visible Bases / Side", minval=0, maxval=20, group=grpOrigin, tooltip="Maximum number of Base zones shown per side. 0 disables the cap.", active=settingsAdvanced)
+maxVisibleBlocksPerSide = input.int(3, "Max Visible Blocks / Side", minval=0, maxval=20, group=grpOrigin, tooltip="Maximum number of Block zones shown per side. 0 disables the cap.", active=settingsAdvanced and originAllowSingleBarPrecursor)
+maxVisibleBasesPerSide2m = input.int(2, "Max Visible Bases / Side (2m)", minval=0, maxval=20, group=grpOrigin, tooltip="Two-minute override for visible Base zones per side. 0 disables the cap on 2m.", active=settingsAdvanced)
+maxVisibleBlocksPerSide2m = input.int(2, "Max Visible Blocks / Side (2m)", minval=0, maxval=20, group=grpOrigin, tooltip="Two-minute override for visible Block zones per side. 0 disables the cap on 2m.", active=settingsAdvanced and originAllowSingleBarPrecursor)
+originTfAdaptMode = input.string("Balanced", "Timeframe Adaptation", options=["Off", "Balanced", "Loose"], group=grpOrigin, tooltip="Automatically loosens Base and Block structural thresholds on higher timeframes. Balanced keeps 2m/5m strict and relaxes 15m, 30m, and 1h+ progressively.", active=settingsAdvanced)
+requireBlockVolumePivot = input.bool(false, "Require Volume Pivot In Strong Blocks", group=grpOrigin, tooltip="When ON, Strong block mode also requires a recent confirmed volume pivot during the displacement leg. NQ Default forces this ON through the effective profile layer.", active=settingsAdvanced and originAllowSingleBarPrecursor)
+blockVolumePivotLen = input.int(5, "Block Volume Pivot Length", minval=1, maxval=20, group=grpOrigin, tooltip="Left bars used to confirm a recent volume pivot for Strong block mode. Uses a 1-bar right-side confirmation to avoid long delays.", active=settingsAdvanced and originAllowSingleBarPrecursor and (requireBlockVolumePivot or futuresProfileMode == "NQ Default" or futuresProfileMode == "CL Default"))
+showZoneDebug = input.bool(false, "Show Zone Debug", group=grpOrigin, tooltip="Adds dashboard rows for BOS state plus the latest base/block acceptance or rejection reason.", active=settingsAdvanced)
+originReactionDecelBars = input.int(2, "Reaction Decel Bars", minval=1, maxval=5, group=grpOrigin, tooltip="Bars inside the zone that must show slower trade before a setup is valid.", active=settingsAdvanced)
+originReactionDecelAtr = input.float(0.85, "Reaction Decel TR (ATR)", minval=0.20, step=0.05, group=grpOrigin, tooltip="A retest bar is considered decelerating when TR is below this ATR multiple.", active=settingsAdvanced)
+originReactionDecelBodyPct = input.float(0.45, "Reaction Decel Body %", minval=0.10, maxval=0.90, step=0.05, group=grpOrigin, tooltip="A decelerating bar must keep body size below this fraction of total range.", active=settingsAdvanced)
+originReactionRedisplaceAtr = input.float(1.0, "Reaction Re-Displacement TR (ATR)", minval=0.30, step=0.10, group=grpOrigin, tooltip="The confirmation bar must expand away from the box by at least this ATR multiple.", active=settingsAdvanced)
+originReactionInvalidTicks = input.int(2, "Reaction Invalidation Ticks", minval=0, maxval=20, group=grpOrigin, tooltip="A close beyond the far side of the box by this many ticks invalidates the setup.", active=settingsAdvanced)
+originMaxBoxes = input.int(12, "Keep Boxes", minval=1, maxval=50, group=grpOrigin, tooltip="Maximum number of displacement origin boxes kept on the chart.", active=settingsAdvanced)
+originMaxBaseHeightAtr = input.float(0.9, "Max Base Height (ATR)", minval=0.1, step=0.1, group=grpOrigin, tooltip="The balance must stay compact relative to ATR.", active=settingsAdvanced)
+originMaxDriftAtr = input.float(0.45, "Max Base Drift (ATR)", minval=0.05, step=0.05, group=grpOrigin, tooltip="Limits directional drift inside the balance before the move launches.", active=settingsAdvanced)
+originMaxEfficiency = input.float(0.55, "Max Base Efficiency", minval=0.10, maxval=1.0, step=0.05, group=grpOrigin, tooltip="Lower values require more two-way internal trade relative to total range traveled.", active=settingsAdvanced)
+originMinLegEfficiency = input.float(0.65, "Min Leg Efficiency", minval=0.20, maxval=1.0, step=0.05, group=grpOrigin, tooltip="Higher values require cleaner, faster directional travel away from the base.", active=settingsAdvanced)
+originMaxPullbackAtr = input.float(0.20, "Max Pullback Into Base (ATR)", minval=0.05, step=0.05, group=grpOrigin, tooltip="Limits how deeply the displacement leg can pull back into the origin base.", active=settingsAdvanced)
+originMinExpansionAtr = input.float(0.60, "Min Expansion Away (ATR)", minval=0.10, step=0.10, group=grpOrigin, tooltip="Minimum displacement distance required away from the origin base.", active=settingsAdvanced)
+originWickInclusionAtr = input.float(0.10, "Repeated Wick Inclusion (ATR)", minval=0.01, step=0.01, group=grpOrigin, tooltip="Repeated wick probes inside this ATR buffer can expand the box beyond body-only bounds.", active=settingsAdvanced)
+originMinBodyPct = input.float(0.55, "Displacement Body %", minval=0.20, maxval=0.95, step=0.05, group=grpOrigin, tooltip="The displacement candle must close with a decisive body.", active=settingsAdvanced)
+originCloseExtremeFrac = input.float(0.25, "Close Near Extreme (%)", minval=0.05, maxval=0.50, step=0.05, group=grpOrigin, tooltip="The displacement candle must close near its directional extreme.", active=settingsAdvanced)
+originSingleBarMaxRangeFrac = input.float(0.80, "Block Max Range vs Impulse", minval=0.20, maxval=1.20, step=0.05, group=grpOrigin, tooltip="Immediate precursor candle must be no larger than this fraction of the strongest displacement bar.", active=settingsAdvanced)
+
+// -------------------- Fixed Internal Defaults (inputs intentionally removed)
+zscore_period = 50
+normal_threshold = 1.0
+elevated_threshold = 2.0
+institutional_threshold = 3.0
+allowLowVolumeAnomaly = false
+use_adaptive = true
+smallBodyP = 0.33
+useDollarVolume = false
+contractMultiplier = 1.0
+openPhaseFrac = 0.25
+closePhaseFrac = 0.75
+sessionLenEma = 20
+minScore = 3.0
+confidenceSmoothLen = 5
+fpReadMinDeltaPct = 0.01
+originOverlapCleanupFrac = 0.65
+originStateRetired = -2
+originStateInvalid = -1
+originStateFresh = 0
+originStateEntered = 1
+originStateDecel = 2
+originStateShift = 3
+originStateTriggered = 4
+originScoreEpsilon = 0.05
+
+// -------------------- Effective Futures Profile
+profileIsESDefault = futuresProfileMode == "ES Default"
+profileIsNQDefault = futuresProfileMode == "NQ Default"
+profileIsCLDefault = futuresProfileMode == "CL Default"
+profileIsGCDefault = futuresProfileMode == "GC Default"
+profileIsGeneralDefault = futuresProfileMode == "General Futures"
+futuresProfileLabel = profileIsESDefault ? "ES Def" : profileIsNQDefault ? "NQ Def" : profileIsCLDefault ? "CL Def" : profileIsGCDefault ? "GC Def" : profileIsGeneralDefault ? "Gen Fut" : "Custom"
+fpProfileEff = profileIsESDefault ? "ES" : profileIsNQDefault ? "NQ" : profileIsCLDefault ? "CL" : profileIsGCDefault ? "GC" : profileIsGeneralDefault ? "Generic Futures" : fpProfile
+zoneMitigationModeEff = profileIsESDefault or profileIsNQDefault or profileIsCLDefault or profileIsGCDefault or profileIsGeneralDefault ? "Close" : zoneMitigationMode
+blockQualityModeEff = profileIsESDefault or profileIsNQDefault or profileIsCLDefault or profileIsGCDefault or profileIsGeneralDefault ? "Strong" : blockQualityMode
+originTfAdaptModeEff = profileIsESDefault or profileIsNQDefault or profileIsCLDefault or profileIsGCDefault or profileIsGeneralDefault ? "Balanced" : originTfAdaptMode
+requireBlockVolumePivotEff = profileIsNQDefault or profileIsCLDefault ? true : profileIsESDefault or profileIsGCDefault or profileIsGeneralDefault ? false : requireBlockVolumePivot
+imbalanceBlockModeEff = profileIsESDefault or profileIsGCDefault or profileIsGeneralDefault ? "Balanced" : profileIsNQDefault or profileIsCLDefault ? "Strict" : imbalanceBlockMode
+sessionBlockProfileEff = profileIsESDefault or profileIsNQDefault or profileIsCLDefault or profileIsGCDefault or profileIsGeneralDefault ? "Moderate" : sessionBlockProfile
+baseMinSpacingBars2mEff = profileIsESDefault ? 12 : profileIsNQDefault ? 16 : profileIsCLDefault ? 18 : profileIsGCDefault ? 14 : profileIsGeneralDefault ? 14 : baseMinSpacingBars2m
+baseMinSpacingBars5mEff = profileIsESDefault ? 6 : profileIsNQDefault ? 8 : profileIsCLDefault ? 9 : profileIsGCDefault ? 7 : profileIsGeneralDefault ? 7 : baseMinSpacingBars5m
+maxVisibleBasesPerSideEff = profileIsESDefault ? 4 : profileIsNQDefault ? 3 : profileIsCLDefault ? 3 : profileIsGCDefault ? 3 : profileIsGeneralDefault ? 3 : maxVisibleBasesPerSide
+maxVisibleBlocksPerSideEff = profileIsESDefault ? 3 : profileIsNQDefault ? 2 : profileIsCLDefault ? 2 : profileIsGCDefault ? 2 : profileIsGeneralDefault ? 2 : maxVisibleBlocksPerSide
+maxVisibleBasesPerSide2mEff = profileIsESDefault ? 2 : profileIsNQDefault ? 2 : profileIsCLDefault ? 1 : profileIsGCDefault ? 2 : profileIsGeneralDefault ? 2 : maxVisibleBasesPerSide2m
+maxVisibleBlocksPerSide2mEff = profileIsESDefault ? 2 : profileIsNQDefault ? 1 : profileIsCLDefault ? 1 : profileIsGCDefault ? 1 : profileIsGeneralDefault ? 1 : maxVisibleBlocksPerSide2m
+
+// -------------------- Stats & Z-Score
+atr_current = ta.atr(atrLen)
+atr_avg = ta.sma(atr_current, 20)
+ma20 = ta.sma(close, 20)
+ma_slope = (ma20 - ma20[5]) / ta.atr(10) * 100
+is_trending = math.abs(ma_slope) > 0.5
+is_high_vol = atr_current > atr_avg * 1.2
+
+adaptive_multiplier = use_adaptive ? ((is_trending ? 1.3 : 0.8) * (is_high_vol ? 1.2 : 1.0)) : 1.0
+current_normal = normal_threshold * adaptive_multiplier
+current_elevated = elevated_threshold * adaptive_multiplier
+current_institutional = institutional_threshold * adaptive_multiplier
+
+// Internal volatility regime: tightens activity filters during broad market stress.
+vixDaily = request.security(vixSymbol, "D", close, barmerge.gaps_off, barmerge.lookahead_off)
+vixDailyPrev = vixDaily[1]
+vixDailyChgPct = not na(vixDailyPrev) and vixDailyPrev != 0 ? ((vixDaily - vixDailyPrev) / vixDailyPrev) * 100.0 : 0.0
+atrPctRankRaw = ta.percentrank(atr_current, atrRegimeLookback)
+atrPctRank = nz(atrPctRankRaw, 0.0)
+atrHighRegime = atrPctRank >= atrHighPercentile
+vixHighRegime = not na(vixDaily) and vixDaily >= vixHighThreshold
+vixShockRegime = not na(vixDaily) and vixDailyChgPct >= vixShockThresholdPct
+volRegimeActive = useVolRegimeFilter and (atrHighRegime or vixHighRegime or vixShockRegime)
+
+// Optional macro-economic context backup (series-level context only; not event timing).
+usUnrate = request.economic("US", "UR")
+usUnratePrev = usUnrate[1]
+usUnrateMoMDelta = not na(usUnrate) and not na(usUnratePrev) ? (usUnrate - usUnratePrev) : 0.0
+econRegimeByLevel = not na(usUnrate) and usUnrate >= econUnrateLevel
+econRegimeByJump = not na(usUnrate) and usUnrateMoMDelta >= econUnrateMoMJump
+econRegimeActive = useEconomicContext and (econRegimeByLevel or econRegimeByJump)
+
+f_recent_release(lastBar, holdBars) =>
+    not na(lastBar) and (bar_index - lastBar) <= holdBars
+
+f_pad2(v) =>
+    v < 10 ? "0" + str.tostring(v) : str.tostring(v)
+
+f_time_ny(ts) =>
+    hh = hour(ts, "America/New_York")
+    mm = minute(ts, "America/New_York")
+    f_pad2(hh) + ":" + f_pad2(mm) + " NY"
+
+// High-impact release detection using gaps_on. Non-na values mark update bars.
+impactAheRaw = request.economic("US", "AHE", barmerge.gaps_on, true)
+impactCoreCpiRaw = request.economic("US", "CCPI", barmerge.gaps_on, true)
+impactCorePceRaw = request.economic("US", "CPCEPI", barmerge.gaps_on, true)
+impactCoreRetailRaw = request.economic("US", "RSEA", barmerge.gaps_on, true)
+impactCpiRaw = request.economic("US", "CPI", barmerge.gaps_on, true)
+impactPceRaw = request.economic("US", "PCEPI", barmerge.gaps_on, true)
+impactPpiRaw = request.economic("US", "PPI", barmerge.gaps_on, true)
+impactNfpRaw = request.economic("US", "NFP", barmerge.gaps_on, true)
+impactClaimsRaw = request.economic("US", "IJC", barmerge.gaps_on, true)
+impactAdpRaw = request.economic("US", "EC", barmerge.gaps_on, true)
+impactRetailSalesRaw = request.economic("US", "RSMM", barmerge.gaps_on, true)
+impactUnrateRaw = request.economic("US", "UR", barmerge.gaps_on, true)
+impactCciRaw = request.economic("US", "CCI", barmerge.gaps_on, true)
+impactFomcProxyRaw = request.economic("US", "INTR", barmerge.gaps_on, true)
+
+impactAheNow = useHighImpactActivity and trackImpactAHE and not na(impactAheRaw)
+impactCoreCpiNow = useHighImpactActivity and trackImpactCoreCPI and not na(impactCoreCpiRaw)
+impactCorePceNow = useHighImpactActivity and trackImpactCorePCE and not na(impactCorePceRaw)
+impactCoreRetailNow = useHighImpactActivity and trackImpactCoreRetail and not na(impactCoreRetailRaw)
+impactCpiNow = useHighImpactActivity and trackImpactCPI and not na(impactCpiRaw)
+impactPceNow = useHighImpactActivity and trackImpactPCE and not na(impactPceRaw)
+impactPpiNow = useHighImpactActivity and trackImpactPPI and not na(impactPpiRaw)
+impactNfpNow = useHighImpactActivity and trackImpactNFP and not na(impactNfpRaw)
+impactClaimsNow = useHighImpactActivity and trackImpactClaims and not na(impactClaimsRaw)
+impactAdpNow = useHighImpactActivity and trackImpactADP and not na(impactAdpRaw)
+impactRetailSalesNow = useHighImpactActivity and trackImpactRetailSales and not na(impactRetailSalesRaw)
+impactUnrateNow = useHighImpactActivity and trackImpactUnemployment and not na(impactUnrateRaw)
+impactCciNow = useHighImpactActivity and trackImpactCCI and not na(impactCciRaw)
+impactFomcProxyNow = useHighImpactActivity and trackImpactFOMCProxy and not na(impactFomcProxyRaw)
+
+var int lastImpactAheBar = na
+var int lastImpactCoreCpiBar = na
+var int lastImpactCorePceBar = na
+var int lastImpactCoreRetailBar = na
+var int lastImpactCpiBar = na
+var int lastImpactPceBar = na
+var int lastImpactPpiBar = na
+var int lastImpactNfpBar = na
+var int lastImpactClaimsBar = na
+var int lastImpactAdpBar = na
+var int lastImpactRetailSalesBar = na
+var int lastImpactUnrateBar = na
+var int lastImpactCciBar = na
+var int lastImpactFomcProxyBar = na
+var int lastImpactAheTs = na
+var int lastImpactCoreCpiTs = na
+var int lastImpactCorePceTs = na
+var int lastImpactCoreRetailTs = na
+var int lastImpactCpiTs = na
+var int lastImpactPceTs = na
+var int lastImpactPpiTs = na
+var int lastImpactNfpTs = na
+var int lastImpactClaimsTs = na
+var int lastImpactAdpTs = na
+var int lastImpactRetailSalesTs = na
+var int lastImpactUnrateTs = na
+var int lastImpactCciTs = na
+var int lastImpactFomcProxyTs = na
+
+if impactAheNow
+    lastImpactAheBar := bar_index
+    lastImpactAheTs := time
+if impactCoreCpiNow
+    lastImpactCoreCpiBar := bar_index
+    lastImpactCoreCpiTs := time
+if impactCorePceNow
+    lastImpactCorePceBar := bar_index
+    lastImpactCorePceTs := time
+if impactCoreRetailNow
+    lastImpactCoreRetailBar := bar_index
+    lastImpactCoreRetailTs := time
+if impactCpiNow
+    lastImpactCpiBar := bar_index
+    lastImpactCpiTs := time
+if impactPceNow
+    lastImpactPceBar := bar_index
+    lastImpactPceTs := time
+if impactPpiNow
+    lastImpactPpiBar := bar_index
+    lastImpactPpiTs := time
+if impactNfpNow
+    lastImpactNfpBar := bar_index
+    lastImpactNfpTs := time
+if impactClaimsNow
+    lastImpactClaimsBar := bar_index
+    lastImpactClaimsTs := time
+if impactAdpNow
+    lastImpactAdpBar := bar_index
+    lastImpactAdpTs := time
+if impactRetailSalesNow
+    lastImpactRetailSalesBar := bar_index
+    lastImpactRetailSalesTs := time
+if impactUnrateNow
+    lastImpactUnrateBar := bar_index
+    lastImpactUnrateTs := time
+if impactCciNow
+    lastImpactCciBar := bar_index
+    lastImpactCciTs := time
+if impactFomcProxyNow
+    lastImpactFomcProxyBar := bar_index
+    lastImpactFomcProxyTs := time
+
+impactAheRecent = useHighImpactActivity and trackImpactAHE and f_recent_release(lastImpactAheBar, impactHoldBars)
+impactCoreCpiRecent = useHighImpactActivity and trackImpactCoreCPI and f_recent_release(lastImpactCoreCpiBar, impactHoldBars)
+impactCorePceRecent = useHighImpactActivity and trackImpactCorePCE and f_recent_release(lastImpactCorePceBar, impactHoldBars)
+impactCoreRetailRecent = useHighImpactActivity and trackImpactCoreRetail and f_recent_release(lastImpactCoreRetailBar, impactHoldBars)
+impactCpiRecent = useHighImpactActivity and trackImpactCPI and f_recent_release(lastImpactCpiBar, impactHoldBars)
+impactPceRecent = useHighImpactActivity and trackImpactPCE and f_recent_release(lastImpactPceBar, impactHoldBars)
+impactPpiRecent = useHighImpactActivity and trackImpactPPI and f_recent_release(lastImpactPpiBar, impactHoldBars)
+impactNfpRecent = useHighImpactActivity and trackImpactNFP and f_recent_release(lastImpactNfpBar, impactHoldBars)
+impactClaimsRecent = useHighImpactActivity and trackImpactClaims and f_recent_release(lastImpactClaimsBar, impactHoldBars)
+impactAdpRecent = useHighImpactActivity and trackImpactADP and f_recent_release(lastImpactAdpBar, impactHoldBars)
+impactRetailSalesRecent = useHighImpactActivity and trackImpactRetailSales and f_recent_release(lastImpactRetailSalesBar, impactHoldBars)
+impactUnrateRecent = useHighImpactActivity and trackImpactUnemployment and f_recent_release(lastImpactUnrateBar, impactHoldBars)
+impactCciRecent = useHighImpactActivity and trackImpactCCI and f_recent_release(lastImpactCciBar, impactHoldBars)
+impactFomcProxyRecent = useHighImpactActivity and trackImpactFOMCProxy and f_recent_release(lastImpactFomcProxyBar, impactHoldBars)
+
+highImpactNow = impactFomcProxyNow or impactAheNow or impactCoreCpiNow or impactCorePceNow or impactCoreRetailNow or impactCpiNow or impactPceNow or impactPpiNow or impactNfpNow or impactClaimsNow or impactAdpNow or impactRetailSalesNow or impactUnrateNow or impactCciNow
+highImpactRecent = impactFomcProxyRecent or impactAheRecent or impactCoreCpiRecent or impactCorePceRecent or impactCoreRetailRecent or impactCpiRecent or impactPceRecent or impactPpiRecent or impactNfpRecent or impactClaimsRecent or impactAdpRecent or impactRetailSalesRecent or impactUnrateRecent or impactCciRecent
+
+highImpactLabel = "None"
+if impactFomcProxyNow or (not highImpactNow and impactFomcProxyRecent)
+    highImpactLabel := "FOMC*"
+else if impactCoreCpiNow or (not highImpactNow and impactCoreCpiRecent)
+    highImpactLabel := "Core CPI"
+else if impactCpiNow or (not highImpactNow and impactCpiRecent)
+    highImpactLabel := "CPI"
+else if impactNfpNow or (not highImpactNow and impactNfpRecent)
+    highImpactLabel := "NFP"
+else if impactUnrateNow or (not highImpactNow and impactUnrateRecent)
+    highImpactLabel := "Unemployment"
+else if impactAheNow or (not highImpactNow and impactAheRecent)
+    highImpactLabel := "Avg Earnings"
+else if impactCorePceNow or (not highImpactNow and impactCorePceRecent)
+    highImpactLabel := "Core PCE"
+else if impactPceNow or (not highImpactNow and impactPceRecent)
+    highImpactLabel := "PCE"
+else if impactRetailSalesNow or (not highImpactNow and impactRetailSalesRecent)
+    highImpactLabel := "Retail Sales"
+else if impactCoreRetailNow or (not highImpactNow and impactCoreRetailRecent)
+    highImpactLabel := "Core Retail"
+else if impactPpiNow or (not highImpactNow and impactPpiRecent)
+    highImpactLabel := "PPI"
+else if impactClaimsNow or (not highImpactNow and impactClaimsRecent)
+    highImpactLabel := "Jobless Claims"
+else if impactAdpNow or (not highImpactNow and impactAdpRecent)
+    highImpactLabel := "ADP"
+else if impactCciNow or (not highImpactNow and impactCciRecent)
+    highImpactLabel := "CCI"
+int activeImpactBar = na
+int activeImpactTs = na
+if highImpactLabel == "FOMC*"
+    activeImpactBar := lastImpactFomcProxyBar
+    activeImpactTs := lastImpactFomcProxyTs
+else if highImpactLabel == "NFP"
+    activeImpactBar := lastImpactNfpBar
+    activeImpactTs := lastImpactNfpTs
+else if highImpactLabel == "Unemployment"
+    activeImpactBar := lastImpactUnrateBar
+    activeImpactTs := lastImpactUnrateTs
+else if highImpactLabel == "Avg Earnings"
+    activeImpactBar := lastImpactAheBar
+    activeImpactTs := lastImpactAheTs
+else if highImpactLabel == "Core CPI"
+    activeImpactBar := lastImpactCoreCpiBar
+    activeImpactTs := lastImpactCoreCpiTs
+else if highImpactLabel == "Core PCE"
+    activeImpactBar := lastImpactCorePceBar
+    activeImpactTs := lastImpactCorePceTs
+else if highImpactLabel == "Core Retail"
+    activeImpactBar := lastImpactCoreRetailBar
+    activeImpactTs := lastImpactCoreRetailTs
+else if highImpactLabel == "PCE"
+    activeImpactBar := lastImpactPceBar
+    activeImpactTs := lastImpactPceTs
+else if highImpactLabel == "Retail Sales"
+    activeImpactBar := lastImpactRetailSalesBar
+    activeImpactTs := lastImpactRetailSalesTs
+else if highImpactLabel == "CPI"
+    activeImpactBar := lastImpactCpiBar
+    activeImpactTs := lastImpactCpiTs
+else if highImpactLabel == "PPI"
+    activeImpactBar := lastImpactPpiBar
+    activeImpactTs := lastImpactPpiTs
+else if highImpactLabel == "Jobless Claims"
+    activeImpactBar := lastImpactClaimsBar
+    activeImpactTs := lastImpactClaimsTs
+else if highImpactLabel == "ADP"
+    activeImpactBar := lastImpactAdpBar
+    activeImpactTs := lastImpactAdpTs
+else if highImpactLabel == "CCI"
+    activeImpactBar := lastImpactCciBar
+    activeImpactTs := lastImpactCciTs
+activeImpactBarsAgo = na(activeImpactBar) ? na : (bar_index - activeImpactBar)
+activeImpactBarsAgoText = na(activeImpactBarsAgo) ? "?" : str.tostring(activeImpactBarsAgo)
+activeImpactTimeText = na(activeImpactTs) ? "time?" : f_time_ny(activeImpactTs)
+
+normal_gate = current_normal + (volRegimeActive ? regimeZBump * 0.5 : 0.0) + (econRegimeActive ? econZBump * 0.5 : 0.0)
+elevated_gate = current_elevated + (volRegimeActive ? regimeZBump : 0.0) + (econRegimeActive ? econZBump : 0.0)
+institutional_gate = current_institutional + (volRegimeActive ? regimeZBump : 0.0) + (econRegimeActive ? econZBump : 0.0)
+minScoreGate = minScore + (volRegimeActive ? regimeScoreBump : 0.0) + (econRegimeActive ? econScoreBump : 0.0)
+
+f_zscore(srcVol) =>
+    m = ta.sma(srcVol, zscore_period)
+    s = ta.stdev(srcVol, zscore_period)
+    s > 0 ? (srcVol - m) / s : 0.0
+
+f_benchmark_z() =>
+    benchVol = useDollarVolume ? close * volume : volume
+    f_zscore(benchVol)
+
+volRaw = useDollarVolume ? close * volume * contractMultiplier : volume
+zLocal = f_zscore(volRaw)
+benchmarkZ = request.security(benchmarkSymbol, timeframe.period, f_benchmark_z(), barmerge.gaps_off, barmerge.lookahead_off)
+relativeDataReady = not na(benchmarkZ)
+usingRelativeNow = useRelativeActivity and relativeDataReady
+relativeFallback = useRelativeActivity and not relativeDataReady
+zRelative = zLocal - benchmarkZ
+zBase = usingRelativeNow ? zRelative : zLocal
+z = zBase - (usingRelativeNow ? relativeZOffset : 0.0)
+zSignal = allowLowVolumeAnomaly ? math.abs(z) : z
+
+// -------------------- Session Context
+f_in_window(curMin, startMin, endMin) =>
+    startMin < endMin ? (curMin >= startMin and curMin < endMin) : (curMin >= startMin or curMin < endMin)
+
+f_fp_phase(curMin, futStartAbs, tokyoAbs, preLondonAbs, londonOpenAbs, usOpenAbs, futEndAbs) =>
+    out = "Maintenance"
+    if f_in_window(curMin, futStartAbs, tokyoAbs)
+        out := "Asia"
+    else if f_in_window(curMin, tokyoAbs, preLondonAbs)
+        out := "Tokyo"
+    else if f_in_window(curMin, preLondonAbs, londonOpenAbs)
+        out := "PreLondon"
+    else if f_in_window(curMin, londonOpenAbs, usOpenAbs)
+        out := "London"
+    else if f_in_window(curMin, usOpenAbs, futEndAbs)
+        out := "NY"
+    out
+
+f_rel_from_anchor(ts, anchor) =>
+    ts >= anchor ? (ts - anchor) : (ts + 1440 - anchor)
+
+f_phase_span_mins(phase, futStartAbs, tokyoAbs, preLondonAbs, londonOpenAbs, usOpenAbs, futEndAbs) =>
+    out = 0
+    if phase == "Asia"
+        out := f_rel_from_anchor(tokyoAbs, futStartAbs)
+    else if phase == "Tokyo"
+        out := f_rel_from_anchor(preLondonAbs, tokyoAbs)
+    else if phase == "PreLondon"
+        out := f_rel_from_anchor(londonOpenAbs, preLondonAbs)
+    else if phase == "London"
+        out := f_rel_from_anchor(usOpenAbs, londonOpenAbs)
+    else if phase == "NY"
+        out := f_rel_from_anchor(futEndAbs, usOpenAbs)
+    out
+
+f_phase_max_bars(phase, chartSec, futStartAbs, tokyoAbs, preLondonAbs, londonOpenAbs, usOpenAbs, futEndAbs) =>
+    mins = f_phase_span_mins(phase, futStartAbs, tokyoAbs, preLondonAbs, londonOpenAbs, usOpenAbs, futEndAbs)
+    barsFloat = chartSec > 0 ? math.floor((mins * 60.0) / chartSec) : 1.0
+    int(math.max(1.0, barsFloat))
+
+f_fp_layout_valid(futStartAbs, tokyoAbs, preLondonAbs, londonOpenAbs, usOpenAbs, futEndAbs) =>
+    tokyoRel = f_rel_from_anchor(tokyoAbs, futStartAbs)
+    preLondonRel = f_rel_from_anchor(preLondonAbs, futStartAbs)
+    londonRel = f_rel_from_anchor(londonOpenAbs, futStartAbs)
+    usOpenRel = f_rel_from_anchor(usOpenAbs, futStartAbs)
+    futEndRel = f_rel_from_anchor(futEndAbs, futStartAbs)
+    tokyoRel > 0 and preLondonRel > tokyoRel and londonRel > preLondonRel and usOpenRel > londonRel and futEndRel > usOpenRel and futEndRel < 1440
+
+f_sum_last(src, len) =>
+    float out = 0.0
+    for i = 0 to len - 1
+        out += nz(src[i], 0.0)
+    out
+
+f_pad_int4(v) =>
+    v >= 1000 ? str.tostring(v) : v >= 100 ? " " + str.tostring(v) : v >= 10 ? "  " + str.tostring(v) : "   " + str.tostring(v)
+
+f_fixed_1dp_4int(v) =>
+    rounded10 = int(math.round(v * 10.0))
+    intPart = int(math.floor(rounded10 / 10.0))
+    fracPart = rounded10 - intPart * 10
+    f_pad_int4(intPart) + "." + str.tostring(fracPart)
+
+f_delta_raw_token(deltaNow) =>
+    na(deltaNow) ? "δ        ?" : math.abs(deltaNow) >= 1000 ? "δ " + (deltaNow >= 0 ? "+" : "-") + f_fixed_1dp_4int(math.abs(deltaNow) / 1000.0) + "k" : "δ " + (deltaNow >= 0 ? "+" : "-") + f_pad_int4(int(math.round(math.abs(deltaNow))))
+
+f_delta_pct_token(deltaPct) =>
+    na(deltaPct) ? "Δ        ?.?%" : "Δ " + (deltaPct >= 0 ? "+" : "-") + f_fixed_1dp_4int(math.abs(deltaPct) * 100.0) + "%"
+
+f_vol_token_k(volNow) =>
+    na(volNow) ? "Vol    ?.?" : volNow >= 1000 ? "Vol " + f_fixed_1dp_4int(volNow / 1000.0) + "k" : "Vol " + f_pad_int4(int(math.round(volNow)))
+
+f_dash_position(posText) =>
+    out = position.bottom_right
+    if posText == "Top Left"
+        out := position.top_left
+    else if posText == "Top Center"
+        out := position.top_center
+    else if posText == "Top Right"
+        out := position.top_right
+    else if posText == "Middle Left"
+        out := position.middle_left
+    else if posText == "Middle Center"
+        out := position.middle_center
+    else if posText == "Middle Right"
+        out := position.middle_right
+    else if posText == "Bottom Left"
+        out := position.bottom_left
+    else if posText == "Bottom Center"
+        out := position.bottom_center
+    out
+
+f_dash_text_size(sizeText) =>
+    out = size.normal
+    if sizeText == "Tiny"
+        out := size.tiny
+    else if sizeText == "Small"
+        out := size.small
+    else if sizeText == "Large"
+        out := size.large
+    else if sizeText == "Huge"
+        out := size.huge
+    out
+
+f_banner_pos_safe(dPos, bPos) =>
+    out = bPos
+    if bPos == dPos
+        if bPos == position.top_left
+            out := position.top_center
+        else if bPos == position.top_center
+            out := position.top_right
+        else if bPos == position.top_right
+            out := position.middle_right
+        else if bPos == position.middle_left
+            out := position.middle_center
+        else if bPos == position.middle_center
+            out := position.middle_right
+        else if bPos == position.middle_right
+            out := position.bottom_right
+        else if bPos == position.bottom_left
+            out := position.bottom_center
+        else if bPos == position.bottom_center
+            out := position.bottom_right
+        else
+            out := position.bottom_center
+    out
+
+f_origin_label_pad(zoneHigh, zoneLow) =>
+    math.max((zoneHigh - zoneLow) * 0.35, atr_current * 0.15, syminfo.mintick * 8)
+
+f_block_active(state) =>
+    state != originStateInvalid and state != originStateRetired
+
+f_base_active(state) =>
+    state != originStateInvalid and state != originStateRetired
+
+f_base_spacing_bars(chartSec) =>
+    chartSec == 120 ? baseMinSpacingBars2mEff : chartSec == 300 ? baseMinSpacingBars5mEff : 0
+
+f_visible_cap(defaultCap, cap2m, chartSec) =>
+    chartSec == 120 ? cap2m : defaultCap
+
+f_zone_invalid_bull(zoneLow, buffer) =>
+    zoneMitigationModeEff == "Wick" ? low < zoneLow - buffer : close < zoneLow - buffer
+
+f_zone_invalid_bear(zoneHigh, buffer) =>
+    zoneMitigationModeEff == "Wick" ? high > zoneHigh + buffer : close > zoneHigh + buffer
+
+f_tf_adapt_relax(chartSec, mode) =>
+    base = chartSec <= 300 ? 0.0 : chartSec <= 900 ? 0.08 : chartSec <= 1800 ? 0.18 : chartSec <= 3600 ? 0.28 : 0.34
+    mode == "Off" ? 0.0 : mode == "Loose" ? math.min(0.50, base * 1.35) : base
+
+f_tf_adapt_label(chartSec, mode) =>
+    mode == "Off" ? "Off" : chartSec <= 300 ? "LTF" : chartSec <= 900 ? "15m" : chartSec <= 1800 ? "30m" : chartSec <= 3600 ? "1h" : "HTF"
+
+f_fmt_debug_num(v) =>
+    na(v) ? "na" : str.tostring(v, "#.##")
+
+f_bars_since_text(lastBar) =>
+    na(lastBar) ? "na" : str.tostring(bar_index - lastBar) + " bars"
+
+curMin = hour(time, "America/New_York") * 60 + minute(time, "America/New_York")
+chartTfSecEarly = timeframe.in_seconds()
+dashPos = f_dash_position(dashboardPosition)
+dashTextSize = f_dash_text_size(dashboardTextSize)
+bannerPosRaw = f_dash_position(bannerPosition)
+bannerPos = f_banner_pos_safe(dashPos, bannerPosRaw)
+bannerSize = f_dash_text_size(bannerTextSize)
+futStartAbs = futSessionStartHour * 60 + futSessionStartMin
+tokyoAbs = tokyoOpenHour * 60 + tokyoOpenMin
+preLondonAbs = preLondonHour * 60 + preLondonMin
+londonOpenAbs = londonOpenHour * 60 + londonOpenMin
+usOpenAbs = usOpenHour * 60 + usOpenMin
+usMiddayAbs = usMiddayHour * 60 + usMiddayMin
+usCloseAbs = usClosePhaseHour * 60 + usClosePhaseMin
+futEndAbs = futSessionEndHour * 60 + futSessionEndMin
+fpLayoutValid = f_fp_layout_valid(futStartAbs, tokyoAbs, preLondonAbs, londonOpenAbs, usOpenAbs, futEndAbs)
+fpPhaseNow = fpLayoutValid ? f_fp_phase(curMin, futStartAbs, tokyoAbs, preLondonAbs, londonOpenAbs, usOpenAbs, futEndAbs) : "Maintenance"
+fpMaxChartSec = fpMaxChartTf == "15m" ? 900 : fpMaxChartTf == "30m" ? 1800 : 3600
+
+futInSession = f_in_window(curMin, futStartAbs, futEndAbs)
+futPhase = "Maintenance"
+if futInSession
+    if f_in_window(curMin, futStartAbs, londonOpenAbs)
+        futPhase := "Asia"
+    else if f_in_window(curMin, londonOpenAbs, usOpenAbs)
+        futPhase := "London"
+    else if f_in_window(curMin, usOpenAbs, usMiddayAbs)
+        futPhase := "NY Open"
+    else if f_in_window(curMin, usMiddayAbs, usCloseAbs)
+        futPhase := "NY Midday"
+    else
+        futPhase := "NY Close"
+
+inRegular = timeframe.isintraday ? session.ismarket : false
+newRegular = inRegular and not inRegular[1]
+endRegular = not inRegular and inRegular[1]
+
+var int regularBars = 0
+var int prevRegularBars = na
+var float expectedRegularBars = na
+
+if newRegular
+    regularBars := 1
+else if inRegular
+    regularBars += 1
+else
+    regularBars := 0
+
+if endRegular
+    prevRegularBars := math.max(1, nz(regularBars[1], 1))
+    alpha = 2.0 / (sessionLenEma + 1.0)
+    expectedRegularBars := na(expectedRegularBars) ? prevRegularBars : expectedRegularBars + alpha * (prevRegularBars - expectedRegularBars)
+
+barsExpected = na(expectedRegularBars) ? (na(prevRegularBars) ? math.max(1, regularBars) : prevRegularBars) : expectedRegularBars
+sessionProgress = inRegular and barsExpected > 0 ? regularBars / barsExpected : na
+
+autoPhase = timeframe.isintraday ? "Overnight" : "Non-Intraday"
+if inRegular
+    if sessionProgress <= openPhaseFrac
+        autoPhase := "Open"
+    else if sessionProgress >= closePhaseFrac
+        autoPhase := "Close"
+    else
+        autoPhase := "Midday"
+
+// For futures symbols, always use futures session phases for display and regime logic.
+isFuturesSymbol = syminfo.type == "futures"
+fpHtfFallback = useFootprintContext and isFuturesSymbol and chartTfSecEarly > fpMaxChartSec
+sessionPhase = isFuturesSymbol ? (useFootprintContext and fpLayoutValid and not fpHtfFallback ? fpPhaseNow : futPhase) : (sessionModel == "Futures (24h)" ? futPhase : autoPhase)
+blockSessionPhase = isFuturesSymbol ? (fpPhaseNow == "Tokyo" ? "Tokyo" : fpPhaseNow == "Asia" ? "Asia" : fpPhaseNow == "PreLondon" ? "London" : futPhase) : sessionPhase
+
+// -------------------- Footprint Context Engine (Futures)
+fpModuleEnabled = useFootprintContext and isFuturesSymbol and not fpHtfFallback
+fpModuleActive = fpModuleEnabled and fpLayoutValid
+fpSessionConfigInvalid = fpModuleEnabled and not fpLayoutValid
+footprint fpCtx = na
+if fpModuleEnabled
+    fpCtx := request.footprint(fpRowsPerFootprint, fpValueAreaPct)
+fpBarDelta = not na(fpCtx) ? fpCtx.delta() : na
+fpBarVol = not na(fpCtx) ? fpCtx.total_volume() : na
+fpBarDeltaPct = not na(fpBarVol) and fpBarVol > 0 ? (fpBarDelta / fpBarVol) : na
+// Previous footprint row always refers to the prior completed chart bar.
+fpPrevDelta = fpBarDelta[1]
+fpPrevVol = fpBarVol[1]
+fpPrevDeltaPct = not na(fpPrevVol) and fpPrevVol > 0 ? (fpPrevDelta / fpPrevVol) : na
+fpEffDeltaPctThreshold = fpProfileEff == "ES" ? 0.08 : fpProfileEff == "NQ" ? 0.10 : fpProfileEff == "GC" ? 0.06 : fpProfileEff == "CL" ? 0.06 : fpProfileEff == "YM" ? 0.07 : fpProfileEff == "Generic Futures" ? 0.07 : fpDeltaPctThreshold
+fpEffMinSessionVol = fpProfileEff == "ES" ? 120000.0 : fpProfileEff == "NQ" ? 70000.0 : fpProfileEff == "GC" ? 25000.0 : fpProfileEff == "CL" ? 30000.0 : fpProfileEff == "YM" ? 55000.0 : fpProfileEff == "Generic Futures" ? 45000.0 : fpMinSessionVol
+fpEffBreakoutBufferTicks = fpProfileEff == "ES" ? 2 : fpProfileEff == "NQ" ? 2 : fpProfileEff == "GC" ? 2 : fpProfileEff == "CL" ? 2 : fpProfileEff == "YM" ? 2 : fpProfileEff == "Generic Futures" ? 2 : fpBreakoutBufferTicks
+fpEffConfirmBars = fpProfileEff == "ES" ? 2 : fpProfileEff == "NQ" ? 2 : fpProfileEff == "GC" ? 2 : fpProfileEff == "CL" ? 2 : fpProfileEff == "YM" ? 2 : fpProfileEff == "Generic Futures" ? 2 : fpConfirmBars
+fpEffDeltaConfirm = fpProfileEff == "ES" ? 500.0 : fpProfileEff == "NQ" ? 400.0 : fpProfileEff == "GC" ? 120.0 : fpProfileEff == "CL" ? 180.0 : fpProfileEff == "YM" ? 280.0 : fpProfileEff == "Generic Futures" ? 250.0 : fpDeltaConfirm
+fpBreakoutBuffer = fpEffBreakoutBufferTicks * syminfo.mintick
+fpRegimeLine = fpRegimeFilter == "VWAP" ? ta.vwap(hlc3) : ta.ema(close, 200)
+fpRegimeLongOk = not na(fpRegimeLine) and close > fpRegimeLine
+fpRegimeShortOk = not na(fpRegimeLine) and close < fpRegimeLine
+
+var string fpCollectSession = "Maintenance"
+var bool fpCollectorActive = false
+var float fpLiveHigh = na
+var float fpLiveLow = na
+var float fpLiveCumDelta = na
+var float fpLiveTotalVol = na
+var int fpLiveBarsWithFp = 0
+
+var string fpContextSession = "None"
+var float fpContextHigh = na
+var float fpContextLow = na
+var float fpContextDeltaPct = na
+var float fpContextTotalVol = na
+var int fpContextBarsWithFp = 0
+var int fpContextMaxBars = 1
+var bool fpLongFired = false
+var bool fpShortFired = false
+
+if fpModuleActive
+    if fpCollectSession != fpPhaseNow
+        if fpCollectorActive and fpCollectSession != "Maintenance"
+            fpContextSession := fpCollectSession
+            fpContextHigh := fpLiveHigh
+            fpContextLow := fpLiveLow
+            fpContextTotalVol := fpLiveTotalVol
+            fpContextDeltaPct := fpLiveTotalVol > 0 ? (fpLiveCumDelta / fpLiveTotalVol) : na
+            fpContextBarsWithFp := fpLiveBarsWithFp
+            fpContextMaxBars := f_phase_max_bars(fpCollectSession, nz(timeframe.in_seconds(), 0), futStartAbs, tokyoAbs, preLondonAbs, londonOpenAbs, usOpenAbs, futEndAbs)
+            fpLongFired := false
+            fpShortFired := false
+
+        if fpPhaseNow != "Maintenance"
+            fpLiveHigh := high
+            fpLiveLow := low
+            fpLiveCumDelta := 0.0
+            fpLiveTotalVol := 0.0
+            fpLiveBarsWithFp := 0
+            fpCollectorActive := true
+        else
+            fpCollectorActive := false
+        fpCollectSession := fpPhaseNow
+
+    if fpCollectorActive and fpPhaseNow != "Maintenance"
+        fpLiveHigh := math.max(nz(fpLiveHigh, high), high)
+        fpLiveLow := math.min(nz(fpLiveLow, low), low)
+        if not na(fpCtx)
+            fpLiveCumDelta += fpCtx.delta()
+            fpLiveTotalVol += fpCtx.total_volume()
+            fpLiveBarsWithFp += 1
+else
+    fpCollectSession := "Maintenance"
+    fpCollectorActive := false
+
+fpLiveDeltaPct = not na(fpLiveTotalVol) and fpLiveTotalVol > 0 ? (fpLiveCumDelta / fpLiveTotalVol) : na
+
+fpRequiredBars = int(math.max(1, math.min(fpMinBarsWithData, fpContextMaxBars)))
+fpContextDataReady = fpModuleActive and fpContextSession != "None" and fpContextBarsWithFp >= fpRequiredBars and not na(fpContextDeltaPct)
+fpContextMins = fpContextSession != "None" ? f_phase_span_mins(fpContextSession, futStartAbs, tokyoAbs, preLondonAbs, londonOpenAbs, usOpenAbs, futEndAbs) : na
+fpVolScale = not na(fpContextMins) ? math.max(0.25, fpContextMins / 300.0) : 1.0
+fpMinVolRequired = fpVolumeCheckMode == "Adaptive" ? (fpEffMinSessionVol * fpVolScale) : fpEffMinSessionVol
+fpContextVolPass = fpModuleActive and fpContextSession != "None" and not na(fpContextTotalVol) and fpContextTotalVol >= fpMinVolRequired
+fpContextBias = fpModuleActive and fpContextSession != "None" and fpContextDataReady and fpContextVolPass and not na(fpContextDeltaPct) ? (fpContextDeltaPct > fpEffDeltaPctThreshold ? "Bull" : fpContextDeltaPct < -fpEffDeltaPctThreshold ? "Bear" : "Neutral") : "Neutral"
+fpContextReady = fpModuleActive and fpContextDataReady and fpContextVolPass and not na(fpContextDeltaPct)
+fpBiasBull = fpContextReady and fpContextBias == "Bull"
+fpBiasBear = fpContextReady and fpContextBias == "Bear"
+fpDataFallback = fpModuleActive and fpContextSession != "None" and (not fpContextDataReady or not fpContextVolPass)
+
+fpHaveLevels = fpContextReady and not na(fpContextHigh) and not na(fpContextLow)
+fpUpBreakCount = f_sum_last(fpHaveLevels and close > (fpContextHigh + fpBreakoutBuffer) ? 1.0 : 0.0, fpEffConfirmBars)
+fpDownBreakCount = f_sum_last(fpHaveLevels and close < (fpContextLow - fpBreakoutBuffer) ? 1.0 : 0.0, fpEffConfirmBars)
+fpUpDeltaCount = f_sum_last(nz(fpBarDelta, 0) > fpEffDeltaConfirm ? 1.0 : 0.0, fpEffConfirmBars)
+fpDownDeltaCount = f_sum_last(nz(fpBarDelta, 0) < -fpEffDeltaConfirm ? 1.0 : 0.0, fpEffConfirmBars)
+fpLongConfirmed = fpBiasBull and fpRegimeLongOk and fpUpBreakCount >= fpEffConfirmBars and fpUpDeltaCount >= fpEffConfirmBars
+fpShortConfirmed = fpBiasBear and fpRegimeShortOk and fpDownBreakCount >= fpEffConfirmBars and fpDownDeltaCount >= fpEffConfirmBars
+fpLongSignal = fpLongConfirmed and (not fpOneSignalPerSide or not fpLongFired)
+fpShortSignal = fpShortConfirmed and (not fpOneSignalPerSide or not fpShortFired)
+
+if fpLongSignal
+    fpLongFired := true
+if fpShortSignal
+    fpShortFired := true
+
+fpBreakState = "OFF"
+if fpModuleEnabled
+    if not fpLayoutValid
+        fpBreakState := "Invalid Session Times"
+    else if fpContextSession == "None"
+        fpBreakState := fpCollectSession != "Maintenance" ? "Collecting" : "Waiting"
+    else if not fpContextReady
+        fpBreakState := "NA"
+    else if fpLongSignal
+        fpBreakState := "Long"
+    else if fpShortSignal
+        fpBreakState := "Short"
+    else if fpOneSignalPerSide and fpLongFired and not fpShortFired
+        fpBreakState := "Locked Long"
+    else if fpOneSignalPerSide and fpShortFired and not fpLongFired
+        fpBreakState := "Locked Short"
+    else
+        fpBreakState := "Pending"
+
+// -------------------- HTF Z-Score
+f_htf_z() =>
+    srcVol = useDollarVolume ? close * volume * contractMultiplier : volume
+    f_zscore(srcVol)
+
+f_next_higher_tf(chartSec) =>
+    out = "12M"
+    if chartSec <= 60
+        out := "5"
+    else if chartSec <= 300
+        out := "15"
+    else if chartSec <= 900
+        out := "60"
+    else if chartSec <= 1800
+        out := "120"
+    else if chartSec <= 3600
+        out := "240"
+    else if chartSec <= 14400
+        out := "1D"
+    else if chartSec <= 86400
+        out := "1W"
+    else if chartSec <= 604800
+        out := "1M"
+    else if chartSec <= 2592000
+        out := "3M"
+    out
+
+// HTF precedence: input override (blank -> 60), then auto-raised to next higher TF if needed.
+manualHTF = higherTF_override == "" ? "60" : higherTF_override
+chartTfSec = timeframe.in_seconds()
+manualTfSec = timeframe.in_seconds(manualHTF)
+higherTF = na(manualTfSec) ? f_next_higher_tf(chartTfSec) : (manualTfSec > chartTfSec ? manualHTF : f_next_higher_tf(chartTfSec))
+
+// Confirmed HTF value only (reduces live HTF flicker/repaint in gate logic)
+zHTF_live = request.security(syminfo.tickerid, higherTF, f_htf_z(), barmerge.gaps_off, barmerge.lookahead_off)
+zHTF = zHTF_live[1]
+
+useMTFGate = requireMTF
+okMTF = not useMTFGate or na(zHTF) or zHTF > zThreshHTF
+
+// -------------------- Timeframe-Adaptive Structural Thresholds
+tfAdaptRelax = f_tf_adapt_relax(chartTfSec, originTfAdaptModeEff)
+tfAdaptLabel = f_tf_adapt_label(chartTfSec, originTfAdaptModeEff)
+baseVisibleCapNow = f_visible_cap(maxVisibleBasesPerSideEff, maxVisibleBasesPerSide2mEff, chartTfSec)
+blockVisibleCapNow = f_visible_cap(maxVisibleBlocksPerSideEff, maxVisibleBlocksPerSide2mEff, chartTfSec)
+originMaxBaseHeightAtrEff = originMaxBaseHeightAtr * (1.0 + tfAdaptRelax * 0.35)
+originMaxDriftAtrEff = originMaxDriftAtr * (1.0 + tfAdaptRelax * 0.75)
+originMaxEfficiencyEff = math.min(1.0, originMaxEfficiency + tfAdaptRelax * 0.25)
+originMinLegEfficiencyEff = math.max(0.20, originMinLegEfficiency - tfAdaptRelax * 0.22)
+originMaxPullbackAtrEff = originMaxPullbackAtr * (1.0 + tfAdaptRelax * 0.90)
+originMinExpansionAtrEff = math.max(0.10, originMinExpansionAtr - tfAdaptRelax * 0.30)
+originMinBodyPctEff = math.max(0.20, originMinBodyPct - tfAdaptRelax * 0.18)
+originCloseExtremeFracEff = math.min(0.50, originCloseExtremeFrac + tfAdaptRelax * 0.12)
+originSingleBarMaxRangeFracEff = math.min(1.20, originSingleBarMaxRangeFrac + tfAdaptRelax * 0.25)
+blockActivityGateEff = math.max(normal_gate, elevated_gate - tfAdaptRelax * 0.45)
+blockMidpointBufferEff = tfAdaptRelax * 0.18
+blockCloseBeyondFracEff = math.max(0.0, 0.10 - tfAdaptRelax * 0.14)
+imbalanceRangeFracEff = imbalanceBlockModeEff == "Strict" ? math.max(originSingleBarMaxRangeFracEff, 1.0) : imbalanceBlockModeEff == "Aggressive" ? math.max(originSingleBarMaxRangeFracEff, 1.25 + tfAdaptRelax * 0.10) : math.max(originSingleBarMaxRangeFracEff, 1.10 + tfAdaptRelax * 0.05)
+imbalanceMidpointFracEff = imbalanceBlockModeEff == "Strict" ? 0.0 : imbalanceBlockModeEff == "Aggressive" ? -0.10 : 0.0
+sessionBlockPct = not isFuturesSymbol or sessionBlockProfileEff == "Off" ? 0.0 : blockSessionPhase == "Asia" ? 0.10 : blockSessionPhase == "Tokyo" ? 0.05 : blockSessionPhase == "NY Open" ? -0.10 : blockSessionPhase == "NY Midday" ? 0.12 : blockSessionPhase == "NY Close" ? 0.05 : 0.0
+blockActivityGateSessEff = blockActivityGateEff * (1.0 + sessionBlockPct)
+blockExpansionAtrSessEff = originMinExpansionAtrEff * (1.0 + sessionBlockPct * 0.60)
+blockPrecursorRangeFracEff = math.max(0.30, originSingleBarMaxRangeFracEff * (1.0 - sessionBlockPct * 0.60))
+blockMidpointBufferSessEff = math.max(0.0, blockMidpointBufferEff * (1.0 - sessionBlockPct * 1.20))
+blockCloseBeyondFracSessEff = math.max(0.0, blockCloseBeyondFracEff * (1.0 + sessionBlockPct))
+imbalanceRangeFracSessEff = math.max(0.50, imbalanceRangeFracEff * (1.0 - sessionBlockPct * 0.60))
+imbalanceMidpointFracSessEff = imbalanceMidpointFracEff + sessionBlockPct * 0.30
+imbalanceActivityGateSessEff = math.max(normal_gate, blockActivityGateSessEff * 0.90)
+is2mChart = chartTfSec == 120
+imbalanceRangeFracFinal = is2mChart ? imbalanceRangeFracSessEff * 1.12 : imbalanceRangeFracSessEff
+imbalanceMidpointFracFinal = is2mChart ? (imbalanceMidpointFracSessEff - 0.08) : imbalanceMidpointFracSessEff
+imbalanceActivityGateFinal = is2mChart ? math.max(normal_gate * 0.95, imbalanceActivityGateSessEff - 0.10) : imbalanceActivityGateSessEff
+imbalanceBodyPctFinal = is2mChart ? math.max(0.43, math.max(0.50, originMinBodyPctEff - 0.05) - 0.07) : math.max(0.50, originMinBodyPctEff - 0.05)
+imbalanceExpansionAtrFinal = is2mChart ? math.max(0.30, blockExpansionAtrSessEff * 0.60) : math.max(0.35, blockExpansionAtrSessEff * 0.70)
+
+// -------------------- Candle / Pattern Features
+prevClose = close[1]
+tr = math.max(high - low, math.max(math.abs(high - prevClose), math.abs(low - prevClose)))
+atr_bar = ta.rma(tr, atrLen)
+rng = high - low
+body = math.abs(close - open)
+bodyPct = rng > 0 ? body / rng : 0.0
+bodyHigh = math.max(open, close)
+bodyLow = math.min(open, close)
+
+rangeSpike = tr > atr_bar * atrMult
+smallBody = rng > 0 and bodyPct < smallBodyP
+
+isElevated = zSignal >= elevated_gate
+isInstitutional = zSignal >= institutional_gate
+
+rawMomentum = isElevated and rangeSpike
+rawAbsorption = isElevated and smallBody
+blockVolumePivotConfirmed = not na(ta.pivothigh(volume, blockVolumePivotLen, 1))
+
+// -------------------- Swing / BOS Leg Model
+var float lastSwingHigh = na
+var float lastSwingLow = na
+var int lastSwingHighBar = na
+var int lastSwingLowBar = na
+var int lastBullBosBrokenPivotBar = na
+var int lastBearBosBrokenPivotBar = na
+var int lastBullBosBar = na
+var int lastBearBosBar = na
+var int bullBlockLegSeq = 0
+var int bearBlockLegSeq = 0
+var int swingBias = 0
+
+pivotHighConfirmed = ta.pivothigh(high, originSwingPivotLen, originSwingPivotLen)
+pivotLowConfirmed = ta.pivotlow(low, originSwingPivotLen, originSwingPivotLen)
+if not na(pivotHighConfirmed)
+    lastSwingHigh := pivotHighConfirmed
+    lastSwingHighBar := bar_index - originSwingPivotLen
+if not na(pivotLowConfirmed)
+    lastSwingLow := pivotLowConfirmed
+    lastSwingLowBar := bar_index - originSwingPivotLen
+
+bullBosNow = barstate.isconfirmed and not na(lastSwingHigh) and close > lastSwingHigh and (na(lastBullBosBrokenPivotBar) or lastSwingHighBar > lastBullBosBrokenPivotBar)
+bearBosNow = barstate.isconfirmed and not na(lastSwingLow) and close < lastSwingLow and (na(lastBearBosBrokenPivotBar) or lastSwingLowBar > lastBearBosBrokenPivotBar)
+if bullBosNow
+    bullBlockLegSeq += 1
+    lastBullBosBrokenPivotBar := lastSwingHighBar
+    lastBullBosBar := bar_index
+    swingBias := 1
+if bearBosNow
+    bearBlockLegSeq += 1
+    lastBearBosBrokenPivotBar := lastSwingLowBar
+    lastBearBosBar := bar_index
+    swingBias := -1
+
+// Locate the last compact balance area before a confirmed displacement leg.
+f_detect_origin_zone(isBull) =>
+    bool found = false
+    int bestStartBarsAgo = na
+    float bestZoneHigh = na
+    float bestZoneLow = na
+    float bestScore = na
+    sideText = isBull ? "Bull" : "Bear"
+    string bestDebug = sideText + " base: no candidate"
+    string lastDebug = sideText + " base: insufficient history"
+
+    for len = originMinBaseBars to originMaxBaseBars
+        baseStartBarsAgo = originConfirmBars + len - 1
+        if not na(open[baseStartBarsAgo]) and not na(close[originConfirmBars])
+            float clusterBodyHigh = na
+            float clusterBodyLow = na
+            float clusterTrSum = 0.0
+            float clusterAtrSum = 0.0
+            int bullCount = 0
+            int bearCount = 0
+            int smallBodyCount = 0
+            int fpBullCount = 0
+            int fpBearCount = 0
+            int fpSamples = 0
+
+            for i = originConfirmBars to baseStartBarsAgo
+                barBodyHigh = math.max(open[i], close[i])
+                barBodyLow = math.min(open[i], close[i])
+                clusterBodyHigh := na(clusterBodyHigh) ? barBodyHigh : math.max(clusterBodyHigh, barBodyHigh)
+                clusterBodyLow := na(clusterBodyLow) ? barBodyLow : math.min(clusterBodyLow, barBodyLow)
+                clusterTrSum += nz(tr[i], 0.0)
+                clusterAtrSum += nz(atr_bar[i], 0.0)
+                bullCount += close[i] > open[i] ? 1 : 0
+                bearCount += close[i] < open[i] ? 1 : 0
+                smallBodyCount += bodyPct[i] < smallBodyP ? 1 : 0
+                if not na(fpBarDelta[i])
+                    fpSamples += 1
+                    fpBullCount += fpBarDelta[i] > 0 ? 1 : 0
+                    fpBearCount += fpBarDelta[i] < 0 ? 1 : 0
+
+            avgAtr = clusterAtrSum / len
+            wickAllowance = avgAtr * originWickInclusionAtr
+            upperProbeCount = 0
+            lowerProbeCount = 0
+            upperProbeHigh = clusterBodyHigh
+            lowerProbeLow = clusterBodyLow
+
+            for i = originConfirmBars to baseStartBarsAgo
+                if high[i] > clusterBodyHigh and high[i] <= clusterBodyHigh + wickAllowance
+                    upperProbeCount += 1
+                    upperProbeHigh := math.max(upperProbeHigh, high[i])
+                if low[i] < clusterBodyLow and low[i] >= clusterBodyLow - wickAllowance
+                    lowerProbeCount += 1
+                    lowerProbeLow := math.min(lowerProbeLow, low[i])
+
+            zoneHigh = upperProbeCount >= 2 ? upperProbeHigh : clusterBodyHigh
+            zoneLow = lowerProbeCount >= 2 ? lowerProbeLow : clusterBodyLow
+            zoneHeight = zoneHigh - zoneLow
+            netDrift = math.abs(close[originConfirmBars] - open[baseStartBarsAgo])
+            balanceEfficiency = clusterTrSum > 0 ? (zoneHeight / clusterTrSum) : 1.0
+            twoSidedCandles = bullCount > 0 and bearCount > 0
+            twoSidedFootprint = fpSamples < 2 ? true : (fpBullCount > 0 and fpBearCount > 0)
+            failedAuction = smallBodyCount > 0 or (isBull ? lowerProbeCount > 0 : upperProbeCount > 0)
+            compactBase = avgAtr > 0 and zoneHeight <= avgAtr * originMaxBaseHeightAtrEff
+            driftOk = avgAtr > 0 and netDrift <= avgAtr * originMaxDriftAtrEff
+            efficiencyOk = balanceEfficiency <= originMaxEfficiencyEff
+            legHigh = high
+            legLow = low
+            if originConfirmBars > 1
+                for i = 1 to originConfirmBars - 1
+                    legHigh := math.max(legHigh, high[i])
+                    legLow := math.min(legLow, low[i])
+            legTrSum = f_sum_last(tr, originConfirmBars)
+            legNetMove = isBull ? (close - open[originConfirmBars - 1]) : (open[originConfirmBars - 1] - close)
+            legEfficiency = legTrSum > 0 ? (legNetMove / legTrSum) : 0.0
+            legExpansion = isBull ? (legHigh - zoneHigh) : (zoneLow - legLow)
+            legPullbackOk = avgAtr > 0 and (isBull ? (legLow >= zoneHigh - avgAtr * originMaxPullbackAtrEff) : (legHigh <= zoneLow + avgAtr * originMaxPullbackAtrEff))
+            legBreaksStructure = isBull ? (legHigh > zoneHigh and close > zoneHigh) : (legLow < zoneLow and close < zoneLow)
+            legDirectionalCount = 0
+            legImpulseBarCount = 0
+
+            for i = 0 to originConfirmBars - 1
+                legRange = high[i] - low[i]
+                legDirectionalBar = isBull ? (close[i] > open[i]) : (close[i] < open[i])
+                legDirectionalCount += legDirectionalBar ? 1 : 0
+                legImpulseBar = legRange > 0 and bodyPct[i] >= originMinBodyPctEff and (isBull ? (close[i] >= high[i] - legRange * originCloseExtremeFracEff) : (close[i] <= low[i] + legRange * originCloseExtremeFracEff))
+                legImpulseBarCount += legImpulseBar ? 1 : 0
+
+            legDirectional = legDirectionalCount == originConfirmBars
+            legEfficient = legEfficiency >= originMinLegEfficiencyEff
+            legExpanded = avgAtr > 0 and legExpansion >= avgAtr * originMinExpansionAtrEff
+            legImpulse = legImpulseBarCount >= 1
+
+            failReason = not compactBase ? "wide base" : not driftOk ? "drift too high" : not efficiencyOk ? "base inefficient" : not twoSidedCandles ? "one-sided candles" : not twoSidedFootprint ? "one-sided footprint" : not failedAuction ? "no failed auction" : not legPullbackOk ? "deep pullback" : not legBreaksStructure ? "no structure break" : not legDirectional ? "mixed leg" : not legEfficient ? "weak leg efficiency" : not legExpanded ? "insufficient expansion" : not legImpulse ? "no impulse bar" : "pass"
+            if compactBase and driftOk and efficiencyOk and twoSidedCandles and twoSidedFootprint and failedAuction and legPullbackOk and legBreaksStructure and legDirectional and legEfficient and legExpanded and legImpulse
+                widthScore = 1.0 - math.min(1.0, zoneHeight / (avgAtr * originMaxBaseHeightAtrEff))
+                driftScore = 1.0 - math.min(1.0, netDrift / (avgAtr * originMaxDriftAtrEff))
+                efficiencyScore = 1.0 - math.min(1.0, balanceEfficiency / originMaxEfficiencyEff)
+                compressionScore = smallBodyCount / len
+                legScore = math.min(1.0, legEfficiency / originMinLegEfficiencyEff) + math.min(1.0, legExpansion / (avgAtr * originMinExpansionAtrEff))
+                score = widthScore + driftScore + efficiencyScore + compressionScore + legScore - ((len - originMinBaseBars) * 0.05)
+                if not found or score > bestScore
+                    found := true
+                    bestStartBarsAgo := baseStartBarsAgo
+                    bestZoneHigh := zoneHigh
+                    bestZoneLow := zoneLow
+                    bestScore := score
+                    bestDebug := sideText + " base PASS len " + str.tostring(len) + " score " + f_fmt_debug_num(score)
+            else
+                lastDebug := sideText + " base FAIL len " + str.tostring(len) + " " + failReason
+        else
+            lastDebug := sideText + " base FAIL insufficient history"
+
+    [found, bestStartBarsAgo, bestZoneHigh, bestZoneLow, bestScore, found ? bestDebug : lastDebug]
+
+f_detect_displacement_block(isBull) =>
+    bool found = false
+    int startBarsAgo = na
+    float zoneHigh = na
+    float zoneLow = na
+    float bestScore = na
+    sideText = isBull ? "Bull" : "Bear"
+    string debugText = sideText + " block: insufficient history"
+
+    if not na(open[originConfirmBars])
+        precursorHigh = high[originConfirmBars]
+        precursorLow = low[originConfirmBars]
+        precursorRange = precursorHigh - precursorLow
+        precursorAtr = atr_bar[originConfirmBars]
+        legHigh = high
+        legLow = low
+        legMaxRange = high - low
+        legMaxZ = nz(zSignal, 0.0)
+        legMinClose = close
+        legMaxClose = close
+        if originConfirmBars > 1
+            for i = 1 to originConfirmBars - 1
+                legHigh := math.max(legHigh, high[i])
+                legLow := math.min(legLow, low[i])
+                legMaxRange := math.max(legMaxRange, high[i] - low[i])
+                legMaxZ := math.max(legMaxZ, nz(zSignal[i], 0.0))
+                legMinClose := math.min(legMinClose, close[i])
+                legMaxClose := math.max(legMaxClose, close[i])
+        legTrSum = f_sum_last(tr, originConfirmBars)
+        legNetMove = isBull ? (close - open[originConfirmBars - 1]) : (open[originConfirmBars - 1] - close)
+        legEfficiency = legTrSum > 0 ? (legNetMove / legTrSum) : 0.0
+        legExpansion = isBull ? (legHigh - precursorHigh) : (precursorLow - legLow)
+        legCloseBreak = isBull ? legMaxClose > precursorHigh : legMinClose < precursorLow
+        legBreaksPrecursor = isBull ? (legHigh > precursorHigh and legCloseBreak) : (legLow < precursorLow and legCloseBreak)
+        legDirectionalCount = 0
+        legImpulseBarCount = 0
+        legDirectionalMin = math.max(1, originConfirmBars - 1)
+        for i = 0 to originConfirmBars - 1
+            legRange = high[i] - low[i]
+            legDirectionalBar = isBull ? (close[i] > open[i]) : (close[i] < open[i])
+            legDirectionalCount += legDirectionalBar ? 1 : 0
+            legImpulseBar = legRange > 0 and bodyPct[i] >= originMinBodyPctEff and (isBull ? (close[i] >= high[i] - legRange * originCloseExtremeFracEff) : (close[i] <= low[i] + legRange * originCloseExtremeFracEff))
+            legImpulseBarCount += legImpulseBar ? 1 : 0
+        legDirectional = legDirectionalCount >= legDirectionalMin
+        legEfficient = legEfficiency >= originMinLegEfficiencyEff
+        legExpanded = precursorAtr > 0 and legExpansion >= precursorAtr * blockExpansionAtrSessEff
+        legImpulse = legImpulseBarCount >= 1
+        precursorSmaller = precursorRange > 0 and legMaxRange > 0 and precursorRange <= legMaxRange * blockPrecursorRangeFracEff
+        precursorMid = (precursorHigh + precursorLow) * 0.5
+        recentVolumePivot = f_sum_last(blockVolumePivotConfirmed ? 1.0 : 0.0, originConfirmBars) > 0
+        activityPass = blockQualityModeEff == "Basic" or legMaxZ >= blockActivityGateSessEff
+        midpointPass = blockQualityModeEff == "Basic" or (isBull ? legMinClose > precursorMid - precursorRange * blockMidpointBufferSessEff : legMaxClose < precursorMid + precursorRange * blockMidpointBufferSessEff)
+        closeBeyondPass = blockQualityModeEff == "Basic" or (precursorRange <= 0 ? true : (isBull ? legMaxClose > precursorHigh + precursorRange * blockCloseBeyondFracSessEff : legMinClose < precursorLow - precursorRange * blockCloseBeyondFracSessEff))
+        flowPass = blockQualityModeEff == "Basic" or (not fpContextReady or (isBull ? fpContextBias != "Bear" : fpContextBias != "Bull"))
+        swingPass = blockQualityModeEff == "Basic" or swingBias == 0 or (isBull ? swingBias >= 0 : swingBias <= 0)
+        sessionPass = blockQualityModeEff == "Basic" or sessionPhase != "Maintenance"
+        volumePivotPass = blockQualityModeEff == "Basic" or not requireBlockVolumePivotEff or recentVolumePivot
+        failReason = not precursorSmaller ? "precursor too large" : not legBreaksPrecursor ? "no precursor break" : not legDirectional ? "mixed leg" : not legEfficient ? "weak leg efficiency" : not legExpanded ? "insufficient expansion" : not legImpulse ? "no impulse bar" : not activityPass ? "activity weak" : not midpointPass ? "failed midpoint hold" : not closeBeyondPass ? "close not decisive" : not flowPass ? "opposing flow bias" : not swingPass ? "BOS bias mismatch" : not sessionPass ? "maintenance session" : not volumePivotPass ? "no volume pivot" : "pass"
+
+        if precursorSmaller and legBreaksPrecursor and legDirectional and legEfficient and legExpanded and legImpulse and activityPass and midpointPass and closeBeyondPass and flowPass and swingPass and sessionPass and volumePivotPass
+            found := true
+            startBarsAgo := originConfirmBars
+            zoneHigh := precursorHigh
+            zoneLow := precursorLow
+            efficiencyScore = math.min(1.5, legEfficiency / originMinLegEfficiency)
+            expansionScore = precursorAtr > 0 ? math.min(1.5, legExpansion / (precursorAtr * originMinExpansionAtr)) : 0.0
+            activityScore = math.max(0.0, legMaxZ - normal_gate)
+            followThroughScore = precursorRange > 0 ? math.min(1.0, math.abs(close - precursorMid) / precursorRange) : 0.0
+            flowScore = flowPass ? 0.25 : 0.0
+            bestScore := efficiencyScore + expansionScore + activityScore + followThroughScore + flowScore
+            debugText := sideText + " block PASS score " + f_fmt_debug_num(bestScore) + " leg " + str.tostring(originConfirmBars)
+        else
+            debugText := sideText + " block FAIL " + failReason
+
+    if not found and allowImbalanceBlockFallback and not na(open[1])
+        fallbackHigh = high[1]
+        fallbackLow = low[1]
+        fallbackRange = fallbackHigh - fallbackLow
+        fallbackMid = (fallbackHigh + fallbackLow) * 0.5
+        impulseRange = high - low
+        impulseExpansion = isBull ? (high - fallbackHigh) : (fallbackLow - low)
+        fallbackPrecursorSmaller = fallbackRange > 0 and impulseRange > 0 and fallbackRange <= impulseRange * imbalanceRangeFracFinal
+        fallbackWickBreak = isBull ? high > fallbackHigh : low < fallbackLow
+        fallbackCloseBreak = isBull ? close > fallbackHigh : close < fallbackLow
+        fallbackMidpointBreak = fallbackRange <= 0 ? false : (isBull ? close >= fallbackMid + fallbackRange * imbalanceMidpointFracFinal : close <= fallbackMid - fallbackRange * imbalanceMidpointFracFinal)
+        fallbackBreak = imbalanceBlockModeEff == "Strict" ? (fallbackWickBreak and fallbackCloseBreak) : (fallbackWickBreak and (fallbackCloseBreak or fallbackMidpointBreak))
+        fallbackDirectional = isBull ? close > open : close < open
+        fallbackImpulse = impulseRange > 0 and bodyPct >= imbalanceBodyPctFinal and (isBull ? (close >= high - impulseRange * math.min(0.35, originCloseExtremeFracEff + 0.10)) : (close <= low + impulseRange * math.min(0.35, originCloseExtremeFracEff + 0.10)))
+        fallbackExpanded = atr_bar > 0 and impulseExpansion >= atr_bar * imbalanceExpansionAtrFinal
+        fallbackActivity = blockQualityModeEff == "Basic" or nz(zSignal, 0.0) >= imbalanceActivityGateFinal or rangeSpike
+        fallbackFlow = blockQualityModeEff == "Basic" or (not fpContextReady or (isBull ? fpContextBias != "Bear" : fpContextBias != "Bull"))
+        fallbackSwing = blockQualityModeEff == "Basic" or swingBias == 0 or (isBull ? swingBias >= 0 : swingBias <= 0)
+        fallbackFailReason = not fallbackPrecursorSmaller ? "imbalance precursor too large" : not fallbackBreak ? "imbalance no break" : not fallbackDirectional ? "imbalance mixed bar" : not fallbackImpulse ? "imbalance weak body" : not fallbackExpanded ? "imbalance expansion weak" : not fallbackActivity ? "imbalance activity weak" : not fallbackFlow ? "imbalance opposing flow" : not fallbackSwing ? "imbalance BOS mismatch" : "pass"
+
+        if fallbackPrecursorSmaller and fallbackBreak and fallbackDirectional and fallbackImpulse and fallbackExpanded and fallbackActivity and fallbackFlow and fallbackSwing
+            found := true
+            startBarsAgo := 1
+            zoneHigh := fallbackHigh
+            zoneLow := fallbackLow
+            bestScore := math.max(nz(bestScore, 0.0), 1.0 + math.max(0.0, nz(zSignal, 0.0) - normal_gate) + math.min(1.5, impulseExpansion / math.max(syminfo.mintick, atr_bar)))
+            debugText := sideText + " block PASS imbalance " + str.lower(imbalanceBlockModeEff) + " score " + f_fmt_debug_num(bestScore)
+        else
+            debugText := sideText + " block FAIL " + fallbackFailReason
+
+    [found, startBarsAgo, zoneHigh, zoneLow, bestScore, debugText]
+
+volScore = math.min(3.0, math.max(0.0, zSignal - normal_gate))
+rangeScore = atr_bar > 0 ? math.min(2.0, math.max(0.0, tr / atr_bar - atrMult)) : 0.0
+tightBody = math.min(2.0, math.max(0.0, (smallBodyP - bodyPct) * 4.0))
+scoreMomentum = rawMomentum ? (volScore + rangeScore + (isInstitutional ? 1.0 : 0.0)) : 0.0
+scoreAbsorption = rawAbsorption ? (volScore + tightBody + (isInstitutional ? 1.0 : 0.0)) : 0.0
+
+// Mutually exclusive output: if both patterns occur, pick the stronger one (tie -> momentum)
+preferMomentum = rawMomentum and (not rawAbsorption or scoreMomentum >= scoreAbsorption)
+preferAbsorption = rawAbsorption and not preferMomentum
+
+var int lastMarkBar = na
+onCooldown = not na(lastMarkBar) and (bar_index - lastMarkBar) < cooldownBars
+
+canShow = not newsGuard
+canEmit = canShow and not onCooldown and okMTF
+isClosedBar = barstate.isconfirmed
+
+fpDirBullBar = not na(fpBarDelta) ? fpBarDelta > 0 : close > open
+fpDirBearBar = not na(fpBarDelta) ? fpBarDelta < 0 : close < open
+fpDirectionalBiasActive = fpContextReady and (fpBiasBull or fpBiasBear)
+fpDirectionalMatch = not fpDirectionalBiasActive or (fpBiasBull and fpDirBullBar) or (fpBiasBear and fpDirBearBar)
+fpHardMode = fpModuleEnabled and footprintGateMode == "Hard"
+fpSoftMode = fpModuleEnabled and footprintGateMode == "Soft"
+fpHardDirectionalBlock = fpHardMode and fpDirectionalBiasActive and not fpDirectionalMatch
+fpHardAbsorptionBlock = fpHardDirectionalBlock and not allowAbsorptionAgainstBias
+
+markMomentumRaw = isClosedBar and canEmit and preferMomentum and scoreMomentum >= minScoreGate
+markAbsRaw = isClosedBar and canEmit and preferAbsorption and scoreAbsorption >= minScoreGate
+markActivityElevRaw = isClosedBar and canEmit and isElevated and not isInstitutional
+markActivityInstRaw = isClosedBar and canEmit and isInstitutional
+
+markMomentum = markMomentumRaw and not fpHardDirectionalBlock
+markAbs = markAbsRaw and not fpHardAbsorptionBlock
+markActivityElev = markActivityElevRaw and not fpHardDirectionalBlock
+markActivityInst = markActivityInstRaw and not fpHardDirectionalBlock
+
+fpHardGateBlocked = fpHardMode and ((markMomentumRaw and not markMomentum) or (markActivityElevRaw and not markActivityElev) or (markActivityInstRaw and not markActivityInst) or (markAbsRaw and not markAbs))
+
+hasAnyMark = markMomentum or markAbs or markActivityElev or markActivityInst
+
+originCanConfirm = canShow and (originUseSignalGates ? (not onCooldown and okMTF) : true)
+[originBullFoundRaw, originBullStartBarsAgo, originBullHigh, originBullLow, originBullScore, originBullDebug] = f_detect_origin_zone(true)
+[originBearFoundRaw, originBearStartBarsAgo, originBearHigh, originBearLow, originBearScore, originBearDebug] = f_detect_origin_zone(false)
+[blockBullFoundRaw, blockBullStartBarsAgo, blockBullHigh, blockBullLow, blockBullScore, blockBullDebug] = f_detect_displacement_block(true)
+[blockBearFoundRaw, blockBearStartBarsAgo, blockBearHigh, blockBearLow, blockBearScore, blockBearDebug] = f_detect_displacement_block(false)
+
+originBullLeft = not na(originBullStartBarsAgo) ? (bar_index - originBullStartBarsAgo) : na
+originBearLeft = not na(originBearStartBarsAgo) ? (bar_index - originBearStartBarsAgo) : na
+blockBullLeft = not na(blockBullStartBarsAgo) ? (bar_index - blockBullStartBarsAgo) : na
+blockBearLeft = not na(blockBearStartBarsAgo) ? (bar_index - blockBearStartBarsAgo) : na
+
+var int lastBullOriginLeft = na
+var float lastBullOriginHigh = na
+var float lastBullOriginLow = na
+var int lastBearOriginLeft = na
+var float lastBearOriginHigh = na
+var float lastBearOriginLow = na
+var int lastBullBlockLeft = na
+var float lastBullBlockHigh = na
+var float lastBullBlockLow = na
+var int lastBearBlockLeft = na
+var float lastBearBlockHigh = na
+var float lastBearBlockLow = na
+var box[] originBullBoxes = array.new_box()
+var box[] originBearBoxes = array.new_box()
+var label[] originBullLabels = array.new_label()
+var label[] originBearLabels = array.new_label()
+var label[] originBullTriggerLabels = array.new_label()
+var label[] originBearTriggerLabels = array.new_label()
+var line[] originBullMidLines = array.new_line()
+var line[] originBearMidLines = array.new_line()
+var float[] originBullHighs = array.new_float()
+var float[] originBullLows = array.new_float()
+var float[] originBearHighs = array.new_float()
+var float[] originBearLows = array.new_float()
+var int[] originBullLeftBars = array.new_int()
+var int[] originBearLeftBars = array.new_int()
+var int[] originBullCreatedBars = array.new_int()
+var int[] originBearCreatedBars = array.new_int()
+var int[] originBullStates = array.new_int()
+var int[] originBearStates = array.new_int()
+var int[] originBullTouchBars = array.new_int()
+var int[] originBearTouchBars = array.new_int()
+var int[] originBullDecelCounts = array.new_int()
+var int[] originBearDecelCounts = array.new_int()
+var float[] originBullReactionExtremes = array.new_float()
+var float[] originBearReactionExtremes = array.new_float()
+var float[] originBullShiftLevels = array.new_float()
+var float[] originBearShiftLevels = array.new_float()
+var int[] originBullLegIds = array.new_int()
+var int[] originBearLegIds = array.new_int()
+var box[] blockBullBoxes = array.new_box()
+var box[] blockBearBoxes = array.new_box()
+var label[] blockBullLabels = array.new_label()
+var label[] blockBearLabels = array.new_label()
+var line[] blockBullMidLines = array.new_line()
+var line[] blockBearMidLines = array.new_line()
+var float[] blockBullHighs = array.new_float()
+var float[] blockBullLows = array.new_float()
+var float[] blockBearHighs = array.new_float()
+var float[] blockBearLows = array.new_float()
+var int[] blockBullLeftBars = array.new_int()
+var int[] blockBearLeftBars = array.new_int()
+var int[] blockBullCreatedBars = array.new_int()
+var int[] blockBearCreatedBars = array.new_int()
+var int[] blockBullStates = array.new_int()
+var int[] blockBearStates = array.new_int()
+var int[] blockBullLegIds = array.new_int()
+var int[] blockBearLegIds = array.new_int()
+
+sameBullOrigin = not na(lastBullOriginLeft) and not na(lastBullOriginHigh) and not na(lastBullOriginLow) and not na(originBullLeft) and not na(originBullHigh) and not na(originBullLow) and originBullLeft == lastBullOriginLeft and math.abs(originBullHigh - lastBullOriginHigh) <= syminfo.mintick * 0.5 and math.abs(originBullLow - lastBullOriginLow) <= syminfo.mintick * 0.5
+sameBearOrigin = not na(lastBearOriginLeft) and not na(lastBearOriginHigh) and not na(lastBearOriginLow) and not na(originBearLeft) and not na(originBearHigh) and not na(originBearLow) and originBearLeft == lastBearOriginLeft and math.abs(originBearHigh - lastBearOriginHigh) <= syminfo.mintick * 0.5 and math.abs(originBearLow - lastBearOriginLow) <= syminfo.mintick * 0.5
+sameBullBlock = not na(lastBullBlockLeft) and not na(lastBullBlockHigh) and not na(lastBullBlockLow) and not na(blockBullLeft) and not na(blockBullHigh) and not na(blockBullLow) and blockBullLeft == lastBullBlockLeft and math.abs(blockBullHigh - lastBullBlockHigh) <= syminfo.mintick * 0.5 and math.abs(blockBullLow - lastBullBlockLow) <= syminfo.mintick * 0.5
+sameBearBlock = not na(lastBearBlockLeft) and not na(lastBearBlockHigh) and not na(lastBearBlockLow) and not na(blockBearLeft) and not na(blockBearHigh) and not na(blockBearLow) and blockBearLeft == lastBearBlockLeft and math.abs(blockBearHigh - lastBearBlockHigh) <= syminfo.mintick * 0.5 and math.abs(blockBearLow - lastBearBlockLow) <= syminfo.mintick * 0.5
+
+baseMinSpacingBarsNow = f_base_spacing_bars(chartTfSec)
+bullOriginCandidateRaw = showOriginBox and originCanConfirm and isClosedBar and originBullFoundRaw and not na(originBullStartBarsAgo) and originBullHigh > originBullLow and not sameBullOrigin
+bearOriginCandidateRaw = showOriginBox and originCanConfirm and isClosedBar and originBearFoundRaw and not na(originBearStartBarsAgo) and originBearHigh > originBearLow and not sameBearOrigin
+bullBosLegIdCandidate = bullBlockLegSeq == 0 ? 1 : bullBlockLegSeq
+bearBosLegIdCandidate = bearBlockLegSeq == 0 ? 1 : bearBlockLegSeq
+bullOriginLegIdNow = bullOriginCandidateRaw ? bullBosLegIdCandidate : na
+bearOriginLegIdNow = bearOriginCandidateRaw ? bearBosLegIdCandidate : na
+bullBaseLegActive = false
+bearBaseLegActive = false
+int bullLastBaseCreatedSameLeg = na
+int bearLastBaseCreatedSameLeg = na
+if array.size(originBullStates) > 0 and not na(bullOriginLegIdNow)
+    for i = 0 to array.size(originBullStates) - 1
+        existingBullLegId = array.get(originBullLegIds, i)
+        if existingBullLegId == bullOriginLegIdNow
+            existingBullCreated = array.get(originBullCreatedBars, i)
+            bullLastBaseCreatedSameLeg := na(bullLastBaseCreatedSameLeg) ? existingBullCreated : math.max(bullLastBaseCreatedSameLeg, existingBullCreated)
+            if f_base_active(array.get(originBullStates, i))
+                bullBaseLegActive := true
+if array.size(originBearStates) > 0 and not na(bearOriginLegIdNow)
+    for i = 0 to array.size(originBearStates) - 1
+        existingBearLegId = array.get(originBearLegIds, i)
+        if existingBearLegId == bearOriginLegIdNow
+            existingBearCreated = array.get(originBearCreatedBars, i)
+            bearLastBaseCreatedSameLeg := na(bearLastBaseCreatedSameLeg) ? existingBearCreated : math.max(bearLastBaseCreatedSameLeg, existingBearCreated)
+            if f_base_active(array.get(originBearStates, i))
+                bearBaseLegActive := true
+bullBaseLegBlocked = bullOriginCandidateRaw and oneActiveBasePerLeg and bullBaseLegActive
+bearBaseLegBlocked = bearOriginCandidateRaw and oneActiveBasePerLeg and bearBaseLegActive
+bullBaseSpacingBlocked = bullOriginCandidateRaw and baseMinSpacingBarsNow > 0 and not na(bullLastBaseCreatedSameLeg) and (bar_index - bullLastBaseCreatedSameLeg) < baseMinSpacingBarsNow
+bearBaseSpacingBlocked = bearOriginCandidateRaw and baseMinSpacingBarsNow > 0 and not na(bearLastBaseCreatedSameLeg) and (bar_index - bearLastBaseCreatedSameLeg) < baseMinSpacingBarsNow
+bullOriginCandidate = bullOriginCandidateRaw and not bullBaseLegBlocked and not bullBaseSpacingBlocked
+bearOriginCandidate = bearOriginCandidateRaw and not bearBaseLegBlocked and not bearBaseSpacingBlocked
+originConflict = bullOriginCandidate and bearOriginCandidate
+originBullScoreSafe = nz(originBullScore, -1000000.0)
+originBearScoreSafe = nz(originBearScore, -1000000.0)
+
+originBullWinsConflict = originConflict and (originBullScoreSafe > originBearScoreSafe + originScoreEpsilon or (math.abs(originBullScoreSafe - originBearScoreSafe) <= originScoreEpsilon and close >= open))
+originBearWinsConflict = originConflict and not originBullWinsConflict
+originBullFound = bullOriginCandidate and (not bearOriginCandidate or originBullWinsConflict)
+originBearFound = bearOriginCandidate and (not bullOriginCandidate or originBearWinsConflict)
+blockBullCandidate = originAllowSingleBarPrecursor and originCanConfirm and isClosedBar and blockBullFoundRaw and not na(blockBullStartBarsAgo) and blockBullHigh > blockBullLow and not sameBullBlock
+blockBearCandidate = originAllowSingleBarPrecursor and originCanConfirm and isClosedBar and blockBearFoundRaw and not na(blockBearStartBarsAgo) and blockBearHigh > blockBearLow and not sameBearBlock
+blockConflict = blockBullCandidate and blockBearCandidate
+blockBullScoreSafe = nz(blockBullScore, -1000000.0)
+blockBearScoreSafe = nz(blockBearScore, -1000000.0)
+blockBullWinsConflict = blockConflict and (blockBullScoreSafe > blockBearScoreSafe + originScoreEpsilon or (math.abs(blockBullScoreSafe - blockBearScoreSafe) <= originScoreEpsilon and close >= open))
+blockBearWinsConflict = blockConflict and not blockBullWinsConflict
+blockBullFound = blockBullCandidate and (not blockBearCandidate or blockBullWinsConflict)
+blockBearFound = blockBearCandidate and (not blockBullCandidate or blockBearWinsConflict)
+if blockBullFound and bullBlockLegSeq == 0
+    bullBlockLegSeq := 1
+if blockBearFound and bearBlockLegSeq == 0
+    bearBlockLegSeq := 1
+bullBlockLegIdNow = blockBullFound ? bullBlockLegSeq : na
+bearBlockLegIdNow = blockBearFound ? bearBlockLegSeq : na
+bullBaseGateText = bullBaseLegBlocked ? "Bull base gated active BOS leg " + str.tostring(bullOriginLegIdNow) : bullBaseSpacingBlocked ? "Bull base gated spacing " + str.tostring(baseMinSpacingBarsNow) + " bars" : originBullDebug
+bearBaseGateText = bearBaseLegBlocked ? "Bear base gated active BOS leg " + str.tostring(bearOriginLegIdNow) : bearBaseSpacingBlocked ? "Bear base gated spacing " + str.tostring(baseMinSpacingBarsNow) + " bars" : originBearDebug
+baseDebugText = not originCanConfirm ? "Base gated by cooldown/HTF" : originBullFound and originConflict ? bullBaseGateText + " | beat bear " + f_fmt_debug_num(originBearScoreSafe) : originBearFound and originConflict ? bearBaseGateText + " | beat bull " + f_fmt_debug_num(originBullScoreSafe) : originBullFound ? bullBaseGateText : originBearFound ? bearBaseGateText : originBullScoreSafe >= originBearScoreSafe ? bullBaseGateText : bearBaseGateText
+blockDebugText = not originCanConfirm ? "Block gated by cooldown/HTF" : blockBullFound and blockConflict ? blockBullDebug + " | beat bear " + f_fmt_debug_num(blockBearScoreSafe) : blockBearFound and blockConflict ? blockBearDebug + " | beat bull " + f_fmt_debug_num(blockBullScoreSafe) : blockBullFound ? blockBullDebug : blockBearFound ? blockBearDebug : swingBias < 0 ? blockBearDebug : swingBias > 0 ? blockBullDebug : blockBullScoreSafe >= blockBearScoreSafe ? blockBullDebug : blockBearDebug
+swingBiasText = swingBias == 1 ? "Bull" : swingBias == -1 ? "Bear" : "Neutral"
+swingDebugText = "Bias " + swingBiasText + " | BOS↑ " + f_bars_since_text(lastBullBosBar) + " | BOS↓ " + f_bars_since_text(lastBearBosBar) + " | TF " + tfAdaptLabel + " r" + f_fmt_debug_num(tfAdaptRelax) + " | " + futuresProfileLabel + " | BS " + blockSessionPhase + " " + str.tostring(int(math.round(sessionBlockPct * 100.0))) + "%" + " | BaseGap " + str.tostring(baseMinSpacingBarsNow) + " | P" + str.tostring(originSwingPivotLen)
+
+if originBullFound
+    bullCleanupIdx = 0
+    bullCandidateHeight = originBullHigh - originBullLow
+    while bullCleanupIdx < array.size(originBullBoxes)
+        oldBullHigh = array.get(originBullHighs, bullCleanupIdx)
+        oldBullLow = array.get(originBullLows, bullCleanupIdx)
+        oldBullHeight = oldBullHigh - oldBullLow
+        bullOverlap = math.max(0.0, math.min(originBullHigh, oldBullHigh) - math.max(originBullLow, oldBullLow))
+        bullOverlapFrac = bullCandidateHeight > 0 and oldBullHeight > 0 ? (bullOverlap / math.min(bullCandidateHeight, oldBullHeight)) : 0.0
+        if bullOverlapFrac >= originOverlapCleanupFrac
+            oldBullBox = array.remove(originBullBoxes, bullCleanupIdx)
+            oldBullLabel = array.remove(originBullLabels, bullCleanupIdx)
+            oldBullTriggerLabel = array.remove(originBullTriggerLabels, bullCleanupIdx)
+            oldBullMidLine = array.remove(originBullMidLines, bullCleanupIdx)
+            array.remove(originBullHighs, bullCleanupIdx)
+            array.remove(originBullLows, bullCleanupIdx)
+            array.remove(originBullLeftBars, bullCleanupIdx)
+            array.remove(originBullCreatedBars, bullCleanupIdx)
+            array.remove(originBullStates, bullCleanupIdx)
+            array.remove(originBullTouchBars, bullCleanupIdx)
+            array.remove(originBullDecelCounts, bullCleanupIdx)
+            array.remove(originBullReactionExtremes, bullCleanupIdx)
+            array.remove(originBullShiftLevels, bullCleanupIdx)
+            array.remove(originBullLegIds, bullCleanupIdx)
+            box.delete(oldBullBox)
+            if not na(oldBullLabel)
+                label.delete(oldBullLabel)
+            if not na(oldBullTriggerLabel)
+                label.delete(oldBullTriggerLabel)
+            if not na(oldBullMidLine)
+                line.delete(oldBullMidLine)
+        else
+            bullCleanupIdx += 1
+
+    bullOriginLeftBar = bar_index - originBullStartBarsAgo
+    bullOriginBox = box.new(bullOriginLeftBar, originBullHigh, bar_index + originExtendBars, originBullLow, xloc=xloc.bar_index, bgcolor=color.new(color.aqua, 86), border_color=color.aqua, border_width=2)
+    bullOriginMidY = math.avg(originBullHigh, originBullLow)
+    bullOriginMidLine = line.new(bullOriginLeftBar, bullOriginMidY, bullOriginLeftBar + 1, bullOriginMidY, xloc=xloc.bar_index, extend=extend.right, color=color.new(color.aqua, showZoneMidpoint ? 45 : 100), style=line.style_dashed, width=1)
+    bullLabelY = originBullLow - f_origin_label_pad(originBullHigh, originBullLow)
+    label bullOriginLabel = na
+    if showOriginLabel
+        bullOriginLabel := label.new(bar_index + originExtendBars + originLabelOffsetBars, bullLabelY, "Base ↑ | Fresh", xloc=xloc.bar_index, yloc=yloc.price, style=label.style_none, textcolor=color.white, size=size.normal)
+    array.push(originBullBoxes, bullOriginBox)
+    array.push(originBullLabels, bullOriginLabel)
+    array.push(originBullTriggerLabels, na)
+    array.push(originBullMidLines, bullOriginMidLine)
+    array.push(originBullHighs, originBullHigh)
+    array.push(originBullLows, originBullLow)
+    array.push(originBullLeftBars, bullOriginLeftBar)
+    array.push(originBullCreatedBars, bar_index)
+    array.push(originBullStates, originStateFresh)
+    array.push(originBullTouchBars, na)
+    array.push(originBullDecelCounts, 0)
+    array.push(originBullReactionExtremes, na)
+    array.push(originBullShiftLevels, na)
+    array.push(originBullLegIds, bullOriginLegIdNow)
+    lastBullOriginLeft := originBullLeft
+    lastBullOriginHigh := originBullHigh
+    lastBullOriginLow := originBullLow
+    if array.size(originBullBoxes) > originMaxBoxes
+        oldBullBox = array.shift(originBullBoxes)
+        oldBullLabel = array.shift(originBullLabels)
+        oldBullTriggerLabel = array.shift(originBullTriggerLabels)
+        oldBullMidLine = array.shift(originBullMidLines)
+        array.shift(originBullHighs)
+        array.shift(originBullLows)
+        array.shift(originBullLeftBars)
+        array.shift(originBullCreatedBars)
+        array.shift(originBullStates)
+        array.shift(originBullTouchBars)
+        array.shift(originBullDecelCounts)
+        array.shift(originBullReactionExtremes)
+        array.shift(originBullShiftLevels)
+        array.shift(originBullLegIds)
+        box.delete(oldBullBox)
+        if not na(oldBullLabel)
+            label.delete(oldBullLabel)
+        if not na(oldBullTriggerLabel)
+            label.delete(oldBullTriggerLabel)
+        if not na(oldBullMidLine)
+            line.delete(oldBullMidLine)
+
+if originBearFound
+    bearCleanupIdx = 0
+    bearCandidateHeight = originBearHigh - originBearLow
+    while bearCleanupIdx < array.size(originBearBoxes)
+        oldBearHigh = array.get(originBearHighs, bearCleanupIdx)
+        oldBearLow = array.get(originBearLows, bearCleanupIdx)
+        oldBearHeight = oldBearHigh - oldBearLow
+        bearOverlap = math.max(0.0, math.min(originBearHigh, oldBearHigh) - math.max(originBearLow, oldBearLow))
+        bearOverlapFrac = bearCandidateHeight > 0 and oldBearHeight > 0 ? (bearOverlap / math.min(bearCandidateHeight, oldBearHeight)) : 0.0
+        if bearOverlapFrac >= originOverlapCleanupFrac
+            oldBearBox = array.remove(originBearBoxes, bearCleanupIdx)
+            oldBearLabel = array.remove(originBearLabels, bearCleanupIdx)
+            oldBearTriggerLabel = array.remove(originBearTriggerLabels, bearCleanupIdx)
+            oldBearMidLine = array.remove(originBearMidLines, bearCleanupIdx)
+            array.remove(originBearHighs, bearCleanupIdx)
+            array.remove(originBearLows, bearCleanupIdx)
+            array.remove(originBearLeftBars, bearCleanupIdx)
+            array.remove(originBearCreatedBars, bearCleanupIdx)
+            array.remove(originBearStates, bearCleanupIdx)
+            array.remove(originBearTouchBars, bearCleanupIdx)
+            array.remove(originBearDecelCounts, bearCleanupIdx)
+            array.remove(originBearReactionExtremes, bearCleanupIdx)
+            array.remove(originBearShiftLevels, bearCleanupIdx)
+            array.remove(originBearLegIds, bearCleanupIdx)
+            box.delete(oldBearBox)
+            if not na(oldBearLabel)
+                label.delete(oldBearLabel)
+            if not na(oldBearTriggerLabel)
+                label.delete(oldBearTriggerLabel)
+            if not na(oldBearMidLine)
+                line.delete(oldBearMidLine)
+        else
+            bearCleanupIdx += 1
+
+    bearOriginLeftBar = bar_index - originBearStartBarsAgo
+    bearOriginBox = box.new(bearOriginLeftBar, originBearHigh, bar_index + originExtendBars, originBearLow, xloc=xloc.bar_index, bgcolor=color.new(color.red, 86), border_color=color.red, border_width=2)
+    bearOriginMidY = math.avg(originBearHigh, originBearLow)
+    bearOriginMidLine = line.new(bearOriginLeftBar, bearOriginMidY, bearOriginLeftBar + 1, bearOriginMidY, xloc=xloc.bar_index, extend=extend.right, color=color.new(color.red, showZoneMidpoint ? 45 : 100), style=line.style_dashed, width=1)
+    bearLabelY = originBearHigh + f_origin_label_pad(originBearHigh, originBearLow)
+    label bearOriginLabel = na
+    if showOriginLabel
+        bearOriginLabel := label.new(bar_index + originExtendBars + originLabelOffsetBars, bearLabelY, "Base ↓ | Fresh", xloc=xloc.bar_index, yloc=yloc.price, style=label.style_none, textcolor=color.white, size=size.normal)
+    array.push(originBearBoxes, bearOriginBox)
+    array.push(originBearLabels, bearOriginLabel)
+    array.push(originBearTriggerLabels, na)
+    array.push(originBearMidLines, bearOriginMidLine)
+    array.push(originBearHighs, originBearHigh)
+    array.push(originBearLows, originBearLow)
+    array.push(originBearLeftBars, bearOriginLeftBar)
+    array.push(originBearCreatedBars, bar_index)
+    array.push(originBearStates, originStateFresh)
+    array.push(originBearTouchBars, na)
+    array.push(originBearDecelCounts, 0)
+    array.push(originBearReactionExtremes, na)
+    array.push(originBearShiftLevels, na)
+    array.push(originBearLegIds, bearOriginLegIdNow)
+    lastBearOriginLeft := originBearLeft
+    lastBearOriginHigh := originBearHigh
+    lastBearOriginLow := originBearLow
+    if array.size(originBearBoxes) > originMaxBoxes
+        oldBearBox = array.shift(originBearBoxes)
+        oldBearLabel = array.shift(originBearLabels)
+        oldBearTriggerLabel = array.shift(originBearTriggerLabels)
+        oldBearMidLine = array.shift(originBearMidLines)
+        array.shift(originBearHighs)
+        array.shift(originBearLows)
+        array.shift(originBearLeftBars)
+        array.shift(originBearCreatedBars)
+        array.shift(originBearStates)
+        array.shift(originBearTouchBars)
+        array.shift(originBearDecelCounts)
+        array.shift(originBearReactionExtremes)
+        array.shift(originBearShiftLevels)
+        array.shift(originBearLegIds)
+        box.delete(oldBearBox)
+        if not na(oldBearLabel)
+            label.delete(oldBearLabel)
+        if not na(oldBearTriggerLabel)
+            label.delete(oldBearTriggerLabel)
+        if not na(oldBearMidLine)
+            line.delete(oldBearMidLine)
+
+if blockBullFound
+    if oneActiveBlockPerLeg and array.size(blockBullStates) > 0
+        for i = 0 to array.size(blockBullStates) - 1
+            oldBullBlockState = array.get(blockBullStates, i)
+            oldBullBlockLegId = array.get(blockBullLegIds, i)
+            if f_block_active(oldBullBlockState) and oldBullBlockLegId == bullBlockLegIdNow
+                array.set(blockBullStates, i, originStateRetired)
+    bullBlockCleanupIdx = 0
+    bullBlockCandidateHeight = blockBullHigh - blockBullLow
+    while bullBlockCleanupIdx < array.size(blockBullBoxes)
+        oldBullBlockHigh = array.get(blockBullHighs, bullBlockCleanupIdx)
+        oldBullBlockLow = array.get(blockBullLows, bullBlockCleanupIdx)
+        oldBullBlockHeight = oldBullBlockHigh - oldBullBlockLow
+        bullBlockOverlap = math.max(0.0, math.min(blockBullHigh, oldBullBlockHigh) - math.max(blockBullLow, oldBullBlockLow))
+        bullBlockOverlapFrac = bullBlockCandidateHeight > 0 and oldBullBlockHeight > 0 ? (bullBlockOverlap / math.min(bullBlockCandidateHeight, oldBullBlockHeight)) : 0.0
+        if bullBlockOverlapFrac >= originOverlapCleanupFrac
+            oldBullBlockBox = array.remove(blockBullBoxes, bullBlockCleanupIdx)
+            oldBullBlockLabel = array.remove(blockBullLabels, bullBlockCleanupIdx)
+            oldBullBlockMidLine = array.remove(blockBullMidLines, bullBlockCleanupIdx)
+            array.remove(blockBullHighs, bullBlockCleanupIdx)
+            array.remove(blockBullLows, bullBlockCleanupIdx)
+            array.remove(blockBullLeftBars, bullBlockCleanupIdx)
+            array.remove(blockBullCreatedBars, bullBlockCleanupIdx)
+            array.remove(blockBullStates, bullBlockCleanupIdx)
+            array.remove(blockBullLegIds, bullBlockCleanupIdx)
+            box.delete(oldBullBlockBox)
+            if not na(oldBullBlockLabel)
+                label.delete(oldBullBlockLabel)
+            if not na(oldBullBlockMidLine)
+                line.delete(oldBullBlockMidLine)
+        else
+            bullBlockCleanupIdx += 1
+
+    bullBlockLeftBar = bar_index - blockBullStartBarsAgo
+    bullBlockBox = box.new(bullBlockLeftBar, blockBullHigh, bar_index + originExtendBars, blockBullLow, xloc=xloc.bar_index, bgcolor=color.new(color.green, 92), border_color=color.green, border_width=1)
+    bullBlockMidY = math.avg(blockBullHigh, blockBullLow)
+    bullBlockMidLine = line.new(bullBlockLeftBar, bullBlockMidY, bullBlockLeftBar + 1, bullBlockMidY, xloc=xloc.bar_index, extend=extend.right, color=color.new(color.green, showZoneMidpoint ? 55 : 100), style=line.style_dashed, width=1)
+    bullBlockLabelY = blockBullLow - f_origin_label_pad(blockBullHigh, blockBullLow)
+    label bullBlockLabel = na
+    if showOriginLabel
+        bullBlockLabel := label.new(bar_index + originExtendBars + originLabelOffsetBars, bullBlockLabelY, "Block ↑ | Fresh", xloc=xloc.bar_index, yloc=yloc.price, style=label.style_none, textcolor=color.white, size=size.normal)
+    array.push(blockBullBoxes, bullBlockBox)
+    array.push(blockBullLabels, bullBlockLabel)
+    array.push(blockBullMidLines, bullBlockMidLine)
+    array.push(blockBullHighs, blockBullHigh)
+    array.push(blockBullLows, blockBullLow)
+    array.push(blockBullLeftBars, bullBlockLeftBar)
+    array.push(blockBullCreatedBars, bar_index)
+    array.push(blockBullStates, originStateFresh)
+    array.push(blockBullLegIds, bullBlockLegIdNow)
+    lastBullBlockLeft := blockBullLeft
+    lastBullBlockHigh := blockBullHigh
+    lastBullBlockLow := blockBullLow
+    if array.size(blockBullBoxes) > originMaxBoxes
+        oldBullBlockBox = array.shift(blockBullBoxes)
+        oldBullBlockLabel = array.shift(blockBullLabels)
+        oldBullBlockMidLine = array.shift(blockBullMidLines)
+        array.shift(blockBullHighs)
+        array.shift(blockBullLows)
+        array.shift(blockBullLeftBars)
+        array.shift(blockBullCreatedBars)
+        array.shift(blockBullStates)
+        array.shift(blockBullLegIds)
+        box.delete(oldBullBlockBox)
+        if not na(oldBullBlockLabel)
+            label.delete(oldBullBlockLabel)
+        if not na(oldBullBlockMidLine)
+            line.delete(oldBullBlockMidLine)
+
+if blockBearFound
+    if oneActiveBlockPerLeg and array.size(blockBearStates) > 0
+        for i = 0 to array.size(blockBearStates) - 1
+            oldBearBlockState = array.get(blockBearStates, i)
+            oldBearBlockLegId = array.get(blockBearLegIds, i)
+            if f_block_active(oldBearBlockState) and oldBearBlockLegId == bearBlockLegIdNow
+                array.set(blockBearStates, i, originStateRetired)
+    bearBlockCleanupIdx = 0
+    bearBlockCandidateHeight = blockBearHigh - blockBearLow
+    while bearBlockCleanupIdx < array.size(blockBearBoxes)
+        oldBearBlockHigh = array.get(blockBearHighs, bearBlockCleanupIdx)
+        oldBearBlockLow = array.get(blockBearLows, bearBlockCleanupIdx)
+        oldBearBlockHeight = oldBearBlockHigh - oldBearBlockLow
+        bearBlockOverlap = math.max(0.0, math.min(blockBearHigh, oldBearBlockHigh) - math.max(blockBearLow, oldBearBlockLow))
+        bearBlockOverlapFrac = bearBlockCandidateHeight > 0 and oldBearBlockHeight > 0 ? (bearBlockOverlap / math.min(bearBlockCandidateHeight, oldBearBlockHeight)) : 0.0
+        if bearBlockOverlapFrac >= originOverlapCleanupFrac
+            oldBearBlockBox = array.remove(blockBearBoxes, bearBlockCleanupIdx)
+            oldBearBlockLabel = array.remove(blockBearLabels, bearBlockCleanupIdx)
+            oldBearBlockMidLine = array.remove(blockBearMidLines, bearBlockCleanupIdx)
+            array.remove(blockBearHighs, bearBlockCleanupIdx)
+            array.remove(blockBearLows, bearBlockCleanupIdx)
+            array.remove(blockBearLeftBars, bearBlockCleanupIdx)
+            array.remove(blockBearCreatedBars, bearBlockCleanupIdx)
+            array.remove(blockBearStates, bearBlockCleanupIdx)
+            array.remove(blockBearLegIds, bearBlockCleanupIdx)
+            box.delete(oldBearBlockBox)
+            if not na(oldBearBlockLabel)
+                label.delete(oldBearBlockLabel)
+            if not na(oldBearBlockMidLine)
+                line.delete(oldBearBlockMidLine)
+        else
+            bearBlockCleanupIdx += 1
+
+    bearBlockLeftBar = bar_index - blockBearStartBarsAgo
+    bearBlockBox = box.new(bearBlockLeftBar, blockBearHigh, bar_index + originExtendBars, blockBearLow, xloc=xloc.bar_index, bgcolor=color.new(color.orange, 92), border_color=color.orange, border_width=1)
+    bearBlockMidY = math.avg(blockBearHigh, blockBearLow)
+    bearBlockMidLine = line.new(bearBlockLeftBar, bearBlockMidY, bearBlockLeftBar + 1, bearBlockMidY, xloc=xloc.bar_index, extend=extend.right, color=color.new(color.orange, showZoneMidpoint ? 55 : 100), style=line.style_dashed, width=1)
+    bearBlockLabelY = blockBearHigh + f_origin_label_pad(blockBearHigh, blockBearLow)
+    label bearBlockLabel = na
+    if showOriginLabel
+        bearBlockLabel := label.new(bar_index + originExtendBars + originLabelOffsetBars, bearBlockLabelY, "Block ↓ | Fresh", xloc=xloc.bar_index, yloc=yloc.price, style=label.style_none, textcolor=color.white, size=size.normal)
+    array.push(blockBearBoxes, bearBlockBox)
+    array.push(blockBearLabels, bearBlockLabel)
+    array.push(blockBearMidLines, bearBlockMidLine)
+    array.push(blockBearHighs, blockBearHigh)
+    array.push(blockBearLows, blockBearLow)
+    array.push(blockBearLeftBars, bearBlockLeftBar)
+    array.push(blockBearCreatedBars, bar_index)
+    array.push(blockBearStates, originStateFresh)
+    array.push(blockBearLegIds, bearBlockLegIdNow)
+    lastBearBlockLeft := blockBearLeft
+    lastBearBlockHigh := blockBearHigh
+    lastBearBlockLow := blockBearLow
+    if array.size(blockBearBoxes) > originMaxBoxes
+        oldBearBlockBox = array.shift(blockBearBoxes)
+        oldBearBlockLabel = array.shift(blockBearLabels)
+        oldBearBlockMidLine = array.shift(blockBearMidLines)
+        array.shift(blockBearHighs)
+        array.shift(blockBearLows)
+        array.shift(blockBearLeftBars)
+        array.shift(blockBearCreatedBars)
+        array.shift(blockBearStates)
+        array.shift(blockBearLegIds)
+        box.delete(oldBearBlockBox)
+        if not na(oldBearBlockLabel)
+            label.delete(oldBearBlockLabel)
+        if not na(oldBearBlockMidLine)
+            line.delete(oldBearBlockMidLine)
+
+originBullReactionTriggerNow = false
+originBearReactionTriggerNow = false
+originBullMitigatedNow = false
+originBearMitigatedNow = false
+blockBullMitigatedNow = false
+blockBearMitigatedNow = false
+reactionInvalidBuffer = originReactionInvalidTicks * syminfo.mintick
+reactionDecelBar = tr <= atr_bar * originReactionDecelAtr and bodyPct <= originReactionDecelBodyPct
+reactionBullImpulseBar = rng > 0 and tr >= atr_bar * originReactionRedisplaceAtr and bodyPct >= originMinBodyPct and close > open and close >= high - rng * originCloseExtremeFrac
+reactionBearImpulseBar = rng > 0 and tr >= atr_bar * originReactionRedisplaceAtr and bodyPct >= originMinBodyPct and close < open and close <= low + rng * originCloseExtremeFrac
+
+if enableOriginReaction and isClosedBar
+    bullBoxCount = array.size(originBullBoxes)
+    if bullBoxCount > 0
+        for i = 0 to bullBoxCount - 1
+            bullState = array.get(originBullStates, i)
+            prevBullState = bullState
+            zoneHigh = array.get(originBullHighs, i)
+            zoneLow = array.get(originBullLows, i)
+            leftBar = array.get(originBullLeftBars, i)
+            createdBar = array.get(originBullCreatedBars, i)
+            touchBar = array.get(originBullTouchBars, i)
+            decelCount = array.get(originBullDecelCounts, i)
+            reactionLow = array.get(originBullReactionExtremes, i)
+            shiftHigh = array.get(originBullShiftLevels, i)
+            overlap = bar_index > createdBar and high >= zoneLow and low <= zoneHigh
+            closeInside = close <= zoneHigh and close >= zoneLow
+            invalidated = f_zone_invalid_bull(zoneLow, reactionInvalidBuffer)
+            bullBoxObj = array.get(originBullBoxes, i)
+            bullZoneLabel = array.get(originBullLabels, i)
+            bullMidLine = array.get(originBullMidLines, i)
+
+            if bullState == originStateFresh
+                if overlap
+                    bullState := originStateEntered
+                    touchBar := bar_index
+                    decelCount := reactionDecelBar and closeInside ? 1 : 0
+                    reactionLow := low
+                    shiftHigh := high
+                    if decelCount >= originReactionDecelBars
+                        bullState := originStateDecel
+            else if bullState == originStateEntered
+                if invalidated
+                    bullState := originStateInvalid
+                else if overlap
+                    reactionLow := na(reactionLow) ? low : math.min(reactionLow, low)
+                    shiftHigh := na(shiftHigh) ? high : math.max(shiftHigh, high)
+                    decelCount := reactionDecelBar and closeInside ? (decelCount + 1) : 0
+                    if decelCount >= originReactionDecelBars
+                        bullState := originStateDecel
+                else if close > zoneHigh
+                    bullState := originStateFresh
+                    touchBar := na
+                    decelCount := 0
+                    reactionLow := na
+                    shiftHigh := na
+            else if bullState == originStateDecel
+                prevReactionLow = reactionLow
+                prevShiftHigh = shiftHigh
+                if invalidated
+                    bullState := originStateInvalid
+                else
+                    if overlap or closeInside
+                        reactionLow := na(reactionLow) ? low : math.min(reactionLow, low)
+                        shiftHigh := na(shiftHigh) ? high : math.max(shiftHigh, high)
+                    bullStructureShift = not na(prevShiftHigh) and close > prevShiftHigh and close > open and (na(prevReactionLow) or low > prevReactionLow + syminfo.mintick * 0.5)
+                    if bullStructureShift
+                        bullState := originStateShift
+                        shiftHigh := math.max(nz(prevShiftHigh, high), high)
+            else if bullState == originStateShift
+                if invalidated
+                    bullState := originStateInvalid
+                else
+                    bullTrigger = reactionBullImpulseBar and close > zoneHigh and (na(shiftHigh) or close > shiftHigh)
+                    if bullTrigger
+                        bullState := originStateTriggered
+                        originBullReactionTriggerNow := true
+                        bullTriggerLabel = array.get(originBullTriggerLabels, i)
+                        if showOriginTriggerLabel and na(bullTriggerLabel)
+                            bullTriggerLabel := label.new(bar_index, low, "Entry ↑", xloc=xloc.bar_index, yloc=yloc.belowbar, style=label.style_label_up, color=color.new(color.green, 0), textcolor=color.white, size=size.small)
+                        array.set(originBullTriggerLabels, i, bullTriggerLabel)
+            else if bullState == originStateTriggered
+                if invalidated
+                    bullState := originStateInvalid
+
+            if bullState == originStateInvalid and prevBullState != originStateInvalid and prevBullState != originStateRetired
+                originBullMitigatedNow := true
+
+            bullStatusText = "Invalid"
+            if bullState == originStateFresh
+                bullStatusText := "Fresh"
+            else if bullState == originStateEntered or bullState == originStateDecel
+                bullStatusText := "Touched"
+            else if bullState == originStateShift
+                bullStatusText := "Shift"
+            else if bullState == originStateTriggered
+                bullStatusText := "Triggered"
+            bullLabelColor = bullState == originStateInvalid ? color.silver : color.white
+            bullLabelX = createdBar + originExtendBars + originLabelOffsetBars
+            bullLabelY = zoneLow - f_origin_label_pad(zoneHigh, zoneLow)
+            bullBaseHidden = false
+            if baseVisibleCapNow > 0
+                newerBullBaseCount = 0
+                for j = 0 to bullBoxCount - 1
+                    if j != i
+                        otherCreated = array.get(originBullCreatedBars, j)
+                        otherState = array.get(originBullStates, j)
+                        if otherCreated > createdBar and otherState != originStateRetired
+                            newerBullBaseCount += 1
+                bullBaseHidden := newerBullBaseCount >= baseVisibleCapNow
+            if bullBaseHidden
+                box.set_border_style(bullBoxObj, line.style_solid)
+                box.set_border_width(bullBoxObj, 1)
+                box.set_border_color(bullBoxObj, color.new(color.aqua, 100))
+                box.set_bgcolor(bullBoxObj, color.new(color.aqua, 100))
+            else if bullState == originStateFresh
+                box.set_border_style(bullBoxObj, line.style_solid)
+                box.set_border_width(bullBoxObj, 2)
+                box.set_border_color(bullBoxObj, color.aqua)
+                box.set_bgcolor(bullBoxObj, color.new(color.aqua, 86))
+            else if bullState == originStateEntered or bullState == originStateDecel
+                box.set_border_style(bullBoxObj, line.style_dashed)
+                box.set_border_width(bullBoxObj, 1)
+                box.set_border_color(bullBoxObj, color.aqua)
+                box.set_bgcolor(bullBoxObj, color.new(color.aqua, 90))
+            else if bullState == originStateShift
+                box.set_border_style(bullBoxObj, line.style_dashed)
+                box.set_border_width(bullBoxObj, 2)
+                box.set_border_color(bullBoxObj, color.aqua)
+                box.set_bgcolor(bullBoxObj, color.new(color.aqua, 84))
+            else if bullState == originStateTriggered
+                box.set_border_style(bullBoxObj, line.style_solid)
+                box.set_border_width(bullBoxObj, 2)
+                box.set_border_color(bullBoxObj, color.lime)
+                box.set_bgcolor(bullBoxObj, color.new(color.aqua, 80))
+            else
+                box.set_border_style(bullBoxObj, line.style_dotted)
+                box.set_border_width(bullBoxObj, 1)
+                box.set_border_color(bullBoxObj, color.gray)
+                box.set_bgcolor(bullBoxObj, color.new(color.aqua, 95))
+            bullHideLabel = bullBaseHidden
+            if not bullHideLabel and bullBoxCount > 1
+                for j = 0 to bullBoxCount - 1
+                    if j != i
+                        otherCreated = array.get(originBullCreatedBars, j)
+                        otherState = array.get(originBullStates, j)
+                        if otherCreated > createdBar and otherState != originStateInvalid
+                            otherHigh = array.get(originBullHighs, j)
+                            otherLow = array.get(originBullLows, j)
+                            if math.max(0.0, math.min(zoneHigh, otherHigh) - math.max(zoneLow, otherLow)) > 0
+                                bullHideLabel := true
+            if not bullHideLabel
+                bullBlockCountForLabel = array.size(blockBullBoxes)
+                if bullBlockCountForLabel > 0
+                    for j = 0 to bullBlockCountForLabel - 1
+                        otherCreated = array.get(blockBullCreatedBars, j)
+                        otherState = array.get(blockBullStates, j)
+                        if otherCreated >= createdBar and f_block_active(otherState)
+                            otherHigh = array.get(blockBullHighs, j)
+                            otherLow = array.get(blockBullLows, j)
+                            if math.max(0.0, math.min(zoneHigh, otherHigh) - math.max(zoneLow, otherLow)) > 0
+                                bullHideLabel := true
+            if not na(bullZoneLabel)
+                if bullHideLabel
+                    label.set_text(bullZoneLabel, "")
+                else
+                    label.set_x(bullZoneLabel, bullLabelX)
+                    label.set_y(bullZoneLabel, bullLabelY)
+                    label.set_text(bullZoneLabel, "Base ↑ | " + bullStatusText)
+                    label.set_textcolor(bullZoneLabel, bullLabelColor)
+            if not na(bullMidLine)
+                line.set_xy1(bullMidLine, leftBar, math.avg(zoneHigh, zoneLow))
+                line.set_xy2(bullMidLine, leftBar + 1, math.avg(zoneHigh, zoneLow))
+                line.set_style(bullMidLine, line.style_dashed)
+                line.set_width(bullMidLine, 1)
+                if showZoneMidpoint and not bullBaseHidden
+                    bullMidColor = bullState == originStateInvalid ? color.new(color.gray, 45) : bullState == originStateTriggered ? color.new(color.lime, 25) : color.new(color.aqua, 35)
+                    line.set_color(bullMidLine, bullMidColor)
+                else
+                    line.set_color(bullMidLine, color.new(color.aqua, 100))
+
+            array.set(originBullStates, i, bullState)
+            array.set(originBullTouchBars, i, touchBar)
+            array.set(originBullDecelCounts, i, decelCount)
+            array.set(originBullReactionExtremes, i, reactionLow)
+            array.set(originBullShiftLevels, i, shiftHigh)
+
+    bearBoxCount = array.size(originBearBoxes)
+    if bearBoxCount > 0
+        for i = 0 to bearBoxCount - 1
+            bearState = array.get(originBearStates, i)
+            prevBearState = bearState
+            zoneHigh = array.get(originBearHighs, i)
+            zoneLow = array.get(originBearLows, i)
+            leftBar = array.get(originBearLeftBars, i)
+            createdBar = array.get(originBearCreatedBars, i)
+            touchBar = array.get(originBearTouchBars, i)
+            decelCount = array.get(originBearDecelCounts, i)
+            reactionHigh = array.get(originBearReactionExtremes, i)
+            shiftLow = array.get(originBearShiftLevels, i)
+            overlap = bar_index > createdBar and high >= zoneLow and low <= zoneHigh
+            closeInside = close <= zoneHigh and close >= zoneLow
+            invalidated = f_zone_invalid_bear(zoneHigh, reactionInvalidBuffer)
+            bearBoxObj = array.get(originBearBoxes, i)
+            bearZoneLabel = array.get(originBearLabels, i)
+            bearMidLine = array.get(originBearMidLines, i)
+
+            if bearState == originStateFresh
+                if overlap
+                    bearState := originStateEntered
+                    touchBar := bar_index
+                    decelCount := reactionDecelBar and closeInside ? 1 : 0
+                    reactionHigh := high
+                    shiftLow := low
+                    if decelCount >= originReactionDecelBars
+                        bearState := originStateDecel
+            else if bearState == originStateEntered
+                if invalidated
+                    bearState := originStateInvalid
+                else if overlap
+                    reactionHigh := na(reactionHigh) ? high : math.max(reactionHigh, high)
+                    shiftLow := na(shiftLow) ? low : math.min(shiftLow, low)
+                    decelCount := reactionDecelBar and closeInside ? (decelCount + 1) : 0
+                    if decelCount >= originReactionDecelBars
+                        bearState := originStateDecel
+                else if close < zoneLow
+                    bearState := originStateFresh
+                    touchBar := na
+                    decelCount := 0
+                    reactionHigh := na
+                    shiftLow := na
+            else if bearState == originStateDecel
+                prevReactionHigh = reactionHigh
+                prevShiftLow = shiftLow
+                if invalidated
+                    bearState := originStateInvalid
+                else
+                    if overlap or closeInside
+                        reactionHigh := na(reactionHigh) ? high : math.max(reactionHigh, high)
+                        shiftLow := na(shiftLow) ? low : math.min(shiftLow, low)
+                    bearStructureShift = not na(prevShiftLow) and close < prevShiftLow and close < open and (na(prevReactionHigh) or high < prevReactionHigh - syminfo.mintick * 0.5)
+                    if bearStructureShift
+                        bearState := originStateShift
+                        shiftLow := math.min(nz(prevShiftLow, low), low)
+            else if bearState == originStateShift
+                if invalidated
+                    bearState := originStateInvalid
+                else
+                    bearTrigger = reactionBearImpulseBar and close < zoneLow and (na(shiftLow) or close < shiftLow)
+                    if bearTrigger
+                        bearState := originStateTriggered
+                        originBearReactionTriggerNow := true
+                        bearTriggerLabel = array.get(originBearTriggerLabels, i)
+                        if showOriginTriggerLabel and na(bearTriggerLabel)
+                            bearTriggerLabel := label.new(bar_index, high, "Entry ↓", xloc=xloc.bar_index, yloc=yloc.abovebar, style=label.style_label_down, color=color.new(color.red, 0), textcolor=color.white, size=size.small)
+                        array.set(originBearTriggerLabels, i, bearTriggerLabel)
+            else if bearState == originStateTriggered
+                if invalidated
+                    bearState := originStateInvalid
+
+            if bearState == originStateInvalid and prevBearState != originStateInvalid and prevBearState != originStateRetired
+                originBearMitigatedNow := true
+
+            bearStatusText = "Invalid"
+            if bearState == originStateFresh
+                bearStatusText := "Fresh"
+            else if bearState == originStateEntered or bearState == originStateDecel
+                bearStatusText := "Touched"
+            else if bearState == originStateShift
+                bearStatusText := "Shift"
+            else if bearState == originStateTriggered
+                bearStatusText := "Triggered"
+            bearLabelColor = bearState == originStateInvalid ? color.silver : color.white
+            bearLabelX = createdBar + originExtendBars + originLabelOffsetBars
+            bearLabelY = zoneHigh + f_origin_label_pad(zoneHigh, zoneLow)
+            bearBaseHidden = false
+            if baseVisibleCapNow > 0
+                newerBearBaseCount = 0
+                for j = 0 to bearBoxCount - 1
+                    if j != i
+                        otherCreated = array.get(originBearCreatedBars, j)
+                        otherState = array.get(originBearStates, j)
+                        if otherCreated > createdBar and otherState != originStateRetired
+                            newerBearBaseCount += 1
+                bearBaseHidden := newerBearBaseCount >= baseVisibleCapNow
+            if bearBaseHidden
+                box.set_border_style(bearBoxObj, line.style_solid)
+                box.set_border_width(bearBoxObj, 1)
+                box.set_border_color(bearBoxObj, color.new(color.red, 100))
+                box.set_bgcolor(bearBoxObj, color.new(color.red, 100))
+            else if bearState == originStateFresh
+                box.set_border_style(bearBoxObj, line.style_solid)
+                box.set_border_width(bearBoxObj, 2)
+                box.set_border_color(bearBoxObj, color.red)
+                box.set_bgcolor(bearBoxObj, color.new(color.red, 86))
+            else if bearState == originStateEntered or bearState == originStateDecel
+                box.set_border_style(bearBoxObj, line.style_dashed)
+                box.set_border_width(bearBoxObj, 1)
+                box.set_border_color(bearBoxObj, color.red)
+                box.set_bgcolor(bearBoxObj, color.new(color.red, 90))
+            else if bearState == originStateShift
+                box.set_border_style(bearBoxObj, line.style_dashed)
+                box.set_border_width(bearBoxObj, 2)
+                box.set_border_color(bearBoxObj, color.red)
+                box.set_bgcolor(bearBoxObj, color.new(color.red, 84))
+            else if bearState == originStateTriggered
+                box.set_border_style(bearBoxObj, line.style_solid)
+                box.set_border_width(bearBoxObj, 2)
+                box.set_border_color(bearBoxObj, color.red)
+                box.set_bgcolor(bearBoxObj, color.new(color.red, 80))
+            else
+                box.set_border_style(bearBoxObj, line.style_dotted)
+                box.set_border_width(bearBoxObj, 1)
+                box.set_border_color(bearBoxObj, color.gray)
+                box.set_bgcolor(bearBoxObj, color.new(color.red, 95))
+            bearHideLabel = bearBaseHidden
+            if not bearHideLabel and bearBoxCount > 1
+                for j = 0 to bearBoxCount - 1
+                    if j != i
+                        otherCreated = array.get(originBearCreatedBars, j)
+                        otherState = array.get(originBearStates, j)
+                        if otherCreated > createdBar and otherState != originStateInvalid
+                            otherHigh = array.get(originBearHighs, j)
+                            otherLow = array.get(originBearLows, j)
+                            if math.max(0.0, math.min(zoneHigh, otherHigh) - math.max(zoneLow, otherLow)) > 0
+                                bearHideLabel := true
+            if not bearHideLabel
+                bearBlockCountForLabel = array.size(blockBearBoxes)
+                if bearBlockCountForLabel > 0
+                    for j = 0 to bearBlockCountForLabel - 1
+                        otherCreated = array.get(blockBearCreatedBars, j)
+                        otherState = array.get(blockBearStates, j)
+                        if otherCreated >= createdBar and f_block_active(otherState)
+                            otherHigh = array.get(blockBearHighs, j)
+                            otherLow = array.get(blockBearLows, j)
+                            if math.max(0.0, math.min(zoneHigh, otherHigh) - math.max(zoneLow, otherLow)) > 0
+                                bearHideLabel := true
+            if not na(bearZoneLabel)
+                if bearHideLabel
+                    label.set_text(bearZoneLabel, "")
+                else
+                    label.set_x(bearZoneLabel, bearLabelX)
+                    label.set_y(bearZoneLabel, bearLabelY)
+                    label.set_text(bearZoneLabel, "Base ↓ | " + bearStatusText)
+                    label.set_textcolor(bearZoneLabel, bearLabelColor)
+            if not na(bearMidLine)
+                line.set_xy1(bearMidLine, leftBar, math.avg(zoneHigh, zoneLow))
+                line.set_xy2(bearMidLine, leftBar + 1, math.avg(zoneHigh, zoneLow))
+                line.set_style(bearMidLine, line.style_dashed)
+                line.set_width(bearMidLine, 1)
+                if showZoneMidpoint and not bearBaseHidden
+                    bearMidColor = bearState == originStateInvalid ? color.new(color.gray, 45) : bearState == originStateTriggered ? color.new(color.red, 20) : color.new(color.red, 35)
+                    line.set_color(bearMidLine, bearMidColor)
+                else
+                    line.set_color(bearMidLine, color.new(color.red, 100))
+
+            array.set(originBearStates, i, bearState)
+            array.set(originBearTouchBars, i, touchBar)
+            array.set(originBearDecelCounts, i, decelCount)
+            array.set(originBearReactionExtremes, i, reactionHigh)
+            array.set(originBearShiftLevels, i, shiftLow)
+
+if isClosedBar
+    bullBlockIdx = 0
+    while bullBlockIdx < array.size(blockBullBoxes)
+        bullBlockState = array.get(blockBullStates, bullBlockIdx)
+        prevBullBlockState = bullBlockState
+        zoneHigh = array.get(blockBullHighs, bullBlockIdx)
+        zoneLow = array.get(blockBullLows, bullBlockIdx)
+        leftBar = array.get(blockBullLeftBars, bullBlockIdx)
+        createdBar = array.get(blockBullCreatedBars, bullBlockIdx)
+        bullBlockObj = array.get(blockBullBoxes, bullBlockIdx)
+        bullBlockLabel = array.get(blockBullLabels, bullBlockIdx)
+        bullBlockMidLine = array.get(blockBullMidLines, bullBlockIdx)
+        overlap = bar_index > createdBar and high >= zoneLow and low <= zoneHigh
+        invalidated = f_zone_invalid_bull(zoneLow, reactionInvalidBuffer)
+        if bullBlockState == originStateFresh and overlap
+            bullBlockState := originStateEntered
+        if invalidated
+            bullBlockState := originStateInvalid
+        if bullBlockState == originStateInvalid and prevBullBlockState != originStateInvalid and prevBullBlockState != originStateRetired
+            blockBullMitigatedNow := true
+        bullBlockStateHidden = bullBlockState == originStateRetired or (bullBlockState == originStateInvalid and not keepInvalidBlocks)
+        bullBlockCapHidden = false
+        if blockVisibleCapNow > 0
+            newerBullBlockCount = 0
+            for j = 0 to array.size(blockBullBoxes) - 1
+                if j != bullBlockIdx
+                    otherCreated = array.get(blockBullCreatedBars, j)
+                    otherState = array.get(blockBullStates, j)
+                    otherHidden = otherState == originStateRetired or (otherState == originStateInvalid and not keepInvalidBlocks)
+                    if otherCreated > createdBar and not otherHidden
+                        newerBullBlockCount += 1
+            bullBlockCapHidden := newerBullBlockCount >= blockVisibleCapNow
+        bullBlockHidden = bullBlockStateHidden or bullBlockCapHidden
+        bullBlockStatusText = bullBlockState == originStateRetired ? "Retired" : bullBlockState == originStateInvalid ? "Invalid" : bullBlockState == originStateEntered ? "Touched" : "Fresh"
+        bullBlockLabelX = createdBar + originExtendBars + originLabelOffsetBars
+        bullBlockLabelY = zoneLow - f_origin_label_pad(zoneHigh, zoneLow)
+        if bullBlockHidden
+            box.set_border_style(bullBlockObj, line.style_solid)
+            box.set_border_width(bullBlockObj, 1)
+            box.set_border_color(bullBlockObj, color.new(color.green, 100))
+            box.set_bgcolor(bullBlockObj, color.new(color.green, 100))
+        else if bullBlockState == originStateFresh
+            box.set_border_style(bullBlockObj, line.style_dashed)
+            box.set_border_width(bullBlockObj, 1)
+            box.set_border_color(bullBlockObj, color.green)
+            box.set_bgcolor(bullBlockObj, color.new(color.green, 92))
+        else if bullBlockState == originStateEntered
+            box.set_border_style(bullBlockObj, line.style_solid)
+            box.set_border_width(bullBlockObj, 1)
+            box.set_border_color(bullBlockObj, color.green)
+            box.set_bgcolor(bullBlockObj, color.new(color.green, 88))
+        else
+            box.set_border_style(bullBlockObj, line.style_dotted)
+            box.set_border_width(bullBlockObj, 1)
+            box.set_border_color(bullBlockObj, color.gray)
+            box.set_bgcolor(bullBlockObj, color.new(color.green, 95))
+        bullBlockHideLabel = bullBlockHidden
+        if not bullBlockHideLabel
+            bullBlockCountForLabel = array.size(blockBullBoxes)
+            if bullBlockCountForLabel > 1
+                for j = 0 to bullBlockCountForLabel - 1
+                    if j != bullBlockIdx
+                        otherCreated = array.get(blockBullCreatedBars, j)
+                        otherState = array.get(blockBullStates, j)
+                        if otherCreated > createdBar and f_block_active(otherState)
+                            otherHigh = array.get(blockBullHighs, j)
+                            otherLow = array.get(blockBullLows, j)
+                            if math.max(0.0, math.min(zoneHigh, otherHigh) - math.max(zoneLow, otherLow)) > 0
+                                bullBlockHideLabel := true
+        if not bullBlockHideLabel
+            bullBaseCountForLabel = array.size(originBullBoxes)
+            if bullBaseCountForLabel > 0
+                for j = 0 to bullBaseCountForLabel - 1
+                    otherCreated = array.get(originBullCreatedBars, j)
+                    otherState = array.get(originBullStates, j)
+                    if otherCreated > createdBar and otherState != originStateInvalid
+                        otherHigh = array.get(originBullHighs, j)
+                        otherLow = array.get(originBullLows, j)
+                        if math.max(0.0, math.min(zoneHigh, otherHigh) - math.max(zoneLow, otherLow)) > 0
+                            bullBlockHideLabel := true
+        if not na(bullBlockLabel)
+            if bullBlockHideLabel
+                label.set_text(bullBlockLabel, "")
+            else
+                label.set_x(bullBlockLabel, bullBlockLabelX)
+                label.set_y(bullBlockLabel, bullBlockLabelY)
+                label.set_text(bullBlockLabel, "Block ↑ | " + bullBlockStatusText)
+                label.set_textcolor(bullBlockLabel, bullBlockState == originStateInvalid ? color.silver : color.white)
+        if not na(bullBlockMidLine)
+            line.set_xy1(bullBlockMidLine, leftBar, math.avg(zoneHigh, zoneLow))
+            line.set_xy2(bullBlockMidLine, leftBar + 1, math.avg(zoneHigh, zoneLow))
+            line.set_style(bullBlockMidLine, line.style_dashed)
+            line.set_width(bullBlockMidLine, 1)
+            if showZoneMidpoint and not bullBlockHidden
+                bullBlockMidColor = bullBlockState == originStateInvalid ? color.new(color.gray, 55) : bullBlockState == originStateEntered ? color.new(color.green, 30) : color.new(color.green, 45)
+                line.set_color(bullBlockMidLine, bullBlockMidColor)
+            else
+                line.set_color(bullBlockMidLine, color.new(color.green, 100))
+        array.set(blockBullStates, bullBlockIdx, bullBlockState)
+        bullBlockIdx += 1
+
+    bearBlockIdx = 0
+    while bearBlockIdx < array.size(blockBearBoxes)
+        bearBlockState = array.get(blockBearStates, bearBlockIdx)
+        prevBearBlockState = bearBlockState
+        zoneHigh = array.get(blockBearHighs, bearBlockIdx)
+        zoneLow = array.get(blockBearLows, bearBlockIdx)
+        leftBar = array.get(blockBearLeftBars, bearBlockIdx)
+        createdBar = array.get(blockBearCreatedBars, bearBlockIdx)
+        bearBlockObj = array.get(blockBearBoxes, bearBlockIdx)
+        bearBlockLabel = array.get(blockBearLabels, bearBlockIdx)
+        bearBlockMidLine = array.get(blockBearMidLines, bearBlockIdx)
+        overlap = bar_index > createdBar and high >= zoneLow and low <= zoneHigh
+        invalidated = f_zone_invalid_bear(zoneHigh, reactionInvalidBuffer)
+        if bearBlockState == originStateFresh and overlap
+            bearBlockState := originStateEntered
+        if invalidated
+            bearBlockState := originStateInvalid
+        if bearBlockState == originStateInvalid and prevBearBlockState != originStateInvalid and prevBearBlockState != originStateRetired
+            blockBearMitigatedNow := true
+        bearBlockStateHidden = bearBlockState == originStateRetired or (bearBlockState == originStateInvalid and not keepInvalidBlocks)
+        bearBlockCapHidden = false
+        if blockVisibleCapNow > 0
+            newerBearBlockCount = 0
+            for j = 0 to array.size(blockBearBoxes) - 1
+                if j != bearBlockIdx
+                    otherCreated = array.get(blockBearCreatedBars, j)
+                    otherState = array.get(blockBearStates, j)
+                    otherHidden = otherState == originStateRetired or (otherState == originStateInvalid and not keepInvalidBlocks)
+                    if otherCreated > createdBar and not otherHidden
+                        newerBearBlockCount += 1
+            bearBlockCapHidden := newerBearBlockCount >= blockVisibleCapNow
+        bearBlockHidden = bearBlockStateHidden or bearBlockCapHidden
+        bearBlockStatusText = bearBlockState == originStateRetired ? "Retired" : bearBlockState == originStateInvalid ? "Invalid" : bearBlockState == originStateEntered ? "Touched" : "Fresh"
+        bearBlockLabelX = createdBar + originExtendBars + originLabelOffsetBars
+        bearBlockLabelY = zoneHigh + f_origin_label_pad(zoneHigh, zoneLow)
+        if bearBlockHidden
+            box.set_border_style(bearBlockObj, line.style_solid)
+            box.set_border_width(bearBlockObj, 1)
+            box.set_border_color(bearBlockObj, color.new(color.orange, 100))
+            box.set_bgcolor(bearBlockObj, color.new(color.orange, 100))
+        else if bearBlockState == originStateFresh
+            box.set_border_style(bearBlockObj, line.style_dashed)
+            box.set_border_width(bearBlockObj, 1)
+            box.set_border_color(bearBlockObj, color.orange)
+            box.set_bgcolor(bearBlockObj, color.new(color.orange, 92))
+        else if bearBlockState == originStateEntered
+            box.set_border_style(bearBlockObj, line.style_solid)
+            box.set_border_width(bearBlockObj, 1)
+            box.set_border_color(bearBlockObj, color.orange)
+            box.set_bgcolor(bearBlockObj, color.new(color.orange, 88))
+        else
+            box.set_border_style(bearBlockObj, line.style_dotted)
+            box.set_border_width(bearBlockObj, 1)
+            box.set_border_color(bearBlockObj, color.gray)
+            box.set_bgcolor(bearBlockObj, color.new(color.orange, 95))
+        bearBlockHideLabel = bearBlockHidden
+        if not bearBlockHideLabel
+            bearBlockCountForLabel = array.size(blockBearBoxes)
+            if bearBlockCountForLabel > 1
+                for j = 0 to bearBlockCountForLabel - 1
+                    if j != bearBlockIdx
+                        otherCreated = array.get(blockBearCreatedBars, j)
+                        otherState = array.get(blockBearStates, j)
+                        if otherCreated > createdBar and f_block_active(otherState)
+                            otherHigh = array.get(blockBearHighs, j)
+                            otherLow = array.get(blockBearLows, j)
+                            if math.max(0.0, math.min(zoneHigh, otherHigh) - math.max(zoneLow, otherLow)) > 0
+                                bearBlockHideLabel := true
+        if not bearBlockHideLabel
+            bearBaseCountForLabel = array.size(originBearBoxes)
+            if bearBaseCountForLabel > 0
+                for j = 0 to bearBaseCountForLabel - 1
+                    otherCreated = array.get(originBearCreatedBars, j)
+                    otherState = array.get(originBearStates, j)
+                    if otherCreated > createdBar and otherState != originStateInvalid
+                        otherHigh = array.get(originBearHighs, j)
+                        otherLow = array.get(originBearLows, j)
+                        if math.max(0.0, math.min(zoneHigh, otherHigh) - math.max(zoneLow, otherLow)) > 0
+                            bearBlockHideLabel := true
+        if not na(bearBlockLabel)
+            if bearBlockHideLabel
+                label.set_text(bearBlockLabel, "")
+            else
+                label.set_x(bearBlockLabel, bearBlockLabelX)
+                label.set_y(bearBlockLabel, bearBlockLabelY)
+                label.set_text(bearBlockLabel, "Block ↓ | " + bearBlockStatusText)
+                label.set_textcolor(bearBlockLabel, bearBlockState == originStateInvalid ? color.silver : color.white)
+        if not na(bearBlockMidLine)
+            line.set_xy1(bearBlockMidLine, leftBar, math.avg(zoneHigh, zoneLow))
+            line.set_xy2(bearBlockMidLine, leftBar + 1, math.avg(zoneHigh, zoneLow))
+            line.set_style(bearBlockMidLine, line.style_dashed)
+            line.set_width(bearBlockMidLine, 1)
+            if showZoneMidpoint and not bearBlockHidden
+                bearBlockMidColor = bearBlockState == originStateInvalid ? color.new(color.gray, 55) : bearBlockState == originStateEntered ? color.new(color.orange, 30) : color.new(color.orange, 45)
+                line.set_color(bearBlockMidLine, bearBlockMidColor)
+            else
+                line.set_color(bearBlockMidLine, color.new(color.orange, 100))
+        array.set(blockBearStates, bearBlockIdx, bearBlockState)
+        bearBlockIdx += 1
+
+var int lastHighActivityBar = na
+
+if isClosedBar and hasAnyMark
+    lastMarkBar := bar_index
+
+if isClosedBar and (markActivityElev or markActivityInst)
+    lastHighActivityBar := bar_index
+
+maintenanceBreak = sessionPhase == "Maintenance"
+
+barsSinceHighActivity = na(lastHighActivityBar) ? na : (bar_index - lastHighActivityBar)
+activityRecencyText = na(barsSinceHighActivity) ? "none" : (barsSinceHighActivity == 0 ? "now" : "last " + str.tostring(barsSinceHighActivity) + " bars")
+
+// -------------------- Soft Context Flags
+softGateActive = maintenanceBreak or (useMTFGate and not okMTF) or relativeFallback or onCooldown
+
+// -------------------- Confidence Model (Gated-State Synced)
+confBase = markActivityInst ? 88.0 : markMomentum ? 74.0 : markAbs ? 70.0 : markActivityElev ? 60.0 : 22.0
+fpSoftMismatchPenalty = fpSoftMode and fpDirectionalBiasActive and not fpDirectionalMatch and (markMomentum or markAbs or markActivityElev or markActivityInst)
+confAdj = confBase - (softGateActive ? 5.0 : 0.0) - (fpSoftMismatchPenalty ? fpSoftPenaltyPct : 0.0)
+confRawPct = math.min(100.0, math.max(0.0, confAdj))
+confPct = ta.ema(confRawPct, confidenceSmoothLen)
+
+// -------------------- Dashboard (Compact Activity View)
+var table dash = table.new(position.top_right, 2, 10, border_width=1)
+var table iconBanner = table.new(position.bottom_center, 5, 1, border_width=1)
+
+if barstate.islast
+    if showDashboard
+        table.set_position(dash, dashPos)
+        labelBg = color.new(color.black, 0)
+        valueBg = color.new(color.black, 70)
+        headBg = color.new(color.blue, 75)
+        sessionBg = color.new(color.red, 70)
+        if sessionPhase == "NY Open" or sessionPhase == "Open" or sessionPhase == "NY"
+            sessionBg := color.new(color.green, 75)
+        else if sessionPhase == "NY Midday" or sessionPhase == "Midday"
+            sessionBg := color.new(color.orange, 70)
+        else if sessionPhase == "NY Close" or sessionPhase == "Close"
+            sessionBg := color.new(color.blue, 65)
+        else if sessionPhase == "London"
+            sessionBg := color.new(color.aqua, 70)
+        else if sessionPhase == "Asia"
+            sessionBg := color.new(color.yellow, 70)
+        else if sessionPhase == "Tokyo"
+            sessionBg := color.new(color.yellow, 55)
+        else if sessionPhase == "PreLondon"
+            sessionBg := color.new(color.aqua, 55)
+        else if sessionPhase == "Overnight"
+            sessionBg := color.new(color.gray, 75)
+        activityLevelText = markActivityInst ? "Extreme" : markActivityElev ? "High" : (not na(barsSinceHighActivity) and barsSinceHighActivity <= cooldownBars ? "Normal" : "Low")
+        activityText = activityLevelText + " | " + activityRecencyText
+        activityBg = markActivityInst ? color.new(color.fuchsia, 70) : markActivityElev ? color.new(color.yellow, 70) : activityLevelText == "Normal" ? color.new(color.blue, 70) : valueBg
+        pressureText = "Balanced"
+        if econRegimeActive
+            pressureText := "Macro Econ Caution"
+        else if markAbs
+            pressureText := "Absorption"
+        else if markActivityInst or markMomentum
+            pressureText := "Push Likely"
+        else if softGateActive
+            pressureText := "Caution"
+        pressureBg = valueBg
+        if econRegimeActive
+            pressureBg := color.new(color.yellow, 70)
+        else if markAbs
+            pressureBg := color.new(color.orange, 70)
+        else if markActivityInst or markMomentum
+            pressureBg := color.new(color.green, 75)
+        else if softGateActive
+            pressureBg := color.new(color.yellow, 70)
+        newsText = "None"
+        if highImpactNow
+            newsText := highImpactLabel + " now @ " + activeImpactTimeText + " | " + activeImpactBarsAgoText + " bars ago"
+        else if highImpactRecent
+            newsText := highImpactLabel + " recent @ " + activeImpactTimeText + " | " + activeImpactBarsAgoText + " bars ago"
+        newsBg = highImpactNow ? color.new(color.red, 70) : highImpactRecent ? color.new(color.orange, 70) : valueBg
+        sessionTextColor = color.white
+        activityTextColor = color.white
+        pressureTextColor = color.white
+        newsTextColor = color.white
+        fpPrevText = "Module disabled"
+        fpPrevBg = valueBg
+        fpPrevTextColor = color.white
+        fpLiveText = "Module disabled"
+        fpLiveBg = valueBg
+        fpLiveTextColor = color.white
+        fpReadText = "Balanced"
+        fpReadBg = color.new(color.black, 65)
+        fpReadTextColor = color.white
+        if useFootprintContext and not isFuturesSymbol
+            fpPrevText := "Futures only"
+            fpPrevBg := color.new(color.gray, 75)
+            fpLiveText := "Futures only"
+            fpLiveBg := color.new(color.gray, 75)
+            fpReadText := "Futures only"
+            fpReadBg := color.new(color.gray, 75)
+        else if fpHtfFallback
+            fpPrevText := "HTF fallback"
+            fpPrevBg := color.new(color.gray, 78)
+            fpLiveText := "Footprint off > " + fpMaxChartTf
+            fpLiveBg := color.new(color.gray, 78)
+            fpReadText := "Zone logic only"
+            fpReadBg := color.new(color.gray, 78)
+        else if fpModuleEnabled
+            fpPrevDeltaToken = f_delta_raw_token(fpPrevDelta)
+            fpPrevPctToken = f_delta_pct_token(fpPrevDeltaPct)
+            fpPrevVolToken = f_vol_token_k(fpPrevVol)
+            fpPrevText := fpPrevDeltaToken + " | " + fpPrevPctToken + " | " + fpPrevVolToken
+            fpPrevBg := color.new(color.black, 65)
+
+            fpLiveDeltaToken = f_delta_raw_token(fpBarDelta)
+            fpLivePctToken = f_delta_pct_token(fpBarDeltaPct)
+            fpLiveVolToken = f_vol_token_k(fpBarVol)
+            fpLiveText := fpLiveDeltaToken + " | " + fpLivePctToken + " | " + fpLiveVolToken
+            fpLiveBg := color.new(color.blue, 83)
+
+            if not na(fpPrevDeltaPct)
+                fpPrevTextColor := fpPrevDeltaPct > 0 ? color.lime : fpPrevDeltaPct < 0 ? color.red : color.white
+            if not na(fpBarDeltaPct)
+                fpLiveTextColor := fpBarDeltaPct > 0 ? color.lime : fpBarDeltaPct < 0 ? color.red : color.white
+
+            fpPrevBull = not na(fpPrevDeltaPct) and fpPrevDeltaPct > fpReadMinDeltaPct
+            fpPrevBear = not na(fpPrevDeltaPct) and fpPrevDeltaPct < -fpReadMinDeltaPct
+            fpLiveBull = not na(fpBarDeltaPct) and fpBarDeltaPct > fpReadMinDeltaPct
+            fpLiveBear = not na(fpBarDeltaPct) and fpBarDeltaPct < -fpReadMinDeltaPct
+            fpLiveStronger = not na(fpBarDeltaPct) and not na(fpPrevDeltaPct) and math.abs(fpBarDeltaPct) > math.abs(fpPrevDeltaPct)
+            fpLiveUpBar = close > open
+            fpLiveDownBar = close < open
+
+            if fpLiveUpBar and fpLiveBear
+                fpReadText := "Sell absorption"
+                fpReadTextColor := color.orange
+            else if fpLiveDownBar and fpLiveBull
+                fpReadText := "Buy absorption"
+                fpReadTextColor := color.aqua
+            else if fpPrevBull and fpLiveBull
+                fpReadText := fpLiveStronger ? "Buyers strengthening" : "Buyers fading"
+                fpReadTextColor := fpLiveStronger ? color.lime : color.yellow
+            else if fpPrevBear and fpLiveBear
+                fpReadText := fpLiveStronger ? "Sellers strengthening" : "Sellers fading"
+                fpReadTextColor := fpLiveStronger ? color.red : color.yellow
+            else if fpLiveBull
+                fpReadText := "Buyers strengthening"
+                fpReadTextColor := color.lime
+            else if fpLiveBear
+                fpReadText := "Sellers strengthening"
+                fpReadTextColor := color.red
+
+        table.cell(dash, 0, 0, "OriginFlow", text_color=color.white, bgcolor=headBg, text_size=dashTextSize)
+        table.cell(dash, 1, 0, sessionPhase, text_color=sessionTextColor, bgcolor=sessionBg, text_size=dashTextSize)
+        table.cell(dash, 0, 1, "Activity", text_color=color.white, bgcolor=labelBg, text_size=dashTextSize)
+        table.cell(dash, 1, 1, activityText, text_color=activityTextColor, bgcolor=activityBg, text_size=dashTextSize)
+        table.cell(dash, 0, 2, "Activity Bias", text_color=color.white, bgcolor=labelBg, text_size=dashTextSize)
+        table.cell(dash, 1, 2, pressureText, text_color=pressureTextColor, bgcolor=pressureBg, text_size=dashTextSize)
+        table.cell(dash, 0, 3, "News", text_color=color.white, bgcolor=labelBg, text_size=dashTextSize)
+        table.cell(dash, 1, 3, newsText, text_color=newsTextColor, bgcolor=newsBg, text_size=dashTextSize)
+        table.cell(dash, 0, 4, "FP Prev", text_color=color.white, bgcolor=labelBg, text_size=dashTextSize)
+        table.cell(dash, 1, 4, fpPrevText, text_color=fpPrevTextColor, bgcolor=fpPrevBg, text_size=dashTextSize)
+        table.cell(dash, 0, 5, "FP Live", text_color=color.white, bgcolor=labelBg, text_size=dashTextSize)
+        table.cell(dash, 1, 5, fpLiveText, text_color=fpLiveTextColor, bgcolor=fpLiveBg, text_size=dashTextSize)
+        table.cell(dash, 0, 6, "FP Read", text_color=color.white, bgcolor=labelBg, text_size=dashTextSize)
+        table.cell(dash, 1, 6, fpReadText, text_color=fpReadTextColor, bgcolor=fpReadBg, text_size=dashTextSize)
+        if showZoneDebug
+            swingBg = swingBias == 1 ? color.new(color.green, 78) : swingBias == -1 ? color.new(color.red, 78) : valueBg
+            table.cell(dash, 0, 7, "Structure", text_color=color.white, bgcolor=labelBg, text_size=dashTextSize)
+            table.cell(dash, 1, 7, swingDebugText, text_color=color.white, bgcolor=swingBg, text_size=dashTextSize)
+            table.cell(dash, 0, 8, "Base Debug", text_color=color.white, bgcolor=labelBg, text_size=dashTextSize)
+            table.cell(dash, 1, 8, baseDebugText, text_color=color.white, bgcolor=valueBg, text_size=dashTextSize)
+            table.cell(dash, 0, 9, "Block Debug", text_color=color.white, bgcolor=labelBg, text_size=dashTextSize)
+            table.cell(dash, 1, 9, blockDebugText, text_color=color.white, bgcolor=valueBg, text_size=dashTextSize)
+        else
+            table.cell(dash, 0, 7, "", text_color=color.new(color.white, 100), bgcolor=color.new(color.black, 100))
+            table.cell(dash, 1, 7, "", text_color=color.new(color.white, 100), bgcolor=color.new(color.black, 100))
+            table.cell(dash, 0, 8, "", text_color=color.new(color.white, 100), bgcolor=color.new(color.black, 100))
+            table.cell(dash, 1, 8, "", text_color=color.new(color.white, 100), bgcolor=color.new(color.black, 100))
+            table.cell(dash, 0, 9, "", text_color=color.new(color.white, 100), bgcolor=color.new(color.black, 100))
+            table.cell(dash, 1, 9, "", text_color=color.new(color.white, 100), bgcolor=color.new(color.black, 100))
+    else
+        for r = 0 to 9
+            for c = 0 to 1
+                table.cell(dash, c, r, "", text_color=color.new(color.white, 100), bgcolor=color.new(color.black, 100))
+
+    // Bottom-center icon legend banner (separate from dashboard).
+    if showIconBanner
+        table.set_position(iconBanner, bannerPos)
+        table.cell(iconBanner, 0, 0, "Activity Icons", text_color=color.white, bgcolor=color.new(color.black, 0), text_size=bannerSize)
+        table.cell(iconBanner, 1, 0, "✕ Elev", text_color=color.yellow, bgcolor=color.new(color.black, 70), text_size=bannerSize)
+        table.cell(iconBanner, 2, 0, "○ Inst", text_color=color.fuchsia, bgcolor=color.new(color.black, 70), text_size=bannerSize)
+        table.cell(iconBanner, 3, 0, "■ Mom", text_color=color.aqua, bgcolor=color.new(color.black, 70), text_size=bannerSize)
+        table.cell(iconBanner, 4, 0, "◆ Abs", text_color=color.orange, bgcolor=color.new(color.black, 70), text_size=bannerSize)
+    else
+        for c = 0 to 4
+            table.cell(iconBanner, c, 0, "", text_color=color.new(color.white, 100), bgcolor=color.new(color.black, 100))
+
+// -------------------- Plots & Alerts
+plotshape(markActivityElev, title="Activity (Elevated)", style=shape.xcross, location=location.abovebar, color=color.yellow, size=size.small)
+plotshape(markActivityInst, title="Activity (Institutional)", style=shape.circle, location=location.abovebar, color=color.fuchsia, size=size.small)
+
+plotshape(markMomentum, title="Momentum Activity", style=shape.square, location=location.abovebar, color=color.aqua, size=size.small)
+plotshape(markAbs, title="Absorption Activity", style=shape.diamond, location=location.abovebar, color=color.orange, size=size.small)
+
+alertsEnabled = not newsGuard
+gatedEventAlert = alertsEnabled and isClosedBar and hasAnyMark
+patternEventAlert = alertsEnabled and isClosedBar and (markMomentum or markAbs)
+originBullAlert = alertsEnabled and originBullFound
+originBearAlert = alertsEnabled and originBearFound
+originBullReactionAlert = alertsEnabled and isClosedBar and originBullReactionTriggerNow
+originBearReactionAlert = alertsEnabled and isClosedBar and originBearReactionTriggerNow
+originBullMitigatedAlert = alertsEnabled and isClosedBar and originBullMitigatedNow
+originBearMitigatedAlert = alertsEnabled and isClosedBar and originBearMitigatedNow
+blockBullMitigatedAlert = alertsEnabled and isClosedBar and blockBullMitigatedNow
+blockBearMitigatedAlert = alertsEnabled and isClosedBar and blockBearMitigatedNow
+econContextAlert = alertsEnabled and isClosedBar and econRegimeActive and not (econRegimeActive[1] == true)
+highImpactReleaseAlert = alertsEnabled and isClosedBar and highImpactNow
+fpContextReadyAlert = alertsEnabled and isClosedBar and fpContextReady and not fpContextReady[1]
+fpBiasBullAlert = alertsEnabled and isClosedBar and fpBiasBull and not fpBiasBull[1]
+fpBiasBearAlert = alertsEnabled and isClosedBar and fpBiasBear and not fpBiasBear[1]
+fpBreakLongAlert = alertsEnabled and isClosedBar and fpLongSignal
+fpBreakShortAlert = alertsEnabled and isClosedBar and fpShortSignal
+fpHardGateBlockedAlert = alertsEnabled and isClosedBar and fpHardGateBlocked
+fpDataFallbackAlert = alertsEnabled and isClosedBar and fpDataFallback and not fpDataFallback[1]
+fpSessionConfigInvalidAlert = alertsEnabled and isClosedBar and fpSessionConfigInvalid and not fpSessionConfigInvalid[1]
+
+alertcondition(markActivityElev, "Activity (Elevated)", "Elevated activity detected (gated).")
+alertcondition(markActivityInst, "Activity (Institutional)", "Institutional activity detected (gated).")
+alertcondition(gatedEventAlert, "Activity NOW (Gated Event)", "Gated activity event fired.")
+alertcondition(patternEventAlert, "Pattern Activity (Mode Only)", "Pattern activity event fired (Momentum/Absorption).")
+alertcondition(originBullAlert, "Displacement Origin Bull", "Bullish displacement origin box detected.")
+alertcondition(originBearAlert, "Displacement Origin Bear", "Bearish displacement origin box detected.")
+alertcondition(originBullReactionAlert, "Origin Reaction Long Trigger", "Bullish origin zone completed enter, deceleration, structure shift, and re-displacement.")
+alertcondition(originBearReactionAlert, "Origin Reaction Short Trigger", "Bearish origin zone completed enter, deceleration, structure shift, and re-displacement.")
+alertcondition(originBullMitigatedAlert, "Base Bull Mitigated", "Bullish Base zone was mitigated or invalidated.")
+alertcondition(originBearMitigatedAlert, "Base Bear Mitigated", "Bearish Base zone was mitigated or invalidated.")
+alertcondition(blockBullMitigatedAlert, "Block Bull Mitigated", "Bullish Block zone was mitigated or invalidated.")
+alertcondition(blockBearMitigatedAlert, "Block Bear Mitigated", "Bearish Block zone was mitigated or invalidated.")
+alertcondition(alertsEnabled and isClosedBar and relativeFallback, "Relative Mode Fallback", "Relative mode is ON but benchmark data is unavailable; using local z-score fallback.")
+alertcondition(econContextAlert, "Economic Context Caution", "Economic context caution regime is active (UR level or MoM jump trigger).")
+alertcondition(highImpactReleaseAlert, "High-Impact Release Detected", "High-impact macro release update detected (CPI/PPI/NFP/CCI/FOMC proxy).")
+alertcondition(fpContextReadyAlert, "Flow Bias Context Ready", "Completed session flow-bias context is ready.")
+alertcondition(fpBiasBullAlert, "Flow Bias Bull", "Flow-bias session context turned bullish.")
+alertcondition(fpBiasBearAlert, "Flow Bias Bear", "Flow-bias session context turned bearish.")
+alertcondition(fpBreakLongAlert, "Flow Bias Confirmed Long", "Flow-bias breakout confirmation is long.")
+alertcondition(fpBreakShortAlert, "Flow Bias Confirmed Short", "Flow-bias breakout confirmation is short.")
+alertcondition(fpHardGateBlockedAlert, "Flow Bias Hard-Gate Blocked Event", "Directional event was blocked by hard flow-bias gate.")
+alertcondition(fpDataFallbackAlert, "Flow Bias Data Fallback", "Flow-bias context is in low-quality fallback mode (low volume or sparse data).")
+alertcondition(fpSessionConfigInvalidAlert, "Flow Bias Session Config Invalid", "Flow-bias session boundaries are invalid. Check Tokyo/PreLondon/London/NY times.")
+
+// Legacy alert titles kept for backward compatibility with existing user alert setups.
+alertcondition(fpContextReadyAlert, "Footprint Context Ready", "Completed session flow-bias context is ready.")
+alertcondition(fpBiasBullAlert, "Footprint Bias Bull", "Flow-bias session context turned bullish.")
+alertcondition(fpBiasBearAlert, "Footprint Bias Bear", "Flow-bias session context turned bearish.")
+alertcondition(fpBreakLongAlert, "Footprint Confirmed Long", "Flow-bias breakout confirmation is long.")
+alertcondition(fpBreakShortAlert, "Footprint Confirmed Short", "Flow-bias breakout confirmation is short.")
+alertcondition(fpHardGateBlockedAlert, "Footprint Hard-Gate Blocked Event", "Directional event was blocked by hard flow-bias gate.")
+alertcondition(fpDataFallbackAlert, "Footprint Data Fallback", "Flow-bias context is in low-quality fallback mode (low volume or sparse data).")

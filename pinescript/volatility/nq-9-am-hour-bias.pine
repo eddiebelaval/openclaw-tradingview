@@ -1,0 +1,795 @@
+// This Pine Script™ is subject to the Terms of Use at https://www.tradingview.com/pine-script-docs/en/v5/Disclaimer.html
+// © constantinpabst
+//
+// ════════════════════════════════════════════════════════════════════════
+// NQ 9 AM Hour Bias
+// ════════════════════════════════════════════════════════════════════════
+//
+// WHAT IT DOES
+// Draws the 9:00-10:00 AM ET candle as a box, scores its quality, then
+// tracks breakout confirmation, pullback depth, extension targets, and
+// a reversal clock for the rest of the trading day.
+//
+// HOW IT WORKS
+// 1. Builds the 9-10 AM candle (open/high/low/close) and marks the
+//    9:30 RTH open inside it.
+// 2. Grades candle quality (A/B/C) using three filters:
+//    - Body ratio: body > 50% of range
+//    - Close position: close in top 25% (green) or bottom 25% (red)
+//    - 9:30 open position: open in lower 75% (green) or upper 75% (red)
+// 3. After 10 AM, monitors for a breakout of the candle high (green) or
+//    low (red) during the 10-11 AM hour. Grade A + breakout = A+.
+// 4. Tracks pullback depth from the breakout level. If price retraces
+//    more than 150% of the 9 AM range, the signal is marked DEAD.
+// 5. If the candle extreme is NOT broken, a reversal clock activates
+//    with progressively increasing conviction each hour.
+// 6. Plots 0.5x and 1.0x range extensions in the breakout direction.
+//
+// HARDCODED STATISTICS — IMPORTANT DISCLOSURE
+// The win rates and reversal percentages shown in the dashboard are
+// hardcoded values derived from a backtest of 1,495 NQ trading days
+// (January 2020 - December 2025, 1-minute bars, New York timezone).
+// These are HISTORICAL observations, not live calculations. Key stats:
+//   - Grade A+ green: 85.4% close above 9:30 open (N=280)
+//   - Grade A+ red:   78.4% close below 9:30 open (N=200)
+//   - Reversal (not broken by 3 PM): 84% green, 75% red
+//   - 150% flush invalidation: ~45% win rate (coin flip)
+// These numbers reflect past behavior and may not persist in the future.
+// The backtest methodology, full results, and sample sizes are available
+// in the source code comments and the author's published backtest report.
+//
+// WHAT MAKES THIS DIFFERENT
+// Most "opening range" indicators use the 9:30-10:30 RTH first hour.
+// This indicator uses the 9:00-10:00 window, which captures pre-market
+// positioning and the RTH open transition — a structurally different
+// signal. The quality grading system, pullback invalidation rule, and
+// reversal clock are all derived from a specific NQ backtest, not
+// generic assumptions.
+//
+// RISK DISCLAIMER
+// This indicator is an analytical tool, not financial advice. Past
+// performance does not guarantee future results. The hardcoded
+// statistics were derived from historical NQ data and may not apply to
+// other instruments, timeframes, or future market conditions. Always
+// use proper risk management. Trade at your own risk.
+//
+// ════════════════════════════════════════════════════════════════════════
+
+//@version=5
+indicator("NQ 9 AM Hour Bias", overlay=true, max_boxes_count=50, max_lines_count=100, max_labels_count=50)
+
+// ════════════════════════════════════════════════════════════════════════
+// INPUTS
+// ════════════════════════════════════════════════════════════════════════
+
+var g_FH      = "9 AM Candle"
+lookback      = input.int(1, "Show Last N Sessions", minval=1, maxval=5, group=g_FH)
+bullColor     = input.color(color.new(#26a69a, 0), "Bullish Color", group=g_FH)
+bearColor     = input.color(color.new(#ef5350, 0), "Bearish Color", group=g_FH)
+boxTransp     = input.int(88, "Box Transparency", minval=0, maxval=100, group=g_FH)
+
+var g_OPEN    = "9:30 RTH Open"
+show930       = input.bool(true, "Show 9:30 Line", group=g_OPEN)
+color930      = input.color(color.new(color.yellow, 0), "Color", group=g_OPEN)
+style930      = input.string("Dashed", "Style", options=["Solid", "Dotted", "Dashed"], group=g_OPEN)
+width930      = input.int(2, "Width", minval=1, maxval=5, group=g_OPEN)
+
+var g_LEVELS  = "Post-FH Levels"
+showMidline   = input.bool(true, "Show Midline", group=g_LEVELS)
+showExt05     = input.bool(true, "Show 0.5x Extension", group=g_LEVELS)
+showExt10     = input.bool(true, "Show 1.0x Extension", group=g_LEVELS)
+extColor      = input.color(color.new(color.aqua, 0), "Extension Color", group=g_LEVELS)
+extStyle      = input.string("Dashed", "Extension Style", options=["Solid", "Dotted", "Dashed"], group=g_LEVELS)
+extWidth      = input.int(1, "Extension Width", minval=1, maxval=5, group=g_LEVELS)
+showExtLabels = input.bool(true, "Show Extension Labels", group=g_LEVELS)
+showFlushZone = input.bool(true, "Show 150% Invalidation Zone", group=g_LEVELS)
+flushColor    = input.color(color.new(color.orange, 85), "Flush Zone Color", group=g_LEVELS)
+
+var g_SIGNALS = "Signals & Labels"
+showSignalLbl = input.bool(true, "Show Signal Grade Label", group=g_SIGNALS)
+showBreakMark = input.bool(true, "Show Breakout Marker", group=g_SIGNALS)
+showInvalMark = input.bool(true, "Show Invalidation Marker", group=g_SIGNALS)
+
+var g_DASH    = "Dashboard"
+showDashboard = input.bool(true, "Show Dashboard", group=g_DASH)
+dashPosition  = input.string("Top Right", "Position", options=["Top Right", "Top Left", "Bottom Right", "Bottom Left"], group=g_DASH)
+dashTheme     = input.string("Dark", "Theme", options=["Dark", "Light"], group=g_DASH)
+dashSize      = input.string("Small", "Text Size", options=["Tiny", "Small", "Normal", "Large"], group=g_DASH)
+
+var g_ALERTS  = "Alerts"
+alertOnGrade  = input.bool(true, "Alert on FH Complete", group=g_ALERTS)
+alertOnBreak  = input.bool(true, "Alert on Breakout", group=g_ALERTS)
+alertOnEntry  = input.bool(true, "Alert on Pullback Entry", group=g_ALERTS)
+alertOnInval  = input.bool(true, "Alert on Invalidation", group=g_ALERTS)
+alertOnRev    = input.bool(true, "Alert on Reversal Signal", group=g_ALERTS)
+
+// ════════════════════════════════════════════════════════════════════════
+// CONSTANTS (var ensures single allocation, not re-evaluated each bar)
+// ════════════════════════════════════════════════════════════════════════
+
+var string TZ              = "America/New_York"
+var float  BODY_THRESH     = 0.50
+var float  GREEN_CLOSE_TH  = 0.75
+var float  RED_CLOSE_TH    = 0.25
+var float  GREEN_930_TH    = 0.75
+var float  RED_930_TH      = 0.25
+var float  FLUSH_MULT      = 1.50
+
+// ════════════════════════════════════════════════════════════════════════
+// STATE DECLARATIONS
+// ════════════════════════════════════════════════════════════════════════
+
+// FH candle data
+var float fh_open       = na
+var float fh_high       = na
+var float fh_low        = na
+var float fh_close      = na
+var float fh_range      = na
+var int   fh_start_bar  = na
+var int   fh_end_bar    = na
+var bool  fh_valid      = false
+var bool  fh_green      = false
+var bool  fh_red        = false
+
+// 9:30 open
+var float price_930     = na
+var bool  has_930       = false
+var int   bar_930       = na
+
+// Quality metrics
+var float body_ratio    = na
+var float close_pos     = na
+var float open_930_pos  = na
+var bool  q_body        = false
+var bool  q_close       = false
+var bool  q_930         = false
+var string signal_grade = "—"
+var string fh_direction = "FLAT"
+var color  grade_color  = color.gray
+
+// Breakout tracking
+var bool  broke_above   = false
+var bool  broke_below   = false
+var int   break_bar     = na
+var bool  break_in_1011 = false
+
+// Pullback tracking (measured from FH breakout level, not post-break extreme)
+var bool  pullback_reached  = false
+var float pb_deepest        = 0.0
+var float pb_depth_pct      = 0.0
+var bool  pb_invalidated    = false
+
+// Reversal tracking
+var bool  rev_signal    = false
+var int   rev_hour      = na
+var float rev_pct       = na
+
+// Phase tracking
+var string phase        = "WAITING"
+// WAITING → FORMING → SCORED → MONITORING
+
+// Drawing objects
+var box   fhBox         = na
+var line  line930       = na
+var line  lineHigh      = na
+var line  lineLow       = na
+var line  lineMid       = na
+var line  lineExt05     = na
+var line  lineExt10     = na
+var label lblExt05      = na
+var label lblExt10      = na
+var box   flushBoxHigh  = na
+var box   flushBoxLow   = na
+var label signalLabel   = na
+var label breakLabel    = na
+var label invalLabel    = na
+
+// Session history for cleanup
+type FHSession
+    box   fh_box
+    line  ln_930
+    line  ln_high
+    line  ln_low
+    line  ln_mid
+    line  ln_ext05
+    line  ln_ext10
+    label lbl_ext05
+    label lbl_ext10
+    box   flush_hi
+    box   flush_lo
+    label sig_lbl
+    label brk_lbl
+    label inv_lbl
+
+var array<FHSession> history = array.new<FHSession>(0)
+
+// Pre-compute style lookups once (inputs never change at runtime)
+var string line930Style = style930 == "Dotted" ? line.style_dotted : style930 == "Solid" ? line.style_solid : line.style_dashed
+var string extLineStyle = extStyle == "Dotted" ? line.style_dotted : extStyle == "Solid" ? line.style_solid : line.style_dashed
+
+// ════════════════════════════════════════════════════════════════════════
+// SESSION DETECTION
+// ════════════════════════════════════════════════════════════════════════
+
+inFH        = not na(time(timeframe.period, "0900-1000:1234567", TZ))
+fhJustEnded = not inFH and inFH[1]
+inRTH       = not na(time(timeframe.period, "0930-1600:1234567", TZ))
+rthStart    = inRTH and not inRTH[1]
+
+// Exact 9:30 open from 30-min bar — works on any chart timeframe
+price_930_ref = request.security(syminfo.tickerid, "30", open, barmerge.gaps_off, barmerge.lookahead_on)
+in1011      = not na(time(timeframe.period, "1000-1100:1234567", TZ))
+in1112      = not na(time(timeframe.period, "1100-1200:1234567", TZ))
+in1213      = not na(time(timeframe.period, "1200-1300:1234567", TZ))
+in1314      = not na(time(timeframe.period, "1300-1400:1234567", TZ))
+in1415      = not na(time(timeframe.period, "1400-1500:1234567", TZ))
+in1516      = not na(time(timeframe.period, "1500-1600:1234567", TZ))
+postFH      = not inFH and fh_valid and inRTH
+
+// Hour transitions for reversal clock
+hour11start = in1112 and not in1112[1]
+hour12start = in1213 and not in1213[1]
+hour13start = in1314 and not in1314[1]
+hour14start = in1415 and not in1415[1]
+hour15start = in1516 and not in1516[1]
+
+// ════════════════════════════════════════════════════════════════════════
+// NEW DAY RESET
+// ════════════════════════════════════════════════════════════════════════
+
+if ta.change(time("D"))
+    // Archive current drawings before reset
+    if fh_valid and not na(fhBox)
+        fhRecord = FHSession.new(fhBox, line930, lineHigh, lineLow, lineMid, lineExt05, lineExt10, lblExt05, lblExt10, flushBoxHigh, flushBoxLow, signalLabel, breakLabel, invalLabel)
+        array.unshift(history, fhRecord)
+        // Cleanup beyond lookback
+        while array.size(history) > lookback
+            old = array.pop(history)
+            if not na(old.fh_box)
+                box.delete(old.fh_box)
+            if not na(old.ln_930)
+                line.delete(old.ln_930)
+            if not na(old.ln_high)
+                line.delete(old.ln_high)
+            if not na(old.ln_low)
+                line.delete(old.ln_low)
+            if not na(old.ln_mid)
+                line.delete(old.ln_mid)
+            if not na(old.ln_ext05)
+                line.delete(old.ln_ext05)
+            if not na(old.ln_ext10)
+                line.delete(old.ln_ext10)
+            if not na(old.lbl_ext05)
+                label.delete(old.lbl_ext05)
+            if not na(old.lbl_ext10)
+                label.delete(old.lbl_ext10)
+            if not na(old.flush_hi)
+                box.delete(old.flush_hi)
+            if not na(old.flush_lo)
+                box.delete(old.flush_lo)
+            if not na(old.sig_lbl)
+                label.delete(old.sig_lbl)
+            if not na(old.brk_lbl)
+                label.delete(old.brk_lbl)
+            if not na(old.inv_lbl)
+                label.delete(old.inv_lbl)
+
+    // Reset all state
+    fh_open       := na
+    fh_high       := na
+    fh_low        := na
+    fh_close      := na
+    fh_range      := na
+    fh_start_bar  := na
+    fh_end_bar    := na
+    fh_valid      := false
+    fh_green      := false
+    fh_red        := false
+    price_930     := na
+    has_930       := false
+    bar_930       := na
+    body_ratio    := na
+    close_pos     := na
+    open_930_pos  := na
+    q_body        := false
+    q_close       := false
+    q_930         := false
+    signal_grade  := "—"
+    fh_direction  := "FLAT"
+    grade_color   := color.gray
+    broke_above      := false
+    broke_below      := false
+    break_bar        := na
+    break_in_1011    := false
+    pullback_reached := false
+    pb_deepest       := 0.0
+    pb_depth_pct     := 0.0
+    pb_invalidated   := false
+    rev_signal    := false
+    rev_hour      := na
+    rev_pct       := na
+    phase         := "WAITING"
+    fhBox         := na
+    line930       := na
+    lineHigh      := na
+    lineLow       := na
+    lineMid       := na
+    lineExt05     := na
+    lineExt10     := na
+    lblExt05      := na
+    lblExt10      := na
+    flushBoxHigh  := na
+    flushBoxLow   := na
+    signalLabel   := na
+    breakLabel    := na
+    invalLabel    := na
+
+// ════════════════════════════════════════════════════════════════════════
+// PHASE 1: CAPTURE 9:30 OPEN + BUILD FH CANDLE
+// ════════════════════════════════════════════════════════════════════════
+
+// Capture 9:30 open (RTH transition + request.security for exact price)
+if rthStart and not has_930
+    price_930 := price_930_ref
+    has_930   := true
+    bar_930   := bar_index
+
+// Build FH candle bar by bar
+if inFH
+    phase := "FORMING"
+    if not inFH[1]
+        // First bar of session
+        fh_open      := open
+        fh_high      := high
+        fh_low       := low
+        fh_start_bar := bar_index
+    else
+        fh_high := math.max(fh_high, high)
+        fh_low  := math.min(fh_low, low)
+    fh_close := close
+
+    // Draw/update box in real-time (gray while forming)
+    if na(fhBox)
+        fhBox := box.new(fh_start_bar, fh_high, bar_index, fh_low, bgcolor=color.new(color.gray, boxTransp), border_color=color.gray, border_width=2)
+    else
+        box.set_top(fhBox, fh_high)
+        box.set_bottom(fhBox, fh_low)
+        box.set_right(fhBox, bar_index)
+
+// Draw 9:30 line in real-time (starts at 9:30 bar, not 9:00)
+if show930 and has_930 and not na(bar_930) and bar_index >= bar_930
+    if na(line930)
+        line930 := line.new(bar_930, price_930, bar_index, price_930, color=color930, width=width930, style=line930Style)
+    else
+        line.set_x2(line930, bar_index)
+
+// ════════════════════════════════════════════════════════════════════════
+// PHASE 2: FH COMPLETE — SCORE CANDLE QUALITY
+// ════════════════════════════════════════════════════════════════════════
+
+if fhJustEnded and not fh_valid
+    fh_valid  := true
+    fh_end_bar := bar_index - 1
+    fh_range   := fh_high - fh_low
+    fh_green  := fh_close > fh_open
+    fh_red    := fh_close < fh_open
+    fh_direction := fh_green ? "LONG" : fh_red ? "SHORT" : "FLAT"
+
+    // Calculate quality metrics
+    body_ratio := fh_range > 0 ? math.abs(fh_close - fh_open) / fh_range : 0.0
+    close_pos  := fh_range > 0 ? (fh_close - fh_low) / fh_range : 0.5
+    open_930_pos := fh_range > 0 and has_930 ? (price_930 - fh_low) / fh_range : na
+
+    // Grade quality filters
+    q_body := body_ratio > BODY_THRESH
+
+    if not has_930
+        q_close := false
+        q_930   := false
+    else if fh_green
+        q_close := close_pos > GREEN_CLOSE_TH
+        q_930   := open_930_pos < GREEN_930_TH
+    else if fh_red
+        q_close := close_pos < RED_CLOSE_TH
+        q_930   := open_930_pos > RED_930_TH
+    else
+        q_close := false
+        q_930   := false
+
+    // Determine grade
+    qualityCount = (q_body ? 1 : 0) + (q_close ? 1 : 0) + (q_930 ? 1 : 0)
+
+    if fh_green or fh_red
+        if qualityCount == 3
+            signal_grade := "A"
+            grade_color  := fh_green ? bullColor : bearColor
+        else if qualityCount == 2
+            signal_grade := "B"
+            grade_color  := fh_green ? bullColor : bearColor
+        else
+            signal_grade := "C"
+            grade_color  := color.gray
+    else
+        signal_grade := "FLAT"
+        grade_color  := color.gray
+
+    phase := "SCORED"
+
+    // Shared session color (computed once, used for box + lines)
+    sessionColor = fh_green ? bullColor : fh_red ? bearColor : color.gray
+
+    // Finalize box color
+    if not na(fhBox)
+        box.set_bgcolor(fhBox, color.new(sessionColor, boxTransp))
+        box.set_border_color(fhBox, sessionColor)
+        box.set_right(fhBox, fh_end_bar)
+
+    // Draw FH high/low extension lines
+    lineHigh := line.new(fh_end_bar, fh_high, fh_end_bar, fh_high, color=sessionColor, width=1, style=line.style_dotted)
+    lineLow  := line.new(fh_end_bar, fh_low, fh_end_bar, fh_low, color=sessionColor, width=1, style=line.style_dotted)
+    if showMidline
+        fh_mid = (fh_high + fh_low) / 2.0
+        lineMid := line.new(fh_end_bar, fh_mid, fh_end_bar, fh_mid, color=color.new(sessionColor, 50), width=1, style=line.style_dotted)
+
+    // Draw 0.5x and 1.0x extension lines
+    if fh_range > 0
+        if fh_green
+            if showExt05
+                ext05 = fh_high + 0.5 * fh_range
+                lineExt05 := line.new(fh_end_bar, ext05, fh_end_bar, ext05, color=extColor, width=extWidth, style=extLineStyle)
+                if showExtLabels
+                    lblExt05 := label.new(fh_end_bar, ext05, ".5", color=color.new(color.black, 100), textcolor=extColor, style=label.style_label_left, size=size.small)
+            if showExt10
+                ext10 = fh_high + 1.0 * fh_range
+                lineExt10 := line.new(fh_end_bar, ext10, fh_end_bar, ext10, color=extColor, width=extWidth, style=extLineStyle)
+                if showExtLabels
+                    lblExt10 := label.new(fh_end_bar, ext10, "1", color=color.new(color.black, 100), textcolor=extColor, style=label.style_label_left, size=size.small)
+        else if fh_red
+            if showExt05
+                ext05 = fh_low - 0.5 * fh_range
+                lineExt05 := line.new(fh_end_bar, ext05, fh_end_bar, ext05, color=extColor, width=extWidth, style=extLineStyle)
+                if showExtLabels
+                    lblExt05 := label.new(fh_end_bar, ext05, ".5", color=color.new(color.black, 100), textcolor=extColor, style=label.style_label_left, size=size.small)
+            if showExt10
+                ext10 = fh_low - 1.0 * fh_range
+                lineExt10 := line.new(fh_end_bar, ext10, fh_end_bar, ext10, color=extColor, width=extWidth, style=extLineStyle)
+                if showExtLabels
+                    lblExt10 := label.new(fh_end_bar, ext10, "1", color=color.new(color.black, 100), textcolor=extColor, style=label.style_label_left, size=size.small)
+
+    // Draw 150% flush zone
+    if showFlushZone and fh_range > 0
+        flushAbove = fh_high + (fh_range * (FLUSH_MULT - 1.0))
+        flushBelow = fh_low - (fh_range * (FLUSH_MULT - 1.0))
+        flushBoxHigh := box.new(fh_end_bar, flushAbove, fh_end_bar, fh_high, bgcolor=flushColor, border_color=color.new(color.orange, 70), border_width=1, border_style=line.style_dotted)
+        flushBoxLow  := box.new(fh_end_bar, fh_low, fh_end_bar, flushBelow, bgcolor=flushColor, border_color=color.new(color.orange, 70), border_width=1, border_style=line.style_dotted)
+
+    // Signal grade label
+    if showSignalLbl
+        lblText   = fh_direction + " " + signal_grade
+        lblStyle  = fh_green ? label.style_label_up : label.style_label_down
+        lblY      = fh_green ? fh_low : fh_high
+        signalLabel := label.new(fh_end_bar, lblY, lblText, color=color.new(grade_color, 20), textcolor=color.white, style=lblStyle, size=size.normal)
+
+// ════════════════════════════════════════════════════════════════════════
+// PHASE 3: POST-FH MONITORING (Breakout, Pullback, Reversal)
+// ════════════════════════════════════════════════════════════════════════
+
+if postFH and not pb_invalidated
+    phase := "MONITORING"
+
+    // Extend level lines
+    if not na(lineHigh)
+        line.set_x2(lineHigh, bar_index)
+    if not na(lineLow)
+        line.set_x2(lineLow, bar_index)
+    if not na(lineMid)
+        line.set_x2(lineMid, bar_index)
+    if not na(lineExt05)
+        line.set_x2(lineExt05, bar_index)
+    if not na(lblExt05)
+        label.set_x(lblExt05, bar_index)
+    if not na(lineExt10)
+        line.set_x2(lineExt10, bar_index)
+    if not na(lblExt10)
+        label.set_x(lblExt10, bar_index)
+    if not na(flushBoxHigh)
+        box.set_right(flushBoxHigh, bar_index)
+    if not na(flushBoxLow)
+        box.set_right(flushBoxLow, bar_index)
+
+    // ── Breakout Detection (confirmed bars only — prevents intrabar repainting) ──
+    if barstate.isconfirmed
+        if fh_green and not broke_above
+            if high > fh_high
+                broke_above   := true
+                break_bar     := bar_index
+                break_in_1011 := in1011
+                // Upgrade grade A → A+ with breakout confirmation
+                if signal_grade == "A" and break_in_1011
+                    signal_grade := "A+"
+                    if showSignalLbl and not na(signalLabel)
+                        label.set_text(signalLabel, "LONG A+")
+
+                if showBreakMark
+                    breakLabel := label.new(bar_index, high, "BRK", color=color.new(bullColor, 30), textcolor=color.white, style=label.style_label_down, size=size.tiny)
+
+                if alertOnBreak
+                    alert("FH High broken — bullish breakout confirmed", alert.freq_once_per_bar)
+
+        if fh_red and not broke_below
+            if low < fh_low
+                broke_below   := true
+                break_bar     := bar_index
+                break_in_1011 := in1011
+                if signal_grade == "A" and break_in_1011
+                    signal_grade := "A+"
+                    if showSignalLbl and not na(signalLabel)
+                        label.set_text(signalLabel, "SHORT A+")
+
+                if showBreakMark
+                    breakLabel := label.new(bar_index, low, "BRK", color=color.new(bearColor, 30), textcolor=color.white, style=label.style_label_up, size=size.tiny)
+
+                if alertOnBreak
+                    alert("FH Low broken — bearish breakout confirmed", alert.freq_once_per_bar)
+
+    // ── Pullback Tracking (confirmed bars only, consistent with breakout detection) ──
+    if barstate.isconfirmed
+        if fh_green and broke_above and break_in_1011
+            if low <= fh_high and not pullback_reached
+                pullback_reached := true
+                if alertOnEntry
+                    alert("Pullback to FH High — long entry zone", alert.freq_once_per_bar)
+
+            currentPB = math.max(0.0, fh_high - low)
+            if currentPB > pb_deepest
+                pb_deepest := currentPB
+            pb_depth_pct := fh_range > 0 ? pb_deepest / fh_range : 0.0
+
+            if pb_depth_pct >= FLUSH_MULT and not pb_invalidated
+                pb_invalidated := true
+                signal_grade   := "DEAD"
+                grade_color    := color.gray
+                if showSignalLbl and not na(signalLabel)
+                    label.set_text(signalLabel, "LONG DEAD")
+                    label.set_color(signalLabel, color.new(color.gray, 20))
+                if showInvalMark
+                    invalLabel := label.new(bar_index, low, "X", color=color.new(color.gray, 30), textcolor=color.white, style=label.style_label_up, size=size.small)
+                if alertOnInval
+                    alert("Signal invalidated — pullback exceeded 150% of FH range", alert.freq_once_per_bar)
+
+        if fh_red and broke_below and break_in_1011
+            if high >= fh_low and not pullback_reached
+                pullback_reached := true
+                if alertOnEntry
+                    alert("Pullback to FH Low — short entry zone", alert.freq_once_per_bar)
+
+            currentPB = math.max(0.0, high - fh_low)
+            if currentPB > pb_deepest
+                pb_deepest := currentPB
+            pb_depth_pct := fh_range > 0 ? pb_deepest / fh_range : 0.0
+
+            if pb_depth_pct >= FLUSH_MULT and not pb_invalidated
+                pb_invalidated := true
+                signal_grade   := "DEAD"
+                grade_color    := color.gray
+                if showSignalLbl and not na(signalLabel)
+                    label.set_text(signalLabel, "SHORT DEAD")
+                    label.set_color(signalLabel, color.new(color.gray, 20))
+                if showInvalMark
+                    invalLabel := label.new(bar_index, high, "X", color=color.new(color.gray, 30), textcolor=color.white, style=label.style_label_up, size=size.small)
+                if alertOnInval
+                    alert("Signal invalidated — pullback exceeded 150% of FH range", alert.freq_once_per_bar)
+
+    // ── Reversal Clock (FH level NOT broken) ──
+    // Triggers at 11 AM, then subsequent hours update conviction %
+    if fh_green and not broke_above and not rev_signal and hour11start
+        rev_signal := true
+        rev_hour   := 11
+        rev_pct    := 58.1
+        if alertOnRev
+            alert("Reversal signal — FH high not broken by 11 AM, bias flipping bearish", alert.freq_once_per_bar)
+
+    if fh_red and not broke_below and not rev_signal and hour11start
+        rev_signal := true
+        rev_hour   := 11
+        rev_pct    := 56.6
+        if alertOnRev
+            alert("Reversal signal — FH low not broken by 11 AM, bias flipping bullish", alert.freq_once_per_bar)
+
+// Reversal clock: update conviction for hours 12-15
+if postFH and fh_green and not broke_above and rev_signal
+    if hour12start
+        rev_hour := 12
+        rev_pct  := 65.6
+        if alertOnRev
+            alert("Reversal strengthening — FH high not broken by 12 PM (65.6%)", alert.freq_once_per_bar)
+    if hour13start
+        rev_hour := 13
+        rev_pct  := 71.0
+        if alertOnRev
+            alert("Reversal strengthening — FH high not broken by 1 PM (71.0%)", alert.freq_once_per_bar)
+    if hour14start
+        rev_hour := 14
+        rev_pct  := 77.4
+        if alertOnRev
+            alert("Reversal strengthening — FH high not broken by 2 PM (77.4%)", alert.freq_once_per_bar)
+    if hour15start
+        rev_hour := 15
+        rev_pct  := 83.9
+        if alertOnRev
+            alert("Reversal strengthening — FH high not broken by 3 PM (83.9%)", alert.freq_once_per_bar)
+
+if postFH and fh_red and not broke_below and rev_signal
+    if hour12start
+        rev_hour := 12
+        rev_pct  := 62.4
+        if alertOnRev
+            alert("Reversal strengthening — FH low not broken by 12 PM (62.4%)", alert.freq_once_per_bar)
+    if hour13start
+        rev_hour := 13
+        rev_pct  := 67.5
+        if alertOnRev
+            alert("Reversal strengthening — FH low not broken by 1 PM (67.5%)", alert.freq_once_per_bar)
+    if hour14start
+        rev_hour := 14
+        rev_pct  := 69.8
+        if alertOnRev
+            alert("Reversal strengthening — FH low not broken by 2 PM (69.8%)", alert.freq_once_per_bar)
+    if hour15start
+        rev_hour := 15
+        rev_pct  := 75.4
+        if alertOnRev
+            alert("Reversal strengthening — FH low not broken by 3 PM (75.4%)", alert.freq_once_per_bar)
+
+// ════════════════════════════════════════════════════════════════════════
+// ALERT CONDITIONS (static messages for TradingView alert UI)
+// ════════════════════════════════════════════════════════════════════════
+
+if fhJustEnded and alertOnGrade
+    if fh_close > fh_open
+        alert("9 AM candle closed green — check chart for grade", alert.freq_once_per_bar)
+    else if fh_close < fh_open
+        alert("9 AM candle closed red — check chart for grade", alert.freq_once_per_bar)
+
+// ════════════════════════════════════════════════════════════════════════
+// DASHBOARD
+// ════════════════════════════════════════════════════════════════════════
+
+var dashPos = switch dashPosition
+    "Top Left"     => position.top_left
+    "Bottom Right" => position.bottom_right
+    "Bottom Left"  => position.bottom_left
+    =>                position.top_right
+
+var tSize = switch dashSize
+    "Tiny"   => size.tiny
+    "Normal" => size.normal
+    "Large"  => size.large
+    =>          size.small
+
+var tSizeHeader = switch dashSize
+    "Tiny"   => size.small
+    "Normal" => size.large
+    "Large"  => size.huge
+    =>          size.normal
+
+var bool isDark = dashTheme == "Dark"
+
+var table dash = table.new(dashPos, 2, 10, bgcolor=isDark ? color.new(#1e1e1e, 10) : color.new(#f5f5f5, 0), border_width=1, border_color=isDark ? color.new(color.gray, 60) : color.new(color.gray, 40))
+
+checkMark(pass) =>
+    pass ? " \u2713" : " \u2717"
+
+if showDashboard and barstate.islast
+    table.clear(dash, 0, 0, 1, 9)
+    headerBg  = isDark ? color.new(#2d2d2d, 0)    : color.new(#e0e0e0, 0)
+    cellBg    = isDark ? color.new(#1e1e1e, 10)    : color.new(#f5f5f5, 0)
+    dimText   = isDark ? color.new(color.gray, 30)  : color.new(color.gray, 0)
+    brightTxt = isDark ? color.white                : color.black
+
+    // Header
+    table.cell(dash, 0, 0, "NQ 9 AM Hour", text_color=brightTxt, text_size=tSizeHeader, bgcolor=headerBg, text_halign=text.align_left)
+    table.cell(dash, 1, 0, "", bgcolor=headerBg)
+
+    if phase == "WAITING"
+        table.cell(dash, 0, 1, "Waiting for 9 AM", text_color=dimText, text_size=tSize, bgcolor=cellBg, text_halign=text.align_left)
+        table.cell(dash, 1, 1, "", bgcolor=cellBg)
+
+    else if phase == "FORMING"
+        table.cell(dash, 0, 1, "Forming...", text_color=color.yellow, text_size=tSize, bgcolor=cellBg, text_halign=text.align_left)
+        table.cell(dash, 1, 1, "", bgcolor=cellBg)
+
+    else
+        // Signal row
+        sigText = fh_direction + " " + signal_grade
+        table.cell(dash, 0, 1, "Signal", text_color=dimText, text_size=tSize, bgcolor=cellBg, text_halign=text.align_left)
+        table.cell(dash, 1, 1, sigText, text_color=grade_color, text_size=tSizeHeader, bgcolor=cellBg, text_halign=text.align_right)
+
+        // Body ratio
+        bodyText = str.tostring(body_ratio * 100, "#.0") + "%" + checkMark(q_body)
+        bodyCol  = q_body ? brightTxt : dimText
+        table.cell(dash, 0, 2, "Body", text_color=dimText, text_size=tSize, bgcolor=cellBg, text_halign=text.align_left)
+        table.cell(dash, 1, 2, bodyText, text_color=bodyCol, text_size=tSize, bgcolor=cellBg, text_halign=text.align_right)
+
+        // Close position
+        closeText = str.tostring(close_pos * 100, "#.0") + "%" + checkMark(q_close)
+        closeCol  = q_close ? brightTxt : dimText
+        table.cell(dash, 0, 3, "Close", text_color=dimText, text_size=tSize, bgcolor=cellBg, text_halign=text.align_left)
+        table.cell(dash, 1, 3, closeText, text_color=closeCol, text_size=tSize, bgcolor=cellBg, text_halign=text.align_right)
+
+        // 9:30 position
+        openText = na(open_930_pos) ? "—" : str.tostring(open_930_pos * 100, "#.0") + "%" + checkMark(q_930)
+        openCol  = na(open_930_pos) ? dimText : q_930 ? brightTxt : dimText
+        table.cell(dash, 0, 4, "9:30 Pos", text_color=dimText, text_size=tSize, bgcolor=cellBg, text_halign=text.align_left)
+        table.cell(dash, 1, 4, openText, text_color=openCol, text_size=tSize, bgcolor=cellBg, text_halign=text.align_right)
+
+        // Breakout status
+        string brkText = na
+        color  brkCol  = na
+        if fh_green
+            brkText := broke_above ? (break_in_1011 ? "10-11 AM \u2713" : "Late") : rev_signal ? "NOT BROKEN" : "Waiting..."
+            brkCol  := broke_above and break_in_1011 ? bullColor : broke_above ? color.yellow : rev_signal ? color.orange : dimText
+        else if fh_red
+            brkText := broke_below ? (break_in_1011 ? "10-11 AM \u2713" : "Late") : rev_signal ? "NOT BROKEN" : "Waiting..."
+            brkCol  := broke_below and break_in_1011 ? bearColor : broke_below ? color.yellow : rev_signal ? color.orange : dimText
+        else
+            brkText := "N/A"
+            brkCol  := dimText
+        table.cell(dash, 0, 5, "Breakout", text_color=dimText, text_size=tSize, bgcolor=cellBg, text_halign=text.align_left)
+        table.cell(dash, 1, 5, brkText, text_color=brkCol, text_size=tSize, bgcolor=cellBg, text_halign=text.align_right)
+
+        // Pullback depth
+        table.cell(dash, 0, 6, "Pullback", text_color=dimText, text_size=tSize, bgcolor=cellBg, text_halign=text.align_left)
+        if (fh_green and broke_above and break_in_1011) or (fh_red and broke_below and break_in_1011)
+            pbText = str.tostring(pb_depth_pct * 100, "#.0") + "%"
+            pbCol  = pb_invalidated ? color.red : pb_depth_pct > 1.0 ? color.orange : brightTxt
+            table.cell(dash, 1, 6, pbText, text_color=pbCol, text_size=tSize, bgcolor=cellBg, text_halign=text.align_right)
+        else
+            table.cell(dash, 1, 6, "—", text_color=dimText, text_size=tSize, bgcolor=cellBg, text_halign=text.align_right)
+
+        // Status
+        string statusText = na
+        color  statusCol  = na
+        if pb_invalidated
+            statusText := "INVALIDATED"
+            statusCol  := color.red
+        else if rev_signal
+            statusText := "REVERSAL " + str.tostring(rev_pct, "#.0") + "%"
+            statusCol  := color.orange
+        else if broke_above or broke_below
+            statusText := "ACTIVE"
+            statusCol  := color.lime
+        else if fh_valid
+            statusText := "WATCHING"
+            statusCol  := dimText
+        else
+            statusText := "—"
+            statusCol  := dimText
+        table.cell(dash, 0, 7, "Status", text_color=dimText, text_size=tSize, bgcolor=cellBg, text_halign=text.align_left)
+        table.cell(dash, 1, 7, statusText, text_color=statusCol, text_size=tSize, bgcolor=cellBg, text_halign=text.align_right)
+
+        // Win rate (backtest reference)
+        string winText = na
+        color  winCol  = na
+        if signal_grade == "A+"
+            winText := fh_green ? "85.4%" : "78.4%"
+            winCol  := color.lime
+        else if signal_grade == "A"
+            winText := fh_green ? "82.3%" : "74.1%"
+            winCol  := color.lime
+        else if signal_grade == "DEAD"
+            winText := "~45%"
+            winCol  := color.red
+        else if rev_signal
+            winText := str.tostring(rev_pct, "#.0") + "%"
+            winCol  := color.orange
+        else
+            winText := "—"
+            winCol  := dimText
+        table.cell(dash, 0, 8, "Win Rate", text_color=dimText, text_size=tSize, bgcolor=cellBg, text_halign=text.align_left)
+        table.cell(dash, 1, 8, winText, text_color=winCol, text_size=tSize, bgcolor=cellBg, text_halign=text.align_right)
+
+        // Range
+        rangeText = not na(fh_range) ? str.tostring(fh_range, "#.0") + " pts" : "—"
+        table.cell(dash, 0, 9, "FH Range", text_color=dimText, text_size=tSize, bgcolor=cellBg, text_halign=text.align_left)
+        table.cell(dash, 1, 9, rangeText, text_color=dimText, text_size=tSize, bgcolor=cellBg, text_halign=text.align_right)

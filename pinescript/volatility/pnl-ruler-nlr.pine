@@ -1,0 +1,164 @@
+// This Pine Script™ code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © NonLinearRookie
+//
+// PnL Ruler - overlays a dollar-value scale anchored to an ATR-based trailing trend line.
+// The trend line is treated as the entry / zero reference.
+// Dollar PnL is calculated using syminfo.pointvalue (auto-detected per instrument).
+
+//@version=6
+indicator("PnL Ruler [NLR]", overlay = true, max_labels_count = 500)
+
+// ── Inputs ───────────────────────────────────────────────────────────────────
+int   atr_length      = input.int(10,    "ATR Length",         group = "Trend Line")
+float trend_factor    = input.float(2.0, "Trend Factor",       group = "Trend Line")
+float error_margin    = input.float(5.0, "Error Margin",       group = "Trend Line")
+
+int   num_contracts   = input.int(1,     "Contracts",          group = "Contract Spec", minval = 1)
+
+float pnl_step        = input.float(200.0, "PnL Step ($)",     group = "Scale",
+     tooltip = "Dollar increment between scale lines (e.g. 100 = show +$100, +$200 …)")
+int   num_levels      = input.int(5,       "Levels Each Side", group = "Scale", minval = 1, maxval = 20)
+int   lookback_bars   = input.int(30,      "Lookback Bars",    group = "Scale", minval = 0,
+     tooltip = "How many bars to the left the level lines extend into past price action")
+
+bool  show_labels     = input.bool(true, "Show Labels",        group = "Scale")
+bool  show_lines      = input.bool(true, "Show Level Lines",   group = "Scale")
+
+color profit_color    = input.color(color.new(#39FF14, 70),       "Profit Color",     group = "Colors")
+color loss_color      = input.color(color.new(color.fuchsia, 70), "Loss Color",       group = "Colors")
+color entry_color     = input.color(color.new(color.white, 60),   "Entry Color",      group = "Colors")
+color trend_up_color  = input.color(#39FF14,                      "Trend Up Color",   group = "Colors")
+color trend_dn_color  = input.color(color.fuchsia,                "Trend Down Color", group = "Colors")
+
+// ── ATR Candle trend line (replicated — keep inputs in sync) ─────────────────
+calc_trend_line(src_close, src_high, src_low, src_atr, mult) =>
+    float trend_line = 0.0
+    int   direction  = int(1)
+    float true_range = 0.0
+    float src_level  = 0.0
+
+    trend_line := trend_line[1]
+    true_range := true_range[1]
+    src_level  := src_level[1]
+
+    if src_close > src_close[1]
+        trend_line := src_low - src_atr * mult
+        if trend_line < trend_line[1]
+            trend_line := trend_line[1]
+        else
+            src_level := src_low
+
+    if src_close < src_close[1]
+        trend_line := src_high + src_atr * mult
+        if trend_line > trend_line[1]
+            trend_line := trend_line[1]
+        else
+            src_level := src_high
+
+    if math.abs(trend_line - trend_line[1]) < error_margin
+        trend_line := trend_line[1]
+        src_level  := src_level[1]
+
+    if trend_line != trend_line[1]
+        true_range := src_atr
+
+    direction := trend_line > trend_line[1] ? 1 : (trend_line < trend_line[1] ? -1 : direction[1])
+    [trend_line, direction, src_level, direction * true_range]
+
+current_atr                              = ta.atr(atr_length)
+[trend_line, trend_dir, trend_src, trend_range] = calc_trend_line(close, high, low, current_atr, trend_factor)
+
+// ── Trend line plot ───────────────────────────────────────────────────────────
+trend_color = trend_dir > 0 ? trend_up_color : trend_dn_color
+plot(trend_line, "Trend Line", trend_color, 2)
+
+// ── Extreme close for current trend leg ──────────────────────────────────────
+var float extreme_close = close
+extreme_close := trend_dir != trend_dir[1] ? close : trend_dir > 0 ? math.max(extreme_close[1], close) : math.min(extreme_close[1], close)
+plot(extreme_close, "Extreme Close", trend_dir > 0 ? trend_up_color : trend_dn_color, 1, plot.style_circles)
+
+// ── Moving averages ───────────────────────────────────────────────────────────
+int ema_length = input.int(14, "EMA Length", group = "Moving Averages")
+int hma_length = input.int(70, "HMA Length", group = "Moving Averages")
+
+float ema_val = ta.ema(close, ema_length)
+plot(ema_val, "EMA", trend_color, 1, linestyle = plot.linestyle_dashed)
+
+float hma_val      = ta.hma(close, hma_length)
+color hma_color    = hma_val > hma_val[1] ? color.blue : color.orange
+plot(hma_val, "HMA", hma_color, 3)
+
+// ── PnL → price distance conversion ─────────────────────────────────────────
+// syminfo.pointvalue = $ per full price point (e.g. ES=50, NQ=20, MES=5, MNQ=2)
+dollars_per_point = syminfo.pointvalue
+
+pnl_to_price_dist(pnl_dollars) =>
+    pnl_dollars / (dollars_per_point * num_contracts)
+
+// ── Pre-allocate labels and lines once, mutate every tick ────────────────────
+// Array layout: [0] = entry, [1..num_levels] = above, [num_levels+1..2*num_levels] = below
+int total_objects = 1 + num_levels * 2
+
+var label[] level_labels = array.new<label>(total_objects, na)
+var line[]  level_lines  = array.new<line>(total_objects, na)
+
+if barstate.isfirst
+    for idx = 0 to total_objects - 1
+        array.set(level_labels, idx, label.new(na, na, na,
+             style = label.style_label_left,
+             size  = size.small,
+             xloc  = xloc.bar_index))
+        array.set(level_lines, idx, line.new(na, na, na, na,
+             width  = 1,
+             xloc   = xloc.bar_index,
+             extend = extend.none))
+
+// ── Helper: update a label/line pair at a given price ────────────────────────
+update_level(idx, label_x, line_x1, line_x2, price, txt, col, label_visible, line_visible) =>
+    color hidden = color.new(color.white, 100)
+
+    label lbl = array.get(level_labels, idx)
+    label.set_xy(lbl, label_x, price)
+    label.set_text(lbl, txt)
+    label.set_color(lbl, label_visible ? col : hidden)
+    label.set_textcolor(lbl, color.white)
+
+    line ln = array.get(level_lines, idx)
+    line.set_xy1(ln, line_x1, price)
+    line.set_xy2(ln, line_x2, price)
+    line.set_color(ln, line_visible ? col : hidden)
+
+// ── Update scale on every real-time tick ─────────────────────────────────────
+if barstate.islast
+    float entry_price = trend_line
+    bool  is_long     = trend_dir > 0
+
+    int line_x1  = bar_index - lookback_bars  // extends left into price action
+    int line_x2  = bar_index + 10              // extends right into empty space
+    int label_x  = bar_index + 10
+
+    // Entry / zero level
+    update_level(0, label_x, line_x1, line_x2, entry_price,
+         "  ── $0 ──", entry_color, show_labels, show_lines)
+    array.get(level_lines, 0).set_style(line.style_dashed)
+
+    for i = 1 to num_levels
+        float pnl_amount  = pnl_step * i
+        float above_price = entry_price + pnl_to_price_dist(pnl_amount)
+        float below_price = entry_price - pnl_to_price_dist(pnl_amount)
+        string pnl_str    = str.tostring(pnl_amount, "#,###")
+
+        // Above entry: profit for longs, loss for shorts
+        string above_text  = is_long ? "  +" + pnl_str + "$" : "  -" + pnl_str + "$"
+        color  above_color = is_long ? profit_color : loss_color
+        update_level(i, label_x, line_x1, line_x2, above_price,
+             above_text, above_color, show_labels, show_lines)
+        array.get(level_lines, i).set_style(line.style_dotted)
+
+        // Below entry: loss for longs, profit for shorts
+        string below_text  = is_long ? "  -" + pnl_str + "$" : "  +" + pnl_str + "$"
+        color  below_color = is_long ? loss_color : profit_color
+        int    below_idx   = num_levels + i
+        update_level(below_idx, label_x, line_x1, line_x2, below_price,
+             below_text, below_color, show_labels, show_lines)
+        array.get(level_lines, below_idx).set_style(line.style_dotted)

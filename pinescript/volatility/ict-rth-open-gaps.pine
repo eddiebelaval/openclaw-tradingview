@@ -1,0 +1,378 @@
+//@version=6
+// ══════════════════════════════════════════════════════════════════════════════
+//
+// ICT RTH Open Gap
+// Version: 21/03/2026
+//
+// ──────────────────────────────────────────────────────────────────────────────
+//
+// DESCRIPTION:
+// Detects and displays the Regular Trading Hours Opening Gap — the price
+// difference between the previous day's 16:14 NY close and the current day's
+// 09:30 NY open. Based on ICT (Inner Circle Trader) concepts, this gap
+// represents the overnight institutional positioning visible at the cash
+// session open.
+//
+// FEATURES:
+//   • RTH Opening Gap box (16:14 close vs 09:30 open)
+//   • 50% midpoint dashed line (always shown)
+//   • Optional 25% and 75% quartile dashed lines with labels
+//   • Configurable age-based cleanup and "days ago" label suffix
+//
+// TECHNICAL NOTES:
+//   • 1-minute intrabar data via request.security_lower_tf() for precise
+//     capture of the exact 16:14 close and 09:30 open prices
+//   • Works accurately on any chart timeframe
+//   • Boxes created once with fixed top/bottom — only right edge is updated
+//   • Quartile labels use invisible boxes positioned next to level lines
+//
+// ──────────────────────────────────────────────────────────────────────────────
+//
+// AUTHOR: (@username)
+//
+// ══════════════════════════════════════════════════════════════════════════════
+
+indicator("ICT RTH Open Gap", overlay=true, max_boxes_count=500, max_lines_count=500)
+
+// ══════════════════════════════════════════════════════════════════════════════
+// CONSTANTS
+// ══════════════════════════════════════════════════════════════════════════════
+
+string TZ      = "America/New_York"  // All session times reference NY timezone
+int MS_PER_DAY = 86400000            // Milliseconds per calendar day
+
+// ══════════════════════════════════════════════════════════════════════════════
+// INPUTS - Display Settings
+// Master controls for visibility, age, and label options
+// ══════════════════════════════════════════════════════════════════════════════
+
+grpDisplay = "Display Settings"
+
+extendBars = input.int(5, "Extend Beyond Current (bars)", 
+     minval=0, maxval=50, 
+     group=grpDisplay, 
+     tooltip="Number of bars to extend gap boxes beyond the current bar.")
+
+rthDaysToShow = input.int(1, "Max Age (days)", 
+     minval=1, maxval=50, 
+     group=grpDisplay, 
+     tooltip="Maximum age in calendar days. Set to 1 for today only, 2 for today and yesterday, etc.")
+
+showBorder = input.bool(true, "Show Border", 
+     group=grpDisplay, 
+     tooltip="Display a visible border around gap boxes.")
+
+showLabel = input.bool(true, "Show Label", 
+     group=grpDisplay, 
+     tooltip="Display a text label identifying the RTH gap.")
+
+showDaysAgo = input.bool(true, "Show Days Ago", 
+     group=grpDisplay, 
+     tooltip="Append age in days to labels (e.g. 'RTH Gap, 1d ago').")
+
+labelSizeStr = input.string("Small", "Label Size", 
+     options=["Small", "Medium", "Large"], 
+     group=grpDisplay, 
+     tooltip="Text size for the main gap label.")
+
+// ══════════════════════════════════════════════════════════════════════════════
+// INPUTS - Lines
+// Quartile level options and shared line/label color
+// ══════════════════════════════════════════════════════════════════════════════
+
+grpLines = "Lines"
+
+showQuartileLines = input.bool(true, "Show Quartile Lines (25%, 75%)", 
+     group=grpLines, 
+     tooltip="Display dashed lines at the 25% and 75% levels within the RTH gap.")
+
+showQuartileLabels = input.bool(true, "Show Quartile Labels", 
+     group=grpLines, 
+     tooltip="Display '25%' and '75%' text next to quartile lines.")
+
+midLabelColor = input.color(color.new(#787B86, 40), "Midline & Label Color", 
+     group=grpLines, 
+     tooltip="Color for the 50% midpoint line, quartile lines, and all text labels.")
+
+// ══════════════════════════════════════════════════════════════════════════════
+// INPUTS - Colors
+// Fill and border colors for the gap box
+// ══════════════════════════════════════════════════════════════════════════════
+
+grpColors = "Colors"
+
+fillColorRTH = input.color(color.new(#81C784, 85), "Fill Color", 
+     group=grpColors, 
+     tooltip="Background fill for RTH Open Gap boxes.")
+
+borderColorRTH = input.color(color.new(#81C784, 50), "Border Color", 
+     group=grpColors, 
+     tooltip="Border color for RTH Open Gap boxes.")
+
+// ══════════════════════════════════════════════════════════════════════════════
+// LABEL SIZE CONVERSION
+// Map user-friendly string to Pine Script size constant
+// ══════════════════════════════════════════════════════════════════════════════
+
+labelSize = switch labelSizeStr
+    "Small"  => size.small
+    "Medium" => size.normal
+    "Large"  => size.large
+
+// ══════════════════════════════════════════════════════════════════════════════
+// CUSTOM TYPE
+// All drawing objects and metadata for a single RTH gap record
+// ══════════════════════════════════════════════════════════════════════════════
+
+type GapRecord
+    box    gapBox         // Main gap box — top/bottom fixed at creation
+    line   midLine        // 50% midpoint dashed line
+    line   line25         // 25% quartile dashed line
+    line   line75         // 75% quartile dashed line
+    box    labelBox25     // Invisible box positioned as 25% text label
+    box    labelBox75     // Invisible box positioned as 75% text label
+    box    textBox        // Invisible box positioned as main text label
+    int    dayNum         // YYYYMMDD identifier for duplicate prevention
+    float  top            // Upper boundary — fixed, used for label repositioning
+    float  bottom         // Lower boundary — fixed, used for label repositioning
+    string baseLabelText  // Base label text before age suffix
+    int    createdTime    // Timestamp for age calculation
+
+// ══════════════════════════════════════════════════════════════════════════════
+// HELPER FUNCTIONS
+// ══════════════════════════════════════════════════════════════════════════════
+
+// Timestamp for a specific hour:minute on the current bar's date (NY timezone)
+today_ts(h, m) => 
+    timestamp(TZ, year(time, TZ), month(time, TZ), dayofmonth(time, TZ), h, m, 0)
+
+// Unique day identifier (YYYYMMDD) for duplicate detection
+getDayNum() => 
+    year(time, TZ) * 10000 + month(time, TZ) * 100 + dayofmonth(time, TZ)
+
+// Calendar days between a timestamp and today (midnight-to-midnight comparison)
+getDaysAgo(int createdTimestamp) =>
+    int createdMidnight = timestamp(TZ, year(createdTimestamp, TZ), month(createdTimestamp, TZ), dayofmonth(createdTimestamp, TZ), 0, 0, 0)
+    int todayMidnight   = timestamp(TZ, year(timenow, TZ), month(timenow, TZ), dayofmonth(timenow, TZ), 0, 0, 0)
+    int diff = math.round((todayMidnight - createdMidnight) / MS_PER_DAY)
+    math.max(0, diff)
+
+// ══════════════════════════════════════════════════════════════════════════════
+// STATE VARIABLES
+// Persistent detection state and record storage
+// ══════════════════════════════════════════════════════════════════════════════
+
+var array<GapRecord> gapRecords = array.new<GapRecord>()  // All finalized gap records
+
+var float yesterday_close  = na     // Previous session's 16:14 close price
+var float today_open       = na     // Current session's 09:30 open price
+var bool  rth_gap_found    = false  // True once gap detected for this day
+var int   rth_gap_left_bar = na     // Bar index for box left edge
+
+// ══════════════════════════════════════════════════════════════════════════════
+// DISPLAY CONSTANTS
+// ══════════════════════════════════════════════════════════════════════════════
+
+int   labelOffset         = 2                      // Horizontal gap between box edge and labels (bars)
+float quartilePriceOffset = syminfo.mintick * 20   // Vertical padding for quartile label boxes
+
+// ══════════════════════════════════════════════════════════════════════════════
+// CALCULATED COLORS
+// Apply border visibility toggle — hidden borders use 100% transparency
+// ══════════════════════════════════════════════════════════════════════════════
+
+borderColorRTH_final = showBorder ? borderColorRTH : color.new(borderColorRTH, 100)
+
+// ══════════════════════════════════════════════════════════════════════════════
+// SESSION TIME DEFINITIONS
+// Reference times for gap detection (all NY timezone)
+// ══════════════════════════════════════════════════════════════════════════════
+
+rth_close_time = today_ts(16, 14)  // Previous session's closing print
+rth_open_time  = today_ts(9, 30)   // Cash session open
+
+// ══════════════════════════════════════════════════════════════════════════════
+// DAY CHANGE DETECTION & STATE RESET
+// Reset detection state at the start of each new trading day
+// ══════════════════════════════════════════════════════════════════════════════
+
+bool new_day       = ta.change(dayofmonth(time, TZ)) != 0
+int  currentDayNum = getDayNum()
+
+if new_day
+    rth_gap_found    := false
+    today_open       := na
+    rth_gap_left_bar := na
+    // Note: yesterday_close is NOT reset — it carries from the previous day
+
+// ══════════════════════════════════════════════════════════════════════════════
+// FETCH 1-MINUTE DATA
+// CRITICAL: request.security_lower_tf() at global scope binds the indicator
+// to the chart's price scale. Without this, drawing objects will not scale
+// when the user drags or zooms the price axis.
+// ══════════════════════════════════════════════════════════════════════════════
+
+high_arr  = request.security_lower_tf(syminfo.tickerid, "1", high)   // Price scale binding
+close_arr = request.security_lower_tf(syminfo.tickerid, "1", close)  // Used: 16:14 close capture
+open_arr  = request.security_lower_tf(syminfo.tickerid, "1", open)   // Used: 09:30 open capture
+time_arr  = request.security_lower_tf(syminfo.tickerid, "1", time)   // Used: time matching
+
+int arr_size = array.size(high_arr)
+
+// ══════════════════════════════════════════════════════════════════════════════
+// RTH GAP DETECTION
+// Capture previous day's 16:14 close and current day's 09:30 open,
+// then create gap visualization when both prices are available
+// ══════════════════════════════════════════════════════════════════════════════
+
+// -- Scan 1-minute bars for reference prices --
+if arr_size > 0
+    for i = 0 to arr_size - 1
+        int bar_time = array.get(time_arr, i)
+        
+        // Capture 16:14 close — overwrites daily, carries across day boundary
+        if bar_time >= rth_close_time and bar_time < rth_close_time + 60000
+            yesterday_close := array.get(close_arr, i)
+        
+        // Capture 09:30 open — first occurrence only (na guard)
+        if bar_time >= rth_open_time and bar_time < rth_open_time + 60000 and na(today_open)
+            today_open       := array.get(open_arr, i)
+            rth_gap_left_bar := bar_index
+
+// -- Record creation with duplicate prevention --
+if not rth_gap_found and not na(yesterday_close) and not na(today_open) and not na(rth_gap_left_bar)
+    if yesterday_close != today_open
+        rth_gap_found := true
+        
+        float rth_top    = math.max(yesterday_close, today_open)
+        float rth_bottom = math.min(yesterday_close, today_open)
+        
+        bool already_exists = false
+        for rec in gapRecords
+            if rec.dayNum == currentDayNum
+                already_exists := true
+                break
+        
+        if not already_exists
+            int   right_bar = bar_index + extendBars
+            float mid_y     = (rth_top + rth_bottom) / 2
+            float y25       = rth_bottom + (rth_top - rth_bottom) * 0.25
+            float y75       = rth_bottom + (rth_top - rth_bottom) * 0.75
+            
+            // Main gap box
+            newBox = box.new(left=rth_gap_left_bar, top=rth_top, right=right_bar, bottom=rth_bottom, 
+                 xloc=xloc.bar_index, bgcolor=fillColorRTH, border_color=borderColorRTH_final)
+            
+            // 50% midpoint line — always shown for RTH gap
+            newMidLine = line.new(x1=rth_gap_left_bar, y1=mid_y, x2=right_bar, y2=mid_y, 
+                 xloc=xloc.bar_index, color=midLabelColor, style=line.style_dashed, width=1)
+            
+            // 25% and 75% quartile lines
+            newLine25 = line(na)
+            newLine75 = line(na)
+            if showQuartileLines
+                newLine25 := line.new(x1=rth_gap_left_bar, y1=y25, x2=right_bar, y2=y25, 
+                     xloc=xloc.bar_index, color=midLabelColor, style=line.style_dashed, width=1)
+                newLine75 := line.new(x1=rth_gap_left_bar, y1=y75, x2=right_bar, y2=y75, 
+                     xloc=xloc.bar_index, color=midLabelColor, style=line.style_dashed, width=1)
+            
+            // Quartile labels — invisible boxes used as positioned text
+            newLabelBox25 = box(na)
+            newLabelBox75 = box(na)
+            if showQuartileLabels
+                newLabelBox25 := box.new(left=right_bar + labelOffset, top=y25 + quartilePriceOffset, 
+                     right=right_bar + labelOffset + 20, bottom=y25 - quartilePriceOffset, 
+                     xloc=xloc.bar_index, bgcolor=color.new(color.white, 100), border_color=color.new(color.white, 100), 
+                     text="25%", text_color=midLabelColor, 
+                     text_halign=text.align_left, text_valign=text.align_center, text_size=size.small)
+                newLabelBox75 := box.new(left=right_bar + labelOffset, top=y75 + quartilePriceOffset, 
+                     right=right_bar + labelOffset + 20, bottom=y75 - quartilePriceOffset, 
+                     xloc=xloc.bar_index, bgcolor=color.new(color.white, 100), border_color=color.new(color.white, 100), 
+                     text="75%", text_color=midLabelColor, 
+                     text_halign=text.align_left, text_valign=text.align_center, text_size=size.small)
+            
+            // Main text label
+            newTextBox = box(na)
+            if showLabel
+                newTextBox := box.new(left=right_bar + labelOffset, top=rth_top, 
+                     right=right_bar + labelOffset + 50, bottom=rth_bottom, 
+                     xloc=xloc.bar_index, bgcolor=color.new(color.white, 100), border_color=color.new(color.white, 100), 
+                     text="RTH Gap", text_color=midLabelColor, 
+                     text_halign=text.align_left, text_valign=text.align_center, text_size=labelSize)
+            
+            array.push(gapRecords, GapRecord.new(newBox, newMidLine, newLine25, newLine75, 
+                 newLabelBox25, newLabelBox75, newTextBox, currentDayNum, 
+                 rth_top, rth_bottom, "RTH Gap", time))
+
+// ══════════════════════════════════════════════════════════════════════════════
+// UPDATE LOOP — Extend Boxes and Reposition Labels
+// Per-bar extension keeps gap levels visible as price advances (Approach A)
+// Only box.set_right() is called — top/bottom are never modified after creation
+// ══════════════════════════════════════════════════════════════════════════════
+
+if array.size(gapRecords) > 0
+    for rec in gapRecords
+        int new_right = bar_index + extendBars
+        
+        // ── Extend main box and lines ──────────────────────────────────
+        box.set_right(rec.gapBox, new_right)
+        
+        if not na(rec.midLine)
+            line.set_x2(rec.midLine, new_right)
+        if not na(rec.line25)
+            line.set_x2(rec.line25, new_right)
+        if not na(rec.line75)
+            line.set_x2(rec.line75, new_right)
+        
+        // ── Reposition quartile labels ─────────────────────────────────
+        float y25 = rec.bottom + (rec.top - rec.bottom) * 0.25
+        float y75 = rec.bottom + (rec.top - rec.bottom) * 0.75
+        
+        if not na(rec.labelBox25)
+            box.set_left(rec.labelBox25, new_right + labelOffset)
+            box.set_right(rec.labelBox25, new_right + labelOffset + 20)
+            box.set_top(rec.labelBox25, y25 + quartilePriceOffset)
+            box.set_bottom(rec.labelBox25, y25 - quartilePriceOffset)
+        if not na(rec.labelBox75)
+            box.set_left(rec.labelBox75, new_right + labelOffset)
+            box.set_right(rec.labelBox75, new_right + labelOffset + 20)
+            box.set_top(rec.labelBox75, y75 + quartilePriceOffset)
+            box.set_bottom(rec.labelBox75, y75 - quartilePriceOffset)
+        
+        // ── Reposition and update main label ───────────────────────────
+        if not na(rec.textBox)
+            box.set_left(rec.textBox, new_right + labelOffset)
+            box.set_right(rec.textBox, new_right + labelOffset + 50)
+            box.set_top(rec.textBox, rec.top)
+            box.set_bottom(rec.textBox, rec.bottom)
+            box.set_text_size(rec.textBox, labelSize)
+            
+            if showDaysAgo
+                int daysAgo = getDaysAgo(rec.createdTime)
+                string daysText = daysAgo == 0 ? "" : ", " + str.tostring(daysAgo) + "d ago"
+                box.set_text(rec.textBox, rec.baseLabelText + daysText)
+            else
+                box.set_text(rec.textBox, rec.baseLabelText)
+
+// ══════════════════════════════════════════════════════════════════════════════
+// CLEANUP — Remove Gaps Older Than Configured Threshold
+// Runs on last bar only; iterates in reverse for safe removal
+// Deletes ALL drawing objects before removing from the array
+// ══════════════════════════════════════════════════════════════════════════════
+
+if barstate.islast and array.size(gapRecords) > 0
+    for i = array.size(gapRecords) - 1 to 0
+        rec = array.get(gapRecords, i)
+        if getDaysAgo(rec.createdTime) >= rthDaysToShow
+            box.delete(rec.gapBox)
+            line.delete(rec.midLine)
+            line.delete(rec.line25)
+            line.delete(rec.line75)
+            box.delete(rec.labelBox25)
+            box.delete(rec.labelBox75)
+            box.delete(rec.textBox)
+            array.remove(gapRecords, i)
+
+// ══════════════════════════════════════════════════════════════════════════════
+// END OF SCRIPT
+// ══════════════════════════════════════════════════════════════════════════════

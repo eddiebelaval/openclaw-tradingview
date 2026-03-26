@@ -1,0 +1,366 @@
+//@version=5
+strategy("ORB 15m BreakClose -> Mid Retest (3R, SL=0.5%) + Presets + Filters [UTC]",
+     overlay=true,
+     initial_capital=10000,
+     commission_type=strategy.commission.percent,
+     commission_value=0.04,
+     slippage=1,
+     pyramiding=0,
+     calc_on_every_tick=true,
+     process_orders_on_close=true)
+
+//──────────────────────────────────────────────────────────────
+// PRESETS
+//──────────────────────────────────────────────────────────────
+grpPreset = "Presets"
+preset = input.string("BTC Scalp Balanced", "Preset", options=["BTC Scalp Conservative","BTC Scalp Balanced","BTC Scalp Aggressive","Custom"], group=grpPreset)
+
+f_pickFloat(_custom, _cons, _bal, _agg) => preset == "Custom" ? _custom : preset == "BTC Scalp Conservative" ? _cons : preset == "BTC Scalp Balanced" ? _bal : _agg
+f_pickInt(_custom, _cons, _bal, _agg) => preset == "Custom" ? _custom : preset == "BTC Scalp Conservative" ? _cons : preset == "BTC Scalp Balanced" ? _bal : _agg
+
+//──────────────────────────────────────────────────────────────
+// ORB SESSIONS (UTC) — ORB built on 15m
+//──────────────────────────────────────────────────────────────
+grpORB = "ORB Sessions (UTC) — ORB built on 15m"
+orbTF  = input.timeframe("15", "ORB timeframe (keep 15)", group=grpORB)
+tradeWhich = input.string("New York", "ORB to TRADE", options=["Daily Open","London","New York"], group=grpORB)
+
+// Daily 00:00 UTC
+enDaily = input.bool(true, "Enable Daily ORB", group=grpORB, inline="d1")
+dHour   = input.int(0, "H", minval=0, maxval=23, group=grpORB, inline="d1")
+dMin    = input.int(0, "M", minval=0, maxval=59, group=grpORB, inline="d1")
+
+// London 08:00 UTC
+enLon = input.bool(true, "Enable London ORB", group=grpORB, inline="l1")
+lHour  = input.int(8, "H", minval=0, maxval=23, group=grpORB, inline="l1")
+lMin   = input.int(0, "M", minval=0, maxval=59, group=grpORB, inline="l1")
+
+// New York 13:30 UTC
+enNY = input.bool(true, "Enable New York ORB", group=grpORB, inline="n1")
+nHour = input.int(13, "H", minval=0, maxval=23, group=grpORB, inline="n1")
+nMin  = input.int(30, "M", minval=0, maxval=59, group=grpORB, inline="n1")
+
+//──────────────────────────────────────────────────────────────
+// CORE TRADE SETTINGS (with presets)
+//──────────────────────────────────────────────────────────────
+grpLogic = "Trade Logic"
+maxTradesCustom = input.int(2, "Max trades per UTC day (Custom)", minval=1, maxval=10, group=grpLogic)
+midTolPctCustom = input.float(0.10, "Mid retest tolerance % (Custom)", step=0.01, group=grpLogic)
+slPctCustom     = input.float(0.50, "SL beyond OR boundary % (Custom)", step=0.05, group=grpLogic)
+rrCustom        = input.float(3.0, "Take Profit R multiple (Custom)", step=0.25, group=grpLogic)
+
+maxTrades = f_pickInt(maxTradesCustom, 1, 2, 3)
+midTolPct = f_pickFloat(midTolPctCustom, 0.06, 0.10, 0.14)
+slPct     = f_pickFloat(slPctCustom, 0.50, 0.50, 0.50)
+RR        = f_pickFloat(rrCustom, 3.0, 3.0, 3.0)
+
+//──────────────────────────────────────────────────────────────
+// FAKEOUT FILTERS (TOGGLES + preset parameters)
+//──────────────────────────────────────────────────────────────
+grpFF = "Fakeout Filters (Toggle ON/OFF)"
+
+// 1) Trend
+useEMA = input.bool(true, "1) EMA Trend Filter", group=grpFF)
+emaLenCustom = input.int(200, "   EMA length (Custom)", minval=20, group=grpFF)
+emaLen = f_pickInt(emaLenCustom, 200, 200, 100)
+
+// 2) Breakout strength (15m candle)
+useBreakStrength = input.bool(true, "2) 15m Breakout Strength Filter", group=grpFF)
+minDistFracCustom = input.float(0.15, "   Min close distance outside OR (% of OR range) (Custom)", step=0.01, group=grpFF)
+minBodyFracCustom = input.float(0.60, "   Min breakout candle body/range (Custom)", step=0.05, group=grpFF)
+minDistFrac = f_pickFloat(minDistFracCustom, 0.20, 0.15, 0.10)
+minBodyFrac = f_pickFloat(minBodyFracCustom, 0.65, 0.60, 0.55)
+
+// 3) ORB size >= ATR (15m)
+useOrbATR = input.bool(true, "3) ORB Range >= ATR Filter (15m)", group=grpFF)
+atrLenCustom  = input.int(14, "   ATR length (Custom)", minval=5, group=grpFF)
+atrFactCustom = input.float(0.30, "   OR >= ATR * factor (Custom)", step=0.05, group=grpFF)
+atrLen  = f_pickInt(atrLenCustom, 14, 14, 14)
+atrFact = f_pickFloat(atrFactCustom, 0.35, 0.30, 0.25)
+
+// 4) Retest quality
+useRetestQuality = input.bool(true, "4) Retest Quality Filter", group=grpFF)
+requireSideOfMid = input.bool(true, "   Require close on correct side of mid", group=grpFF)
+requireCandleDir = input.bool(true, "   Require candle direction", group=grpFF)
+
+// 5) Extra confirmation
+useExtraConfirm = input.bool(true, "5) Extra Confirmation after retest", group=grpFF)
+confirmBarsCustom = input.int(1, "   Confirm bars (Custom)", minval=1, maxval=3, group=grpFF)
+confirmBars = f_pickInt(confirmBarsCustom, 1, 1, 1)
+confirmRule = input.string("Close beyond Mid", "   Confirm rule", options=["Close beyond Mid","Higher close (long) / Lower close (short)"], group=grpFF)
+
+//──────────────────────────────────────────────────────────────
+// VISUALS
+//──────────────────────────────────────────────────────────────
+grpVis = "Visuals"
+showChannel = input.bool(true, "Show ORB Channel (High/Mid/Low) within session only", group=grpVis)
+showRR      = input.bool(true, "Show RR boxes at entries", group=grpVis)
+historyOn   = input.bool(true, "Show HISTORY (old channels + RR)", group=grpVis)
+maxKeep     = input.int(250, "Max drawings kept (history ON)", minval=50, maxval=500, group=grpVis)
+rrExtendBars = input.int(60, "RR extend bars", minval=10, maxval=300, group=grpVis)
+
+//──────────────────────────────────────────────────────────────
+// 15m ORB + breakout stats function (UTC robust)
+//──────────────────────────────────────────────────────────────
+f_orb_break_stats(_startH, _startM, _enabled, _atrLen) =>
+    var float oH = na
+    var float oL = na
+    var bool  ready = false
+
+    dUTC = dayofmonth(time, "UTC")
+    var int prevDay = na
+    if na(prevDay) or dUTC != prevDay
+        oH := na
+        oL := na
+        ready := false
+        prevDay := dUTC
+
+    y = year(time, "UTC")
+    m = month(time, "UTC")
+    d = dayofmonth(time, "UTC")
+
+    startTS = timestamp("UTC", y, m, d, _startH, _startM)
+    isOrbBar = time == startTS
+
+    if _enabled and isOrbBar
+        oH := high
+        oL := low
+        ready := true
+
+    oM = (oH + oL) / 2.0
+    oR = oH - oL
+
+    rng = math.max(high - low, syminfo.mintick)
+    bodyFrac = math.abs(close - open) / rng
+    atr15 = ta.atr(_atrLen)
+
+    bUp = ready and close > oH and barstate.isconfirmed
+    bDn = ready and close < oL and barstate.isconfirmed
+
+    distUp = (ready and oR > 0) ? (close - oH) / oR : 0.0
+    distDn = (ready and oR > 0) ? (oL - close) / oR : 0.0
+
+    [oH, oL, oM, oR, ready, atr15, bUp, bDn, bodyFrac, distUp, distDn]
+
+// request.security must stay on ONE line (parser-safe)
+[dH, dL, dM, dR, dReady, dAtr15, dBUp, dBDn, dBody, dUpFrac, dDnFrac] = request.security(syminfo.tickerid, orbTF, f_orb_break_stats(dHour, dMin, enDaily, atrLen))
+[lH, lL, lM, lR, lReady, lAtr15, lBUp, lBDn, lBody, lUpFrac, lDnFrac] = request.security(syminfo.tickerid, orbTF, f_orb_break_stats(lHour, lMin, enLon, atrLen))
+[nH, nL, nM, nR, nReady, nAtr15, nBUp, nBDn, nBody, nUpFrac, nDnFrac] = request.security(syminfo.tickerid, orbTF, f_orb_break_stats(nHour, nMin, enNY, atrLen))
+
+orbH = tradeWhich == "Daily Open" ? dH : tradeWhich == "London" ? lH : nH
+orbL = tradeWhich == "Daily Open" ? dL : tradeWhich == "London" ? lL : nL
+orbMid = tradeWhich == "Daily Open" ? dM : tradeWhich == "London" ? lM : nM
+orbRange = tradeWhich == "Daily Open" ? dR : tradeWhich == "London" ? lR : nR
+orbReady = tradeWhich == "Daily Open" ? dReady : tradeWhich == "London" ? lReady : nReady
+atr15 = tradeWhich == "Daily Open" ? dAtr15 : tradeWhich == "London" ? lAtr15 : nAtr15
+breakUp15 = tradeWhich == "Daily Open" ? dBUp : tradeWhich == "London" ? lBUp : nBUp
+breakDn15 = tradeWhich == "Daily Open" ? dBDn : tradeWhich == "London" ? lBDn : nBDn
+bodyFrac15 = tradeWhich == "Daily Open" ? dBody : tradeWhich == "London" ? lBody : nBody
+distUpFrac = tradeWhich == "Daily Open" ? dUpFrac : tradeWhich == "London" ? lUpFrac : nUpFrac
+distDnFrac = tradeWhich == "Daily Open" ? dDnFrac : tradeWhich == "London" ? lDnFrac : nDnFrac
+
+//──────────────────────────────────────────────────────────────
+// Filter evaluations (all single-line)
+//──────────────────────────────────────────────────────────────
+ema = ta.ema(close, emaLen)
+plot(useEMA ? ema : na, "EMA", linewidth=2)
+
+trendLongOk = (not useEMA) or close > ema
+trendShortOk = (not useEMA) or close < ema
+
+breakStrengthLongOk = (not useBreakStrength) or (distUpFrac >= minDistFrac and bodyFrac15 >= minBodyFrac)
+breakStrengthShortOk = (not useBreakStrength) or (distDnFrac >= minDistFrac and bodyFrac15 >= minBodyFrac)
+
+orbAtrOk = (not useOrbATR) or (orbReady and orbRange >= atr15 * atrFact)
+
+//──────────────────────────────────────────────────────────────
+// State machine
+//──────────────────────────────────────────────────────────────
+newDayLocal = ta.change(time("D"))
+var int tradesToday = 0
+if newDayLocal
+    tradesToday := 0
+
+canTrade = tradesToday < maxTrades
+
+var bool waitLongRetest = false
+var bool waitShortRetest = false
+var bool pendingLongConfirm = false
+var bool pendingShortConfirm = false
+var int confirmCount = 0
+
+if newDayLocal
+    waitLongRetest := false
+    waitShortRetest := false
+    pendingLongConfirm := false
+    pendingShortConfirm := false
+    confirmCount := 0
+
+if orbReady and breakUp15 and trendLongOk and breakStrengthLongOk and orbAtrOk
+    waitLongRetest := true
+    waitShortRetest := false
+    pendingLongConfirm := false
+    pendingShortConfirm := false
+    confirmCount := 0
+
+if orbReady and breakDn15 and trendShortOk and breakStrengthShortOk and orbAtrOk
+    waitShortRetest := true
+    waitLongRetest := false
+    pendingLongConfirm := false
+    pendingShortConfirm := false
+    confirmCount := 0
+
+tol = (midTolPct / 100.0) * close
+nearMid = orbReady and not na(orbMid) and math.abs(close - orbMid) <= tol
+
+bullish = close > open
+bearish = close < open
+
+retestQualityLong = (not useRetestQuality) or ((not requireSideOfMid or close >= orbMid) and (not requireCandleDir or bullish))
+retestQualityShort = (not useRetestQuality) or ((not requireSideOfMid or close <= orbMid) and (not requireCandleDir or bearish))
+
+wantLongRetestHit = canTrade and waitLongRetest and nearMid and retestQualityLong and trendLongOk
+wantShortRetestHit = canTrade and waitShortRetest and nearMid and retestQualityShort and trendShortOk
+
+if wantLongRetestHit and useExtraConfirm
+    pendingLongConfirm := true
+    pendingShortConfirm := false
+    confirmCount := 0
+
+if wantShortRetestHit and useExtraConfirm
+    pendingShortConfirm := true
+    pendingLongConfirm := false
+    confirmCount := 0
+
+confirmLongOk = confirmRule == "Close beyond Mid" ? close > orbMid : close > close[1]
+confirmShortOk = confirmRule == "Close beyond Mid" ? close < orbMid : close < close[1]
+
+if pendingLongConfirm or pendingShortConfirm
+    confirmCount += 1
+
+enterLong = canTrade and strategy.position_size <= 0 and ((wantLongRetestHit and not useExtraConfirm) or (pendingLongConfirm and confirmCount >= confirmBars and confirmLongOk))
+enterShort = canTrade and strategy.position_size >= 0 and ((wantShortRetestHit and not useExtraConfirm) or (pendingShortConfirm and confirmCount >= confirmBars and confirmShortOk))
+
+//──────────────────────────────────────────────────────────────
+// Stops & Targets (SL 0.5% beyond OR boundary, TP 3R)
+//──────────────────────────────────────────────────────────────
+slFrac = slPct / 100.0
+stopLong = orbL * (1.0 - slFrac)
+stopShort = orbH * (1.0 + slFrac)
+
+if enterLong
+    strategy.close("ORB-S")
+    tradesToday += 1
+    waitLongRetest := false
+    pendingLongConfirm := false
+    confirmCount := 0
+    entry = close
+    risk = math.max(entry - stopLong, syminfo.mintick)
+    tp = entry + RR * risk
+    strategy.entry("ORB-L", strategy.long)
+    strategy.exit("L-EXIT", "ORB-L", limit=tp, stop=stopLong)
+
+if enterShort
+    strategy.close("ORB-L")
+    tradesToday += 1
+    waitShortRetest := false
+    pendingShortConfirm := false
+    confirmCount := 0
+    entry = close
+    risk = math.max(stopShort - entry, syminfo.mintick)
+    tp = entry - RR * risk
+    strategy.entry("ORB-S", strategy.short)
+    strategy.exit("S-EXIT", "ORB-S", limit=tp, stop=stopShort)
+
+plotshape(enterLong, style=shape.triangleup, location=location.belowbar, size=size.tiny, color=color.lime, text="")
+plotshape(enterShort, style=shape.triangledown, location=location.abovebar, size=size.tiny, color=color.red, text="")
+
+//──────────────────────────────────────────────────────────────
+// SESSION-BOUNDED ORB CHANNEL (High/Mid/Low) from ORB close to session end
+// Daily ends at London start; London ends at NY start; NY ends at next day Daily start
+//──────────────────────────────────────────────────────────────
+var line[] keepLines = array.new_line()
+var box[] keepBoxes = array.new_box()
+
+if historyOn
+    while array.size(keepLines) > maxKeep
+        ln = array.shift(keepLines)
+        if not na(ln)
+            line.delete(ln)
+    while array.size(keepBoxes) > maxKeep
+        bx = array.shift(keepBoxes)
+        if not na(bx)
+            box.delete(bx)
+
+if (not historyOn) and newDayLocal
+    while array.size(keepLines) > 0
+        line.delete(array.shift(keepLines))
+    while array.size(keepBoxes) > 0
+        box.delete(array.shift(keepBoxes))
+
+yUTC = year(time, "UTC")
+mUTC = month(time, "UTC")
+dUTC3 = dayofmonth(time, "UTC")
+
+startH = tradeWhich == "Daily Open" ? dHour : tradeWhich == "London" ? lHour : nHour
+startM = tradeWhich == "Daily Open" ? dMin : tradeWhich == "London" ? lMin : nMin
+
+endH = tradeWhich == "Daily Open" ? lHour : tradeWhich == "London" ? nHour : dHour
+endM = tradeWhich == "Daily Open" ? lMin : tradeWhich == "London" ? nMin : dMin
+
+sessStartTS = timestamp("UTC", yUTC, mUTC, dUTC3, startH, startM)
+orbCloseTS = sessStartTS + 15 * 60 * 1000
+sessEndTS = tradeWhich == "New York" ? timestamp("UTC", yUTC, mUTC, dUTC3 + 1, endH, endM) : timestamp("UTC", yUTC, mUTC, dUTC3, endH, endM)
+
+inSessionWindow = time >= orbCloseTS and time < sessEndTS
+enteredWindow = inSessionWindow and not inSessionWindow[1]
+
+var line chH = na
+var line chM = na
+var line chL = na
+
+if newDayLocal
+    chH := na
+    chM := na
+    chL := na
+
+if showChannel and orbReady and enteredWindow and not na(orbH) and not na(orbL)
+    if not historyOn
+        while array.size(keepLines) > 0
+            line.delete(array.shift(keepLines))
+    chH := line.new(bar_index, orbH, bar_index, orbH, extend=extend.none, color=color.green, width=2)
+    chM := line.new(bar_index, orbMid, bar_index, orbMid, extend=extend.none, color=color.gray, width=1, style=line.style_dashed)
+    chL := line.new(bar_index, orbL, bar_index, orbL, extend=extend.none, color=color.red, width=2)
+    array.push(keepLines, chH)
+    array.push(keepLines, chM)
+    array.push(keepLines, chL)
+
+if showChannel and inSessionWindow and not na(chH)
+    line.set_x2(chH, bar_index)
+    line.set_x2(chM, bar_index)
+    line.set_x2(chL, bar_index)
+
+// RR boxes (optional)
+if showRR and enterLong
+    if not historyOn
+        while array.size(keepBoxes) > 0
+            box.delete(array.shift(keepBoxes))
+    e = close
+    r = math.max(e - stopLong, syminfo.mintick)
+    t3 = e + RR * r
+    bp = box.new(bar_index, t3, bar_index + rrExtendBars, e, bgcolor=color.new(color.green, 85), border_color=color.new(color.green, 40))
+    br = box.new(bar_index, e, bar_index + rrExtendBars, stopLong, bgcolor=color.new(color.red, 85), border_color=color.new(color.red, 40))
+    array.push(keepBoxes, bp)
+    array.push(keepBoxes, br)
+
+if showRR and enterShort
+    if not historyOn
+        while array.size(keepBoxes) > 0
+            box.delete(array.shift(keepBoxes))
+    e = close
+    r = math.max(stopShort - e, syminfo.mintick)
+    t3 = e - RR * r
+    bp = box.new(bar_index, e, bar_index + rrExtendBars, t3, bgcolor=color.new(color.green, 85), border_color=color.new(color.green, 40))
+    br = box.new(bar_index, stopShort, bar_index + rrExtendBars, e, bgcolor=color.new(color.red, 85), border_color=color.new(color.red, 40))
+    array.push(keepBoxes, bp)
+    array.push(keepBoxes, br)

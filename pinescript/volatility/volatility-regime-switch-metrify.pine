@@ -1,0 +1,353 @@
+//@Metrify
+//https://creativecommons.org/licenses/by-nc-sa/4.0/
+
+//@version=6
+indicator('Volatility Regime Switch [Metrify]', 'Metrify VRS', overlay = true, max_boxes_count = 500)
+
+// Inputs
+grp_eng = 'Engine',grp_vis = 'Visual'
+corelen = input.int(21, 'Core Length', minval = 8, maxval = 100, group = grp_eng, tooltip = 'Controls how fast the indicator reacts to price changes.')
+reglen = input.int(55, 'Regime Horizon', minval = 20, maxval = 200, group = grp_eng, tooltip = 'How far back the script looks to judge whether the market is trending or choppy. ')
+sensitivity = input.float(2.0, 'Sensitivity', minval = 0.6, maxval = 5.0, step = 0.05, group = grp_eng)
+cfm = input.int(2, 'Switch Confirmation Bars', minval = 1, maxval = 5, group = grp_eng, tooltip = 'How many bars must confirm a new direction before the script officially switches state. Higher values reduce fake flips but add delay.')
+volsep = input.float(3.0, 'Volatility Separation', minval = 2.0, maxval = 5.0, step = 0.25, group = grp_eng, tooltip = 'How much slower the slow volatility measurement is compared with the fast one. (Core length)')
+showbox = input.bool(true, 'Show Boxes', group = grp_vis)
+
+//Custom calls
+f_clamp(v, lo, hi) =>
+    math.max(lo, math.min(hi, v))
+
+f_inv_var(x, len) =>
+    1.0 / math.max(nz(ta.variance(x, len), 0.0), 1e-10)
+
+f_z(x, len) =>
+    m = ta.sma(x, len)
+    s = ta.stdev(x, len)
+    s == 0.0 or na(s) ? 0.0 : (x - m) / s
+
+f_squash(x) =>
+    0.6366197724 * math.atan(x)
+
+// Core Engine
+visual = true
+ret = math.log(close / nz(close[1], close))
+atrf = ta.atr(corelen)
+slowlen = math.max(corelen + 1, int(math.round(corelen * volsep)))
+atrs = ta.atr(slowlen)
+sigma = ta.stdev(ret, corelen * 2) * close
+
+watrfr = f_inv_var(atrf, corelen)
+watrsr = f_inv_var(atrs, corelen)
+wsigr = f_inv_var(sigma, corelen)
+wvsum = watrfr + watrsr + wsigr
+watrf = watrfr / wvsum
+watrs = watrsr / wvsum
+wsig = wsigr / wvsum
+
+volraw = atrf * watrf + atrs * watrs + sigma * wsig
+volc = math.max(volraw, syminfo.mintick * 4.0)
+
+abstep = math.abs(close - close[1])
+erden = ta.sma(abstep, reglen) * reglen
+er = erden == 0.0 or na(erden) ? 0.0 : math.abs(close - close[reglen]) / erden
+
+adxlen = math.max(7, int(math.round(corelen * 0.8)))
+upmv = high - high[1],dnmv = low[1] - low
+pdm = upmv > dnmv and upmv > 0.0 ? upmv : 0.0
+mdm = dnmv > upmv and dnmv > 0.0 ? dnmv : 0.0
+pclose = nz(close[1], close)
+tr = math.max(high - low, math.max(math.abs(high - pclose), math.abs(low - pclose)))
+trr = ta.rma(tr, adxlen)
+pdi = trr == 0.0 ? 0.0 : 100.0 * ta.rma(pdm, adxlen) / trr
+mdi = trr == 0.0 ? 0.0 : 100.0 * ta.rma(mdm, adxlen) / trr
+disum = pdi + mdi
+dx = disum == 0.0 ? 0.0 : 100.0 * math.abs(pdi - mdi) / disum
+adxraw = ta.rma(dx, adxlen)
+adxn = f_clamp(adxraw / 40.0, 0.0, 1.0)
+
+volrat = f_clamp(atrf / math.max(atrs, syminfo.mintick), 0.5, 1.8)
+volratn = f_clamp((volrat - 0.5) / 1.3, 0.0, 1.0)
+
+werr = f_inv_var(er, reglen)
+wadxr = f_inv_var(adxn, reglen)
+wvrr = f_inv_var(volratn, reglen)
+wrsum = werr + wadxr + wvrr
+wer = werr / wrsum
+wadx = wadxr / wrsum
+wvr = wvrr / wrsum
+
+trreg = f_clamp(er * wer + adxn * wadx + volratn * wvr, 0.0, 1.0)
+nsreg = 1.0 - trreg
+
+emaf = ta.ema(hlc3, corelen), emas = ta.ema(hlc3, corelen * 3)
+anchor = emas + (emaf - emas) * trreg
+
+bmult = (1.0 + nsreg * 1.35) / sensitivity
+bdist = volc * bmult
+upband = anchor + bdist
+lowband = anchor - bdist
+
+var float fup = na
+var float flo = na
+
+fup := na(fup[1]) ? upband : (upband < fup[1] or close[1] > fup[1] ? upband : fup[1])
+flo := na(flo[1]) ? lowband : (lowband > flo[1] or close[1] < flo[1] ? lowband : flo[1])
+
+//--------------------------------------------------------------------------------------------------
+// Intra-Bar Price Action Bias + Conviction
+//--------------------------------------------------------------------------------------------------
+rng = math.max(high - low, syminfo.mintick)
+bodyn = (close - open) / rng
+clv = ((close - low) - (high - close)) / rng
+
+clvz = f_z(clv, corelen)
+bodyz = f_z(bodyn, corelen)
+cbiasr = (clvz + bodyz) * 0.5
+cbias = ta.ema(f_squash(cbiasr), 3)
+
+tbias = (emaf - emas) / volc
+tbiasz = f_z(tbias, reglen)
+tbiasn = f_squash(tbiasz)
+
+dbull = (close - fup) / volc
+dbear = (flo - close) / volc
+
+dbullp = math.max(dbull, 0.0)
+dbearp = math.max(dbear, 0.0)
+dispser = dbullp + dbearp
+dispavg = ta.sma(dispser, reglen)
+dispdev = ta.stdev(dispser, reglen)
+dispden = math.max(nz(dispdev, 0.0), 1e-10)
+dbullz = (dbullp - nz(dispavg, 0.0)) / dispden
+dbearz = (dbearp - nz(dispavg, 0.0)) / dispden
+
+biasmix = (cbias + tbiasn) * 0.5
+breakbull = close > fup ? math.max(dbullz, 0.0) : 0.0
+breakbear = close < flo ? math.max(dbearz, 0.0) : 0.0
+
+convr = ta.ema(biasmix + breakbull - breakbear, 2)
+conviction = ta.ema(convr, 3)
+convmag = math.abs(conviction)
+convavg = ta.sma(convmag, reglen)
+convdev = ta.stdev(convmag, reglen)
+trigger = math.max(nz(convavg, 0.0) + nz(convdev, 0.0), 0.10)
+holds = math.max(2, int(math.round(corelen * (0.16 + nsreg * 0.18))))
+regmid = ta.sma(trreg, reglen)
+noisemid = ta.sma(nsreg, reglen)
+effcfm = cfm + (nsreg > nz(noisemid, nsreg) ? 1 : 0) + (trreg < nz(regmid, trreg) ? 1 : 0)
+accbars = math.max(2, int(math.round(corelen * (0.10 + nsreg * 0.16))))
+rangeser = (high - low) / volc
+rangeavg = ta.sma(rangeser, reglen)
+rangedev = ta.stdev(rangeser, reglen)
+accback = f_clamp(nz(rangeavg, 0.0) * 0.08 + nz(rangedev, 0.0) * 0.06, 0.03, 0.24)
+minft = math.max(nz(rangeavg, 0.0) + nz(rangedev, 0.0) * (0.08 + nsreg * 0.20), 0.20)
+coolbase = math.max(1, int(math.round(corelen * (0.05 + nsreg * 0.08))))
+ready = not na(fup) and not na(flo) and not na(conviction) and not na(dispavg) and not na(convavg) and not na(regmid) and not na(noisemid) and not na(rangeavg)
+bulltrig = ready and close > fup and conviction > trigger
+beartrig = ready and close < flo and conviction < -trigger
+dispzneed = nsreg * 0.50
+bulldispok = dbullz > dispzneed, beardispok = dbearz > dispzneed
+
+// Switching State Machine
+var dir = 0
+var candidate = 0
+var cfmcnt = 0
+var barss = 0
+var swbull = false,var swbear = false
+var pdir = 0,var pbars = 0
+var float pref = na
+var float pentry = na
+var float pvol = na
+var float pmfe = 0.0
+var cooldn = 0
+var failstk = 0
+var float lastq = na
+
+pendbull = false,pendbear = false,rejswitch = false
+
+swbull := false
+swbear := false
+pendbull := false
+pendbear := false
+rejswitch := false
+
+if barstate.isfirst
+    dir := close >= anchor ? 1 : -1
+    candidate := 0
+    cfmcnt := 0
+    barss := 1
+    pdir := 0
+    pbars := 0
+    pref := na
+    pentry := na
+    pvol := na
+    pmfe := 0.0
+    cooldn := 0
+    failstk := 0
+    lastq := na
+else
+    barss += 1
+    cooldn := math.max(cooldn - 1, 0)
+
+    presolved = false,passok = false,failok = false
+
+    if pdir != 0
+        pbars += 1
+        vref = math.max(nz(pvol, volc), syminfo.mintick)
+        pmfe := pdir == 1 ? math.max(pmfe, (high - pentry) / vref) : math.max(pmfe, (pentry - low) / vref)
+
+        accbroken = pdir == 1 ? close < pref - vref * accback : close > pref + vref * accback
+        followneed = minft + failstk * 0.08
+        timereached = pbars >= accbars
+        ftok = pmfe >= followneed
+
+        if accbroken
+            failok := true
+        else if timereached
+            if ftok
+                dir := pdir
+                swbull := dir == 1
+                swbear := dir == -1
+                barss := 1
+                passok := true
+                lastq := f_clamp(pmfe / math.max(followneed, 0.05), 0.0, 3.0)
+                failstk := math.max(failstk - 1, 0)
+            else
+                failok := true
+
+        if failok
+            rejswitch := true
+            failstk := math.min(failstk + 1, 8)
+            cooldn := coolbase + math.min(failstk, 5)
+            lastq := 0.0
+
+        if passok or failok
+            pdir := 0
+            pbars := 0
+            pref := na
+            pentry := na
+            pvol := na
+            pmfe := 0.0
+            candidate := 0
+            cfmcnt := 0
+            presolved := true
+
+    if pdir == 0 and not presolved
+        quietveto = trreg < nz(regmid, trreg) and convmag < trigger
+        cantry = cooldn == 0 and not quietveto and barss >= holds
+
+        if dir == 1
+            if cantry and beartrig and beardispok
+                if candidate == -1
+                    cfmcnt += 1
+                else
+                    candidate := -1
+                    cfmcnt := 1
+            else
+                candidate := 0
+                cfmcnt := 0
+
+            promotebear = candidate == -1 and cfmcnt >= effcfm
+            if promotebear
+                pdir := -1
+                pbars := 0
+                pref := flo
+                pentry := close
+                pvol := volc
+                pmfe := 0.0
+                pendbear := true
+                candidate := 0
+                cfmcnt := 0
+        else
+            if cantry and bulltrig and bulldispok
+                if candidate == 1
+                    cfmcnt += 1
+                else
+                    candidate := 1
+                    cfmcnt := 1
+            else
+                candidate := 0
+                cfmcnt := 0
+
+            promotebull = candidate == 1 and cfmcnt >= effcfm
+            if promotebull
+                pdir := 1
+                pbars := 0
+                pref := fup
+                pentry := close
+                pvol := volc
+                pmfe := 0.0
+                pendbull := true
+                candidate := 0
+                cfmcnt := 0
+
+trail = ready ? (dir == 1 ? flo : fup) : na
+opp = ready ? (dir == 1 ? fup : flo) : na
+
+// Visual Layer
+bullcol = color.rgb(20, 168, 120)
+bearcol = color.rgb(201, 73, 82)
+pendcol = color.rgb(214, 157, 74)
+neutcol = color.rgb(121, 132, 145)
+actcol = dir == 1 ? bullcol : bearcol
+
+zup = ready ? trail + bdist * 0.60 : na
+zlo = ready ? trail - bdist * 0.60 : na
+bline = ready ? trail + cbias * bdist * 0.80 : na
+
+ptrail = plot(trail, 'Main Trail', color = ready ? color.new(actcol, 0) : na, linewidth = 3)
+plot(visual ? opp : na, 'Latent Boundary', color = color.new(neutcol, 78), linewidth = 1, style = plot.style_linebr)
+pzup = plot(visual ? zup : na, 'State Zone Top', color = na, editable = false, display = display.none)
+pzlo = plot(visual ? zlo : na, 'State Zone Bottom', color = na, editable = false, display = display.none)
+pbias = plot(visual ? bline : na, 'Bias Spine', color = na, editable = false, display = display.none)
+
+zalpha = int(f_clamp(88.0 - trreg * 26.0 - math.abs(cbias) * 10.0, 38.0, 88.0))
+balpha = int(f_clamp(88.0 - math.abs(cbias) * 36.0, 48.0, 90.0))
+
+fill(pzup, pzlo, color = visual and ready ? color.new(actcol, zalpha) : na, title = 'Regime Corridor')
+fill(ptrail, pbias, color = visual and ready ? color.new(cbias >= 0 ? bullcol : bearcol, balpha) : na, title = 'Bias Field')
+
+plotshape(visual and swbull ? low - bdist * 0.35 : na, title = 'Bull Switch', style = shape.triangleup, location = location.absolute, size = size.tiny, color = bullcol)
+plotshape(visual and swbear ? high + bdist * 0.35 : na, title = 'Bear Switch', style = shape.triangledown, location = location.absolute, size = size.tiny, color = bearcol)
+plotshape(visual and rejswitch ? close : na, title = 'Rejected Switch', style = shape.xcross, location = location.absolute, size = size.tiny, color = color.new(pendcol, 0))
+
+// Regime Box Engine
+var box rbox = na
+var float rhigh = na
+var float rlow = na
+var array<box> oldboxes = array.new_box()
+
+newreg = visual and showbox and ready and (na(rbox) or swbull or swbear)
+if newreg
+    if not na(rbox)
+        box.set_right(rbox, bar_index)
+        array.push(oldboxes, rbox)
+        if array.size(oldboxes) > 100
+            oldbx = array.shift(oldboxes)
+            box.delete(oldbx)
+
+    rhigh := high
+    rlow := low
+    boxalpha = int(f_clamp(92.0 - trreg * 26.0, 60.0, 92.0))
+    rbox := box.new(left = bar_index, top = rhigh + bdist * 0.55, right = bar_index + 1, bottom = rlow - bdist * 0.55, bgcolor = color.new(actcol, boxalpha), border_color = color.new(actcol, 58))
+else if visual and showbox and ready and not na(rbox)
+    rhigh := na(rhigh) ? high : math.max(rhigh, high)
+    rlow := na(rlow) ? low : math.min(rlow, low)
+    box.set_right(rbox, bar_index + 1)
+    box.set_top(rbox, rhigh + bdist * 0.55)
+    box.set_bottom(rbox, rlow - bdist * 0.55)
+    dynalpha = int(f_clamp(92.0 - trreg * 24.0 - math.abs(cbias) * 9.0, 58.0, 92.0))
+    box.set_bgcolor(rbox, color.new(actcol, dynalpha))
+    box.set_border_color(rbox, color.new(actcol, 62))
+else if not showbox and not na(rbox)
+    box.delete(rbox)
+    rbox := na
+    rhigh := na
+    rlow := na
+    while array.size(oldboxes) > 0
+        oldbx = array.pop(oldboxes)
+        box.delete(oldbx)
+
+alertcondition(swbull, 'VRS - Bull Switch', 'VRS: Trend switched BULLISH')
+alertcondition(swbear, 'VRS - Bear Switch', 'VRS: Trend switched BEARISH')
+alertcondition(rejswitch, 'VRS - Switch Rejected', 'VRS: Candidate switch rejected (acceptance/follow-through failed)')

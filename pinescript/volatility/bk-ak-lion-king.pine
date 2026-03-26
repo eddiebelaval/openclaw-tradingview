@@ -1,0 +1,1323 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © Ki11a_B
+
+
+//@version=6
+indicator("BK AK-Lion King", shorttitle="🦁👑", overlay=false, format=format.price, precision=4, max_labels_count=500, max_boxes_count=100)
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ███ TIMEFRAME DETECTION & ADAPTIVE REGIME
+// ══════════════════════════════════════════════════════════════════════════════
+tfSeconds  = timeframe.in_seconds()
+isSubHour  = tfSeconds < 3600
+tfRegime   = tfSeconds < 300 ? "SCALP" : tfSeconds < 900 ? "INTRA" : tfSeconds < 3600 ? "SWING" : "POSITION"
+tfSenseMult = isSubHour ? 1.0 : 0.7
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ███ INPUTS
+// ══════════════════════════════════════════════════════════════════════════════
+fastLen  = input.int(5,  title="Fast VWMA Length",   group="Core Settings")
+midLen   = input.int(21, title="Medium VWMA Length", group="Core Settings")
+slowLen  = input.int(55, title="Slow VWMA Length",   group="Core Settings")
+amplify  = input.float(2.5, title="Amplitude Multiplier", group="Core Settings")
+
+// ── Footprint Core ──
+fpValueArea      = input.int(70,   title="Value Area %",                    minval=50, maxval=95,   group="Footprint Core")
+fpDeltaThresh    = input.float(0.10, title="Min Delta Ratio (Conviction)",  minval=0.01, maxval=0.50, step=0.01, group="Footprint Core")
+fpAbsorbThresh   = input.float(0.15, title="Absorption: Max |Delta| (near-zero)",  minval=0.01, maxval=0.40, step=0.01, group="Footprint Core")
+fpBlowoffThresh  = input.float(0.55, title="Blow-off: Min |Delta| (extreme one-sided)", minval=0.30, maxval=0.95, step=0.05, group="Footprint Core")
+showFPDeltaDiv   = input.bool(true,  title="Show Delta Divergence Signals (🔻🔺)", group="Footprint Core")
+fpDeltaDivThresh = input.float(0.10, title="Delta Divergence Sensitivity",  minval=0.02, maxval=0.50, step=0.01, group="Footprint Core")
+fpImbalanceThresh = input.float(0.20, title="Compression Imbalance Threshold (🧲)", minval=0.05, maxval=0.50, step=0.05, group="Footprint Core")
+
+// ── Adaptive ML ──
+mlLookback    = input.int(30,   title="ML Signal Lookback", minval=10, maxval=100, group="Adaptive ML")
+mlOutcomeBars = input.int(8,    title="Outcome Check Bars", minval=3,  maxval=20,  group="Adaptive ML")
+mlMinWinRate  = input.float(40.0, title="Min Win Rate %",  minval=0,  maxval=80,  group="Adaptive ML")
+enableML      = input.bool(true,  title="Enable ML Filtering", group="Adaptive ML")
+
+// ── Volatility ──
+contractionBase = input.float(0.001, title="Base Contraction Threshold", group="Volatility")
+expansionBase   = input.float(1.3,   title="Base Expansion Mult",        group="Volatility")
+
+// ── Directional ──
+slopeLookback    = input.int(5,  title="Slope Lookback",    group="Directional")
+pressureLookback = input.int(10, title="Pressure Lookback", group="Directional")
+swingLookback    = input.int(10, title="Swing Lookback",    group="Directional")
+biasThreshold    = input.int(40, title="Bias Threshold",    group="Directional")
+
+// ── Divergence ──
+divPivotLen    = input.int(3,  title="Div Pivot Len",   group="Divergence")
+showRegularDiv = input.bool(true, title="Show Regular Div", group="Divergence")
+showHiddenDiv  = input.bool(true, title="Show Hidden Div",  group="Divergence")
+
+// ── Detection ──
+trapLookback      = input.int(5,    title="Trap Bars",              group="Detection")
+showTraps         = input.bool(true, title="Show Traps",            group="Detection")
+showClimactic     = input.bool(true, title="Show Climactic",        group="Detection")
+climacticMult     = input.float(2.5, title="Climactic StdDev",      group="Detection")
+climacticCooldown = input.int(10,    title="Climactic Cooldown Bars",group="Detection")
+showThreeDrive    = input.bool(true, title="Show 3-Drive",          group="Detection")
+
+// ── Visual ──
+showCompBoxes       = input.bool(true,  title="Show Compression Boxes",         group="Visual")
+minCompBars         = input.int(5,    title="Min Comp Bars",                     group="Visual")
+scaleLookback       = input.int(500,  title="Scale Lookback",                    group="Visual")
+peakThresholdLow    = input.float(35.0, title="Peak Threshold % (Under 1hr)",   group="Visual")
+peakThresholdHigh   = input.float(15.0, title="Peak Threshold % (1hr+)",        group="Visual")
+peakRequireExpansion = input.bool(false, title="Peaks Require Expansion",        group="Visual")
+showCompSignals     = input.bool(true,  title="Compression Signals",             group="Visual")
+showBreakoutSignals = input.bool(true,  title="Breakout Signals",                group="Visual")
+showPeakSignals     = input.bool(true,  title="Peak Signals",                    group="Visual")
+maxLabels           = input.int(75,   title="Max Labels (GLOBAL)",               group="Visual")
+stateWidth          = input.int(2,    title="State Bar Width",                   group="Visual")
+dirBarGap           = input.float(1.5, title="Direction Bar Gap Multiplier", minval=1.0, maxval=5.0, group="Visual")
+showMLTable         = input.bool(false, title="Show ML Table",                   group="Visual")
+tablePosition       = input.string("Middle Left", title="Table Position",
+     options=["Top Right","Top Center","Top Left","Middle Right","Middle Left","Bottom Right","Bottom Center","Bottom Left"], group="Visual")
+iconStackPct        = input.float(12.0, title="Icon Stack Separation %", minval=5.0, maxval=100.0, group="Visual")
+iconSizeInput       = input.string("tiny", title="Icon Size", options=["tiny","small","normal"], group="Visual")
+
+// ── Colors & Style: Oscillator ──
+colFast        = input.color(color.lime,    title="Fast Osc Color",     group="Colors: Oscillator")
+colFastTransp  = input.int(10,             title="Fast Osc Transparency", minval=0, maxval=100, group="Colors: Oscillator")
+fastPlotStyle  = input.string("Area",      title="Fast Plot Style", options=["Area","Line","Histogram"], group="Colors: Oscillator")
+colMid         = input.color(color.orange,  title="Mid Osc Color",      group="Colors: Oscillator")
+colMidTransp   = input.int(0,              title="Mid Osc Transparency", minval=0, maxval=100, group="Colors: Oscillator")
+midLineWidth   = input.int(2,              title="Mid Line Width", minval=1, maxval=5, group="Colors: Oscillator")
+colSlow        = input.color(color.red,     title="Slow Osc Color",     group="Colors: Oscillator")
+colSlowTransp  = input.int(0,              title="Slow Osc Transparency", minval=0, maxval=100, group="Colors: Oscillator")
+slowLineWidth  = input.int(1,              title="Slow Line Width", minval=1, maxval=5, group="Colors: Oscillator")
+colFill12      = input.color(color.yellow,  title="Fill Fast↔Mid Color",  group="Colors: Oscillator")
+fill12Transp   = input.int(85,             title="Fill Fast↔Mid Transparency", minval=0, maxval=100, group="Colors: Oscillator")
+colFill23      = input.color(color.fuchsia, title="Fill Mid↔Slow Color",  group="Colors: Oscillator")
+fill23Transp   = input.int(90,             title="Fill Mid↔Slow Transparency", minval=0, maxval=100, group="Colors: Oscillator")
+
+// ── Colors & Style: State Bar ──
+colStateBreakout    = input.color(color.red,    title="State: Breakout",     group="Colors: State Bar")
+colStateExpanding   = input.color(color.lime,   title="State: Expanding",    group="Colors: State Bar")
+colStateContracting = input.color(color.yellow, title="State: Contracting",  group="Colors: State Bar")
+colStateNeutral     = input.color(color.gray,   title="State: Neutral",      group="Colors: State Bar")
+
+// ── Colors & Style: Direction Bar ──
+colDirBull    = input.color(color.aqua,    title="Direction: Bull",    group="Colors: Direction Bar")
+colDirBear    = input.color(color.fuchsia, title="Direction: Bear",    group="Colors: Direction Bar")
+colDirNeutral = input.color(color.gray,    title="Direction: Neutral", group="Colors: Direction Bar")
+
+// ── Colors & Style: Signals ──
+colSigBull       = input.color(color.aqua,    title="Signal: Bull",          group="Colors: Signals")
+colSigBear       = input.color(color.fuchsia, title="Signal: Bear",          group="Colors: Signals")
+colBreakBull     = input.color(color.lime,    title="Breakout: Bull (🦅)",   group="Colors: Signals")
+colBreakBear     = input.color(color.red,     title="Breakout: Bear (💀)",   group="Colors: Signals")
+colDivBull       = input.color(color.lime,    title="Divergence: Bull (💎)",  group="Colors: Signals")
+colDivBear       = input.color(color.red,     title="Divergence: Bear (💎)",  group="Colors: Signals")
+colTrap          = input.color(color.orange,  title="Trap (⚠️)",             group="Colors: Signals")
+colBleed         = input.color(color.aqua,    title="Bleed Bull (🩸)",       group="Colors: Signals")
+colBleedBear     = input.color(color.fuchsia, title="Bleed Bear (🩸)",       group="Colors: Signals")
+colHidDivEnd     = input.color(color.gray,    title="Hidden Div End (🎭)",   group="Colors: Signals")
+hidDivEndTransp  = input.int(30,             title="Hidden Div End Transparency", minval=0, maxval=100, group="Colors: Signals")
+colThreeDrive    = input.color(color.purple,  title="3-Drive (⛽)",          group="Colors: Signals")
+colFPDistrib     = input.color(color.red,     title="FP Distribution (🔻)",  group="Colors: Signals")
+colFPAccum       = input.color(color.lime,    title="FP Accumulation (🔺)",  group="Colors: Signals")
+colImbalance     = input.color(color.aqua,    title="Imbalance Bull (🧲)",   group="Colors: Signals")
+colImbalanceBear = input.color(color.fuchsia, title="Imbalance Bear (🧲)",   group="Colors: Signals")
+
+// ── Colors & Style: Compression Boxes ──
+colCompBoxBull    = input.color(color.aqua,    title="Comp Box: Bull",       group="Colors: Compression")
+colCompBoxBear    = input.color(color.fuchsia, title="Comp Box: Bear",       group="Colors: Compression")
+colCompBoxNeut    = input.color(color.gray,    title="Comp Box: Neutral",    group="Colors: Compression")
+compBoxTransp     = input.int(88,             title="Comp Box Transparency", minval=0, maxval=100, group="Colors: Compression")
+compBorderWidth   = input.int(1,              title="Comp Border Width", minval=1, maxval=4, group="Colors: Compression")
+
+// ── Colors & Style: FP Status ──
+colFPActive       = input.color(color.teal,   title="FP Active Color",      group="Colors: FP Status")
+colFPInactive     = input.color(color.gray,    title="FP Inactive Color",    group="Colors: FP Status")
+fpActiveTransp    = input.int(30,             title="FP Active Transparency", minval=0, maxval=100, group="Colors: FP Status")
+fpInactiveTransp  = input.int(80,             title="FP Inactive Transparency", minval=0, maxval=100, group="Colors: FP Status")
+
+// ── Energy Columns ──
+showEnergyCols     = input.bool(true,          title="Show Energy Columns",               group="Energy Columns")
+colEnergyBull      = input.color(color.aqua,   title="Column Bull Color",                 group="Energy Columns")
+colEnergyBear      = input.color(color.fuchsia,title="Column Bear Color",                 group="Energy Columns")
+colEnergyNeut      = input.color(color.gray,   title="Column Neutral Color",              group="Energy Columns")
+energyTranspMax    = input.int(88,             title="Max Transparency (weakest)",  minval=50, maxval=98, group="Energy Columns")
+energyTranspMin    = input.int(45,             title="Min Transparency (strongest)", minval=5, maxval=80, group="Energy Columns")
+energyColBaseline  = input.string("Fast vs Mid", title="Column Baseline", options=["Fast vs Mid","Fast vs Slow","Fast vs SMA"], group="Energy Columns")
+energySmaLen       = input.int(21,             title="SMA Length (if Fast vs SMA)", minval=5, maxval=100, group="Energy Columns")
+
+// ── Proto System (default OFF — direct crowns by default) ──
+showProtoDelayed    = input.bool(false, title="Show Proto Icons for Delayed Signals", group="Proto System")
+protoOpacity        = input.int(80,   title="Proto Opacity (0 solid → 100 invisible)", minval=0, maxval=100, group="Proto System")
+protoPeakEnabled    = input.bool(true,  title="Proto Peaks (👑)", group="Proto System")
+proto3DriveEnabled  = input.bool(true,  title="Proto 3-Drive (⛽)", group="Proto System")
+
+// ── Additions ──
+enableBleedEffortResult = input.bool(false, title="🩸 BLEED: Effort vs Result (FP-Upgraded)", group="Additions")
+bleedRangeLen   = input.int(21, title="BLEED: Avg Range Len", minval=5, maxval=200, group="Additions")
+bleedMidBand    = input.float(0.15, title="BLEED: Mid Close Band (±)", minval=0.05, maxval=0.35, group="Additions")
+bleedAbsorbRangeMult = input.float(0.75, title="BLEED: Absorption Range Mult (proxy)", minval=0.1, maxval=2.0, group="Additions")
+bleedBlowoffRangeMult = input.float(1.35, title="BLEED: Blow-off Range Mult (proxy)", minval=0.5, maxval=5.0, group="Additions")
+bleedExtremeFrac = input.float(0.20, title="BLEED: Close Extreme % (proxy)", minval=0.05, maxval=0.49, group="Additions")
+bleedFailMode   = input.string("Midpoint", title="BLEED: Failure Rule (Next Bar)", options=["Midpoint","Full Retrace"], group="Additions")
+enableROutcomes = input.bool(false, title="ML Outcomes: R-multiple Scoring", group="Additions")
+rAtrMult        = input.float(1.0, title="R Size = ATR *", minval=0.1, maxval=10.0, group="Additions")
+rTargetChoice   = input.string("0.5R", title="Outcome Target", options=["0.5R","1R"], group="Additions")
+rTieGoesToStop  = input.bool(true, title="Same-bar target/stop => Stop", group="Additions")
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ███ FOOTPRINT — ALWAYS-ON CORE
+// ══════════════════════════════════════════════════════════════════════════════
+fpTickSize = tfSeconds < 300 ? 25 : tfSeconds < 900 ? 50 : tfSeconds < 3600 ? 100 : 250
+
+footprint reqFP = request.footprint(fpTickSize, fpValueArea)
+fpAvail = not na(reqFP)
+
+fpBuyVol   = fpAvail ? reqFP.buy_volume()   : 0.0
+fpSellVol  = fpAvail ? reqFP.sell_volume()  : 0.0
+fpDelta    = fpAvail ? reqFP.delta()        : 0.0
+fpTotalVol = fpAvail ? reqFP.total_volume() : 0.0
+
+fpDeltaRatio    = fpAvail and fpTotalVol > 0 ? fpDelta / fpTotalVol : 0.0
+fpDeltaRatioAbs = math.abs(fpDeltaRatio)
+
+fpBuyRatio  = fpAvail and fpTotalVol > 0 ? fpBuyVol / fpTotalVol * 100 : 50.0
+fpSellRatio = 100.0 - fpBuyRatio
+
+// ── POC row ──
+volume_row fpPOCrow = na
+if fpAvail
+    fpPOCrow := reqFP.poc()
+fpPOCHigh    = not na(fpPOCrow) ? fpPOCrow.up_price()   : na
+fpPOCLow     = not na(fpPOCrow) ? fpPOCrow.down_price()  : na
+fpPOCMid     = not na(fpPOCrow) ? (fpPOCHigh + fpPOCLow) / 2 : na
+fpPOCDelta   = not na(fpPOCrow) ? fpPOCrow.delta()       : na
+fpPOCBuyVol  = not na(fpPOCrow) ? fpPOCrow.buy_volume()  : na
+fpPOCSellVol = not na(fpPOCrow) ? fpPOCrow.sell_volume() : na
+
+// ── VAH / VAL rows ──
+volume_row fpVAHrow = na
+volume_row fpVALrow = na
+if fpAvail
+    fpVAHrow := reqFP.vah()
+    fpVALrow := reqFP.val()
+fpVAH    = not na(fpVAHrow) ? fpVAHrow.up_price()   : na
+fpVAL    = not na(fpVALrow) ? fpVALrow.down_price()  : na
+fpVAWidth = not na(fpVAH) and not na(fpVAL) ? fpVAH - fpVAL : na
+
+fpAboveVA = not na(fpVAH) and close > fpVAH
+fpBelowVA = not na(fpVAL) and close < fpVAL
+fpInsideVA = not fpAboveVA and not fpBelowVA
+fpVAContext = fpAboveVA ? "ABOVE VA ⬆" : fpBelowVA ? "BELOW VA ⬇" : "INSIDE VA ↔"
+
+// ── POC Migration ──
+var float lastPOCMid = na
+fpPOCMigration = not na(fpPOCMid) and not na(lastPOCMid) ?
+     fpPOCMid > lastPOCMid ? "RISING 🟢" : fpPOCMid < lastPOCMid ? "FALLING 🔴" : "FLAT ⬛" : "N/A"
+if not na(fpPOCMid)
+    lastPOCMid := fpPOCMid
+
+// ── Delta Acceleration ──
+fpDeltaPrev    = fpDeltaRatio[1]
+fpDeltaAccel   = fpAvail ? fpDeltaRatio - fpDeltaPrev : 0.0
+fpDeltaAccelStr = math.abs(fpDeltaAccel) < 0.05 ? "FLAT" :
+     fpDeltaAccel > 0 ? (fpDeltaRatio > 0 ? "ACCELERATING ✅" : "RECOVERING ↗") :
+     (fpDeltaRatio < 0 ? "ACCELERATING ✅" : "FADING ⚠️")
+
+// ── Cumulative delta over pressure lookback ──
+fpDeltaSum      = math.sum(fpAvail ? fpDelta    : 0.0, pressureLookback)
+fpVolSum        = math.sum(fpAvail ? fpTotalVol : 0.0, pressureLookback)
+fpDeltaRatioCum = fpVolSum > 0 ? fpDeltaSum / fpVolSum : 0.0
+fpCumDeltaDir = fpDeltaRatioCum > 0.05 ? "NET BUY" : fpDeltaRatioCum < -0.05 ? "NET SELL" : "BALANCED"
+
+// ── POC delta context ──
+fpPOCDeltaStr = not na(fpPOCDelta) ?
+     fpPOCDelta > 0 ? "BUYERS at POC ✅" : fpPOCDelta < 0 ? "SELLERS at POC ⚠️" : "CONTESTED" : "N/A"
+
+var string fpNarrative = "AWAITING FP DATA"
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ███ ATR-ADAPTIVE THRESHOLDS
+// ══════════════════════════════════════════════════════════════════════════════
+atr      = ta.atr(14)
+atrFast  = ta.atr(7)
+atrSlow  = ta.atr(50)
+atrRatio = atrSlow > 0 ? atrFast / atrSlow : 1.0
+volRegimeMult        = atrRatio > 1.2 ? 1.1 : atrRatio < 0.8 ? 0.9 : 1.0
+contractionThreshold = contractionBase * tfSenseMult
+expansionMult        = expansionBase
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ███ CORE OSCILLATOR
+// ══════════════════════════════════════════════════════════════════════════════
+volBaseFast = ta.vwma(high - low, fastLen) * volume * amplify
+volBaseMid  = ta.vwma(close, midLen)       * volume * amplify
+volBaseSlow = ta.vwma(hlc3, slowLen)       * volume * amplify
+osc1 = ta.ema(volBaseFast, 3)
+osc2 = ta.ema(volBaseMid,  3)
+osc3 = ta.ema(volBaseSlow, 3)
+
+oscMax      = math.max(osc1, math.max(osc2, osc3))
+rollingMax  = ta.highest(oscMax, scaleLookback)
+scaleFactor = rollingMax > 999 ? rollingMax / 999 : 1.0
+osc1_scaled = osc1 / scaleFactor
+osc2_scaled = osc2 / scaleFactor
+osc3_scaled = osc3 / scaleFactor
+stateBarPos = -999 / scaleFactor * 0.05
+iconBaseY   = osc1_scaled * 0.25
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ███ VOLATILITY STATE + COMPRESSION TRACKING
+// ══════════════════════════════════════════════════════════════════════════════
+vwma1 = ta.vwma(close, fastLen)
+vwma2 = ta.vwma(close, midLen)
+vwma3 = ta.vwma(close, slowLen)
+vwmaSpread    = math.max(vwma1, math.max(vwma2, vwma3)) - math.min(vwma1, math.min(vwma2, vwma3))
+isContracting = vwmaSpread / close < contractionThreshold
+expThreshold  = ta.sma(osc1, 21) * expansionMult
+isExpanding   = osc1 > expThreshold
+isBreakout    = isExpanding and not isContracting
+
+var int   compressionBars  = 0
+var int   compressionStart = 0
+var float compHighOsc      = 0.0
+var float compLowOsc       = 0.0
+
+// FP: POC & delta accumulation during compression
+var float compPOCAccum    = 0.0
+var int   compPOCN        = 0
+var float savedCompPOC    = na
+var float compDeltaAccum  = 0.0
+var int   compDeltaN      = 0
+var float savedCompDelta  = 0.0
+
+if isContracting
+    if compressionBars == 0
+        compressionStart := bar_index
+        compHighOsc := osc1_scaled
+        compLowOsc  := osc1_scaled
+    compressionBars += 1
+    compHighOsc := math.max(compHighOsc, osc1_scaled)
+    compLowOsc  := math.min(compLowOsc,  osc1_scaled)
+    if fpAvail and not na(fpPOCMid)
+        compPOCAccum += fpPOCMid
+        compPOCN     += 1
+    compDeltaAccum += fpDeltaRatio
+    compDeltaN     += 1
+else
+    if isContracting[1] and compressionBars[1] >= minCompBars
+        savedCompPOC   := compPOCN > 0 ? compPOCAccum / compPOCN : na
+        savedCompDelta := compDeltaN > 0 ? compDeltaAccum / compDeltaN : 0.0
+    compressionBars := 0
+    compPOCAccum    := 0.0
+    compPOCN        := 0
+    compDeltaAccum  := 0.0
+    compDeltaN      := 0
+
+wasContracting = isContracting[1] or isContracting[2] or isContracting[3]
+isBreakoutInit = isExpanding and not isExpanding[1] and wasContracting
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ███ DIRECTIONAL BIAS ENGINE — HYBRID: FP DELTA + PROXY FALLBACK
+// ══════════════════════════════════════════════════════════════════════════════
+slope1 = (vwma1 - vwma1[slopeLookback]) / slopeLookback
+slope2 = (vwma2 - vwma2[slopeLookback]) / slopeLookback
+slope3 = (vwma3 - vwma3[slopeLookback]) / slopeLookback
+slopeNorm1   = slope1 > 0 ? 1.0 : slope1 < 0 ? -1.0 : 0.0
+slopeNorm2   = slope2 > 0 ? 1.0 : slope2 < 0 ? -1.0 : 0.0
+slopeNorm3   = slope3 > 0 ? 1.0 : slope3 < 0 ? -1.0 : 0.0
+slopeScore   = (slopeNorm1 + slopeNorm2 + slopeNorm3) / 3 * 100
+slopeAligned = slopeNorm1 == slopeNorm2 and slopeNorm2 == slopeNorm3
+slopeStr     = slopeAligned ? "ALIGNED" : "MIXED"
+
+// ── PROXY pressure (always computed — works without FP) ──
+barPressure    = (close - open) * volume
+cumPressure    = math.sum(barPressure, pressureLookback)
+cumVolume      = math.sum(volume, pressureLookback)
+avgPressure    = cumVolume > 0 ? cumPressure / cumVolume : 0
+proxyPressure  = math.max(-100, math.min(100, avgPressure / atr * 100))
+
+// ── FP pressure (real delta — only when footprint data flows) ──
+fpPressure     = math.max(-100, math.min(100, fpDeltaRatioCum * 100))
+
+// ── HYBRID: prefer FP when available, proxy fallback ──
+pressureScore  = fpAvail ? fpPressure : proxyPressure
+pressureSource = fpAvail ? "FP" : "PROXY"
+
+swingHi      = ta.highest(high, swingLookback)
+swingLo      = ta.lowest(low,   swingLookback)
+prevSwingHi  = ta.highest(high[swingLookback], swingLookback)
+prevSwingLo  = ta.lowest(low[swingLookback],   swingLookback)
+structBull   = swingHi > prevSwingHi and swingLo > prevSwingLo
+structBear   = swingHi < prevSwingHi and swingLo < prevSwingLo
+structScore  = structBull ? 100.0 : structBear ? -100.0 : 0.0
+structStr    = structBull ? "HH/HL" : structBear ? "LH/LL" : "TRANS"
+
+rangePos      = swingHi != swingLo ? (close - swingLo) / (swingHi - swingLo) : 0.5
+rangePosScore = (rangePos - 0.5) * 200
+
+dirBias  = slopeScore * 0.30 + pressureScore * 0.35 + structScore * 0.25 + rangePosScore * 0.10
+dirBias := math.max(-100, math.min(100, dirBias))
+isBullBias = dirBias >= biasThreshold
+isBearBias = dirBias <= -biasThreshold
+biasStr    = isBullBias ? "BULL" : isBearBias ? "BEAR" : "NEUT"
+confStr    = math.abs(dirBias) >= 70 ? "HIGH" : math.abs(dirBias) >= 50 ? "MED" : "LOW"
+
+// FP: Breakout conviction
+breakoutConviction = fpAvail ? (isBullBias ? fpDeltaRatio : -fpDeltaRatio) : 0.0
+convictionStr      = not fpAvail           ? "FP:N/A" :
+     breakoutConviction > fpDeltaThresh * 2 ? "HIGH ✅" :
+     breakoutConviction > fpDeltaThresh      ? "MED ⚠️" : "LOW ❌"
+breakConvCol = not fpAvail ? (isBullBias ? colBreakBull : colBreakBear) :
+     breakoutConviction > fpDeltaThresh * 2 ? color.lime :
+     breakoutConviction > fpDeltaThresh ? color.yellow : color.orange
+
+firstExpansion     = isExpanding and not isExpanding[1]
+continuedExpansion = isExpanding and isExpanding[1] and not isExpanding[2]
+
+var int lastBullBreakBar = 0, var int lastBearBreakBar = 0
+breakoutCooldown = 5
+bullishBreakoutRaw = (firstExpansion or continuedExpansion) and isBullBias
+bearishBreakoutRaw = (firstExpansion or continuedExpansion) and isBearBias
+bullishBreakout = bullishBreakoutRaw and (bar_index - lastBullBreakBar) > breakoutCooldown
+bearishBreakout = bearishBreakoutRaw and (bar_index - lastBearBreakBar) > breakoutCooldown
+if bullishBreakout
+    lastBullBreakBar := bar_index
+if bearishBreakout
+    lastBearBreakBar := bar_index
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ███ ML SIGNAL TRACKING
+// ══════════════════════════════════════════════════════════════════════════════
+var array<int> bullCompOut  = array.new_int(0), var array<int> bearCompOut  = array.new_int(0)
+var array<int> bullBreakOut = array.new_int(0), var array<int> bearBreakOut = array.new_int(0)
+var array<int> bullPeakOut  = array.new_int(0), var array<int> bearPeakOut  = array.new_int(0)
+var array<int> bullDivOut   = array.new_int(0), var array<int> bearDivOut   = array.new_int(0)
+var array<int> trapOut      = array.new_int(0)
+var array<int> fpBullDivOut = array.new_int(0), var array<int> fpBearDivOut = array.new_int(0)
+
+if barstate.isfirst
+    for i = 0 to mlLookback - 1
+        array.push(bullCompOut,  i % 2), array.push(bearCompOut,  i % 2)
+        array.push(bullBreakOut, i % 2), array.push(bearBreakOut, i % 2)
+        array.push(bullPeakOut,  i % 2), array.push(bearPeakOut,  i % 2)
+        array.push(bullDivOut,   i % 2), array.push(bearDivOut,   i % 2)
+        array.push(trapOut,      i % 2)
+        array.push(fpBullDivOut, i % 2), array.push(fpBearDivOut, i % 2)
+
+var int realSignalCount = 0
+
+var array<int>   pBullCompBars  = array.new_int(0),   var array<float> pBullCompPx  = array.new_float(0), var array<float> pBullCompR  = array.new_float(0)
+var array<int>   pBearCompBars  = array.new_int(0),   var array<float> pBearCompPx  = array.new_float(0), var array<float> pBearCompR  = array.new_float(0)
+var array<int>   pBullBreakBars = array.new_int(0),   var array<float> pBullBreakPx = array.new_float(0), var array<float> pBullBreakR = array.new_float(0)
+var array<int>   pBearBreakBars = array.new_int(0),   var array<float> pBearBreakPx = array.new_float(0), var array<float> pBearBreakR = array.new_float(0)
+var array<int>   pBullPeakBars  = array.new_int(0),   var array<float> pBullPeakPx  = array.new_float(0), var array<float> pBullPeakR  = array.new_float(0)
+var array<int>   pBearPeakBars  = array.new_int(0),   var array<float> pBearPeakPx  = array.new_float(0), var array<float> pBearPeakR  = array.new_float(0)
+var array<int>   pFPBullDivBars = array.new_int(0),   var array<float> pFPBullDivPx = array.new_float(0), var array<float> pFPBullDivR = array.new_float(0)
+var array<int>   pFPBearDivBars = array.new_int(0),   var array<float> pFPBearDivPx = array.new_float(0), var array<float> pFPBearDivR = array.new_float(0)
+
+calcWR(outcomes) =>
+    tot = array.size(outcomes), w = 0
+    for i = 0 to tot - 1
+        if array.get(outcomes, i) == 1
+            w += 1
+    tot > 0 ? w / tot * 100 : 50.0
+
+bullCompWR  = calcWR(bullCompOut),  bearCompWR  = calcWR(bearCompOut)
+bullBreakWR = calcWR(bullBreakOut), bearBreakWR = calcWR(bearBreakOut)
+bullPeakWR  = calcWR(bullPeakOut),  bearPeakWR  = calcWR(bearPeakOut)
+bullDivWR   = calcWR(bullDivOut),   bearDivWR   = calcWR(bearDivOut)
+trapWR      = calcWR(trapOut)
+fpBullDivWR = calcWR(fpBullDivOut), fpBearDivWR = calcWR(fpBearDivOut)
+
+calcOutcomeR(entry, R, isBull) =>
+    tgtMult = rTargetChoice == "1R" ? 1.0 : 0.5
+    int firstTgt = na, int firstStp = na
+    for k = 1 to mlOutcomeBars
+        idx = mlOutcomeBars - k
+        h = high[idx], l = low[idx]
+        if na(firstTgt)
+            firstTgt := isBull ? (h >= entry + R * tgtMult ? k : na) : (l <= entry - R * tgtMult ? k : na)
+        if na(firstStp)
+            firstStp := isBull ? (l <= entry - R * 0.5 ? k : na) : (h >= entry + R * 0.5 ? k : na)
+    win = false
+    if not na(firstTgt) and na(firstStp)
+        win := true
+    else if not na(firstTgt) and not na(firstStp)
+        win := firstTgt < firstStp ? true : firstStp < firstTgt ? false : not rTieGoesToStop
+    win
+
+procPend(pBars, pPx, pR, outs, isBull) =>
+    i = 0, cnt = 0
+    while i < array.size(pBars)
+        sBar = array.get(pBars, i), sPx = array.get(pPx, i), sR = array.get(pR, i)
+        if bar_index - sBar >= mlOutcomeBars
+            win = enableROutcomes ? calcOutcomeR(sPx, sR, isBull) : (isBull ? close > sPx : close < sPx)
+            if array.size(outs) >= mlLookback
+                array.shift(outs)
+            array.push(outs, win ? 1 : 0)
+            array.remove(pBars, i), array.remove(pPx, i), array.remove(pR, i)
+            cnt += 1
+        else
+            i += 1
+    cnt
+
+rc1 = procPend(pBullCompBars,  pBullCompPx,  pBullCompR,  bullCompOut,  true)
+rc2 = procPend(pBearCompBars,  pBearCompPx,  pBearCompR,  bearCompOut,  false)
+rc3 = procPend(pBullBreakBars, pBullBreakPx, pBullBreakR, bullBreakOut, true)
+rc4 = procPend(pBearBreakBars, pBearBreakPx, pBearBreakR, bearBreakOut, false)
+rc5 = procPend(pBullPeakBars,  pBullPeakPx,  pBullPeakR,  bullPeakOut,  false)
+rc6 = procPend(pBearPeakBars,  pBearPeakPx,  pBearPeakR,  bearPeakOut,  true)
+rc7 = procPend(pFPBullDivBars, pFPBullDivPx, pFPBullDivR, fpBullDivOut, true)
+rc8 = procPend(pFPBearDivBars, pFPBearDivPx, pFPBearDivR, fpBearDivOut, false)
+realSignalCount := realSignalCount + rc1 + rc2 + rc3 + rc4 + rc5 + rc6 + rc7 + rc8
+isWarmedUp = realSignalCount >= 10
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ███ ENERGY & PROJECTIONS
+// ══════════════════════════════════════════════════════════════════════════════
+rollingMaxScaled = ta.highest(osc1_scaled, scaleLookback)
+energyPct  = rollingMaxScaled > 0 ? osc1_scaled / rollingMaxScaled * 100 : 0
+compEnergy = math.min(compressionBars, 50) / 50.0
+projMove   = atr * (1 + compEnergy * 2)
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ███ ENERGY COLUMNS — DIRECTIONAL MAGNITUDE FIELD
+// ══════════════════════════════════════════════════════════════════════════════
+// Magnitude: differential between fast energy and baseline
+energyDiff = switch energyColBaseline
+    "Fast vs Mid"  => osc1_scaled - osc2_scaled
+    "Fast vs Slow" => osc1_scaled - osc3_scaled
+    "Fast vs SMA"  => osc1_scaled - ta.sma(osc1_scaled, energySmaLen)
+    => osc1_scaled - osc2_scaled
+
+// Absolute magnitude for gradient calculation
+energyMag    = math.abs(energyDiff)
+energyMagMax = ta.highest(energyMag, scaleLookback)
+
+// Gradient: normalize magnitude 0→1, map to transparency range (high transp = weak, low transp = strong)
+energyNorm  = energyMagMax > 0 ? math.min(energyMag / energyMagMax, 1.0) : 0.0
+energyTransp = math.round(energyTranspMax - (energyTranspMax - energyTranspMin) * energyNorm)
+
+// Signed column: positive = bull, negative = bear, near-zero = neutral
+energyColVal = isBullBias ? energyMag : isBearBias ? -energyMag : energyMag * 0.15
+
+// Color selection with gradient transparency
+energyColColor = isBullBias ? color.new(colEnergyBull, energyTransp) :
+     isBearBias ? color.new(colEnergyBear, energyTransp) :
+     color.new(colEnergyNeut, energyTranspMax)
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ███ PEAK DETECTION + FP DELTA DIVERGENCE TRACKING
+// ══════════════════════════════════════════════════════════════════════════════
+pivotLen         = 1
+peakThresholdFinal = tfSeconds >= 3600 ? peakThresholdHigh : peakThresholdLow
+peakMinLevel     = rollingMaxScaled * (peakThresholdFinal / 100)
+isPeak           = osc1_scaled[pivotLen] > osc1_scaled[pivotLen + 1] and osc1_scaled[pivotLen] > osc1_scaled[pivotLen - 1]
+isMajorPeak      = isPeak and osc1_scaled[pivotLen] > peakMinLevel[pivotLen]
+isBreakoutPeak   = peakRequireExpansion ? (isMajorPeak and (isExpanding[pivotLen] or isExpanding[pivotLen + 1])) : isMajorPeak
+bullPeak         = isBreakoutPeak and close[pivotLen] > close[pivotLen + 1]
+bearPeak         = isBreakoutPeak and close[pivotLen] <= close[pivotLen + 1]
+
+// FP: Track delta ratio at each confirmed peak
+var float lastPeakDelta1 = na
+var float lastPeakDelta2 = na
+
+if isMajorPeak
+    lastPeakDelta2 := lastPeakDelta1
+    lastPeakDelta1 := fpAvail ? fpDeltaRatio[pivotLen] : na
+
+// Delta Divergence Signals (Tier 2)
+fpDeltaBearDiv = showFPDeltaDiv and bullPeak and fpAvail and
+     not na(lastPeakDelta1) and not na(lastPeakDelta2) and
+     (lastPeakDelta2 - lastPeakDelta1) > fpDeltaDivThresh
+
+fpDeltaBullDiv = showFPDeltaDiv and bearPeak and fpAvail and
+     not na(lastPeakDelta1) and not na(lastPeakDelta2) and
+     (lastPeakDelta1 - lastPeakDelta2) > fpDeltaDivThresh
+
+// Proto candidate flags
+protoPeakOn        = showProtoDelayed and protoPeakEnabled and showPeakSignals
+protoPeakCandidate = protoPeakOn and barstate.isconfirmed and
+     osc1_scaled > peakMinLevel and osc1_scaled > osc1_scaled[1] and osc1_scaled > osc1_scaled[2] and
+     (not peakRequireExpansion or isExpanding)
+protoPeakIsBull    = close > close[1]
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ███ DIVERGENCE ENGINE (price vs oscillator)
+// ══════════════════════════════════════════════════════════════════════════════
+oscPivotHi = ta.pivothigh(osc1_scaled, divPivotLen, divPivotLen)
+oscPivotLo = ta.pivotlow(osc1_scaled,  divPivotLen, divPivotLen)
+var float prevOscHi = na, var float prevOscLo = na
+var float prevPriceHi = na, var float prevPriceLo = na
+if not na(oscPivotHi)
+    prevOscHi := oscPivotHi
+if not na(oscPivotLo)
+    prevOscLo := oscPivotLo
+_phVal = ta.pivothigh(high, divPivotLen, divPivotLen)
+_plVal = ta.pivotlow(low, divPivotLen, divPivotLen)
+if not na(_phVal)
+    prevPriceHi := _phVal
+if not na(_plVal)
+    prevPriceLo := _plVal
+
+oscEma3        = ta.ema(osc1_scaled, 3)
+oscCrossOver   = ta.crossover(osc1_scaled, oscEma3)
+oscCrossUnder  = ta.crossunder(osc1_scaled, oscEma3)
+regBullDiv  = not na(prevPriceLo) and not na(prevOscLo) and low < prevPriceLo and osc1_scaled > prevOscLo and oscCrossOver
+regBearDiv  = not na(prevPriceHi) and not na(prevOscHi) and high > prevPriceHi and osc1_scaled < prevOscHi and oscCrossUnder
+
+// ── HIDDEN DIV — STATE MACHINE (fire once at START, once at END) ──
+hidBullDivRaw = not na(prevPriceLo) and not na(prevOscLo) and low > prevPriceLo and osc1_scaled < prevOscLo and isBullBias
+hidBearDivRaw = not na(prevPriceHi) and not na(prevOscHi) and high < prevPriceHi and osc1_scaled > prevOscHi and isBearBias
+
+var bool hidBullActive = false
+var bool hidBearActive = false
+
+hidBullStart = hidBullDivRaw and not hidBullActive
+hidBullEnd   = not hidBullDivRaw and hidBullActive
+hidBearStart = hidBearDivRaw and not hidBearActive
+hidBearEnd   = not hidBearDivRaw and hidBearActive
+
+if hidBullStart
+    hidBullActive := true
+if hidBullEnd
+    hidBullActive := false
+if hidBearStart
+    hidBearActive := true
+if hidBearEnd
+    hidBearActive := false
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ███ TRAP & EXHAUSTION
+// ══════════════════════════════════════════════════════════════════════════════
+var bool inBullBreak = false, var bool inBearBreak = false, var int breakBar = 0
+if isBreakoutInit and isBullBias
+    inBullBreak := true, breakBar := bar_index
+if isBreakoutInit and isBearBias
+    inBearBreak := true, breakBar := bar_index
+
+bullTrap = inBullBreak and not isExpanding and (bar_index - breakBar) <= trapLookback and (bar_index - breakBar) >= 2
+bearTrap = inBearBreak and not isExpanding and (bar_index - breakBar) <= trapLookback and (bar_index - breakBar) >= 2
+if bullTrap or (bar_index - breakBar) > trapLookback
+    inBullBreak := false
+if bearTrap or (bar_index - breakBar) > trapLookback
+    inBearBreak := false
+
+volMean = ta.sma(volume, 21)
+volStd  = ta.stdev(volume, 21)
+climacticRaw = volume > (volMean + volStd * climacticMult) and isExpanding
+var int lastClimacticBar = 0
+isClimactic = climacticRaw and (bar_index - lastClimacticBar) > climacticCooldown
+if isClimactic
+    lastClimacticBar := bar_index
+
+var float pk1 = na, var float pk2 = na, var float pk3 = na
+if isMajorPeak
+    pk3 := pk2, pk2 := pk1, pk1 := osc1_scaled[pivotLen]
+threeDrive = not na(pk1) and not na(pk2) and not na(pk3) and pk1 < pk2 and pk2 < pk3 and isMajorPeak
+
+proto3On        = showProtoDelayed and proto3DriveEnabled and showThreeDrive
+proto3Candidate = proto3On and barstate.isconfirmed and
+     not na(pk1) and not na(pk2) and
+     osc1_scaled > peakMinLevel and osc1_scaled > osc1_scaled[1] and osc1_scaled > osc1_scaled[2] and
+     osc1_scaled < pk1 and pk1 < pk2
+
+// BLEED context data
+avgRange    = ta.sma(high - low, bleedRangeLen)
+candleRange = high - low
+closePos    = candleRange > 0 ? (close - low) / candleRange : 0.5
+closeMid    = closePos > (0.5 - bleedMidBand) and closePos < (0.5 + bleedMidBand)
+
+// FP-based BLEED classification
+fpAbsorption  = isClimactic and fpAvail and fpDeltaRatioAbs < fpAbsorbThresh
+fpBlowoffBull = isClimactic and fpAvail and fpDeltaRatio >  fpBlowoffThresh and isBullBias
+fpBlowoffBear = isClimactic and fpAvail and fpDeltaRatio < -fpBlowoffThresh and isBearBias
+fpBlowoff     = fpBlowoffBull or fpBlowoffBear
+
+// PROXY-based BLEED classification (fallback when no FP)
+proxyAbsorption = isClimactic and not fpAvail and avgRange > 0 and candleRange < avgRange * bleedAbsorbRangeMult and closeMid
+proxyWideBleed  = isClimactic and not fpAvail and avgRange > 0 and candleRange > avgRange * bleedBlowoffRangeMult
+proxyCloseExtBull = closePos >= (1.0 - bleedExtremeFrac)
+proxyCloseExtBear = closePos <= bleedExtremeFrac
+proxyBlowoffBull  = proxyWideBleed and isBullBias and proxyCloseExtBull
+proxyBlowoffBear  = proxyWideBleed and isBearBias and proxyCloseExtBear
+proxyBlowoff      = proxyBlowoffBull or proxyBlowoffBear
+
+// HYBRID: use whichever is available
+bleedAbsorption = fpAvail ? fpAbsorption : proxyAbsorption
+bleedBlowoff    = fpAvail ? fpBlowoff : proxyBlowoff
+bleedBlowoffIsBull = fpAvail ? fpBlowoffBull : proxyBlowoffBull
+
+// ── Auction narrative engine ──
+if fpAvail
+    if fpAbsorption
+        fpNarrative := "ABSORPTION: High vol, near-zero delta. Both sides active. Walls on both sides — do NOT fade blindly."
+    else if fpBlowoffBull
+        fpNarrative := "CLIMAX BUY: Extreme one-sided buy delta. Late buyers piling in. Smart money likely distributing INTO this."
+    else if fpBlowoffBear
+        fpNarrative := "CLIMAX SELL: Extreme one-sided sell delta. Panic selling. Smart money likely accumulating INTO this."
+    else if fpBuyRatio > 65 and fpPOCDelta > 0
+        fpNarrative := "INSTITUTIONAL BUY: Buy dominant + buyers winning at POC. Trend has real fuel."
+    else if fpSellRatio > 65 and fpPOCDelta < 0
+        fpNarrative := "INSTITUTIONAL SELL: Sell dominant + sellers winning at POC. Trend has real fuel."
+    else if fpBuyRatio > 55 and fpPOCDelta < 0
+        fpNarrative := "HIDDEN BEAR: Price bid up but sellers taking control at POC. Trap potential."
+    else if fpSellRatio > 55 and fpPOCDelta > 0
+        fpNarrative := "HIDDEN BULL: Price offered down but buyers absorbing at POC. Reversal potential."
+    else if fpAboveVA and fpDeltaRatio < 0
+        fpNarrative := "DISTRIBUTION ABOVE VA: Price above value but sell delta present. Return to VA likely."
+    else if fpBelowVA and fpDeltaRatio > 0
+        fpNarrative := "ACCUMULATION BELOW VA: Price below value but buy delta present. Return to VA likely."
+    else if fpInsideVA
+        fpNarrative := "VALUE AREA ROTATION: Inside VA = two-sided. Wait for VA boundary test or POC reaction."
+    else
+        fpNarrative := "DIRECTIONAL: " + (fpDeltaRatio > 0 ? "Buyers" : "Sellers") + " in control. Monitor POC migration for continuation."
+else
+    fpNarrative := "FP UNAVAILABLE — proxy mode active"
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ███ SIGNAL CONDITIONS (ML GATED)
+// ══════════════════════════════════════════════════════════════════════════════
+compReady    = isContracting and compressionBars >= 5 and compressionBars[1] < 5
+mlActive     = enableML and isWarmedUp
+bullCompSig  = compReady and isBullBias and (not mlActive or bullCompWR >= mlMinWinRate)
+bearCompSig  = compReady and isBearBias and (not mlActive or bearCompWR >= mlMinWinRate)
+bullBreakSig = bullishBreakout and showBreakoutSignals
+bearBreakSig = bearishBreakout and showBreakoutSignals
+bullPeakSig  = bullPeak and showPeakSignals
+bearPeakSig  = bearPeak and showPeakSignals
+regBullDivSig = regBullDiv and showRegularDiv and (not mlActive or bullDivWR >= mlMinWinRate)
+regBearDivSig = regBearDiv and showRegularDiv and (not mlActive or bearDivWR >= mlMinWinRate)
+
+// Hidden div: STATE MACHINE — fire on transitions only
+hidBullDivStartSig = hidBullStart and showHiddenDiv
+hidBullDivEndSig   = hidBullEnd and showHiddenDiv
+hidBearDivStartSig = hidBearStart and showHiddenDiv
+hidBearDivEndSig   = hidBearEnd and showHiddenDiv
+
+bullTrapSig  = bullTrap and showTraps and (not mlActive or trapWR >= mlMinWinRate)
+bearTrapSig  = bearTrap and showTraps and (not mlActive or trapWR >= mlMinWinRate)
+climacticSig = isClimactic and showClimactic
+threeDriveSig = threeDrive and showThreeDrive
+fpDeltaBearDivSig = fpDeltaBearDiv and (not mlActive or fpBearDivWR >= mlMinWinRate)
+fpDeltaBullDivSig = fpDeltaBullDiv and (not mlActive or fpBullDivWR >= mlMinWinRate)
+
+// FP: Compression imbalance
+compressImbalanceBull = isContracting[1] and compressionBars[1] >= minCompBars and
+     savedCompDelta >  fpImbalanceThresh
+compressImbalanceBear = isContracting[1] and compressionBars[1] >= minCompBars and
+     savedCompDelta < -fpImbalanceThresh
+compressionEnded = not isContracting and isContracting[1] and compressionBars[1] >= minCompBars
+
+// Register pending outcomes
+rNow = atr * rAtrMult
+if bullCompSig
+    array.push(pBullCompBars,  bar_index), array.push(pBullCompPx,  close), array.push(pBullCompR,  rNow)
+if bearCompSig
+    array.push(pBearCompBars,  bar_index), array.push(pBearCompPx,  close), array.push(pBearCompR,  rNow)
+if bullBreakSig
+    array.push(pBullBreakBars, bar_index), array.push(pBullBreakPx, close), array.push(pBullBreakR, rNow)
+if bearBreakSig
+    array.push(pBearBreakBars, bar_index), array.push(pBearBreakPx, close), array.push(pBearBreakR, rNow)
+if bullPeakSig
+    array.push(pBullPeakBars,  bar_index), array.push(pBullPeakPx,  close), array.push(pBullPeakR,  rNow)
+if bearPeakSig
+    array.push(pBearPeakBars,  bar_index), array.push(pBearPeakPx,  close), array.push(pBearPeakR,  rNow)
+if fpDeltaBullDivSig
+    array.push(pFPBullDivBars, bar_index - pivotLen), array.push(pFPBullDivPx, close[pivotLen]), array.push(pFPBullDivR, rNow)
+if fpDeltaBearDivSig
+    array.push(pFPBearDivBars, bar_index - pivotLen), array.push(pFPBearDivPx, close[pivotLen]), array.push(pFPBearDivR, rNow)
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ███ GLOBAL LABEL BUDGET MANAGER
+// ══════════════════════════════════════════════════════════════════════════════
+var label[] allLabels       = array.new_label()
+var label[] protectedLabels = array.new_label()
+
+protectLabel(l) =>
+    if array.indexof(protectedLabels, l) == -1
+        array.push(protectedLabels, l)
+
+unprotectLabel(l) =>
+    idx = array.indexof(protectedLabels, l)
+    if idx != -1
+        array.remove(protectedLabels, idx)
+
+removeFromAll(l) =>
+    idx = array.indexof(allLabels, l)
+    if idx != -1
+        array.remove(allLabels, idx)
+
+deleteLabelAll(l) =>
+    label.delete(l), unprotectLabel(l), removeFromAll(l)
+
+capLabels() =>
+    tries = 0
+    while array.size(allLabels) > maxLabels and tries < (maxLabels + 50)
+        l = array.shift(allLabels)
+        if array.indexof(protectedLabels, l) != -1
+            array.push(allLabels, l)
+        else
+            label.delete(l)
+        tries += 1
+
+addLabel(l, bool protectNow) =>
+    array.push(allLabels, l)
+    if protectNow
+        protectLabel(l)
+    capLabels()
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ███ ICON STACKING
+// ══════════════════════════════════════════════════════════════════════════════
+var array<int> sigBars   = array.new_int(0)
+var array<int> sigCounts = array.new_int(0)
+
+iconSize = switch iconSizeInput
+    "tiny"   => size.tiny
+    "small"  => size.small
+    "normal" => size.normal
+    => size.tiny
+iconSizeExec = switch iconSizeInput
+    "tiny"   => size.small
+    "small"  => size.normal
+    "normal" => size.normal
+    => size.small
+
+stackSeparation = rollingMaxScaled * (iconStackPct / 100)
+
+getStack(barIdx) =>
+    idx = array.indexof(sigBars, barIdx)
+    if idx == -1
+        array.push(sigBars, barIdx), array.push(sigCounts, 1)
+        0.0
+    else
+        cnt = array.get(sigCounts, idx)
+        array.set(sigCounts, idx, cnt + 1)
+        cnt * stackSeparation
+
+if array.size(sigBars) > 100
+    array.shift(sigBars), array.shift(sigCounts)
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ███ TOOLTIP BUILDER — INSTITUTIONAL ZENITH GRADE
+// ══════════════════════════════════════════════════════════════════════════════
+buildTT(sig, bias, conf, slp, pres, stru, eng, comp, proj, atrV, wr) =>
+    t  = "══════ " + sig + " ══════\n"
+    t += "TF:" + tfRegime + "  ATR:" + (volRegimeMult > 1 ? "HIGH 🔥" : volRegimeMult < 1 ? "LOW 🧊" : "NORM") + "\n"
+    t += "─── MARKET STRUCTURE ───\n"
+    t += "Bias:" + str.tostring(bias, "#") + " [" + (bias >= 40 ? "BULL" : bias <= -40 ? "BEAR" : "NEUT") + "]  Conf:" + conf + "\n"
+    t += "Slope:" + slp + "  Struct:" + stru + "\n"
+    t += "Pressure:" + str.tostring(pres, "#") + " [" + pressureSource + "]\n"
+    t += "Energy:" + str.tostring(eng, "#") + "%  Comp:" + str.tostring(comp) + "b\n"
+    t += "ATR:" + str.tostring(atrV, "#.##") + "  Proj:±" + str.tostring(proj, "#.##") + "\n"
+    t += "─── ORDER FLOW ───\n"
+    t += fpAvail ? "Buy:" + str.tostring(fpBuyRatio, "#.#") + "%  Sell:" + str.tostring(fpSellRatio, "#.#") + "%\n" : "FP: Unavailable (proxy active)\n"
+    t += fpAvail ? "Δ:" + str.tostring(fpDeltaRatio, "#.##") + "  Trend:" + fpDeltaAccelStr + "\n" : ""
+    t += fpAvail ? "CumΔ(" + str.tostring(pressureLookback) + "b):" + fpCumDeltaDir + "\n" : ""
+    t += fpAvail ? "POC:" + (not na(fpPOCMid) ? str.tostring(fpPOCMid, "#.##") : "N/A") + "  " + fpPOCDeltaStr + "\n" : ""
+    t += fpAvail ? "POC Migr:" + fpPOCMigration + "\n" : ""
+    t += fpAvail ? "VA:" + (not na(fpVAH) ? str.tostring(fpVAH, "#.##") : "N/A") + " / " + (not na(fpVAL) ? str.tostring(fpVAL, "#.##") : "N/A") + "  " + fpVAContext + "\n" : ""
+    t += "─── WHAT'S HAPPENING ───\n"
+    t += fpNarrative + "\n"
+    t += "─── EDGE ───\n"
+    t += "📊 WIN:" + str.tostring(wr, "#") + "%\n"
+    t
+
+buildFPLine() =>
+    s = ""
+    if fpAvail
+        s := "─── LIVE ORDER FLOW ───\n"
+        s += "Buy:" + str.tostring(fpBuyRatio, "#.#") + "%  Sell:" + str.tostring(fpSellRatio, "#.#") + "%  Vol:" + str.tostring(fpTotalVol, format.volume) + "\n"
+        s += "Δ:" + str.tostring(fpDeltaRatio, "#.##") + "  " + fpDeltaAccelStr + "\n"
+        s += "CumΔ:" + fpCumDeltaDir + "  POC:" + (not na(fpPOCMid) ? str.tostring(fpPOCMid, "#.##") : "N/A") + "\n"
+        s += fpPOCDeltaStr + "  Migr:" + fpPOCMigration + "\n"
+        s += "VAH:" + (not na(fpVAH) ? str.tostring(fpVAH, "#.##") : "N/A") + "  VAL:" + (not na(fpVAL) ? str.tostring(fpVAL, "#.##") : "N/A") + "\n"
+        s += fpVAContext + "  Tick:" + str.tostring(fpTickSize) + "\n"
+        s += "─── NARRATIVE ───\n"
+        s += fpNarrative + "\n"
+    else
+        s := "─── PROXY MODE ───\nFP data not available\nPressure:" + str.tostring(proxyPressure, "#") + " (close-open*vol)\n"
+    s
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ███ PROTO QUEUE (peaks + 3-drive — only when enabled)
+// ══════════════════════════════════════════════════════════════════════════════
+var label[] protoLbls = array.new_label()
+var int[]   protoBars = array.new_int()
+var int[]   protoType = array.new_int()
+
+protoPush(_lbl, _bar, _type) =>
+    array.push(protoLbls, _lbl), array.push(protoBars, _bar), array.push(protoType, _type)
+
+protoRemoveAt(i) =>
+    array.remove(protoLbls, i), array.remove(protoBars, i), array.remove(protoType, i)
+
+if protoPeakCandidate
+    pCol = protoPeakIsBull ? color.new(colSigBull, protoOpacity) : color.new(colSigBear, protoOpacity)
+    sY   = iconBaseY + getStack(bar_index)
+    pLbl = label.new(bar_index, sY, "👑", style=label.style_none, textcolor=pCol, size=iconSize,
+         tooltip="══ 👑 PROTO PEAK ══\nCandidate (not confirmed)\nAwait next bar…")
+    addLabel(pLbl, true)
+    protoPush(pLbl, bar_index, 1)
+
+if proto3Candidate
+    sY   = iconBaseY + getStack(bar_index)
+    pLbl3 = label.new(bar_index, sY, "⛽", style=label.style_none, textcolor=color.new(colThreeDrive, protoOpacity), size=iconSize,
+         tooltip="══ ⛽ PROTO 3-DRIVE ══\nCandidate (not confirmed)\nAwait next bar…")
+    addLabel(pLbl3, true)
+    protoPush(pLbl3, bar_index, 2)
+
+if showProtoDelayed and array.size(protoLbls) > 0
+    i = array.size(protoLbls) - 1
+    while i >= 0
+        b   = array.get(protoBars, i)
+        typ = array.get(protoType, i)
+        L   = array.get(protoLbls, i)
+        if bar_index - b == pivotLen
+            pivBar = bar_index - pivotLen
+            if typ == 1
+                didConfirm = (bullPeakSig or bearPeakSig) and (pivBar == b)
+                if didConfirm
+                    finalCol = bullPeakSig ? colSigBull : colSigBear
+                    label.set_textcolor(L, finalCol)
+                    ttFinal = buildTT(bullPeakSig ? "👑BULL PEAK" : "👑BEAR PEAK",
+                         dirBias[pivotLen], confStr, slopeStr, pressureScore[pivotLen], structStr,
+                         energyPct[pivotLen], compressionBars[pivotLen], projMove[pivotLen], atr[pivotLen],
+                         bullPeakSig ? bullPeakWR : bearPeakWR)
+                    ttFinal += "⚠️ EXHAUSTION\nScale out 50-75%\nTrail to BE\n"
+                    ttFinal += buildFPLine()
+                    label.set_tooltip(L, ttFinal)
+                    unprotectLabel(L), capLabels()
+                else
+                    deleteLabelAll(L)
+                protoRemoveAt(i)
+            if typ == 2
+                didConfirm3 = threeDriveSig and (pivBar == b)
+                if didConfirm3
+                    label.set_textcolor(L, colThreeDrive)
+                    tt3 = "══ ⛽ TANK EMPTY ══\nP1:" + str.tostring(pk3,"#") + " P2:" + str.tostring(pk2,"#") + " P3:" + str.tostring(pk1,"#") + "\n⚠️ Out of fuel after 3 drives\nMomentum DEPLETED\n" + buildFPLine()
+                    label.set_tooltip(L, tt3)
+                    unprotectLabel(L), capLabels()
+                else
+                    deleteLabelAll(L)
+                protoRemoveAt(i)
+        i -= 1
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ███ MAIN SIGNAL LABELS
+// ══════════════════════════════════════════════════════════════════════════════
+
+// 🔋 Compression
+if showCompSignals and bullCompSig
+    sY = iconBaseY + getStack(bar_index)
+    tt = buildTT("🔋CHARGING", dirBias, confStr, slopeStr, pressureScore, structStr, energyPct, compressionBars, projMove, atr, bullCompWR)
+    tt += "─── SETUP ───\n"
+    tt += "LONG loading — energy coiling\n"
+    tt += "Entry: Breakout above comp high\n"
+    tt += "Stop: Below comp low\n"
+    tt += "Proj: +" + str.tostring(projMove,"#.##") + " once launched\n"
+    tt += (savedCompDelta > fpImbalanceThresh ? "🧲 BUY IMBALANCE in comp — loaded long\n" : "")
+    tt += (not na(savedCompPOC) ? "Mag POC: " + str.tostring(savedCompPOC,"#.##") + "\n" : "")
+    tt += buildFPLine()
+    addLabel(label.new(bar_index, sY, "🔋", style=label.style_none, textcolor=colSigBull, size=iconSize, tooltip=tt), false)
+
+if showCompSignals and bearCompSig
+    sY = iconBaseY + getStack(bar_index)
+    tt = buildTT("🔋CHARGING", dirBias, confStr, slopeStr, pressureScore, structStr, energyPct, compressionBars, projMove, atr, bearCompWR)
+    tt += "─── SETUP ───\n"
+    tt += "SHORT loading — energy coiling\n"
+    tt += "Entry: Breakdown below comp low\n"
+    tt += "Stop: Above comp high\n"
+    tt += "Proj: -" + str.tostring(projMove,"#.##") + " once launched\n"
+    tt += (savedCompDelta < -fpImbalanceThresh ? "🧲 SELL IMBALANCE in comp — loaded short\n" : "")
+    tt += (not na(savedCompPOC) ? "Mag POC: " + str.tostring(savedCompPOC,"#.##") + "\n" : "")
+    tt += buildFPLine()
+    addLabel(label.new(bar_index, sY, "🔋", style=label.style_none, textcolor=colSigBear, size=iconSize, tooltip=tt), false)
+
+// 🦅 Eagle Rising — conviction-colored
+if showBreakoutSignals and bullBreakSig
+    sY = iconBaseY + getStack(bar_index)
+    tt = buildTT("🦅EAGLE RISING", dirBias, confStr, slopeStr, pressureScore, structStr, energyPct, compressionBars[1], projMove, atr, bullBreakWR)
+    tt += "─── EXECUTION ───\n"
+    tt += "Entry: MARKET / pullback to POC\n"
+    tt += "Stop: " + str.tostring(low - atr * 0.5,"#.##") + " (0.5 ATR below bar)\n"
+    tt += "T1: +" + str.tostring(projMove * 0.5,"#.##") + " (scale 50%)\n"
+    tt += "T2: +" + str.tostring(projMove,"#.##") + " (trail remainder)\n"
+    tt += fpAvail ? "FP Conv: [" + convictionStr + "] Δ=" + str.tostring(fpDeltaRatio,"#.##") + "\n" : ""
+    tt += (fpAvail and breakoutConviction < fpDeltaThresh ? "⚠️ LOW CONVICTION — size down or wait\n" : "")
+    tt += buildFPLine()
+    addLabel(label.new(bar_index, sY, "🦅", style=label.style_none, textcolor=breakConvCol, size=iconSizeExec, tooltip=tt), false)
+
+// 💀 Death Drop — conviction-colored
+if showBreakoutSignals and bearBreakSig
+    sY = iconBaseY + getStack(bar_index)
+    tt = buildTT("💀DEATH DROP", dirBias, confStr, slopeStr, pressureScore, structStr, energyPct, compressionBars[1], projMove, atr, bearBreakWR)
+    tt += "─── EXECUTION ───\n"
+    tt += "Entry: MARKET / dead-cat into POC\n"
+    tt += "Stop: " + str.tostring(high + atr * 0.5,"#.##") + " (0.5 ATR above bar)\n"
+    tt += "T1: -" + str.tostring(projMove * 0.5,"#.##") + " (scale 50%)\n"
+    tt += "T2: -" + str.tostring(projMove,"#.##") + " (trail remainder)\n"
+    tt += fpAvail ? "FP Conv: [" + convictionStr + "] Δ=" + str.tostring(fpDeltaRatio,"#.##") + "\n" : ""
+    tt += (fpAvail and breakoutConviction < fpDeltaThresh ? "⚠️ LOW CONVICTION — size down or wait\n" : "")
+    tt += buildFPLine()
+    addLabel(label.new(bar_index, sY, "💀", style=label.style_none, textcolor=breakConvCol, size=iconSizeExec, tooltip=tt), false)
+
+// 💎 Regular divergence
+if regBullDivSig
+    sY = iconBaseY + getStack(bar_index)
+    tt  = "══ 💎 DIAMOND BULL ══\n"
+    tt += "Price: LOWER LOW  Energy: HIGHER LOW\n"
+    tt += "─── INTERPRETATION ───\n"
+    tt += "Sellers making new lows but LOSING momentum.\n"
+    tt += "Smart money absorbing supply at lows.\n"
+    tt += "Trigger: Break above last swing high.\n"
+    tt += fpAvail ? (fpDeltaRatio > 0 ? "✅ FP CONFIRMS: Buy delta present\n" : "⚠️ FP WEAK: Sell delta still active — wait\n") : ""
+    tt += "📊 WIN:" + str.tostring(bullDivWR,"#") + "%\n"
+    tt += buildFPLine()
+    addLabel(label.new(bar_index, sY, "💎", style=label.style_none, textcolor=colDivBull, size=iconSize, tooltip=tt), false)
+
+if regBearDivSig
+    sY = iconBaseY + getStack(bar_index)
+    tt  = "══ 💎 DIAMOND BEAR ══\n"
+    tt += "Price: HIGHER HIGH  Energy: LOWER HIGH\n"
+    tt += "─── INTERPRETATION ───\n"
+    tt += "Buyers making new highs but LOSING momentum.\n"
+    tt += "Smart money distributing into strength.\n"
+    tt += "Trigger: Break below last swing low.\n"
+    tt += fpAvail ? (fpDeltaRatio < 0 ? "✅ FP CONFIRMS: Sell delta present\n" : "⚠️ FP WEAK: Buy delta still active — wait\n") : ""
+    tt += "📊 WIN:" + str.tostring(bearDivWR,"#") + "%\n"
+    tt += buildFPLine()
+    addLabel(label.new(bar_index, sY, "💎", style=label.style_none, textcolor=colDivBear, size=iconSize, tooltip=tt), false)
+
+// 🎭 Hidden divergence — STATE MACHINE: START (vivid) + END (gray)
+if hidBullDivStartSig
+    sY = iconBaseY + getStack(bar_index)
+    addLabel(label.new(bar_index, sY, "🎭", style=label.style_none, textcolor=colSigBull, size=iconSize,
+         tooltip="══ 🎭 HIDDEN BULL START ══\nPrice:HL Energy:LL\n✅ Trend continuation ACTIVE\nAdd to longs — ride the wave\n" + buildFPLine()), false)
+
+if hidBullDivEndSig
+    sY = iconBaseY + getStack(bar_index)
+    addLabel(label.new(bar_index, sY, "🎭", style=label.style_none, textcolor=color.new(colHidDivEnd, hidDivEndTransp), size=iconSize,
+         tooltip="══ 🎭 HIDDEN BULL END ══\nCondition EXHAUSTED\nContinuation signal no longer active\nTighten or take profits\n" + buildFPLine()), false)
+
+if hidBearDivStartSig
+    sY = iconBaseY + getStack(bar_index)
+    addLabel(label.new(bar_index, sY, "🎭", style=label.style_none, textcolor=colSigBear, size=iconSize,
+         tooltip="══ 🎭 HIDDEN BEAR START ══\nPrice:LH Energy:HH\n✅ Trend continuation ACTIVE\nAdd to shorts — ride the wave\n" + buildFPLine()), false)
+
+if hidBearDivEndSig
+    sY = iconBaseY + getStack(bar_index)
+    addLabel(label.new(bar_index, sY, "🎭", style=label.style_none, textcolor=color.new(colHidDivEnd, hidDivEndTransp), size=iconSize,
+         tooltip="══ 🎭 HIDDEN BEAR END ══\nCondition EXHAUSTED\nContinuation signal no longer active\nTighten or take profits\n" + buildFPLine()), false)
+
+// ⚠️ Traps
+if bullTrapSig
+    sY = iconBaseY + getStack(bar_index)
+    addLabel(label.new(bar_index, sY, "⚠️", style=label.style_none, textcolor=colTrap, size=iconSize,
+         tooltip="══ ⚠️ BULL TRAP ══\nBreakout FAILED — longs trapped\n─── WHAT HAPPENED ───\nPrice broke out but energy collapsed.\nLongs are underwater. Stops below entry = fuel.\nCounter SHORT on any bounce to breakout level.\n" + (fpAvail ? "FP: Δ=" + str.tostring(fpDeltaRatio,"#.##") + " " + (fpDeltaRatio < -fpDeltaThresh ? "SELL CONFIRMED ✅" : "weak — monitor") + "\n" : "") + "📊 WIN:" + str.tostring(trapWR,"#") + "%\n" + buildFPLine()), false)
+
+if bearTrapSig
+    sY = iconBaseY + getStack(bar_index)
+    addLabel(label.new(bar_index, sY, "⚠️", style=label.style_none, textcolor=colTrap, size=iconSize,
+         tooltip="══ ⚠️ BEAR TRAP ══\nBreakdown FAILED — shorts trapped\n─── WHAT HAPPENED ───\nPrice broke down but energy collapsed.\nShorts are underwater. Stops above entry = fuel.\nCounter LONG on any pullback to breakdown level.\n" + (fpAvail ? "FP: Δ=" + str.tostring(fpDeltaRatio,"#.##") + " " + (fpDeltaRatio > fpDeltaThresh ? "BUY CONFIRMED ✅" : "weak — monitor") + "\n" : "") + "📊 WIN:" + str.tostring(trapWR,"#") + "%\n" + buildFPLine()), false)
+
+// 🔻 FP DELTA BEAR DIVERGENCE — TIER 2
+if fpDeltaBearDivSig
+    peakY = osc1_scaled[pivotLen]
+    sY    = peakY + getStack(bar_index - pivotLen)
+    tt  = "══ 🔻 DISTRIBUTION DETECTED ══\n"
+    tt += "─── THE HIDDEN SIGNAL ───\n"
+    tt += "Price made a new energy peak (HH) BUT\n"
+    tt += "Delta DECLINED: " + str.tostring(lastPeakDelta2,"#.##") + " → " + str.tostring(lastPeakDelta1,"#.##") + "\n"
+    tt += "─── WHAT THIS MEANS ───\n"
+    tt += "Buyers are buying LESS aggressively at higher prices.\n"
+    tt += "Institutions are SELLING INTO retail FOMO.\n"
+    tt += "─── ACTION ───\n"
+    tt += "Scale back / exit longs at next resistance.\n"
+    tt += "SHORT trigger: break below last HL + sell delta.\n"
+    tt += "POC now: " + (not na(fpPOCMid) ? str.tostring(fpPOCMid,"#.##") : "N/A") + "\n"
+    tt += "📊 WIN:" + str.tostring(fpBearDivWR,"#") + "%\n"
+    tt += buildFPLine()
+    addLabel(label.new(bar_index - pivotLen, sY, "🔻", style=label.style_none, textcolor=colFPDistrib, size=iconSize, tooltip=tt), false)
+
+// 🔺 FP DELTA BULL DIVERGENCE — TIER 2
+if fpDeltaBullDivSig
+    peakY = osc1_scaled[pivotLen]
+    sY    = peakY + getStack(bar_index - pivotLen)
+    tt  = "══ 🔺 ACCUMULATION DETECTED ══\n"
+    tt += "─── THE HIDDEN SIGNAL ───\n"
+    tt += "Price made a new energy peak (LL) BUT\n"
+    tt += "Delta ROSE: " + str.tostring(lastPeakDelta2,"#.##") + " → " + str.tostring(lastPeakDelta1,"#.##") + "\n"
+    tt += "─── WHAT THIS MEANS ───\n"
+    tt += "Sellers are selling LESS aggressively at lower prices.\n"
+    tt += "Institutions are BUYING INTO retail panic.\n"
+    tt += "─── ACTION ───\n"
+    tt += "Cover / exit shorts at next support.\n"
+    tt += "LONG trigger: break above last LH + buy delta.\n"
+    tt += "POC now: " + (not na(fpPOCMid) ? str.tostring(fpPOCMid,"#.##") : "N/A") + "\n"
+    tt += "📊 WIN:" + str.tostring(fpBullDivWR,"#") + "%\n"
+    tt += buildFPLine()
+    addLabel(label.new(bar_index - pivotLen, sY, "🔺", style=label.style_none, textcolor=colFPAccum, size=iconSize, tooltip=tt), false)
+
+// 🧲 COMPRESSION IMBALANCE — TIER 3
+if compressionEnded and (compressImbalanceBull or compressImbalanceBear)
+    sY  = compHighOsc[1] + getStack(compressionStart[1])
+    col = compressImbalanceBull ? colImbalance : colImbalanceBear
+    dir = compressImbalanceBull ? "BUY" : "SELL"
+    tt  = "══ 🧲 IMBALANCE STACK ══\nAvg Comp Δ:" + str.tostring(savedCompDelta,"#.##") + "\n"
+    tt += dir + " dominant during compression\n"
+    tt += compressImbalanceBull ? "✅ Institutions LOADING LONGS\nExpect upside breakout\n" : "✅ Institutions LOADING SHORTS\nExpect downside breakdown\n"
+    tt += "Comp Duration:" + str.tostring(compressionBars[1]) + "b\n"
+    tt += not na(savedCompPOC) ? "Avg POC: " + str.tostring(savedCompPOC,"#.##") + "\n" : ""
+    addLabel(label.new(compressionStart[1], sY, "🧲", style=label.style_none, textcolor=col, size=iconSize, tooltip=tt), false)
+
+// Peak / 3-drive — DIRECT placement when proto is OFF
+if bullPeakSig and not (showProtoDelayed and protoPeakEnabled)
+    peakY = osc1_scaled[pivotLen]
+    sY    = peakY + getStack(bar_index - pivotLen)
+    tt    = buildTT("👑BULL PEAK", dirBias[pivotLen], confStr, slopeStr, pressureScore[pivotLen], structStr, energyPct[pivotLen], compressionBars[pivotLen], projMove[pivotLen], atr[pivotLen], bullPeakWR)
+    tt   += "⚠️ EXHAUSTION\nScale out 50-75%\nTrail to BE\n" + buildFPLine()
+    addLabel(label.new(bar_index - pivotLen, sY, "👑", style=label.style_none, textcolor=colSigBull, size=iconSize, tooltip=tt), false)
+
+if bearPeakSig and not (showProtoDelayed and protoPeakEnabled)
+    peakY = osc1_scaled[pivotLen]
+    sY    = peakY + getStack(bar_index - pivotLen)
+    tt    = buildTT("👑BEAR PEAK", dirBias[pivotLen], confStr, slopeStr, pressureScore[pivotLen], structStr, energyPct[pivotLen], compressionBars[pivotLen], projMove[pivotLen], atr[pivotLen], bearPeakWR)
+    tt   += "⚠️ EXHAUSTION\nScale out 50-75%\nTrail to BE\n" + buildFPLine()
+    addLabel(label.new(bar_index - pivotLen, sY, "👑", style=label.style_none, textcolor=colSigBear, size=iconSize, tooltip=tt), false)
+
+if threeDriveSig and not (showProtoDelayed and proto3DriveEnabled)
+    peakY = osc1_scaled[pivotLen]
+    sY    = peakY + getStack(bar_index - pivotLen)
+    tt    = "══ ⛽ TANK EMPTY ══\nP1:" + str.tostring(pk3,"#") + " P2:" + str.tostring(pk2,"#") + " P3:" + str.tostring(pk1,"#") + "\n⚠️ Out of fuel after 3 drives\nMomentum DEPLETED\n" + buildFPLine()
+    addLabel(label.new(bar_index - pivotLen, sY, "⛽", style=label.style_none, textcolor=colThreeDrive, size=iconSize, tooltip=tt), false)
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ███ BLEED — HYBRID (FP when available, proxy fallback)
+// ══════════════════════════════════════════════════════════════════════════════
+var label[] bleedPendLbls    = array.new_label()
+var int[]   bleedPendBars    = array.new_int()
+var bool[]  bleedPendIsBull  = array.new_bool()
+var float[] bleedPendDeltaR  = array.new_float()
+var float[] bleedPendVolR    = array.new_float()
+
+if climacticSig and not enableBleedEffortResult
+    sY  = iconBaseY + getStack(bar_index)
+    vR  = volume / volMean
+    cCol = isBullBias ? colBleed : isBearBias ? colBleedBear : colBleed
+    tt  = "══ 🩸 BLEED ══\nVol:" + str.tostring(vR,"#.#") + "x avg\n"
+    tt += fpAvail ? "Δ:" + str.tostring(fpDeltaRatio,"#.##") + " " + (bleedAbsorption ? "[ABSORPTION]" : bleedBlowoff ? "[BLOW-OFF]" : "[DIRECTIONAL]") + "\n" : ""
+    tt += "⚠️ EXTREME participation\nTIGHTEN stops\nScale out 50%+\n" + buildFPLine()
+    addLabel(label.new(bar_index, sY, "🩸", style=label.style_none, textcolor=cCol, size=iconSize, tooltip=tt), false)
+
+if climacticSig and enableBleedEffortResult
+    sY  = iconBaseY + getStack(bar_index)
+    vR  = volume / volMean
+    cCol = isBullBias ? colBleed : isBearBias ? colBleedBear : colBleed
+
+    cls = bleedAbsorption ? "ABSORPTION (CONTINUATION RISK)" :
+          bleedBlowoff    ? "BLOW-OFF? (PENDING CONFIRM)" : "DIRECTIONAL BLEED"
+
+    tt  = "══ 🩸 BLEED ══\nClass:" + cls + "\n"
+    tt += "Vol:" + str.tostring(vR,"#.#") + "x avg\n"
+    tt += fpAvail ? "Δ Ratio:" + str.tostring(fpDeltaRatio,"#.##") + "\n" : "ClosePos:" + str.tostring(closePos,"#.##") + "  RangeR:" + str.tostring(avgRange > 0 ? candleRange / avgRange : 0,"#.##") + "\n"
+    tt += fpAvail ? "Buy:" + str.tostring(fpBuyVol, format.volume) + " Sell:" + str.tostring(fpSellVol, format.volume) + "\n" : ""
+    tt += bleedAbsorption ? "⚠️ Two-sided absorption\nDon't fade blindly — walls on both sides\n" : ""
+    tt += bleedBlowoff    ? "⚠️ Extreme one-sided = climax\nAwaiting next-bar failure/hold...\n" : ""
+    tt += (not bleedAbsorption and not bleedBlowoff) ? "⚠️ Directional bleed\nTIGHTEN stops / Scale out 50%+\n" : ""
+
+    lbl = label.new(bar_index, sY, "🩸", style=label.style_none, textcolor=cCol, size=iconSize, tooltip=tt)
+    addLabel(lbl, false)
+
+    if bleedBlowoff
+        protectLabel(lbl)
+        array.push(bleedPendLbls,   lbl)
+        array.push(bleedPendBars,   bar_index)
+        array.push(bleedPendIsBull, bleedBlowoffIsBull)
+        array.push(bleedPendDeltaR, fpAvail ? fpDeltaRatio : closePos)
+        array.push(bleedPendVolR,   vR)
+
+if enableBleedEffortResult and array.size(bleedPendLbls) > 0
+    j = array.size(bleedPendLbls) - 1
+    while j >= 0
+        bb = array.get(bleedPendBars, j)
+        if bar_index - bb == 1
+            LL         = array.get(bleedPendLbls, j)
+            isBullCand = array.get(bleedPendIsBull, j)
+            dR0        = array.get(bleedPendDeltaR, j)
+            vR0        = array.get(bleedPendVolR, j)
+
+            prevMid = (high[1] + low[1]) / 2.0
+            fail = bleedFailMode == "Full Retrace" ?
+                 (isBullCand ? close < low[1] : close > high[1]) :
+                 (isBullCand ? close < prevMid : close > prevMid)
+
+            verdict = fail ? "TERMINAL (REVERSAL RISK)" : "CLIMAX (CONTINUATION RISK)"
+            tt2  = "══ 🩸 BLEED ══\nClass:" + verdict + "\n"
+            tt2 += "Vol:" + str.tostring(vR0,"#.#") + "x avg\n"
+            tt2 += fpAvail ? "Δ Now:" + str.tostring(fpDeltaRatio,"#.##") + "\n" : ""
+            tt2 += fail ? "⚠️ Next bar FAILED → reversal probability HIGH\n" : "✅ Next bar HELD → continuation probability HIGH\n"
+            label.set_tooltip(LL, tt2)
+            unprotectLabel(LL), capLabels()
+
+            array.remove(bleedPendLbls,  j), array.remove(bleedPendBars,   j)
+            array.remove(bleedPendIsBull,j), array.remove(bleedPendDeltaR, j)
+            array.remove(bleedPendVolR,  j)
+        j -= 1
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ███ COMPRESSION BOXES
+// ══════════════════════════════════════════════════════════════════════════════
+var box[]   compBoxes  = array.new_box()
+var label[] compLabels = array.new_label()
+
+if showCompBoxes and compressionEnded
+    boxCol    = isBullBias ? color.new(colCompBoxBull, compBoxTransp) : isBearBias ? color.new(colCompBoxBear, compBoxTransp) : color.new(colCompBoxNeut, compBoxTransp)
+    borderCol = isBullBias ? colCompBoxBull : isBearBias ? colCompBoxBear : colCompBoxNeut
+    bx = box.new(compressionStart[1], compHighOsc[1], bar_index - 1, compLowOsc[1] * 0.85, bgcolor=boxCol, border_color=borderCol, border_width=compBorderWidth)
+    array.push(compBoxes, bx)
+
+    dur  = compressionBars[1]
+    arr  = isBullBias ? "▲" : isBearBias ? "▼" : "◆"
+    mag  = compressImbalanceBull or compressImbalanceBear ? " 🧲" : ""
+    bTT  = "══ COMPRESSION ══\nDuration:" + str.tostring(dur) + "b\nBias:" + biasStr + "(" + str.tostring(dirBias,"#") + ")\n"
+    bTT += "Energy:" + str.tostring(compEnergy * 100,"#") + "%\nProj:" + str.tostring(projMove,"#.##") + "\n"
+    bTT += "── FP INSIDE DATA ──\n"
+    bTT += "Avg Δ Bias:" + str.tostring(savedCompDelta,"#.##") +
+         (savedCompDelta > fpImbalanceThresh ? " [BUY DOM 🧲]" : savedCompDelta < -fpImbalanceThresh ? " [SELL DOM 🧲]" : " [NEUTRAL]") + "\n"
+    bTT += not na(savedCompPOC) ? "Magnetic POC: " + str.tostring(savedCompPOC,"#.##") + "\n" : ""
+    bTT += "💡 Longer=Bigger move\n"
+    bTT += isBullBias ? "Expect UPSIDE" : isBearBias ? "Expect DOWNSIDE" : "Wait for clarity"
+
+    lbl = label.new(compressionStart[1], compHighOsc[1], str.tostring(dur) + "b" + arr + mag, style=label.style_none, textcolor=borderCol, size=size.tiny, tooltip=bTT)
+    array.push(compLabels, lbl)
+    addLabel(lbl, false)
+
+    if array.size(compBoxes) > 20
+        box.delete(array.shift(compBoxes))
+        deleteLabelAll(array.shift(compLabels))
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ███ PLOTS (all wired to Colors & Style inputs)
+// ══════════════════════════════════════════════════════════════════════════════
+fastStyle = switch fastPlotStyle
+    "Area"      => plot.style_area
+    "Line"      => plot.style_line
+    "Histogram" => plot.style_histogram
+    =>             plot.style_area
+
+// Energy columns — plotted first so they render BEHIND the oscillator curves
+plot(showEnergyCols ? energyColVal : na, title="Energy Columns", color=energyColColor, style=plot.style_columns, editable=true)
+hline(0, title="Zero Line", color=color.new(color.gray, 80), linestyle=hline.style_dotted, editable=true)
+
+p1 = plot(osc1_scaled, title="Fast", color=color.new(colFast, colFastTransp), style=fastStyle, editable=true)
+p2 = plot(osc2_scaled, title="Mid",  color=color.new(colMid, colMidTransp), linewidth=midLineWidth, editable=true)
+p3 = plot(osc3_scaled, title="Slow", color=color.new(colSlow, colSlowTransp), linewidth=slowLineWidth, editable=true)
+fill(p1, p2, color=color.new(colFill12, fill12Transp))
+fill(p2, p3, color=color.new(colFill23, fill23Transp))
+
+scaleAnchor       = math.max(rollingMaxScaled, 1.0)
+maxIconsPerBar    = 10
+stackPctCapForScale = 100.0
+topAnchor = scaleAnchor * (1.25 + maxIconsPerBar * (stackPctCapForScale / 100.0))
+botAnchor = -scaleAnchor * 1.25
+plot(topAnchor, title="ScaleAnchorTop",    display=display.none, editable=false)
+plot(botAnchor, title="ScaleAnchorBottom", display=display.none, editable=false)
+
+stateCol = isBreakout ? colStateBreakout : isExpanding ? colStateExpanding : isContracting ? colStateContracting : colStateNeutral
+plot(stateBarPos, title="State",     color=stateCol, linewidth=stateWidth, editable=true)
+dirBarPos = stateBarPos * dirBarGap
+dirCol = isBullBias ? colDirBull : isBearBias ? colDirBear : colDirNeutral
+plot(dirBarPos, title="Direction", color=dirCol,   linewidth=stateWidth, editable=true)
+
+// FP status bar
+fpBarCol = fpAvail ? color.new(colFPActive, fpActiveTransp) : color.new(colFPInactive, fpInactiveTransp)
+plot(stateBarPos * dirBarGap * 1.5, title="FP Status", color=fpBarCol, linewidth=1, editable=true)
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ███ ML TABLE
+// ══════════════════════════════════════════════════════════════════════════════
+tablePos = switch tablePosition
+    "Top Right"    => position.top_right
+    "Top Center"   => position.top_center
+    "Top Left"     => position.top_left
+    "Middle Right" => position.middle_right
+    "Middle Left"  => position.middle_left
+    "Bottom Right" => position.bottom_right
+    "Bottom Center"=> position.bottom_center
+    "Bottom Left"  => position.bottom_left
+    =>               position.middle_left
+
+var table mlT = na
+if showMLTable and na(mlT)
+    mlT := table.new(tablePos, 3, 9, bgcolor=color.new(color.black, 80), frame_color=color.gray)
+if not showMLTable and not na(mlT)
+    table.delete(mlT), mlT := na
+
+if showMLTable and barstate.islast and not na(mlT)
+    statusTxt = isWarmedUp ? "ML ACTIVE" : "WARMUP (" + str.tostring(realSignalCount) + "/10)"
+    statusCol = isWarmedUp ? color.lime : color.yellow
+    table.cell(mlT, 0, 0, statusTxt,     text_color=statusCol,     text_size=size.tiny)
+    table.cell(mlT, 1, 0, "WIN%",        text_color=color.white,   text_size=size.tiny)
+    table.cell(mlT, 2, 0, "ON",          text_color=color.white,   text_size=size.tiny)
+
+    avgCWR = (bullCompWR + bearCompWR) / 2
+    avgBWR = (bullBreakWR + bearBreakWR) / 2
+    avgPWR = (bullPeakWR + bearPeakWR) / 2
+
+    table.cell(mlT, 0, 1, "🔋Comp",   text_color=color.aqua,   text_size=size.tiny)
+    table.cell(mlT, 1, 1, str.tostring(avgCWR,"#") + "%", text_color=avgCWR >= 50 ? color.lime : color.red, text_size=size.tiny)
+    table.cell(mlT, 2, 1, avgCWR >= mlMinWinRate or not isWarmedUp ? "✓" : "✗", text_color=avgCWR >= mlMinWinRate or not isWarmedUp ? color.lime : color.red, text_size=size.tiny)
+
+    table.cell(mlT, 0, 2, "🦅💀Brk",  text_color=color.lime,   text_size=size.tiny)
+    table.cell(mlT, 1, 2, str.tostring(avgBWR,"#") + "%", text_color=avgBWR >= 50 ? color.lime : color.red, text_size=size.tiny)
+    table.cell(mlT, 2, 2, "✓", text_color=color.lime, text_size=size.tiny)
+
+    table.cell(mlT, 0, 3, "👑Peak",   text_color=color.yellow, text_size=size.tiny)
+    table.cell(mlT, 1, 3, str.tostring(avgPWR,"#") + "%", text_color=avgPWR >= 50 ? color.lime : color.red, text_size=size.tiny)
+    table.cell(mlT, 2, 3, "✓", text_color=color.lime, text_size=size.tiny)
+
+    table.cell(mlT, 0, 4, "⚠️Trap",   text_color=color.orange, text_size=size.tiny)
+    table.cell(mlT, 1, 4, str.tostring(trapWR,"#") + "%", text_color=trapWR >= 50 ? color.lime : color.red, text_size=size.tiny)
+    table.cell(mlT, 2, 4, trapWR >= mlMinWinRate or not isWarmedUp ? "✓" : "✗", text_color=trapWR >= mlMinWinRate or not isWarmedUp ? color.lime : color.red, text_size=size.tiny)
+
+    table.cell(mlT, 0, 5, "🔻DistrWR", text_color=color.red,  text_size=size.tiny)
+    table.cell(mlT, 1, 5, str.tostring(fpBearDivWR,"#") + "%", text_color=fpBearDivWR >= 50 ? color.lime : color.red, text_size=size.tiny)
+    table.cell(mlT, 2, 5, fpBearDivWR >= mlMinWinRate or not isWarmedUp ? "✓" : "✗", text_color=fpBearDivWR >= mlMinWinRate or not isWarmedUp ? color.lime : color.red, text_size=size.tiny)
+
+    table.cell(mlT, 0, 6, "🔺AccumWR", text_color=color.lime, text_size=size.tiny)
+    table.cell(mlT, 1, 6, str.tostring(fpBullDivWR,"#") + "%", text_color=fpBullDivWR >= 50 ? color.lime : color.red, text_size=size.tiny)
+    table.cell(mlT, 2, 6, fpBullDivWR >= mlMinWinRate or not isWarmedUp ? "✓" : "✗", text_color=fpBullDivWR >= mlMinWinRate or not isWarmedUp ? color.lime : color.red, text_size=size.tiny)
+
+    table.cell(mlT, 0, 7, "TF:" + tfRegime + " FP:" + str.tostring(fpTickSize), text_color=color.gray, text_size=size.tiny)
+    table.cell(mlT, 1, 7, "Peak:" + str.tostring(peakThresholdFinal,"#") + "%",  text_color=color.gray, text_size=size.tiny)
+    table.cell(mlT, 2, 7, fpAvail ? "FP✓" : "FP✗", text_color=fpAvail ? color.teal : color.red, text_size=size.tiny)
+
+    table.cell(mlT, 0, 8, "Pres:" + pressureSource, text_color=color.gray, text_size=size.tiny)
+    table.cell(mlT, 1, 8, str.tostring(pressureScore,"#"), text_color=pressureScore > 0 ? color.aqua : pressureScore < 0 ? color.fuchsia : color.gray, text_size=size.tiny)
+    table.cell(mlT, 2, 8, "", text_size=size.tiny)
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ███ ALERTS
+// ══════════════════════════════════════════════════════════════════════════════
+alertcondition(bullCompSig,           title="Bull Charging",       message="ZENITH LION FP: 🔋 CHARGING (Bullish compression)")
+alertcondition(bearCompSig,           title="Bear Charging",       message="ZENITH LION FP: 🔋 CHARGING (Bearish compression)")
+alertcondition(bullBreakSig,          title="Eagle Rising",        message="ZENITH LION FP: 🦅 EAGLE RISING - GO LONG!")
+alertcondition(bearBreakSig,          title="Death Drop",          message="ZENITH LION FP: 💀 DEATH DROP - GO SHORT!")
+alertcondition(bullPeakSig,           title="Bull Peak",           message="ZENITH LION FP: 👑 Bull peak")
+alertcondition(bearPeakSig,           title="Bear Peak",           message="ZENITH LION FP: 👑 Bear peak")
+alertcondition(regBullDivSig,         title="Diamond Bull",        message="ZENITH LION FP: 💎 DIAMOND bullish divergence")
+alertcondition(regBearDivSig,         title="Diamond Bear",        message="ZENITH LION FP: 💎 DIAMOND bearish divergence")
+alertcondition(hidBullDivStartSig,    title="Hidden Bull Start",   message="ZENITH LION FP: 🎭 HIDDEN BULL — continuation ACTIVE")
+alertcondition(hidBullDivEndSig,      title="Hidden Bull End",     message="ZENITH LION FP: 🎭 HIDDEN BULL — condition EXHAUSTED")
+alertcondition(hidBearDivStartSig,    title="Hidden Bear Start",   message="ZENITH LION FP: 🎭 HIDDEN BEAR — continuation ACTIVE")
+alertcondition(hidBearDivEndSig,      title="Hidden Bear End",     message="ZENITH LION FP: 🎭 HIDDEN BEAR — condition EXHAUSTED")
+alertcondition(bullTrapSig,           title="Bull Trap",           message="ZENITH LION FP: ⚠️ Trap detected! (Bull)")
+alertcondition(bearTrapSig,           title="Bear Trap",           message="ZENITH LION FP: ⚠️ Trap detected! (Bear)")
+alertcondition(climacticSig,          title="Bleed",               message="ZENITH LION FP: 🩸 BLEED - Climactic extreme volume")
+alertcondition(threeDriveSig,         title="Tank Empty",          message="ZENITH LION FP: ⛽ TANK EMPTY - 3-drive exhaustion")
+alertcondition(fpDeltaBearDivSig,     title="FP Distribution",    message="ZENITH LION FP: 🔻 DISTRIBUTION — delta diverging at bull peak")
+alertcondition(fpDeltaBullDivSig,     title="FP Accumulation",    message="ZENITH LION FP: 🔺 ACCUMULATION — delta diverging at bear peak")
+alertcondition(compressImbalanceBull, title="FP Bull Imbalance",  message="ZENITH LION FP: 🧲 BUY IMBALANCE stacked in compression")
+alertcondition(compressImbalanceBear, title="FP Bear Imbalance",  message="ZENITH LION FP: 🧲 SELL IMBALANCE stacked in compression")
