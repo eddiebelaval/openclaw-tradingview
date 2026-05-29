@@ -1,5 +1,5 @@
 ---
-last-synced-to-vision: 2026-03-25
+last-synced-to-vision: 2026-04-02
 status: ACTIVE
 ---
 
@@ -14,12 +14,15 @@ scripts/
   run_pipeline.py          # Orchestrator: pine -> python -> backtest -> log
   update_rankings.py       # Recalculates composite scores in Supabase
   daily_run.sh             # Cron wrapper for full pipeline execution
+  validate_rankings.py     # Validates top scripts against TradingView live data
+  rolling_scorer.py        # Rolling 6mo window scorer for consistency ranking
   urls_*.json              # URL manifests per category (10 categories)
 
 framework/
   pine_converter.py        # PineScript -> Python via Claude Haiku API
   backtest_engine.py       # Runs backtesting.py against OHLCV data
   data_fetcher.py          # Fetches market data for SPY, QQQ, BTC
+  tv_bridge.py             # Thin bridge to TradingView Desktop via CDP (MCP CLI)
   csv_logger.py            # Logs results to backtest_results.csv
   stats_formatter.py       # Formats stats output
   supabase_sync.py         # Syncs results to Supabase tables
@@ -61,10 +64,23 @@ TradingView categories
 - roi_pct, max_drawdown_pct, sharpe_ratio, sortino_ratio
 - win_rate_pct, profit_factor, num_trades, expectancy_pct
 
-**Composite Score Formula:**
+**Composite Score Formula (DEPRECATED for ranking):**
 `Sharpe * 0.3 + (ROI/100) * 0.25 + (WinRate/100) * 0.25 + (ProfitFactor/10) * 0.2`
 
 Auto-recalculated by Postgres trigger on every backtest insert/update.
+
+**Consistency Score (NEW primary ranking, Apr 2026):**
+Rolling 6-month non-overlapping windows across SPY/QQQ/BTC.
+`profitable_ratio * 0.35 + sharpe_consistency * 0.25 + roi_norm * 0.25 + active_ratio * 0.15`
+
+Stored in `composite_score` column (replaces old formula). Original composite preserved in `tags` array as `orig_composite:X`.
+
+**TradingView MCP Bridge:**
+- MCP server: `tradingview` (user scope, `node ~/Development/tradingview-mcp/src/server.js`)
+- Python bridge: `framework/tv_bridge.py` (subprocess to CLI, ~200ms/call)
+- Reads: quotes, OHLCV (DataFrame-compatible), study values, chart state
+- Controls: symbol, timeframe, Pine injection, screenshots
+- Limitation: 300 bars max (CLI buffer), strategy tester injection not working
 
 ## API
 

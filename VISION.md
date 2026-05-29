@@ -1,8 +1,8 @@
 ---
-last-evolved: 2026-03-25
+last-evolved: 2026-04-02
 confidence: HIGH
-distance: 40%
-pillars: "3 (3R, 0P, 0U)"
+distance: 30%
+pillars: "4 (3R, 1P, 0U)"
 ---
 
 # VISION
@@ -33,6 +33,12 @@ Claude Haiku converts PineScript to runnable Python backtests using backtesting.
 
 Supabase tables (`ds_tv_indicators`, `ds_tv_backtests`) rank indicators by composite score (30% Sharpe + 25% ROI + 25% Win Rate + 20% Profit Factor). A trigger auto-recalculates on every new backtest insert. The FastAPI server exposes the pipeline as an HTTP endpoint for on-demand backtesting.
 
+### 4. Validate Winners Against Live Data (PROGRESSING)
+
+The original composite score (Sharpe/ROI/WinRate/PF blend) suffers from window bias: strategies that spiked in one 6-month period inflate the score even if they underperform in every other period. Phase 4 introduces a TradingView MCP bridge that reads live chart data and a rolling window scorer that ranks by consistency across multiple time periods and assets. Only strategies profitable across all windows graduate to DeepStack.
+
+Key finding (Apr 2): data between yfinance and TradingView is identical (close delta <$0.05). The divergence was 100% bar count (502 vs 300 bars). Rankings are now recomputed with consistency scoring.
+
 ## North Star
 
-A self-refreshing indicator research pipeline that continuously discovers, tests, and graduates winning strategies into the live DeepStack trading system.
+A self-refreshing indicator research pipeline that continuously discovers, tests, validates against live data, and graduates consistently profitable strategies into the live DeepStack trading system.

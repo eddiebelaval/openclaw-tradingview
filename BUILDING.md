@@ -1,5 +1,5 @@
 ---
-last-updated: 2026-03-25
+last-updated: 2026-04-02
 ---
 
 # BUILDING
@@ -43,10 +43,34 @@ Files are organized by TradingView category (not flat) because: (1) categories m
 ### Composite Score Weighting
 Sharpe (30%) weighted highest because risk-adjusted returns matter more than raw ROI for real trading. Win rate and profit factor together (45%) capture reliability. ROI (25%) captures magnitude. The trigger-based calculation means scores stay fresh automatically.
 
+### Phase 4: Live Validation + Consistency Scoring (Apr 2026)
+
+**Thesis validated:** Pipeline Haiku conversions are faithful (data matches to the penny between yfinance and TradingView). But rankings suffer from window bias: strategies that spiked in one period inflate the composite score.
+
+**What was built:**
+- TradingView MCP bridge (`framework/tv_bridge.py`): reads live chart data via CDP
+- Validation script (`scripts/validate_rankings.py`): re-runs top scripts on TV data
+- Rolling window scorer (`scripts/rolling_scorer.py`): 6-month non-overlapping windows
+- Supabase updated with consistency scores replacing old composite
+
+**Key findings:**
+- 30% trust rate on original top 10 (7/10 diverged on different bar windows)
+- DMI signal test: 40% agreement between TV native (len=14) and pipeline (len=17)
+- Root cause: bar count window bias, NOT data quality or conversion quality
+- 3 strategies survived cross-asset rolling validation:
+  1. swing-highlow-wick-zones (CS=0.755, 82% profitable windows)
+  2. liquidities-pivot-levels (CS=0.748)
+  3. smart-money-auto-order-blocks (CS=0.733)
+
+**Architecture decision: thin bridge first, highway later.**
+Subprocess calls to Node.js CLI (~200ms/call) prove the value before investing in a direct CDP Python client (~20ms/call).
+
 ## What's Next
 
-- [ ] Run full backtest pipeline against all 3,921 scripts
-- [ ] Filter results: Sharpe >= 1, WR >= 60%, trades >= 5
-- [ ] Feed top performers into DeepStack's IBKR strategy pool
+- [ ] Run rolling scorer on all 2,485 scripts (overnight batch job)
+- [ ] Integrate consistency scoring into daily pipeline (auto-compute on new scripts)
+- [ ] Fix 300-bar bridge limit (chunk requests or pipe to file)
+- [ ] Build direct CDP Python client (eliminate subprocess overhead)
+- [ ] Solve Pine injection strategy tester issue (TV Desktop doesn't register isStrategy)
+- [ ] Feed consistently profitable strategies into DAE V2 / DeepStack strategy pool
 - [ ] Set up daily_run.sh cron for continuous indicator discovery
-- [ ] Add new TradingView categories as they emerge
