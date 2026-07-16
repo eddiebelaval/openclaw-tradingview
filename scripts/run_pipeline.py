@@ -165,7 +165,10 @@ def process_single_pine(pine_file: Path) -> bool:
             sharpe_str = f"{sharpe:.2f}" if isinstance(sharpe, (int, float)) else sharpe
             print(f"    {ticker}: ROI={roi_str}  Sharpe={sharpe_str}  Trades={trades}")
 
-    return True
+    # Treat a script as failed when every configured ticker failed. Partial
+    # results remain useful, but an all-error run must be visible in the daily
+    # pipeline summary and persisted failure state.
+    return any("error" not in stats for stats in multi_stats.values())
 
 
 def _write_backtest_file(
@@ -264,13 +267,16 @@ def main():
     # Send Telegram daily summary (non-blocking)
     try:
         from framework.notifications import notify_daily_summary
-        notify_daily_summary(
+        sent = notify_daily_summary(
             total_scraped=len(pines),
             total_converted=success,
             total_failed=failed,
             elapsed_seconds=elapsed,
         )
-        print("  Telegram summary sent")
+        if sent:
+            print("  Telegram summary sent")
+        else:
+            print("  Telegram summary failed")
     except Exception as e:
         print(f"  Telegram notification skipped: {e}")
 
